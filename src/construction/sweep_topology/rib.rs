@@ -1,0 +1,1006 @@
+use super::*;
+use crate::{classify_point, PointClass, SolidClassifier};
+use serde::{Deserialize, Serialize};
+
+/// Rational ruled surface between two curves with IDENTICAL degree, knots and
+/// weight pattern (the drafted-arc rows share one `make_arc` window, so this
+/// yields the EXACT cone patch: each ruling blends radially-corresponding
+/// points at equal weights).
+pub(super) fn ruled_between(bottom: &NurbsCurve, top: &NurbsCurve) -> Result<NurbsSurface, String> {
+    if bottom.degree != top.degree
+        || bottom.control_points.len() != top.control_points.len()
+        || bottom.knots.len() != top.knots.len()
+    {
+        return Err("ruled_between: rows are not representation-compatible".into());
+    }
+    let grid = bottom
+        .control_points
+        .iter()
+        .zip(&top.control_points)
+        .map(|(a, b)| vec![*a, *b])
+        .collect();
+    NurbsSurface::new(
+        bottom.degree,
+        1,
+        bottom.knots.clone(),
+        vec![0.0, 0.0, 1.0, 1.0],
+        grid,
+    )
+}
+
+/// Subrange of a wall ROW curve between the projections of two junction
+/// points.  Splitting (instead of rebuilding with `make_arc`) preserves the
+/// row's parameterization exactly, so the edge is the surface's own boundary
+/// restriction and its parameter-line pcurve is pointwise exact.
+pub(super) fn arc_window_subrange(row: &NurbsCurve, start: Vec3, end: Vec3) -> Result<NurbsCurve, String> {
+    let [d0, d1] = row.domain()?;
+    let span = d1 - d0;
+    let u0 = project_point_to_curve(row, start)?.u;
+    let u1 = project_point_to_curve(row, end)?.u;
+    if u1 <= u0 + 1e-12 {
+        return Err("draftExtrude: a drafted arc's boundary trim inverted".into());
+    }
+    let epsilon = span * 1e-9;
+    let mut current = row.clone();
+    if u0 > d0 + epsilon {
+        current = current.split(u0)?.1;
+    }
+    let domain = current.domain()?;
+    if u1 < domain[1] - epsilon && u1 > domain[0] + epsilon {
+        current = current.split(u1)?.0;
+    }
+    Ok(current)
+}
+
+/// Gradient (unnormalized surface normal direction) of a drafted WALL's
+/// implicit surface at a point on it: for a line wall the tilted plane's
+/// normal; for an arc wall the cone's ∇(ρ − r(z)) = ρ̂ + (d·turn/h)·ẑ.  Exact
+/// closed forms — the junction-conic end tangents come from their cross
+/// products.
+fn wall_gradient(
+    seg: &SegGeom,
+    point: Vec3,
+    zh: Vec3,
+    height: f64,
+    signed_d: f64,
+) -> Result<Vec3, String> {
+    match seg {
+        SegGeom::Line { dir, normal, .. } => dir
+            .cross(normal.scale(signed_d).add(zh.scale(height)))
+            .normalized(),
+        SegGeom::Arc {
+            center, turn, ..
+        } => {
+            let rel = point.sub(*center);
+            let radial = rel.sub(zh.scale(rel.dot(zh)));
+            let rho = radial.normalized()?;
+            rho.add(zh.scale(signed_d * turn / height)).normalized()
+        }
+    }
+}
+
+/// The EXACT junction edge between two adjacent drafted walls, from bottom
+/// junction `a` to top junction `b` with mid-height witness `m` (all three are
+/// exact offset-primitive intersections).  Straight when `m` is collinear
+/// (plane∧plane miter edges, tangent-junction cone rulings); otherwise the
+/// exact CONIC through `a`/`b` with the walls' analytic gradient-cross end
+/// tangents, its rational-quadratic weight solved from `m` (a conic is
+/// uniquely determined by that data, and every drafted wall∧wall intersection
+/// IS a conic — both squared implicits shrink linearly at the same rate, so
+/// their difference is a plane).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn junction_edge_curve(
+    prev: &SegGeom,
+    next: &SegGeom,
+    a: Vec3,
+    m: Vec3,
+    b: Vec3,
+    zh: Vec3,
+    height: f64,
+    signed_d: f64,
+) -> Result<NurbsCurve, String> {
+    let chord = b.sub(a);
+    let length = chord.length();
+    if length <= 1e-12 {
+        return Err("draftExtrude: a junction edge collapsed to a point".into());
+    }
+    let along = m.sub(a).dot(chord) / (length * length);
+    let deviation = m.sub(a).sub(chord.scale(along)).length();
+    if deviation <= length * 1e-9 {
+        return make_line(a, b);
+    }
+    // 2D frame in the conic's plane (it contains a, b, m by construction).
+    let e1 = chord.scale(1.0 / length);
+    let plane_normal = chord.cross(m.sub(a)).normalized()?;
+    let e2 = plane_normal.cross(e1).normalized()?;
+    let orient = |tangent: Vec3| {
+        if tangent.dot(zh) < 0.0 {
+            tangent.scale(-1.0)
+        } else {
+            tangent
+        }
+    };
+    let t0 = orient(wall_gradient(prev, a, zh, height, signed_d)?
+        .cross(wall_gradient(next, a, zh, height, signed_d)?));
+    let t2 = orient(wall_gradient(prev, b, zh, height, signed_d)?
+        .cross(wall_gradient(next, b, zh, height, signed_d)?));
+    let d0 = (t0.dot(e1), t0.dot(e2));
+    let d2 = (t2.dot(e1), t2.dot(e2));
+    let denom = d0.0 * d2.1 - d0.1 * d2.0;
+    let scale0 = d0.0.hypot(d0.1);
+    let scale2 = d2.0.hypot(d2.1);
+    if denom.abs() <= 1e-14 * scale0 * scale2 {
+        return Err("draftExtrude: junction end tangents are parallel — no conic apex".into());
+    }
+    // Apex: a + s·t0 = b + r·t2 solved in 2D (a = origin, b = (length, 0)).
+    let s = length * d2.1 / denom;
+    let apex = (s * d0.0, s * d0.1);
+    if apex.1.abs() <= f64::EPSILON * length {
+        return Err("draftExtrude: junction conic apex is degenerate".into());
+    }
+    // Barycentric coordinates of m over (a, apex, b): m = α·a + β·apex + γ·b.
+    let mq = (m.sub(a).dot(e1), m.sub(a).dot(e2));
+    let beta = mq.1 / apex.1;
+    let gamma = (mq.0 - beta * apex.0) / length;
+    let alpha = 1.0 - beta - gamma;
+    if !(alpha > 0.0 && beta > 0.0 && gamma > 0.0) {
+        return Err(format!(
+            "draftExtrude: junction conic witness fell outside its control triangle \
+             (α={alpha:.3e} β={beta:.3e} γ={gamma:.3e})"
+        ));
+    }
+    let weight = beta / (2.0 * (alpha * gamma).sqrt());
+    let apex_3d = a.add(e1.scale(apex.0)).add(e2.scale(apex.1));
+    NurbsCurve::new(
+        2,
+        vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+        vec![
+            Vec4::from_point(a, 1.0),
+            Vec4::from_point(apex_3d, weight),
+            Vec4::from_point(b, 1.0),
+        ],
+    )
+}
+
+/// In-plane circumcircle of three coplanar points (projected onto `ex`/`ey`,
+/// `np = ex×ey`).  Returns `None` when the three points are collinear.
+fn circumcircle(a: Vec3, b: Vec3, c: Vec3, ex: Vec3, ey: Vec3, np: Vec3) -> Option<(Vec3, f64)> {
+    let (ax, ay) = (a.dot(ex), a.dot(ey));
+    let (bx, by) = (b.dot(ex), b.dot(ey));
+    let (cx, cy) = (c.dot(ex), c.dot(ey));
+    let d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+    if d.abs() < 1e-12 {
+        return None;
+    }
+    let a2 = ax * ax + ay * ay;
+    let b2 = bx * bx + by * by;
+    let c2 = cx * cx + cy * cy;
+    let ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d;
+    let uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d;
+    let plane_off = a.dot(np);
+    let center = ex.scale(ux).add(ey.scale(uy)).add(np.scale(plane_off));
+    let radius = a.sub(center).length();
+    Some((center, radius))
+}
+
+/// Intersect an offset LINE (through `line_point`, direction `line_dir`) with an
+/// offset CIRCLE (`center`, `radius`), returning the root nearest `near` (the
+/// original junction).  A clear Err when they no longer meet (offset too large).
+fn intersect_offset_line_circle(
+    line_point: Vec3,
+    line_dir: Vec3,
+    center: Vec3,
+    radius: f64,
+    near: Vec3,
+) -> Result<Vec3, String> {
+    let dir = line_dir.normalized()?;
+    let f = line_point.sub(center);
+    let b = f.dot(dir);
+    let c = f.dot(f) - radius * radius;
+    let disc = b * b - c;
+    if disc < -1e-9 {
+        return Err("an offset line and arc no longer meet (offset too large)".into());
+    }
+    let root = disc.max(0.0).sqrt();
+    let p1 = line_point.add(dir.scale(-b + root));
+    let p2 = line_point.add(dir.scale(-b - root));
+    Ok(if p1.sub(near).length() <= p2.sub(near).length() {
+        p1
+    } else {
+        p2
+    })
+}
+
+/// Intersect two offset CIRCLES (in the plane whose normal is `plane_normal`),
+/// returning the root nearest `near`.  A clear Err when they are concentric or no
+/// longer meet.
+fn intersect_offset_circles(
+    c1: Vec3,
+    r1: f64,
+    c2: Vec3,
+    r2: f64,
+    plane_normal: Vec3,
+    near: Vec3,
+) -> Result<Vec3, String> {
+    let between = c2.sub(c1);
+    let d = between.length();
+    if d < 1e-9 {
+        return Err("concentric offset arcs do not meet".into());
+    }
+    let axis = between.scale(1.0 / d);
+    let a = (d * d + r1 * r1 - r2 * r2) / (2.0 * d);
+    let h2 = r1 * r1 - a * a;
+    if h2 < -1e-9 {
+        return Err("offset arcs no longer meet (offset too large)".into());
+    }
+    let h = h2.max(0.0).sqrt();
+    let base = c1.add(axis.scale(a));
+    let perp = plane_normal.cross(axis).normalized()?;
+    let p1 = base.add(perp.scale(h));
+    let p2 = base.sub(perp.scale(h));
+    Ok(if p1.sub(near).length() <= p2.sub(near).length() {
+        p1
+    } else {
+        p2
+    })
+}
+
+/// Geometry class of one profile segment, shared by the draft-extrude builder
+/// and the in-plane offset engine: a straight LINE or a circular ARC in the
+/// plane with normal `plane_normal`.
+pub(super) enum SegGeom {
+    Line {
+        start: Vec3,
+        end: Vec3,
+        /// Unit chord direction.
+        dir: Vec3,
+        /// In-plane offset normal `plane_normal × dir` (inward on a CCW loop).
+        normal: Vec3,
+    },
+    Arc {
+        center: Vec3,
+        radius: f64,
+        /// +1 when the arc bends CCW about the plane normal (a convex arc on a
+        /// CCW loop, which SHRINKS under a positive inward offset), −1 when CW.
+        turn: f64,
+        /// ±plane_normal — the axis the arc sweeps CCW about.
+        arc_normal: Vec3,
+        start: Vec3,
+        end: Vec3,
+    },
+}
+
+impl SegGeom {
+    fn start(&self) -> Vec3 {
+        match self {
+            SegGeom::Line { start, .. } | SegGeom::Arc { start, .. } => *start,
+        }
+    }
+
+    fn end(&self) -> Vec3 {
+        match self {
+            SegGeom::Line { end, .. } | SegGeom::Arc { end, .. } => *end,
+        }
+    }
+
+    /// Naive offset image of a point ON this segment's primitive: lines
+    /// translate along their normal; arc points scale radially onto the
+    /// concentric offset circle (Err when a concave arc collapses).
+    fn offset_point(&self, point: Vec3, signed_d: f64) -> Result<Vec3, String> {
+        match self {
+            SegGeom::Line { normal, .. } => Ok(point.add(normal.scale(signed_d))),
+            SegGeom::Arc {
+                center,
+                radius,
+                turn,
+                ..
+            } => {
+                let r_offset = radius - signed_d * turn;
+                if r_offset <= 1e-6 {
+                    return Err("offset: distance is too large — a concave arc collapses".into());
+                }
+                Ok(center.add(point.sub(*center).scale(r_offset / radius)))
+            }
+        }
+    }
+}
+
+/// Classify every profile segment as a LINE (all interior samples on the
+/// chord) or a circular ARC (circumcircle through start/mid/end confirmed by
+/// on-circle samples), with its turning direction about `plane_normal`.
+/// Anything else is a clear Err — the offset/draft machinery is exact for
+/// lines and circles only.
+pub(super) fn classify_profile_segments(
+    profile: &[NurbsCurve],
+    plane_normal: Vec3,
+) -> Result<Vec<SegGeom>, String> {
+    let tol = 1e-6;
+    if profile.is_empty() {
+        return Err("offset: profile has no segments".into());
+    }
+    let np = plane_normal.normalized()?;
+    let ex = np.perpendicular()?;
+    let ey = np.cross(ex).normalized()?;
+    let mut segs = Vec::with_capacity(profile.len());
+    for curve in profile {
+        let [t0, t1] = curve.domain()?;
+        let start = curve.evaluate(t0)?;
+        let end = curve.evaluate(t1)?;
+        let chord = end.sub(start);
+        let chord_len = chord.length();
+        if chord_len <= tol {
+            return Err("offset: profile has a degenerate (zero-length) segment".into());
+        }
+        let dir = chord.scale(1.0 / chord_len);
+        // A straight LINE if every interior sample lies on the chord.
+        let mut is_line = true;
+        for k in 1..8 {
+            let point = curve.evaluate(t0 + (t1 - t0) * k as f64 / 8.0)?;
+            let rel = point.sub(start);
+            let perpendicular = rel.sub(dir.scale(rel.dot(dir))).length();
+            if perpendicular > tol * 10.0 {
+                is_line = false;
+                break;
+            }
+        }
+        if is_line {
+            segs.push(SegGeom::Line {
+                start,
+                end,
+                dir,
+                normal: np.cross(dir).normalized()?,
+            });
+            continue;
+        }
+        // Otherwise it must be a circular ARC: fit a circle through start/mid/end.
+        let mid = curve.evaluate((t0 + t1) * 0.5)?;
+        let (center, radius) = circumcircle(start, mid, end, ex, ey, np).ok_or_else(|| {
+            "offset: only straight lines and circular arcs are supported".to_string()
+        })?;
+        for k in 0..=8 {
+            let point = curve.evaluate(t0 + (t1 - t0) * k as f64 / 8.0)?;
+            if (point.sub(center).length() - radius).abs() > tol * 10.0 {
+                return Err("offset: only straight lines and circular arcs are supported".into());
+            }
+        }
+        // Turning direction about the plane normal (CCW ⇒ +1 ⇒ shrink inward).
+        let bend = np.dot(mid.sub(start).cross(end.sub(mid)));
+        let (arc_normal, turn) = if bend >= 0.0 {
+            (np, 1.0)
+        } else {
+            (np.scale(-1.0), -1.0)
+        };
+        segs.push(SegGeom::Arc {
+            center,
+            radius,
+            turn,
+            arc_normal,
+            start,
+            end,
+        });
+    }
+    Ok(segs)
+}
+
+/// The junction between two consecutive segments' OFFSET primitives at signed
+/// in-plane distance `signed_d`:
+///   • offset 0 → the original shared vertex, exactly;
+///   • a TANGENT (G1) junction degenerates to the shared offset point
+///     (coincident-naive-offsets fast path);
+///   • line∧line → the exact miter V' = V + signed_d/(1+nₐ·n_b)·(nₐ+n_b);
+///   • line∧arc  → the offset line ∩ the offset circle, root nearest V;
+///   • arc∧arc   → the two offset circles ∩, root nearest V.
+/// Offsets that no longer meet (too large for the local feature) are a clear
+/// Err.
+pub(super) fn offset_junction(
+    prev: &SegGeom,
+    next: &SegGeom,
+    plane_normal: Vec3,
+    signed_d: f64,
+) -> Result<Vec3, String> {
+    let vertex = prev.end();
+    if signed_d == 0.0 {
+        return Ok(vertex);
+    }
+    let prev_offset = prev.offset_point(prev.end(), signed_d)?;
+    let next_offset = next.offset_point(next.start(), signed_d)?;
+    if prev_offset.sub(next_offset).length() <= 1e-6 {
+        return Ok(prev_offset.add(next_offset).scale(0.5));
+    }
+    match (prev, next) {
+        (SegGeom::Line { normal: na, .. }, SegGeom::Line { normal: nb, .. }) => {
+            let denom = 1.0 + na.dot(*nb);
+            if denom.abs() < 1e-6 {
+                return Err("offset: degenerate (near-reversal) polyline corner".into());
+            }
+            Ok(vertex.add(na.add(*nb).scale(signed_d / denom)))
+        }
+        (
+            SegGeom::Line { dir, .. },
+            SegGeom::Arc {
+                center,
+                radius,
+                turn,
+                ..
+            },
+        ) => intersect_offset_line_circle(
+            prev_offset,
+            *dir,
+            *center,
+            radius - signed_d * turn,
+            vertex,
+        ),
+        (
+            SegGeom::Arc {
+                center,
+                radius,
+                turn,
+                ..
+            },
+            SegGeom::Line { dir, .. },
+        ) => intersect_offset_line_circle(
+            next_offset,
+            *dir,
+            *center,
+            radius - signed_d * turn,
+            vertex,
+        ),
+        (
+            SegGeom::Arc {
+                center: c1,
+                radius: r1,
+                turn: turn1,
+                ..
+            },
+            SegGeom::Arc {
+                center: c2,
+                radius: r2,
+                turn: turn2,
+                ..
+            },
+        ) => intersect_offset_circles(
+            *c1,
+            r1 - signed_d * turn1,
+            *c2,
+            r2 - signed_d * turn2,
+            plane_normal,
+            vertex,
+        ),
+    }
+}
+
+/// Offset a planar profile CHAIN (a sequence of LINE and circular-ARC segments)
+/// IN-PLANE by the SIGNED distance `signed_d` along the per-segment offset normal
+/// n = (plane_normal × tangent).normalized().  Lines move to a parallel line;
+/// circular arcs move to a CONCENTRIC arc (radius r' = r − signed_d·turn — a
+/// convex-outward arc shrinks, a convex-inward arc grows).  Consecutive offset
+/// segments are re-joined at their [`offset_junction`].  `closed` treats the
+/// chain as a loop (every junction re-joined); an OPEN chain leaves its two end
+/// offsets un-joined.  Returns one reconstructed NurbsCurve per input segment
+/// (make_line / make_arc).  A self-intersecting offset (signed_d too large for
+/// a concave corner or arc) surfaces as a clear Err.
+fn offset_profile_segments(
+    profile: &[NurbsCurve],
+    plane_normal: Vec3,
+    signed_d: f64,
+    closed: bool,
+) -> Result<Vec<NurbsCurve>, String> {
+    let tol = 1e-6;
+    let np = plane_normal.normalized()?;
+    let segs = classify_profile_segments(profile, np)?;
+    let n = segs.len();
+
+    // Naive per-segment offsets, then re-join consecutive ones exactly.
+    let mut offsets: Vec<(Vec3, Vec3)> = segs
+        .iter()
+        .map(|seg| {
+            Ok((
+                seg.offset_point(seg.start(), signed_d)?,
+                seg.offset_point(seg.end(), signed_d)?,
+            ))
+        })
+        .collect::<Result<_, String>>()?;
+    let junctions = if closed { n } else { n.saturating_sub(1) };
+    for i in 0..junctions {
+        let j = (i + 1) % n;
+        let point = offset_junction(&segs[i], &segs[j], np, signed_d)?;
+        offsets[i].1 = point;
+        offsets[j].0 = point;
+    }
+
+    // --- Reconstruct each offset segment as a NurbsCurve.
+    let mut out = Vec::with_capacity(n);
+    for (seg, (off_start, off_end)) in segs.iter().zip(&offsets) {
+        match seg {
+            SegGeom::Line { .. } => out.push(make_line(*off_start, *off_end)?),
+            SegGeom::Arc {
+                center, arc_normal, ..
+            } => {
+                let radial = off_start.sub(*center);
+                let r2 = radial.length();
+                if r2 <= tol {
+                    return Err("offset: reconstructed arc has a zero radius".into());
+                }
+                let ax = radial.scale(1.0 / r2);
+                let ay = arc_normal.cross(ax).normalized()?;
+                let ve = off_end.sub(*center);
+                let mut angle = ve.dot(ay).atan2(ve.dot(ax));
+                if angle <= 1e-9 {
+                    angle += std::f64::consts::TAU;
+                }
+                out.push(make_arc(*center, ax, ay, r2, 0.0, angle)?);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Which way a rib grows out of its sketch — SolidWorks' **Extrusion Direction**
+/// control, and the same two choices it offers.
+///
+/// The two are not variants of one construction: they SWAP which axis carries the
+/// thickness and which carries the growth, which is why a rib built in the wrong
+/// one lies down where it should stand up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RibExtrusion {
+    /// **Parallel to Sketch** (SolidWorks' default, and what everyone means by a
+    /// rib or a gusset): the material grows PARALLEL to the sketch plane and the
+    /// thickness is applied NORMAL to it. A line drawn between two walls becomes a
+    /// thin fin standing ON the sketch plane, growing across it until it lands on
+    /// the part.
+    #[default]
+    ParallelToSketch,
+    /// **Normal to Sketch**: the material grows NORMAL to the sketch plane and the
+    /// thickness is applied IN it. The chain is thickened inside its own plane and
+    /// that ribbon is driven off the plane — walls hanging under a sketch.
+    NormalToSketch,
+}
+
+/// Rib / stiffener (§6.6) — SolidWorks' Rib, both extrusion directions, with its
+/// **Up To Next** end condition.
+///
+/// The chain is thickened by `thickness` and grown along `extrude_dir` until it
+/// LANDS ON THE PART. Which axis carries which is [`RibExtrusion`]'s whole
+/// purpose: `ParallelToSketch` offsets ±thickness/2 along the plane NORMAL and
+/// sweeps the chain IN the plane; `NormalToSketch` offsets ±thickness/2 INSIDE
+/// the plane (miter-joined, straight caps across the open ends) and sweeps that
+/// ribbon along the plane normal.
+///
+/// # Up To Next
+///
+/// There is no depth. SolidWorks' rib has exactly one end condition — the rib
+/// develops until it meets the next faces and the feature FAILS if any part of it
+/// meets nothing — and this reproduces it exactly rather than approximating it:
+/// the chain is swept a generous `reach` (twice the part's bounding diagonal, so
+/// it certainly crosses the part), the sweep is CUT BY THE PART
+/// (`slab − solid`), and the piece that grew out of the sketch is kept. Its
+/// termination surface is therefore the part's own faces, whatever shape they are.
+/// A piece still running at `reach` never landed, and that is the documented
+/// failure — not a silently truncated rib.
+///
+/// `plane_normal` is the profile's own plane when the caller knows it (a sketch
+/// publishes the plane it was drawn on). `None` falls back to deriving the plane
+/// from the chain's bends, which no single straight segment can supply.
+///
+/// V1 SCOPE: POLYLINE profiles only — arcs/curves return a clear Err.
+pub fn rib_from_profile(
+    solid: &BrepSolid,
+    profile: &[NurbsCurve],
+    thickness: f64,
+    extrude_dir: Vec3,
+    plane_normal: Option<Vec3>,
+    extrusion: RibExtrusion,
+    name: Option<&str>,
+) -> Result<BrepSolid, String> {
+    // The union carries face names from its operands; accept `name` for ABI
+    // symmetry with the other builders (the app stamps names post-hoc).
+    let _ = name;
+    let tolerance = 1e-6;
+    if profile.is_empty() {
+        return Err("rib: profile needs at least 1 curve forming an open chain".into());
+    }
+    if !(thickness > 0.0) {
+        return Err("rib: thickness must be positive".into());
+    }
+
+    // --- 1. Extract the ordered chain vertices (segment endpoints) and verify the
+    //        chain is connected end→start.  Segments may be LINES or circular ARCS.
+    let mut vertices = Vec::with_capacity(profile.len() + 1);
+    let mut samples = Vec::new();
+    for (index, curve) in profile.iter().enumerate() {
+        let [start, end] = curve.domain()?;
+        let v_start = curve.evaluate(start)?;
+        let v_end = curve.evaluate(end)?;
+        if v_end.sub(v_start).length() <= tolerance {
+            return Err("rib: profile has a degenerate (zero-length) segment".into());
+        }
+        if index == 0 {
+            vertices.push(v_start);
+        } else if v_start.sub(*vertices.last().unwrap()).length() > tolerance {
+            return Err(format!(
+                "rib: profile chain is not connected at curve {index}"
+            ));
+        }
+        vertices.push(v_end);
+        // Skip k = 0 after the first segment: it duplicates the previous
+        // segment's endpoint, which would otherwise inject a zero-length step
+        // and cancel the corner bend used to derive the plane normal.
+        let first_k = if index == 0 { 0 } else { 1 };
+        for k in first_k..=8 {
+            samples.push(curve.evaluate(start + (end - start) * k as f64 / 8.0)?);
+        }
+    }
+    let count = vertices.len();
+    if count < 2 {
+        return Err("rib: profile needs at least 2 distinct vertices".into());
+    }
+
+    // --- 2. A rib thickens an OPEN profile; a closed loop is an ordinary
+    //        extrude, not a rib.
+    if vertices[count - 1].sub(vertices[0]).length() <= tolerance {
+        return Err("rib: profile chain is closed; rib expects an open chain".into());
+    }
+
+    // --- 3. The profile plane normal np.  A caller-supplied plane wins: it is the
+    //        plane the profile was AUTHORED on (a sketch publishes it), so it is
+    //        both unambiguous in sign and defined for a chain with no bend at all.
+    //        Otherwise derive it from the sampled chain's bends (robust for arc
+    //        segments), which a fully collinear chain cannot yield.  Either way
+    //        the chain must lie in the plane.
+    let np = match plane_normal {
+        Some(supplied) => supplied
+            .normalized()
+            .map_err(|_| "rib: the supplied profile plane normal is degenerate".to_string())?,
+        None => {
+            let mut normal = Vec3::default();
+            for i in 1..samples.len() - 1 {
+                let a = samples[i].sub(samples[i - 1]);
+                let b = samples[i + 1].sub(samples[i]);
+                normal = normal.add(a.cross(b));
+            }
+            normal.normalized().map_err(|_| {
+                "rib: profile is collinear and no profile plane was supplied; cannot determine \
+                 its plane"
+                    .to_string()
+            })?
+        }
+    };
+    let origin = vertices[0];
+    if samples
+        .iter()
+        .any(|point| point.sub(origin).dot(np).abs() > tolerance * 100.0)
+    {
+        return Err(if plane_normal.is_some() {
+            "rib: profile does not lie in the supplied plane".into()
+        } else {
+            "rib: profile is not planar".to_string()
+        });
+    }
+
+    // --- 4. How far to sweep before the part cuts the rib back: twice the part's
+    //        bounding diagonal certainly crosses it from anywhere on the chain, so
+    //        the CUT decides the rib's extent, never this number.
+    let reach = sweep_reach(solid, &vertices)?;
+
+    // --- 5. Build the over-long slab for the requested extrusion direction.  The
+    //        two arms differ only in which axis carries the thickness.
+    let slab = match extrusion {
+        RibExtrusion::ParallelToSketch => {
+            // The growth direction lies IN the plane; anything out of plane is a
+            // caller error, not something to silently project away.
+            let along = extrude_dir.sub(np.scale(extrude_dir.dot(np)));
+            let along = along.normalized().map_err(|_| {
+                "rib: a Parallel-to-Sketch rib grows INSIDE its sketch plane, but the requested \
+                 direction is perpendicular to it"
+                    .to_string()
+            })?;
+            parallel_slab(profile, &vertices, np, along, thickness, reach)?
+        }
+        RibExtrusion::NormalToSketch => {
+            let along = extrude_dir
+                .normalized()
+                .map_err(|_| "rib: extrude direction is degenerate".to_string())?;
+            normal_slab(profile, np, along, thickness, reach)?
+        }
+    };
+
+    // --- 6. Up To Next: cut the over-long slab by the part and keep the piece the
+    //        sketch grew.  That piece is the rib; its far end IS the part's faces.
+    let along = match extrusion {
+        RibExtrusion::ParallelToSketch => {
+            let along = extrude_dir.sub(np.scale(extrude_dir.dot(np)));
+            along.normalized()?
+        }
+        RibExtrusion::NormalToSketch => extrude_dir.normalized()?,
+    };
+    let seeds = chain_probe_seeds(profile)?;
+    let rib = up_to_next(solid, &slab, &seeds, along, reach)?;
+    let Some(rib) = rib else {
+        // Every bit of the sweep was already material: the rib adds nothing, and
+        // the part is its own answer.  Not an error — the same document with a
+        // thicker wall would build exactly this.
+        return Ok(solid.clone());
+    };
+
+    boolean_operation(
+        solid,
+        &rib,
+        BooleanOperation::Union,
+        &BooleanOptions::default(),
+    )
+    .map_err(|error| format!("rib: union of the rib into the part failed: {error}"))
+}
+
+/// Twice the part's bounding diagonal, measured from the chain too so a sketch
+/// standing off the part still sweeps across it.  The rib's real extent is decided
+/// by the cut in [`up_to_next`]; this only has to be generous.
+fn sweep_reach(solid: &BrepSolid, chain: &[Vec3]) -> Result<f64, String> {
+    let mut min = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut max = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let mut extend = |point: Vec3| {
+        min = Vec3::new(min.x.min(point.x), min.y.min(point.y), min.z.min(point.z));
+        max = Vec3::new(max.x.max(point.x), max.y.max(point.y), max.z.max(point.z));
+    };
+    for vertex in &solid.vertices {
+        extend(vertex.point);
+    }
+    for face in solid.shells.iter().flat_map(|shell| &shell.faces) {
+        for row in &face.surface.control_points {
+            for point in row {
+                extend(point.point()?);
+            }
+        }
+    }
+    for point in chain {
+        extend(*point);
+    }
+    let diagonal = max.sub(min).length();
+    if !(diagonal > 0.0) || !diagonal.is_finite() {
+        return Err("rib: the target solid has no extent to grow the rib against".into());
+    }
+    Ok(diagonal * 2.0)
+}
+
+/// Points ON the chain, one per segment — where the rib starts, and so where the
+/// search for its free-space piece begins.
+///
+/// It has to be the chain ITSELF, not the average of its vertices: for a bent
+/// chain that average is off the chain entirely (an L's vertex centroid lands
+/// exactly on the thickened ribbon's inner corner, a knife-edge the classifier
+/// can only answer "on"), and a probe that starts on a boundary finds no piece.
+fn chain_probe_seeds(profile: &[NurbsCurve]) -> Result<Vec<Vec3>, String> {
+    let mut seeds = Vec::with_capacity(profile.len());
+    for curve in profile {
+        let [start, end] = curve.domain()?;
+        seeds.push(curve.evaluate(start + (end - start) * 0.5)?);
+    }
+    if seeds.is_empty() {
+        return Err("rib: profile has no points to grow from".into());
+    }
+    Ok(seeds)
+}
+
+/// **Parallel to Sketch**: the chain swept `reach` along the IN-PLANE direction
+/// `along` gives a closed region inside the sketch plane; that region, offset to
+/// −thickness/2 and extruded `thickness` along the plane normal, is the fin.
+///
+/// The loop must be simple, so a chain that doubles back across its own sweep
+/// self-intersects here and the extrude refuses — the documented V1 limit.
+fn parallel_slab(
+    profile: &[NurbsCurve],
+    vertices: &[Vec3],
+    np: Vec3,
+    along: Vec3,
+    thickness: f64,
+    reach: f64,
+) -> Result<BrepSolid, String> {
+    let offset = along.scale(reach);
+    let chain_start = vertices[0];
+    let chain_end = *vertices.last().expect("chain has vertices");
+    let mut region: Vec<NurbsCurve> = Vec::with_capacity(profile.len() * 2 + 2);
+    for curve in profile {
+        region.push(curve.clone());
+    }
+    region.push(make_line(chain_end, chain_end.add(offset))?);
+    for curve in profile.iter().rev() {
+        region.push(super::extrude::translated_curve(&curve.reversed()?, offset)?);
+    }
+    region.push(make_line(chain_start.add(offset), chain_start)?);
+
+    // Centre the thickness on the sketch plane: start half a thickness under it
+    // and extrude a full thickness back through.
+    let base = region
+        .iter()
+        .map(|curve| super::extrude::translated_curve(curve, np.scale(-thickness * 0.5)))
+        .collect::<Result<Vec<_>, String>>()?;
+    extrude_profile_brep(&base, np, thickness)
+        .map_err(|error| format!("rib: sweeping the profile inside its plane failed: {error}"))
+}
+
+/// **Normal to Sketch**: the chain thickened INSIDE its own plane (miter-offset
+/// ±thickness/2, straight caps across the two open ends → a closed thin loop),
+/// extruded `reach` along `along` (the plane normal).
+fn normal_slab(
+    profile: &[NurbsCurve],
+    np: Vec3,
+    along: Vec3,
+    thickness: f64,
+    reach: f64,
+) -> Result<BrepSolid, String> {
+    let half = thickness * 0.5;
+    let left = offset_profile_segments(profile, np, half, false)
+        .map_err(|error| format!("rib: {error}"))?;
+    let right = offset_profile_segments(profile, np, -half, false)
+        .map_err(|error| format!("rib: {error}"))?;
+    let left_first = &left[0];
+    let left_last = &left[left.len() - 1];
+    let right_first = &right[0];
+    let right_last = &right[right.len() - 1];
+    let left_start = left_first.evaluate(left_first.domain()?[0])?;
+    let left_end = left_last.evaluate(left_last.domain()?[1])?;
+    let right_start = right_first.evaluate(right_first.domain()?[0])?;
+    let right_end = right_last.evaluate(right_last.domain()?[1])?;
+    let mut thin_loop: Vec<NurbsCurve> = Vec::with_capacity(left.len() + right.len() + 2);
+    for curve in &left {
+        thin_loop.push(curve.clone());
+    }
+    thin_loop.push(make_line(left_end, right_end)?);
+    for curve in right.iter().rev() {
+        thin_loop.push(curve.reversed()?);
+    }
+    thin_loop.push(make_line(right_start, left_start)?);
+    extrude_profile_brep(&thin_loop, along, reach)
+        .map_err(|error| format!("rib: extrude of the thickened profile failed: {error}"))
+}
+
+/// SolidWorks' **Up To Next**, exactly: cut the over-long `slab` by the part and
+/// keep the piece the sketch grew into.
+///
+/// `slab − solid` leaves the sweep's free-space pieces, and the boolean assembler
+/// already groups a disconnected result into ONE SHELL PER PIECE (it unions faces
+/// by shared edges), so the pieces are the result's shells. The piece containing
+/// the sketch is the rib; anything past the part is a different piece and is
+/// dropped — that, not a bounding box, is what makes the rib stop at the part's
+/// own faces whatever shape they are.
+///
+/// `Ok(None)` means the sweep was entirely inside existing material: there is
+/// nothing to add. A piece still running at `reach` never landed on anything, and
+/// that is SolidWorks' documented failure ("if any portion of the solid feature
+/// generated does not hit a Next face it fails").
+fn up_to_next(
+    solid: &BrepSolid,
+    slab: &BrepSolid,
+    seeds: &[Vec3],
+    along: Vec3,
+    reach: f64,
+) -> Result<Option<BrepSolid>, String> {
+    let free = match boolean_operation(
+        slab,
+        solid,
+        BooleanOperation::Subtract,
+        &BooleanOptions::default(),
+    ) {
+        Ok(free) => free,
+        // A subtract that refuses because the operands are disjoint means the
+        // sweep never reached the part at all — the Up To Next failure, reported
+        // as itself rather than as a boolean's internal complaint.
+        Err(error) => {
+            // ESSENTIAL REFUSAL (see the sibling below): the cut refusing because
+            // the operands are disjoint IS "the rib met nothing".
+            return Err(format!(
+                "rib: RIB_UP_TO_NEXT_UNBOUNDED — the rib never reaches the part, so it has \
+                 nothing to stop against (SolidWorks' Up To Next requires every part of a rib \
+                 to meet a face); check the rib's direction — the cut reported: {error}"
+            ))
+        }
+    };
+    if free.shells.is_empty() {
+        return Ok(None);
+    }
+
+    // Where the rib actually begins: the first point along the sweep from each
+    // seed that is NOT already material. The chain can be drawn inside a wall, and
+    // the rib is then the free space just beyond it.
+    let classifier = SolidClassifier::new(solid, 1e-6)?;
+    let steps = 64;
+    let mut probes = Vec::new();
+    for seed in seeds {
+        for step in 1..=steps {
+            let point = seed.add(along.scale(reach * step as f64 / steps as f64 * 0.5));
+            if classifier.classify(point)?.class == PointClass::Out {
+                probes.push(point);
+                break;
+            }
+        }
+    }
+    if probes.is_empty() {
+        // Every sample along the sweep sits inside the part: nothing to add.
+        return Ok(None);
+    }
+
+    let mut kept: Option<BrepSolid> = None;
+    for shell in &free.shells {
+        let piece = solid_from_shell(&free, shell);
+        let grown_here = probes
+            .iter()
+            .map(|probe| classify_point(*probe, &piece, 1e-6))
+            .collect::<Result<Vec<_>, String>>()?
+            .into_iter()
+            .any(|classification| classification.class == PointClass::In);
+        if !grown_here {
+            continue;
+        }
+        // SolidWorks' cardinal rule for Up To Next: a piece that is still going at
+        // the end of the sweep never met a face.
+        let overrun = piece
+            .vertices
+            .iter()
+            .map(|vertex| vertex.point.sub(seeds[0]).dot(along))
+            .fold(f64::NEG_INFINITY, f64::max);
+        if overrun >= reach * 0.99 {
+            // ESSENTIAL REFUSAL — do not "open" this one. Unlike a gate that
+            // refuses data the machinery could already answer, this is the
+            // feature's DEFINITION: SolidWorks' rib has one end condition, and
+            // "if any portion of the solid feature generated does not hit a Next
+            // face it fails" is the rule, not a limitation of ours. Accepting it
+            // would ship a rib hanging in space with a far end at an arbitrary
+            // sweep distance, which is exactly the bug this feature was reported
+            // for. The right repair is always the rib's DIRECTION, never this
+            // check.
+            return Err(
+                "rib: RIB_UP_TO_NEXT_UNBOUNDED — part of the rib never lands on the part, so \
+                 it has no face to stop against (SolidWorks' Up To Next requires the whole rib \
+                 to terminate on a face). Turn the rib around with `direction`, or move the \
+                 profile so its sweep meets the part"
+                    .into(),
+            );
+        }
+        kept = Some(match kept {
+            None => piece,
+            Some(previous) => boolean_operation(
+                &previous,
+                &piece,
+                BooleanOperation::Union,
+                &BooleanOptions::default(),
+            )
+            .map_err(|error| format!("rib: joining the rib's own pieces failed: {error}"))?,
+        });
+    }
+    Ok(kept)
+}
+
+/// One shell of `source` as a solid in its own right, carrying only the edges and
+/// vertices its faces use — how a disconnected boolean result is taken apart into
+/// the pieces the assembler already separated.
+fn solid_from_shell(source: &BrepSolid, shell: &ShellRecord) -> BrepSolid {
+    let edge_ids: std::collections::HashSet<u64> = shell
+        .faces
+        .iter()
+        .flat_map(|face| &face.loops)
+        .flat_map(|loop_record| &loop_record.coedges)
+        .map(|coedge| coedge.edge_id)
+        .collect();
+    let edges: Vec<EdgeRecord> = source
+        .edges
+        .iter()
+        .filter(|edge| edge_ids.contains(&edge.id))
+        .cloned()
+        .collect();
+    let vertex_ids: std::collections::HashSet<u64> = edges
+        .iter()
+        .flat_map(|edge| [edge.start_vertex_id, edge.end_vertex_id])
+        .collect();
+    BrepSolid {
+        id: source.id,
+        vertices: source
+            .vertices
+            .iter()
+            .filter(|vertex| vertex_ids.contains(&vertex.id))
+            .cloned()
+            .collect(),
+        edges,
+        shells: vec![shell.clone()],
+        genus: 0,
+    }
+}

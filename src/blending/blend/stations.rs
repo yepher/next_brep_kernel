@@ -1,0 +1,1147 @@
+use crate::topology::{BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord};
+use crate::{fit, NurbsCurve, NurbsSurface, OffsetEvaluator, OffsetNormal, Vec3, Vec4};
+
+/// Fixed uniform station count still used by the OPEN-edge and
+/// edge-preserving marches (edge/support.rs, edge/keep.rs).  The CLOSED
+/// general march is adaptive — see [`SEED_INTERVALS`] / [`MAX_STATIONS`].
+pub(super) const STATIONS: usize = 64;
+pub(super) const NEWTON_ITERATIONS: usize = 24;
+pub(super) const FIT_DEGREE: usize = 3;
+
+/// Uniform seed intervals for sagitta-driven refinement. A span/16 step keeps
+/// continuation inside the tangency Newton solver's convergence basin.
+pub(super) const SEED_INTERVALS: usize = 16;
+
+/// Shared depth budget for sagitta refinement and Newton step-halving retries.
+pub(super) const MAX_REFINEMENT_DEPTH: usize = 4;
+
+/// Maximum adaptive intervals; the station count is one greater. Intervals
+/// reaching this cap retain their best available refinement.
+pub(super) const MAX_STATIONS: usize = SEED_INTERVALS << MAX_REFINEMENT_DEPTH;
+
+pub(super) struct Station {
+    pub(super) uv1: [f64; 2],
+    pub(super) uv2: [f64; 2],
+    pub(super) p1: Vec3,
+    pub(super) p2: Vec3,
+    pub(super) center: Vec3,
+    /// cos(α/2), the middle-row weight (4.9.3).
+    pub(super) weight: f64,
+    /// Tangent-plane intersection point in the section (the arc's middle
+    /// control point before weighting).
+    pub(super) apex: Vec3,
+}
+
+/// The blend march's normal convention: the bare `S_u × S_v` through the C¹
+/// domain extension, with the orientation carried in the SIGN OF ρ rather than
+/// in the face's `same_sense` (`signed_radii`). That is the shared evaluator's
+/// [`OffsetNormal::Raw`] lane; this is its adapter.
+pub(super) fn raw_normal(surface: &NurbsSurface, u: f64, v: f64) -> Result<Vec3, String> {
+    blend_offset(surface).normal(u, v)
+}
+
+/// The march's pointwise offset evaluator for one support carrier.
+///
+/// `center = p + ρ·n` at `stations.rs`'s tangency residual IS an offset-surface
+/// evaluation, and requiring the two supports' centres to coincide IS
+/// intersecting the two offset surfaces — pointwise, without ever materializing
+/// one. Routing it through the shared evaluator says so in code. The march must
+/// NOT inherit [`OffsetNormal::FaceStable`]'s singular recovery: where
+/// `S_u × S_v` collapses the march refuses today, and a recovered normal there
+/// would silently change a residual whose bar is `1e-11·(1 + scale)`.
+pub(super) fn blend_offset(surface: &NurbsSurface) -> OffsetEvaluator<'_> {
+    OffsetEvaluator::new("blend_march", surface, OffsetNormal::Raw)
+}
+
+/// Evaluate a coedge's pcurve at the EDGE parameter, honouring traversal
+/// direction, and return the face (u, v).
+pub(super) fn edge_uv_on_face(
+    coedge: &CoedgeRecord,
+    edge: &EdgeRecord,
+    t: f64,
+) -> Result<[f64; 2], String> {
+    let [p0, p1] = coedge.pcurve.domain()?;
+    let span = edge.t1 - edge.t0;
+    let fraction = if span.abs() <= 1e-15 {
+        0.0
+    } else {
+        ((t - edge.t0) / span).clamp(0.0, 1.0)
+    };
+    let parameter = if coedge.forward {
+        p0 + (p1 - p0) * fraction
+    } else {
+        p1 - (p1 - p0) * fraction
+    };
+    let point = coedge.pcurve.evaluate(parameter)?;
+    Ok([point.x, point.y])
+}
+
+pub(super) struct BlendMate<'a> {
+    pub(super) face: &'a FaceRecord,
+    pub(super) coedge: &'a CoedgeRecord,
+    pub(super) loop_index: usize,
+    /// Signed radius ρ: center = p + ρ·n_raw(p).
+    pub(super) rho: f64,
+}
+
+/// Full evaluation of the tangency system (4.9.2) + (4.9.5) at
+/// uv = (u, v, a, b): the residual plus every by-product the station
+/// construction needs — contact points, ball center, and the RAW surface
+/// normals the residual computed anyway.  The solvers hand back the LAST
+/// converged evaluation so accepted stations are built without
+/// re-evaluating either surface (OCCT's `ComputeValues` unchanged-argument
+/// guard, filleting study §6 lesson 8).
+pub(super) struct TangencyState {
+    pub(super) residual: [f64; 4],
+    pub(super) p1: Vec3,
+    pub(super) p2: Vec3,
+    pub(super) center: Vec3,
+    pub(super) n1: Vec3,
+    pub(super) n2: Vec3,
+}
+
+fn tangency_state(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    rho: [f64; 2],
+    uv: [f64; 4],
+    section_point: Vec3,
+    section_tangent: Vec3,
+) -> Result<TangencyState, String> {
+    // The two offset evaluations the whole residual is built from. Each is ONE
+    // surface evaluation: `deriv1_extended` returns the point together with the
+    // partials the normal needs, and its point is bit-identical to
+    // `evaluate_extended` because
+    // `derivatives_extended(..,0)[0][0] == derivatives_extended(..,1)[0][0]`.
+    let first = blend_offset(first).at(uv[0], uv[1], rho[0])?;
+    let second = blend_offset(second).at(uv[2], uv[3], rho[1])?;
+    // Coincident ball centres = the two offset surfaces intersect here.
+    let center = first.point;
+    let mismatch = center.sub(second.point);
+    let plane = center.sub(section_point).dot(section_tangent);
+    Ok(TangencyState {
+        residual: [mismatch.x, mismatch.y, mismatch.z, plane],
+        p1: first.source,
+        p2: second.source,
+        center,
+        n1: first.normal,
+        n2: second.normal,
+    })
+}
+
+/// Residual of (4.9.2) + (4.9.5) at uv = (u, v, a, b).
+pub(super) fn tangency_residual(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    rho: [f64; 2],
+    uv: [f64; 4],
+    section_point: Vec3,
+    section_tangent: Vec3,
+) -> Result<([f64; 4], Vec3, Vec3, Vec3), String> {
+    let state = tangency_state(first, second, rho, uv, section_point, section_tangent)?;
+    Ok((state.residual, state.p1, state.p2, state.center))
+}
+
+/// Newton on (u, v, a, b) with the section plane fixed, returning the
+/// converged unknowns together with the tangency state of the FINAL
+/// evaluation, so callers never re-evaluate a solved station.
+fn solve_station_state(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    rho: [f64; 2],
+    seed: [f64; 4],
+    section_point: Vec3,
+    section_tangent: Vec3,
+    scale: f64,
+) -> Result<([f64; 4], TangencyState), String> {
+    let mut uv = seed;
+    let tolerance = 1e-11 * (1.0 + scale);
+    for _ in 0..NEWTON_ITERATIONS {
+        let state = tangency_state(first, second, rho, uv, section_point, section_tangent)?;
+        let error = state
+            .residual
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0, f64::max);
+        if error <= tolerance {
+            return Ok((uv, state));
+        }
+        let mut jacobian = [[0.0f64; 4]; 4];
+        let step = 1e-7;
+        for column in 0..4 {
+            let mut probe = uv;
+            probe[column] += step;
+            let probed = tangency_state(first, second, rho, probe, section_point, section_tangent)?;
+            for row in 0..4 {
+                jacobian[row][column] = (probed.residual[row] - state.residual[row]) / step;
+            }
+        }
+        let delta = fit::solve_small::<4>(jacobian, state.residual, 4)
+            .map_err(|error| format!("blend: station Newton is singular ({error})"))?;
+        for (value, correction) in uv.iter_mut().zip(delta) {
+            *value -= correction;
+        }
+    }
+    Err("blend: tangency Newton did not converge".into())
+}
+
+/// Newton on (u, v, a, b) with the section plane fixed.
+pub(super) fn solve_station(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    rho: [f64; 2],
+    seed: [f64; 4],
+    section_point: Vec3,
+    section_tangent: Vec3,
+    scale: f64,
+) -> Result<[f64; 4], String> {
+    solve_station_state(
+        first,
+        second,
+        rho,
+        seed,
+        section_point,
+        section_tangent,
+        scale,
+    )
+    .map(|(uv, _)| uv)
+}
+
+/// Anchored start: one surface parameter frozen on a seam meridian while
+/// the section plane floats along the edge — unknowns are t plus the
+/// three unfrozen surface parameters.  `lock_index` is the frozen slot in
+/// (u, v, a, b): 0 anchors the FIRST carrier's meridian, 2 the SECOND's.
+#[allow(clippy::too_many_arguments)]
+fn solve_anchored_start(
+    edge: &EdgeRecord,
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    rho_at: &dyn Fn(f64) -> [f64; 2],
+    lock_index: usize,
+    u_lock: f64,
+    seed_t: f64,
+    seed_uv: [f64; 4],
+    scale: f64,
+) -> Result<(f64, [f64; 4], TangencyState), String> {
+    let free: [usize; 3] = match lock_index {
+        0 => [1, 2, 3],
+        2 => [0, 1, 3],
+        _ => return Err("blend: unsupported anchor lock index".into()),
+    };
+    let mut x = [seed_t, seed_uv[free[0]], seed_uv[free[1]], seed_uv[free[2]]];
+    let tolerance = 1e-11 * (1.0 + scale);
+    let assemble = |x: &[f64; 4]| -> [f64; 4] {
+        let mut uv = [0.0f64; 4];
+        uv[lock_index] = u_lock;
+        uv[free[0]] = x[1];
+        uv[free[1]] = x[2];
+        uv[free[2]] = x[3];
+        uv
+    };
+    let state_at = |x: &[f64; 4]| -> Result<TangencyState, String> {
+        let derivatives = edge.curve.derivatives_extended(x[0], 1)?;
+        let section_point = derivatives[0];
+        let section_tangent = derivatives[1].normalized()?;
+        tangency_state(
+            first,
+            second,
+            rho_at(x[0]),
+            assemble(x),
+            section_point,
+            section_tangent,
+        )
+    };
+    for _ in 0..NEWTON_ITERATIONS {
+        let state = state_at(&x)?;
+        let error = state
+            .residual
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0, f64::max);
+        if error <= tolerance {
+            return Ok((x[0], assemble(&x), state));
+        }
+        let mut jacobian = [[0.0f64; 4]; 4];
+        let step = 1e-7;
+        for column in 0..4 {
+            let mut probe = x;
+            probe[column] += step;
+            let probed = state_at(&probe)?;
+            for row in 0..4 {
+                jacobian[row][column] = (probed.residual[row] - state.residual[row]) / step;
+            }
+        }
+        let delta = fit::solve_small::<4>(jacobian, state.residual, 4)
+            .map_err(|error| format!("blend: anchored-start Newton is singular ({error})"))?;
+        for (value, correction) in x.iter_mut().zip(delta) {
+            *value -= correction;
+        }
+    }
+    // At an exact periodic seam endpoint the section parameter is already
+    // known.  The four-variable system can nevertheless stall because the
+    // rational closed edge has two one-sided parameterisations at that point:
+    // the contact mismatch converges while the finite-difference t column
+    // leaves a tiny section-plane residual.  Pin the known endpoint and solve
+    // the three independent center-mismatch equations for the three remaining
+    // surface parameters.  Acceptance still requires ALL FOUR original
+    // residuals, so this cannot hide a genuinely wrong anchor.
+    let mut fixed = [x[1], x[2], x[3]];
+    let fixed_state = |values: &[f64; 3]| -> Result<TangencyState, String> {
+        let full = [seed_t, values[0], values[1], values[2]];
+        state_at(&full)
+    };
+    let fixed_plane_tolerance = 2e-6 * (1.0 + scale);
+    for _ in 0..NEWTON_ITERATIONS {
+        let state = fixed_state(&fixed)?;
+        let mismatch_error = state.residual[..3]
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0, f64::max);
+        if mismatch_error <= tolerance && state.residual[3].abs() <= fixed_plane_tolerance {
+            let full = [seed_t, fixed[0], fixed[1], fixed[2]];
+            return Ok((seed_t, assemble(&full), state));
+        }
+        let mut jacobian = [[0.0f64; 3]; 3];
+        let step = 1e-7;
+        for column in 0..3 {
+            let mut probe = fixed;
+            probe[column] += step;
+            let probed = fixed_state(&probe)?;
+            for row in 0..3 {
+                jacobian[row][column] =
+                    (probed.residual[row] - state.residual[row]) / step;
+            }
+        }
+        let mismatch = [state.residual[0], state.residual[1], state.residual[2]];
+        let delta = fit::solve_small::<3>(jacobian, mismatch, 3)
+            .map_err(|error| format!("blend: fixed-seam Newton is singular ({error})"))?;
+        for (value, correction) in fixed.iter_mut().zip(delta) {
+            *value -= correction;
+        }
+    }
+    if std::env::var("BREP_DEBUG_BLEND_MARCH").is_ok() {
+        if let Ok(state) = fixed_state(&fixed) {
+            eprintln!(
+                "fixed-seam Newton failed: t={seed_t:.9} values={fixed:?} residual={:?}",
+                state.residual
+            );
+        }
+        if let Ok(state) = state_at(&x) {
+            eprintln!(
+                "anchored Newton failed: lock_index={lock_index} lock={u_lock:.9} \
+                 seed_t={seed_t:.9} final=({:.9},{:.9},{:.9},{:.9}) residual={:?}",
+                x[0], x[1], x[2], x[3], state.residual
+            );
+        }
+    }
+    Err("blend: anchored seam start did not converge".into())
+}
+
+pub(super) fn apex_point(
+    p1: Vec3,
+    n1: Vec3,
+    p2: Vec3,
+    n2: Vec3,
+    center: Vec3,
+) -> Result<Vec3, String> {
+    let section_normal = p2
+        .sub(p1)
+        .cross(center.sub(p1))
+        .normalized()
+        .map_err(|_| "blend: degenerate section (tangency points collapsed)".to_string())?;
+    let matrix = [
+        [n1.x, n1.y, n1.z],
+        [n2.x, n2.y, n2.z],
+        [section_normal.x, section_normal.y, section_normal.z],
+    ];
+    let rhs = [n1.dot(p1), n2.dot(p2), section_normal.dot(p1)];
+    let solution = fit::solve_small::<3>(matrix, rhs, 3)
+        .map_err(|_| "blend: tangent planes are parallel in the section".to_string())?;
+    Ok(Vec3::new(solution[0], solution[1], solution[2]))
+}
+
+/// One accepted station of the adaptive march: the edge parameter it was
+/// solved at, the converged unknowns (the continuation seed for the next
+/// solve), and the finished section sample.
+struct MarchNode {
+    t: f64,
+    uv: [f64; 4],
+    station: Station,
+}
+
+/// The prefix of the refusal a march makes when the ball's tangency has left
+/// a carrier's own surface — see [`MarchFrame::check_supports_on_carriers`].
+/// Callers match it to tell an ESCAPED march from a merely non-converging one:
+/// the fallbacks that answer a non-convergence (the edge-preserving
+/// construction, the tool cutter) build a blend the rolling ball never made,
+/// so an escape is reported as-is instead.
+pub(crate) const BALL_OFF_CARRIER: &str = "blend: no ball of radius";
+
+/// Shared context of one closed-edge march.
+struct MarchFrame<'a> {
+    edge: &'a EdgeRecord,
+    surface1: &'a NurbsSurface,
+    surface2: &'a NurbsSurface,
+    rho_at: &'a dyn Fn(f64) -> [f64; 2],
+    signs: [f64; 2],
+    scale: f64,
+    /// Committed fit accuracy the sagitta refinement drives toward — see
+    /// the derivation comment in [`march_stations`].
+    fit_tolerance: f64,
+}
+
+impl MarchFrame<'_> {
+    /// Refuse a converged solve whose contact point is not on the carrier at
+    /// all.
+    ///
+    /// `evaluate_extended` continues an OPEN parameter direction along the
+    /// boundary tangent plane, without bound — a required capability, because
+    /// the tangency Newton and the projections legitimately probe just past a
+    /// trim (a support that runs off its face across a G1 edge overshoots by a
+    /// fraction of the patch, and the surgery still trims it there).  Far
+    /// outside the domain that continuation is a fictitious plane, and the
+    /// solver will happily rest the ball on it: when the radius is larger than
+    /// the local wall the true tangency system has NO solution, so the Newton
+    /// slides down the degenerate ridge onto the extension and converges to a
+    /// station whose contact is nowhere near the solid.  That station passes
+    /// every downstream residual and poisons the fit — the reported 2026-09-10
+    /// document came back "control points must be finite with positive
+    /// weights" from the rational row fit, and "ambiguous preserved boundary
+    /// edge" from the fallback the escape routed to.
+    ///
+    /// One full domain span outside is the sanity bound: it is not a
+    /// tolerance to tune but the difference between an overshoot onto a
+    /// neighbour (measured 4e-3 of the span on the reported edge's first
+    /// station) and an escape (283 spans on its middle ones).  CLOSED
+    /// directions are exempt — the march deliberately unwraps a periodic
+    /// carrier's parameter and every image is the same real surface.
+    fn check_supports_on_carriers(&self, t: f64, uv: [f64; 4]) -> Result<(), String> {
+        for (index, surface, uv) in [
+            (1usize, self.surface1, [uv[0], uv[1]]),
+            (2usize, self.surface2, [uv[2], uv[3]]),
+        ] {
+            let (closed_u, closed_v) = surface.closed_directions()?;
+            for (axis, closed, value, domain) in [
+                ("u", closed_u, uv[0], surface.domain_u()?),
+                ("v", closed_v, uv[1], surface.domain_v()?),
+            ] {
+                let span = domain[1] - domain[0];
+                if closed || (value >= domain[0] - span && value <= domain[1] + span) {
+                    continue;
+                }
+                let radius = (self.rho_at)(t)[index - 1].abs();
+                // The anchored march runs t PAST t1 (it starts on the seam
+                // meridian and closes one lap later), so the station's own
+                // parameter has to come back into the edge's domain before it
+                // names a point: `evaluate` would clamp it to the seam and
+                // report the wrong end of the lap.
+                let point = self.edge.curve.evaluate(self.wrapped(t)).unwrap_or_default();
+                return Err(format!(
+                    "{BALL_OFF_CARRIER} {radius} is tangent to both faces at \
+                     ({:.6}, {:.6}, {:.6}): the contact ran off carrier {index}'s \
+                     surface ({axis} = {value:.6} outside [{:.6}, {:.6}])",
+                    point.x, point.y, point.z, domain[0], domain[1]
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// A march parameter brought back into the edge's own domain: closed edges
+    /// wrap (the anchored march closes a full lap past `t1`), open ones clamp.
+    fn wrapped(&self, t: f64) -> f64 {
+        let [t0, t1] = [self.edge.t0, self.edge.t1];
+        if self.edge.start_vertex_id == self.edge.end_vertex_id && t1 > t0 {
+            t0 + (t - t0).rem_euclid(t1 - t0)
+        } else {
+            t.clamp(t0, t1)
+        }
+    }
+
+    /// Finish a converged solve into a station, reusing the solver's final
+    /// tangency evaluation (points, center, normals) instead of
+    /// re-evaluating both surfaces.
+    fn node(&self, t: f64, uv: [f64; 4], state: &TangencyState) -> Result<MarchNode, String> {
+        self.check_supports_on_carriers(t, uv)?;
+        let cos_alpha = self.signs[0] * self.signs[1] * state.n1.dot(state.n2);
+        let weight = ((1.0 + cos_alpha) * 0.5).max(0.0).sqrt();
+        if weight <= 1e-6 {
+            return Err("blend: faces are tangent at a station (α = π)".into());
+        }
+        let apex = apex_point(state.p1, state.n1, state.p2, state.n2, state.center)?;
+        Ok(MarchNode {
+            t,
+            uv,
+            station: Station {
+                uv1: [uv[0], uv[1]],
+                uv2: [uv[2], uv[3]],
+                p1: state.p1,
+                p2: state.p2,
+                center: state.center,
+                weight,
+                apex,
+            },
+        })
+    }
+
+    /// Solve one station at `t`.  `lock` freezes the FIRST carrier's u on a
+    /// seam meridian and frees t instead (the anchored endpoint contract).
+    /// The uv track stays continuous because every seed is a neighbouring
+    /// converged solution — wrapping would need the seed itself to jump,
+    /// which it never does mid-march.
+    fn solve_node(&self, t: f64, seed: [f64; 4], lock: Option<f64>) -> Result<MarchNode, String> {
+        if let Some(u_lock) = lock {
+            let (t_solved, uv, state) = solve_anchored_start(
+                self.edge,
+                self.surface1,
+                self.surface2,
+                self.rho_at,
+                0,
+                u_lock,
+                t,
+                seed,
+                self.scale,
+            )?;
+            self.node(t_solved, uv, &state)
+        } else {
+            let derivatives = self.edge.curve.derivatives_extended(t, 1)?;
+            let section_tangent = derivatives[1].normalized()?;
+            let (uv, state) = solve_station_state(
+                self.surface1,
+                self.surface2,
+                (self.rho_at)(t),
+                seed,
+                derivatives[0],
+                section_tangent,
+                self.scale,
+            )?;
+            self.node(t, uv, &state)
+        }
+    }
+
+    /// Should the interval (left, right) keep its midpoint as a station?
+    /// Checked on every row the fit commits: the two rails, the ball
+    /// center, and the section apex (the middle-row control point).
+    fn needs_refinement(&self, left: &Station, probe: &Station, right: &Station) -> bool {
+        [
+            (left.p1, probe.p1, right.p1),
+            (left.p2, probe.p2, right.p2),
+            (left.center, probe.center, right.center),
+            (left.apex, probe.apex, right.apex),
+        ]
+        .into_iter()
+        .any(|(a, m, b)| {
+            let chord = b.sub(a);
+            let chord_sq = chord.dot(chord);
+            let offset = m.sub(a);
+            // Sagitta: distance from the midpoint sample to the chord line
+            // (falling back to the plain offset when the chord collapses —
+            // a stalled track with a displaced midpoint must refine).
+            let sagitta = if chord_sq > 0.0 {
+                offset.cross(chord).length() / chord_sq.sqrt()
+            } else {
+                offset.length()
+            };
+            // Three consecutive samples estimate the local track curvature
+            // through their circumscribed circle, κ ≈ 8·s/ℓ² (s = sagitta,
+            // ℓ = chord).  The committed rows are degree-3 interpolants; a
+            // cubic's maximum error over one spacing-ℓ interval of a
+            // curvature-κ track is ≈ (5/384)·ℓ⁴·|f⁗| ≈ ℓ⁴·κ³/77, which in
+            // the measured quantities is ≈ 8·s³/ℓ².  Refine while that
+            // estimate exceeds the committed fit accuracy.
+            8.0 * sagitta * sagitta * sagitta > self.fit_tolerance * chord_sq
+        })
+    }
+
+    /// Solve and append every station in (nodes.last().t, right_t], in
+    /// strictly increasing parameter order.  An interval is bisected when
+    /// its midpoint sagitta says the fitted rows would miss the tolerance
+    /// (the probe becomes a station) or when the continuation Newton cannot
+    /// cross it in one step (OCCT's step-halving retry, walking study §1
+    /// stage 4).  Both recursions share one `depth` budget, so a march can
+    /// never exceed SEED_INTERVALS·2^MAX_REFINEMENT_DEPTH = MAX_STATIONS
+    /// intervals; at the cap the best-effort grid stands and only a
+    /// persistent Newton failure surfaces (named error, no fallback).
+    fn march_interval(
+        &self,
+        nodes: &mut Vec<MarchNode>,
+        right_t: f64,
+        lock: Option<f64>,
+        presolved: Option<MarchNode>,
+        depth: usize,
+    ) -> Result<(), String> {
+        let (left_t, left_uv) = {
+            let left = nodes
+                .last()
+                .expect("march interval requires a solved left station");
+            (left.t, left.uv)
+        };
+        let right = match presolved {
+            Some(node) => node,
+            None => match self.solve_node(right_t, left_uv, lock) {
+                Ok(node) => node,
+                Err(error) => {
+                    if depth >= MAX_REFINEMENT_DEPTH {
+                        return Err(error);
+                    }
+                    self.march_interval(nodes, 0.5 * (left_t + right_t), None, None, depth + 1)?;
+                    return self.march_interval(nodes, right_t, lock, None, depth + 1);
+                }
+            },
+        };
+        if depth < MAX_REFINEMENT_DEPTH {
+            let mid_t = 0.5 * (left_t + right.t);
+            match self.solve_node(mid_t, left_uv, None) {
+                Ok(probe) => {
+                    let split = self.needs_refinement(
+                        &nodes.last().expect("left station").station,
+                        &probe.station,
+                        &right.station,
+                    );
+                    if split {
+                        self.march_interval(nodes, mid_t, None, Some(probe), depth + 1)?;
+                        return self.march_interval(nodes, right.t, None, Some(right), depth + 1);
+                    }
+                }
+                Err(_) => {
+                    // The sagitta probe would not converge from the
+                    // interval's left seed, so the interval cannot be
+                    // certified flat: subdivide into it.  The recursion
+                    // re-attempts the SAME solve once per level (cheap and
+                    // deterministic) before halving toward it with closer
+                    // seeds; if the failure persists at the depth cap the
+                    // named Newton error surfaces.
+                    self.march_interval(nodes, mid_t, None, None, depth + 1)?;
+                    return self.march_interval(nodes, right.t, None, Some(right), depth + 1);
+                }
+            }
+        }
+        nodes.push(right);
+        Ok(())
+    }
+}
+
+/// Characteristic length of a blend march: the LOCAL model scale of the
+/// geometry actually being solved.
+///
+/// The march is a *local* solve — one edge, its two supports, and a rolling
+/// ball — so the length its residual bars are measured against is the extent of
+/// that neighbourhood, not the extent of the whole solid and emphatically not
+/// its distance from the world origin (see [`crate::model_scale`]).  Two terms:
+///
+/// * the marched edge's own extent ([`crate::curve_model_scale`]), and
+/// * the blend radius, because a fat ball on a short edge puts the contact
+///   points and the spine `|ρ|` away from the edge — there the ball, not the
+///   edge, sets the size of the geometry being solved.
+///
+/// Floored at 1.0, exactly as the origin-distance form it replaces was, so the
+/// small end of the corpus keeps the bands it was tuned against and this change
+/// moves ONE thing: placement-dependence.
+pub(super) fn march_model_scale(
+    curve: &NurbsCurve,
+    t0: f64,
+    t1: f64,
+    radius: f64,
+) -> Result<f64, String> {
+    Ok(crate::curve_model_scale(curve, t0, t1)?
+        .max(radius.abs())
+        .max(1.0))
+}
+
+/// March the closed edge once around with ADAPTIVE, sagitta-driven station
+/// placement (OCCT `BRepBlend_Walking` deflection control — filleting
+/// study §1 stage 4, §6 lesson 4).  Returns the stations in parameter
+/// order; the last is the first again (u-coordinates unwrapped
+/// continuously, so on a closed carrier the final u differs from the first
+/// by the carrier period).  The endpoint stations sit exactly at t_start /
+/// t_start + span (or, when anchored, exactly ON the seam meridian with t
+/// freed — unchanged from the fixed grid), and the count adapts between
+/// SEED_INTERVALS + 1 and MAX_STATIONS + 1 with the spine's curvature.
+pub(super) fn march_stations(
+    edge: &EdgeRecord,
+    first: &BlendMate,
+    second: &BlendMate,
+    radius_at: &dyn Fn(f64) -> f64,
+    anchor_u: Option<f64>,
+) -> Result<Vec<Station>, String> {
+    let span = edge.t1 - edge.t0;
+    let radius_extent = [0.0, 0.5, 1.0]
+        .into_iter()
+        .map(|fraction| radius_at(edge.t0 + span * fraction).abs())
+        .fold(0.0, f64::max);
+    let scale = march_model_scale(&edge.curve, edge.t0, edge.t1, radius_extent)?;
+    crate::report_scale_migration("blend_march_closed", scale, || {
+        let a = edge.curve.evaluate(edge.t0).unwrap_or_default();
+        let b = edge.curve.evaluate(edge.t0 + span * 0.5).unwrap_or_default();
+        a.length().max(b.length()).max(1.0)
+    });
+    let surface1 = &first.face.surface;
+    let surface2 = &second.face.surface;
+    let signs = [first.rho.signum(), second.rho.signum()];
+    let rho_at = |t: f64| -> [f64; 2] {
+        let radius = radius_at(t);
+        [signs[0] * radius, signs[1] * radius]
+    };
+    let u_span = {
+        let [u0, u1] = surface1.domain_u()?;
+        u1 - u0
+    };
+    // Anchoring: find the edge parameter whose tangency point sits on ANY
+    // periodic image of the F1 seam meridian, then distribute stations from
+    // there once around. Boolean pcurves are deliberately allowed to stay
+    // unwrapped (for example [0.25, 1.25]); comparing only against the base
+    // domain start would choose the wrong meridian and make the anchored
+    // Newton cross most of the loop before it could converge.
+    let (t_start, anchor_u) = if let Some(base_lock) = anchor_u {
+        // Seed t: where the EDGE pcurve on F1 crosses the seam meridian.
+        let mut best = (edge.t0, f64::INFINITY, base_lock);
+        for index in 0..=64 {
+            let t = edge.t0 + span * index as f64 / 64.0;
+            let uv = edge_uv_on_face(first.coedge, edge, t)?;
+            let lap = ((uv[0] - base_lock) / u_span).round();
+            let lock = base_lock + lap * u_span;
+            let distance = (uv[0] - lock).abs();
+            if distance < best.1 {
+                best = (t, distance, lock);
+            }
+        }
+        (best.0, Some(best.2))
+    } else {
+        (edge.t0, None)
+    };
+    let mut seed = {
+        let t = t_start.clamp(edge.t0, edge.t1);
+        let uv1 = edge_uv_on_face(first.coedge, edge, t)?;
+        let uv2 = edge_uv_on_face(second.coedge, edge, t)?;
+        [uv1[0], uv1[1], uv2[0], uv2[1]]
+    };
+    if let Some(u_lock) = anchor_u {
+        seed[0] = u_lock;
+    }
+    if std::env::var("BREP_DEBUG_BLEND_MARCH").is_ok() {
+        eprintln!(
+            "anchor seed: t={t_start:.9} lock={anchor_u:?} uv={seed:?} u_span={u_span:.9}"
+        );
+    }
+    // Refinement bar: the kernel's committed fit accuracy, from the SAME
+    // policy the blending pipeline instantiates at its tolerance sites
+    // (fillet/edges.rs, fillet/tool.rs pass model = 1e-7).
+    // `intersection_fit` is the "maximum geometric error accepted while
+    // fitting" band — the accuracy the marched-and-fitted rows commit to —
+    // NOT OCCT's fixed 0.88/0.98 walking constants.  `scale` is this module's
+    // march scale ([`march_model_scale`] — the marched edge's own extent, the
+    // same convention the Newton and closure tolerances use); its only effect
+    // here is the ladder's scale·1e-8 floor, which the 20·model term dominates
+    // for anything smaller than ~200 units ACROSS.  (It read "within ~200 units
+    // of the origin" until audit slice 0, when the scale stopped depending on
+    // where the part sits and started depending on how big it is.)
+    let fit_tolerance = crate::KernelTolerances::for_scale(scale, 1e-7).intersection_fit;
+    let frame = MarchFrame {
+        edge,
+        surface1,
+        surface2,
+        rho_at: &rho_at,
+        signs,
+        scale,
+        fit_tolerance,
+    };
+    let mut nodes: Vec<MarchNode> = Vec::with_capacity(SEED_INTERVALS + 1);
+    nodes.push(frame.solve_node(t_start, seed, anchor_u)?);
+    for index in 1..=SEED_INTERVALS {
+        let t = t_start + span * index as f64 / SEED_INTERVALS as f64;
+        // Anchored marches free t and freeze u on the seam meridian at BOTH
+        // endpoints so both ends of the support pcurve land exactly on the
+        // seam; the closing lock advances by the carrier period travelled.
+        let lock = if anchor_u.is_some() && index == SEED_INTERVALS {
+            let u_direction = (nodes[1].uv[0] - nodes[0].uv[0]).signum();
+            anchor_u.map(|u| u + u_direction * u_span)
+        } else {
+            None
+        };
+        frame.march_interval(&mut nodes, t, lock, None, 0)?;
+    }
+    debug_assert!(
+        nodes.len() <= MAX_STATIONS + 1,
+        "adaptive march exceeded its hard station cap"
+    );
+    let stations: Vec<Station> = nodes.into_iter().map(|node| node.station).collect();
+    let first_station = &stations[0];
+    let last_station = stations.last().expect("march produced stations");
+    if last_station.p1.sub(first_station.p1).length() > 1e-6 * scale
+        || last_station.p2.sub(first_station.p2).length() > 1e-6 * scale
+    {
+        return Err("blend: closed-edge march did not return to its start".into());
+    }
+    Ok(stations)
+}
+
+/// Chord-length parameters over the mean of the two support polylines,
+/// normalised to [0, 1] (§4.9: station spacing proportional to the mean
+/// support arc length).
+pub(super) fn station_parameters(stations: &[Station]) -> Vec<f64> {
+    let mut parameters = Vec::with_capacity(stations.len());
+    let mut accumulated = 0.0;
+    parameters.push(0.0);
+    for pair in stations.windows(2) {
+        let step1 = pair[1].p1.sub(pair[0].p1).length();
+        let step2 = pair[1].p2.sub(pair[0].p2).length();
+        accumulated += 0.5 * (step1 + step2);
+        parameters.push(accumulated);
+    }
+    let total = accumulated.max(1e-12);
+    for parameter in &mut parameters {
+        *parameter /= total;
+    }
+    parameters
+}
+
+pub(super) struct FittedRows {
+    pub(super) surface: NurbsSurface,
+    pub(super) cr: NurbsCurve,
+    pub(super) cs: NurbsCurve,
+    /// Support pcurves in station order (forward traversal).
+    pub(super) cr_pcurve: NurbsCurve,
+    pub(super) cs_pcurve: NurbsCurve,
+    pub(super) u_domain: [f64; 2],
+    /// The rolling ball's centre path, fitted over the SAME parameters as the
+    /// rows, so `center(u)` is the centre of the section at `surface(u, ·)`.
+    /// A constant-radius blend is the radius-r canal of this curve, which is
+    /// what lets a sibling stripe's surface be tested as a DISTANCE to it (the
+    /// two-edge miter seam, `miter.rs`).  Only the open march fits it.
+    pub(super) center: Option<NurbsCurve>,
+    /// True when the surface is the EXACT extrusion of one section along a
+    /// straight spine (a straight edge between two planes: the blend is a
+    /// cylinder patch), laid out with the section along v.  The surgery
+    /// transposes such a face once it is built so the analytic recogniser —
+    /// which wants the circle along u — sees the cylinder it is.
+    pub(super) exact_extrusion: bool,
+    /// Row parameters of the sections AT the edge's two vertices (the march
+    /// snaps one station onto each), start then end.  A stripe that stops at
+    /// its own vertex — a flush join with a tangent neighbour, or a capped
+    /// end — stops here.  Only the open march sets them.
+    pub(super) vertex_stations: Option<[f64; 2]>,
+}
+
+/// Preserve the exact rotational geometry of a coaxial analytic blend.
+/// The general closed-row interpolator is intentionally approximate in the
+/// marching direction; when every station is a rigid rotation of one exact
+/// section, rebuilding that section as a revolution preserves exact circular
+/// support rims.  Spheres are symmetric about every axis through their centre;
+/// other revolution carriers must expose the same axis line.
+pub(super) fn exact_closed_revolution_rows(
+    stations: &[Station],
+    first: &BlendMate,
+    second: &BlendMate,
+    chamfer: bool,
+) -> Option<Result<FittedRows, String>> {
+    let analytic1 = first.face.surface.analytic()?;
+    let analytic2 = second.face.surface.analytic()?;
+    let (axis_origin, base_axis) = match (analytic1, analytic2) {
+        (
+            crate::AnalyticSurface::Sphere { frame: frame1, .. },
+            crate::AnalyticSurface::Sphere { frame: frame2, .. },
+        ) => {
+            // A sphere's stored frame is only its construction history.  Two
+            // distinct sphere centres define the actual blend symmetry axis.
+            let axis = frame2.origin.sub(frame1.origin).normalized().ok()?;
+            (frame1.origin, axis)
+        }
+        _ => {
+            let carrier = if !matches!(analytic1, crate::AnalyticSurface::Sphere { .. }) {
+                analytic1.frame()?
+            } else {
+                analytic2.frame()?
+            };
+            let axis = carrier.axis.normalized().ok()?;
+            let origin = carrier.origin;
+            let scale = origin.length().max(1.0);
+            let on_same_axis = |surface: &crate::AnalyticSurface| {
+                let (point, aligned) = match surface {
+                    crate::AnalyticSurface::Sphere { frame, .. } => (frame.origin, true),
+                    other => {
+                        let Some(frame) = other.frame() else {
+                            return false;
+                        };
+                        (frame.origin, frame.axis.cross(axis).length() <= 1e-7)
+                    }
+                };
+                let offset = point.sub(origin);
+                let distance = offset.sub(axis.scale(offset.dot(axis))).length();
+                aligned && distance <= 1e-7 * scale.max(point.length())
+            };
+            if !on_same_axis(analytic1) || !on_same_axis(analytic2) {
+                return None;
+            }
+            (origin, axis)
+        }
+    };
+    Some((|| {
+        let first_station = stations.first().ok_or("blend: no sphere stations")?;
+        let next_station = stations
+            .get(1)
+            .ok_or("blend: exact revolution needs two stations")?;
+        let radial = |point: Vec3| {
+            let offset = point.sub(axis_origin);
+            offset.sub(base_axis.scale(offset.dot(base_axis)))
+        };
+        let sweep_sign = radial(first_station.p1)
+            .cross(radial(next_station.p1))
+            .dot(base_axis)
+            .signum();
+        let axis = if sweep_sign < 0.0 {
+            base_axis.scale(-1.0)
+        } else {
+            base_axis
+        };
+        let generatrix = if chamfer {
+            crate::make_line(first_station.p1, first_station.p2)?
+        } else {
+            NurbsCurve::new(
+                2,
+                vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+                vec![
+                    Vec4::from_point(first_station.p1, 1.0),
+                    Vec4::from_point(first_station.apex, first_station.weight),
+                    Vec4::from_point(first_station.p2, 1.0),
+                ],
+            )?
+        };
+        let surface =
+            crate::make_revolution(axis_origin, axis, &generatrix, std::f64::consts::TAU)?;
+        let cr = surface.iso_curve_v(0.0)?;
+        let cs = surface.iso_curve_v(1.0)?;
+        // The exact 3D rims are circles about the centre line, but on a
+        // sphere whose stored polar frame uses another axis their UV tracks
+        // are curved.  Fit those marched tracks against the exact rational
+        // revolution parameter (not the generic chord-length parameter), so
+        // each pcurve parameter evaluates to the same point as the exact rim.
+        let mut angle = 0.0;
+        let mut revolution_parameters = Vec::with_capacity(stations.len());
+        revolution_parameters.push(0.0);
+        for pair in stations.windows(2) {
+            let from = radial(pair[0].p1).normalized()?;
+            let to = radial(pair[1].p1).normalized()?;
+            let mut step = from.cross(to).dot(axis).atan2(from.dot(to));
+            if step < 0.0 {
+                step += std::f64::consts::TAU;
+            }
+            angle += step;
+            revolution_parameters.push(crate::analytic_surface::circle_angle_to_parameter(
+                4,
+                std::f64::consts::TAU,
+                angle.min(std::f64::consts::TAU),
+            ));
+        }
+        *revolution_parameters.last_mut().unwrap() = 1.0;
+        let fitted = fit_closed_rows(stations, &revolution_parameters, chamfer)?;
+        Ok(FittedRows {
+            surface,
+            cr,
+            cs,
+            cr_pcurve: fitted.cr_pcurve,
+            cs_pcurve: fitted.cs_pcurve,
+            u_domain: [0.0, 1.0],
+            center: None,
+            exact_extrusion: false,
+            vertex_stations: None,
+        })
+    })())
+}
+
+/// Wrapped-overlap closed interpolation: extend the station list by
+/// FIT_DEGREE wrapped stations on each side, interpolate every row with
+/// the SAME parameters (shared knots), split out the middle span, then
+/// snap the end control columns equal.  The seam endpoints are
+/// interpolation points, so all rows close exactly; the wrap keeps the
+/// seam tangent mismatch at interpolation-error scale.
+pub(super) fn fit_closed_rows(
+    stations: &[Station],
+    parameters: &[f64],
+    chamfer: bool,
+) -> Result<FittedRows, String> {
+    let count = stations.len();
+    // Unwrapped pcurve periods: how far each uv track travelled in one
+    // loop (zero on open carriers, ±domain-span across a seam).
+    let period1 = stations[count - 1].uv1[0] - stations[0].uv1[0];
+    let period1_v = stations[count - 1].uv1[1] - stations[0].uv1[1];
+    let period2 = stations[count - 1].uv2[0] - stations[0].uv2[0];
+    let period2_v = stations[count - 1].uv2[1] - stations[0].uv2[1];
+    let wrap = |index: isize| -> usize {
+        let n = (count - 1) as isize;
+        (((index % n) + n) % n) as usize
+    };
+    let mut extended_params = Vec::new();
+    let mut samples_cr = Vec::new();
+    let mut samples_mid = Vec::new();
+    let mut samples_cs = Vec::new();
+    let mut samples_uv1 = Vec::new();
+    let mut samples_uv2 = Vec::new();
+    let mut push = |station: &Station, parameter: f64, laps: f64| {
+        extended_params.push(parameter);
+        samples_cr.push(Vec4::from_point(station.p1, 1.0));
+        samples_cs.push(Vec4::from_point(station.p2, 1.0));
+        samples_mid.push(Vec4 {
+            x: station.apex.x * station.weight,
+            y: station.apex.y * station.weight,
+            z: station.apex.z * station.weight,
+            w: station.weight,
+        });
+        samples_uv1.push(Vec4::from_point(
+            Vec3::new(
+                station.uv1[0] + laps * period1,
+                station.uv1[1] + laps * period1_v,
+                0.0,
+            ),
+            1.0,
+        ));
+        samples_uv2.push(Vec4::from_point(
+            Vec3::new(
+                station.uv2[0] + laps * period2,
+                station.uv2[1] + laps * period2_v,
+                0.0,
+            ),
+            1.0,
+        ));
+    };
+    for offset in (1..=FIT_DEGREE).rev() {
+        let index = wrap(-(offset as isize));
+        push(&stations[index], parameters[index] - 1.0, -1.0);
+    }
+    for index in 0..count {
+        // The final station already carries the +period uv from the march.
+        push(&stations[index], parameters[index], 0.0);
+    }
+    for offset in 1..=FIT_DEGREE {
+        let index = wrap(offset as isize);
+        push(&stations[index], parameters[index] + 1.0, 1.0);
+    }
+    let low = extended_params[0];
+    let high = *extended_params.last().unwrap();
+    let range = high - low;
+    let normalized: Vec<f64> = extended_params
+        .iter()
+        .map(|parameter| (parameter - low) / range)
+        .collect();
+    let seam_low = (0.0 - low) / range;
+    let seam_high = (1.0 - low) / range;
+    let fit_row = |samples: &[Vec4]| -> Result<NurbsCurve, String> {
+        let curve = fit::interpolate_homogeneous(samples, FIT_DEGREE, &normalized)?;
+        let (_, tail) = curve.split(seam_low)?;
+        let (middle, _) = tail.split(seam_high)?;
+        Ok(middle)
+    };
+    let cr = fit_row(&samples_cr)?;
+    let cs = fit_row(&samples_cs)?;
+    let cr_pcurve = fit_row(&samples_uv1)?;
+    let cs_pcurve = fit_row(&samples_uv2)?;
+    let mid = if chamfer {
+        None
+    } else {
+        Some(fit_row(&samples_mid)?)
+    };
+    let u_domain = cr.domain()?;
+    let surface = crate::blend::rows::surface_from_rows(FIT_DEGREE, &cr, &cs, mid.as_ref(), true)?;
+    Ok(FittedRows {
+        surface,
+        cr,
+        cs,
+        cr_pcurve,
+        cs_pcurve,
+        u_domain,
+        center: None,
+        exact_extrusion: false,
+        vertex_stations: None,
+    })
+}
+
+pub(super) fn locate_mate<'a>(
+    solid: &'a BrepSolid,
+    edge_id: u64,
+    skip: Option<(u64, usize)>,
+) -> Result<(&'a FaceRecord, usize, &'a CoedgeRecord), String> {
+    for shell in &solid.shells {
+        for face in &shell.faces {
+            for (loop_index, loop_record) in face.loops.iter().enumerate() {
+                if skip == Some((face.id, loop_index)) {
+                    continue;
+                }
+                if let Some(coedge) = loop_record
+                    .coedges
+                    .iter()
+                    .find(|coedge| coedge.edge_id == edge_id)
+                {
+                    return Ok((face, loop_index, coedge));
+                }
+            }
+        }
+    }
+    Err(format!("blend: edge {edge_id} has no (second) mating face"))
+}
+
+/// Signed radii ρ1/ρ2 (4.9.2): the ball center sits along the inward
+/// bisector of the mid-edge cross-section; ρ is its projection sign onto
+/// each face's RAW normal times the radius.
+pub(super) fn signed_radii(
+    edge: &EdgeRecord,
+    first_face: &FaceRecord,
+    first_coedge: &CoedgeRecord,
+    second_face: &FaceRecord,
+    second_coedge: &CoedgeRecord,
+    radius: f64,
+) -> Result<(f64, f64), String> {
+    let probe_step = (radius * 0.25).max(1e-4);
+    // A closed circle's parameter midpoint can land exactly on a periodic
+    // carrier seam even though it is far from the edge's topological seam.
+    // UV classification calls that probe `Boundary`, so sample symmetric
+    // interior fractions until both support-side signs are unambiguous.
+    let mut seed = None;
+    for fraction in [0.5, 0.375, 0.625, 0.25, 0.75] {
+        let t = edge.t0 + (edge.t1 - edge.t0) * fraction;
+        let point = edge.curve.evaluate(t)?;
+        let tangent = edge.curve.derivatives(t, 1)?[1].normalized()?;
+        let Ok(into1) = crate::fillet::into_face_direction(
+            first_face, point, tangent, point, tangent, probe_step,
+        ) else {
+            continue;
+        };
+        let Ok(into2) = crate::fillet::into_face_direction(
+            second_face,
+            point,
+            tangent,
+            point,
+            tangent,
+            probe_step,
+        ) else {
+            continue;
+        };
+        let uv1 = edge_uv_on_face(first_coedge, edge, t)?;
+        let uv2 = edge_uv_on_face(second_coedge, edge, t)?;
+        seed = Some((point, into1, into2, uv1, uv2));
+        break;
+    }
+    let (mid_point, into1, into2, uv1_mid, uv2_mid) =
+        seed.ok_or("blend: could not orient support directions away from carrier seams")?;
+    let n1_mid = raw_normal(&first_face.surface, uv1_mid[0], uv1_mid[1])?;
+    let n2_mid = raw_normal(&second_face.surface, uv2_mid[0], uv2_mid[1])?;
+    let cos_theta = into1.dot(into2).clamp(-1.0, 1.0);
+    let theta = cos_theta.acos();
+    if theta <= 1e-6 || theta >= std::f64::consts::PI - 1e-6 {
+        return Err("blend: dihedral angle too degenerate".into());
+    }
+    let bisector = into1.add(into2).normalized()?;
+    let center_seed = mid_point.add(bisector.scale(radius / (theta * 0.5).sin()));
+    let tangent_offset = radius / (theta * 0.5).tan();
+    let p1_seed = mid_point.add(into1.scale(tangent_offset));
+    let p2_seed = mid_point.add(into2.scale(tangent_offset));
+    let rho1 = if center_seed.sub(p1_seed).dot(n1_mid) >= 0.0 {
+        radius
+    } else {
+        -radius
+    };
+    let rho2 = if center_seed.sub(p2_seed).dot(n2_mid) >= 0.0 {
+        radius
+    } else {
+        -radius
+    };
+    Ok((rho1, rho2))
+}
