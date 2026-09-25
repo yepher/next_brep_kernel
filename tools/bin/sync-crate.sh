@@ -20,6 +20,7 @@ set -euo pipefail
 CRATE="BREP_kernel"
 BRANCH="main"
 API="https://crates.io/api/v1/crates/${CRATE}"
+MANUAL_LINK="* [Manual](https://deepwiki.com/yepher/next_brep_kernel)"
 UA="${CRATE}-sync-script (https://github.com/yepher/next_brep_kernel)"
 
 dry_run=0
@@ -75,6 +76,16 @@ if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
   exit 1
 fi
 
+# Put the manual link just under README.md's first H1, unless it's already there.
+add_manual_link() {
+  [[ -f README.md ]] || return 0
+  grep -qF "$MANUAL_LINK" README.md && return 0
+  awk -v link="$MANUAL_LINK" '
+    { print }
+    !done && /^# / { print ""; print link; done = 1 }
+  ' README.md >README.md.tmp && mv README.md.tmp README.md
+}
+
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -100,6 +111,7 @@ for v in "${versions[@]}"; do
   # then lay the new release down and stage exactly its contents.
   git ls-files -z -- . ':!tools' | xargs -0 rm -f
   (cd "$src" && tar -cf - .) | tar -xf -
+  add_manual_link
   git add -u -- . ':!tools'
   (cd "$src" && find . -type f -print0) | git add --pathspec-from-file=- --pathspec-file-nul
 
