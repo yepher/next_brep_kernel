@@ -13,7 +13,8 @@
 #   tools/bin/sync-crate.sh --push       # import, then push main to origin
 #   tools/bin/sync-crate.sh 0.6.0        # import one specific version
 #
-# Files under tools/ are never touched, so local scripts survive imports.
+# Repo-local files (tools/, AGENTS.md, CLAUDE.md, .devin/) are never touched,
+# so they survive imports. Add to KEEP below for any new local-only file.
 
 set -euo pipefail
 
@@ -21,6 +22,7 @@ CRATE="BREP_kernel"
 BRANCH="main"
 API="https://crates.io/api/v1/crates/${CRATE}"
 MANUAL_LINK="* [Manual](https://deepwiki.com/yepher/next_brep_kernel)"
+KEEP=(tools AGENTS.md CLAUDE.md .devin)
 UA="${CRATE}-sync-script (https://github.com/yepher/next_brep_kernel)"
 
 dry_run=0
@@ -30,11 +32,14 @@ for arg in "$@"; do
   case "$arg" in
     --dry-run) dry_run=1 ;;
     --push) push=1 ;;
-    -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "unknown option: $arg" >&2; exit 2 ;;
     *) requested+=("$arg") ;;
   esac
 done
+
+keep_specs=()
+for k in "${KEEP[@]}"; do keep_specs+=(":!$k"); done
 
 repo="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 cd "$repo"
@@ -107,12 +112,12 @@ for v in "${versions[@]}"; do
   tar -xzf "$archive" -C "$tmp/src"
   src="$tmp/src/${CRATE}-${v}"
 
-  # Remove tracked files (except tools/) so files deleted upstream go away,
+  # Remove tracked files (except KEEP) so files deleted upstream go away,
   # then lay the new release down and stage exactly its contents.
-  git ls-files -z -- . ':!tools' | xargs -0 rm -f
+  git ls-files -z -- . "${keep_specs[@]}" | xargs -0 rm -f
   (cd "$src" && tar -cf - .) | tar -xf -
   add_manual_link
-  git add -u -- . ':!tools'
+  git add -u -- . "${keep_specs[@]}"
   (cd "$src" && find . -type f -print0) | git add --pathspec-from-file=- --pathspec-file-nul
 
   if git diff --cached --quiet; then
