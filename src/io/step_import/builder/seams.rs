@@ -100,6 +100,24 @@ impl<'a> SolidBuilder<'a> {
     /// the drift is mid-span) so shared topology and loop chaining are
     /// untouched. Runs before any pcurve is fitted, so every face fits
     /// against the corrected curve.
+    ///
+    /// **"Off the carrier" is read off the trim the face will be given, not
+    /// off the closest-point projector.** A projector answer is SOME point of
+    /// the surface, so its distance is an upper bound: a pass is conclusive and
+    /// a fail is not. On a general patch nearly closed in one direction it
+    /// returns the far end's local minimum — on `abc_00000026`'s thread flanks
+    /// at alternate stations of an edge lying on the flank to 1e-13, and along
+    /// the whole of another, reading 2.2e-2 .. 4.2e-2 for an edge that is on
+    /// its carrier. This pass used to believe that reading and interpolate a
+    /// replacement through those feet, which moved 89 edges by up to 4.4e-2
+    /// off the carriers the file had put them on and produced every one of
+    /// that file's 73 loop self-crossings and 16 face-pair crossings.
+    /// `build_loop` already decides the branch correctly — jointly around the
+    /// loop where the carrier aliases (`joint_branch_pcurves`), per coedge
+    /// with the fitter's jump repair elsewhere — so a screened edge is measured
+    /// against exactly that trim's image, and a reconciled edge rides that
+    /// image: a continuous branch, not a sequence of independent projector
+    /// answers.
     pub(super) fn reconcile_edges_onto_surfaces(&mut self, faces: &[PendingFace]) -> Result<(), String> {
         let scale = 1.0 + solid_like_scale(&self.vertices);
         // Reconcile anything that would trip the validator's pcurve band —
@@ -108,53 +126,69 @@ impl<'a> SolidBuilder<'a> {
         // parts.
         let band =
             0.5 * crate::KernelTolerances::for_scale(scale, 1e-7).pcurve_consistency;
+        // In-band curves keep their exact representation; wildly off curves (a
+        // mismatched carrier) are left alone too — forcing those onto the
+        // surface would corrupt geometry that a later stage may still refuse
+        // honestly. The upper guard is scale-proportional: vendor 3D
+        // approximations reach ~1e-3 of model size (PCURVE_S1 master
+        // semantics), anything beyond that is a wrong carrier, not drift.
+        let upper_rel = std::env::var("BREP_RECONCILE_MAX")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(1e-3);
+        const SAMPLES: usize = 32;
         let mut replaced = 0usize;
         for face in faces {
             let surface = &face.surface;
             for (specs, _) in &face.bounds {
-                for (edge_id, _) in specs {
-                    let edge = self.edge_record(*edge_id).clone();
+                // Cheap screen first: most edges ride their surfaces exactly,
+                // and the full sweep on a high-degree carrier is what dominates
+                // import time. The projector's distance never under-reads, so
+                // an edge that passes here is on the carrier.
+                let mut screened = Vec::new();
+                for (index, (edge_id, _)) in specs.iter().enumerate() {
+                    let edge = self.edge_record(*edge_id);
                     if edge.degenerate {
                         continue;
                     }
-                    // Cheap screen first: most edges ride their surfaces
-                    // exactly, and the full projection sweep on a high-degree
-                    // carrier is what dominates import time.
                     let mut screen_worst = 0.0f64;
-                    for index in 0..=4 {
-                        let t = edge.t0 + (edge.t1 - edge.t0) * (0.1 + 0.2 * index as f64);
+                    for station in 0..=4 {
+                        let t = edge.t0 + (edge.t1 - edge.t0) * (0.1 + 0.2 * station as f64);
                         let point = edge.curve.evaluate(t)?;
                         let projection = crate::project_point_to_surface(surface, point)?;
                         let on_surface = surface.evaluate(projection.u, projection.v)?;
                         screen_worst = screen_worst.max(on_surface.sub(point).length());
                     }
-                    if screen_worst <= band {
-                        continue;
+                    if screen_worst > band {
+                        screened.push(index);
                     }
-                    const SAMPLES: usize = 32;
+                }
+                if screened.is_empty() {
+                    continue;
+                }
+                let trims = self.derived_loop_trims(surface, specs, &screened)?;
+                for index in screened {
+                    let (edge_id, forward) = specs[index];
+                    let Some(trim) = trims[index].as_ref() else {
+                        continue;
+                    };
+                    let edge = self.edge_record(edge_id).clone();
+                    let [p0, p1] = trim.domain()?;
                     let mut worst = 0.0f64;
                     let mut projected = Vec::with_capacity(SAMPLES + 1);
                     let mut parameters = Vec::with_capacity(SAMPLES + 1);
-                    for index in 0..=SAMPLES {
-                        let t = edge.t0 + (edge.t1 - edge.t0) * index as f64 / SAMPLES as f64;
+                    for station in 0..=SAMPLES {
+                        let along = station as f64 / SAMPLES as f64;
+                        let t = edge.t0 + (edge.t1 - edge.t0) * along;
                         let point = edge.curve.evaluate(t)?;
-                        let projection = crate::project_point_to_surface(surface, point)?;
-                        let on_surface = surface.evaluate(projection.u, projection.v)?;
+                        // A trim runs in its COEDGE's direction.
+                        let fraction = if forward { along } else { 1.0 - along };
+                        let uv = trim.evaluate(p0 + (p1 - p0) * fraction)?;
+                        let on_surface = surface.evaluate(uv.x, uv.y)?;
                         worst = worst.max(on_surface.sub(point).length());
                         projected.push(on_surface);
                         parameters.push(t);
                     }
-                    // In-band curves keep their exact representation; wildly
-                    // off curves (a mismatched carrier) are left alone too —
-                    // forcing those onto the surface would corrupt geometry
-                    // that a later stage may still refuse honestly. The upper
-                    // guard is scale-proportional: vendor 3D approximations
-                    // reach ~1e-3 of model size (PCURVE_S1 master semantics),
-                    // anything beyond that is a wrong carrier, not drift.
-                    let upper_rel = std::env::var("BREP_RECONCILE_MAX")
-                        .ok()
-                        .and_then(|s| s.parse::<f64>().ok())
-                        .unwrap_or(1e-3);
                     if worst <= band || worst > upper_rel * scale {
                         continue;
                     }
@@ -171,12 +205,18 @@ impl<'a> SolidBuilder<'a> {
                     reconciled[SAMPLES] = edge.curve.evaluate(edge.t1)?;
                     let replacement = crate::interpolate_curve(&reconciled, 3, &parameters)?;
                     if let Some(record) =
-                        self.edges.iter_mut().find(|record| record.id == *edge_id)
+                        self.edges.iter_mut().find(|record| record.id == edge_id)
                     {
                         record.curve = replacement;
                         [record.t0, record.t1] = [parameters[0], parameters[SAMPLES]];
                         replaced += 1;
                     }
+                    self.capture_stage(edge_id, || {
+                        format!(
+                            "reconciled onto face #{} (surface #{}): its trim reads {worst:.3e} off it",
+                            face.face_ref, face.surface_ref
+                        )
+                    });
                 }
             }
         }
@@ -184,6 +224,44 @@ impl<'a> SolidBuilder<'a> {
             eprintln!("RECONCILE replaced {replaced} edge curves (band {band:.6})");
         }
         Ok(())
+    }
+
+    /// The trims `build_loop` derives for one loop, for the coedges in
+    /// `wanted`: the joint branch assignment where the loop takes it, the
+    /// per-coedge fit otherwise. Neither the supplied-pcurve lane nor seam
+    /// pinning is repeated — the first is off by default and the second moves
+    /// a trim along its own seam, not off it.
+    ///
+    /// The per-coedge fit is also the lane that lands on the wrong end of a
+    /// nearly closed patch (edge 438 of `abc_00000026` reads 2.163e-2 through
+    /// it). Where `joint_branch_pcurves` declines a loop on such a carrier,
+    /// this pass inherits that answer and can move an edge that is on its
+    /// carrier; `abc_00000026` escapes only because all 48 of its aliased loops
+    /// are adopted.
+    fn derived_loop_trims(
+        &self,
+        surface: &NurbsSurface,
+        specs: &[(u64, bool)],
+        wanted: &[usize],
+    ) -> Result<Vec<Option<NurbsCurve>>, String> {
+        let pcurve_tol = loop_pcurve_tolerance(surface)?;
+        if let Some(joint) = self.joint_branch_pcurves(surface, specs, pcurve_tol)? {
+            return Ok(joint.into_iter().map(Some).collect());
+        }
+        let mut trims = vec![None; specs.len()];
+        for &index in wanted {
+            let (edge_id, forward) = specs[index];
+            let edge = self.edge_record(edge_id);
+            trims[index] = Some(build_pcurve_on_surface_range(
+                surface,
+                &edge.curve,
+                edge.t0,
+                edge.t1,
+                forward,
+                pcurve_tol,
+            )?);
+        }
+        Ok(trims)
     }
 
     /// Split one kernel edge at parameter `t` into two pieces sharing a new
@@ -239,6 +317,7 @@ impl<'a> SolidBuilder<'a> {
         // shifted every following edge's position, so rebuild the id -> index
         // map. Splits are bounded by seam-crossing edges (rare), not O(E).
         self.rebuild_edge_index();
+        self.capture_split(edge_id, t, left_id, right_id);
         for face in faces.iter_mut() {
             for (specs, _) in &mut face.bounds {
                 let mut rebuilt = Vec::with_capacity(specs.len() + 1);
@@ -422,6 +501,7 @@ impl<'a> SolidBuilder<'a> {
             record.t0 = t0;
             record.t1 = t1;
         }
+        self.capture_stage(edge_id, || "rotated so its vertex sits on the seam".into());
         Ok(true)
     }
 
@@ -465,6 +545,7 @@ impl<'a> SolidBuilder<'a> {
             edge.t0 = t0;
             edge.t1 = t1;
         }
+        self.capture_stage(edge_id, || format!("rim re-seated as the iso circle v = {v_rim:.9}"));
         Ok(())
     }
 

@@ -84,6 +84,21 @@ fn split_self_touching_source(source: &BrepSolid) -> Result<Option<BrepSolid>, S
     Ok(Some(apply_edge_splits(source, SOURCE_OPERAND, &imprint)?))
 }
 
+/// How far past the grown outline a planar opening wall that meets a RULED
+/// opening is padded, in units of the offset-skin band the wall selection reads
+/// (see the wall construction).
+///
+/// Measured on the torus wedge through the pipeline, grown by 0.05, 0.1, 0.5
+/// and 0.999 (band 2e-3): a clearance of 2 or 2.5 bands still shreds the cap
+/// into 22 to 36 faces with the area 5% to 11% high; from 4 bands on every
+/// member builds its 6 faces, and from 4 to 32 bands each member's volume moves
+/// by at most 1.2e-7. 16 sits four times above the first clean reading.
+const RULED_NEIGHBOUR_CLEARANCE_BANDS: f64 = 16.0;
+
+/// How far past its opening plane an inward carrier is grown, as a fraction of
+/// the shell distance (see the fall-short reach in the carrier loop).
+const REACH_CLEARANCE: f64 = 0.25;
+
 pub fn offset_shell(
     source: &BrepSolid,
     opening_face_ids: &[u64],
@@ -94,6 +109,33 @@ pub fn offset_shell(
     // and every carrier built from the source see the same topology.
     let prepared = split_self_touching_source(source)?;
     let source = prepared.as_ref().unwrap_or(source);
+    // An outward shell of the one circular face of a partial revolve is planar
+    // in the meridian half-plane, fold band and all: build it there and revolve
+    // it once (`revolved_wedge.rs`). Anything else declines and takes the
+    // imprint pipeline, unchanged.
+    match revolved_wedge::recognize(source, opening_face_ids, distance) {
+        Ok(revolved_wedge::Recognition::Wedge(wedge)) => {
+            os_debug!("revolved wedge lane: {}", wedge.report());
+            return revolved_wedge::build(&wedge, source);
+        }
+        Ok(revolved_wedge::Recognition::Declined(reason)) => {
+            os_debug!("revolved wedge lane declined: {reason}");
+        }
+        // A source the lane cannot even read is not one it takes; the pipeline
+        // owns every refusal.
+        Err(error) => {
+            os_debug!("revolved wedge lane declined: could not read the source ({error})");
+        }
+    }
+    imprint_attempts(source, opening_face_ids, distance)
+}
+
+
+fn imprint_attempts(
+    source: &BrepSolid,
+    opening_face_ids: &[u64],
+    distance: f64,
+) -> Result<OffsetShellResultRecord, String> {
     // First try with oblique hole-wall carriers extended past their opening
     // planes (the lane that closes tilted/conical through-holes). If that
     // extension fired but the arrangement could not assemble the harder
@@ -103,13 +145,20 @@ pub fn offset_shell(
     // the canonical honesty-gate message.
     let mut extension_fired = false;
     let mut reflex_rebuilds = 0usize;
-    match offset_shell_impl(
+    let mut shadowed_points = Vec::new();
+    let mut omitted = HashSet::default();
+    let mut vacated_notes = Vec::new();
+    let result = match offset_shell_impl(
         source,
         opening_face_ids,
         distance,
         true,
         &mut extension_fired,
         &mut reflex_rebuilds,
+        &HashSet::default(),
+        &mut shadowed_points,
+        &mut omitted,
+        &mut vacated_notes,
     ) {
         Ok(result) => {
             // Attribution marker: which pipeline produced this result. A
@@ -128,6 +177,8 @@ pub fn offset_shell(
             os_debug!("extended pipeline failed ({error}); retrying without carrier extension");
             let mut unused = false;
             let mut retry_reflex = 0usize;
+            shadowed_points.clear();
+            omitted.clear();
             let retried = offset_shell_impl(
                 source,
                 opening_face_ids,
@@ -135,6 +186,10 @@ pub fn offset_shell(
                 false,
                 &mut unused,
                 &mut retry_reflex,
+                &HashSet::default(),
+                &mut shadowed_points,
+                &mut omitted,
+                &mut vacated_notes,
             );
             os_debug!(
                 "offset_shell result: RETRY without extension ({}, reflex-rebuilt {retry_reflex})",
@@ -143,7 +198,66 @@ pub fn offset_shell(
             retried
         }
         Err(error) => Err(error),
+    };
+    // A refusal from a shell whose selection saw two offsets CROSS inside
+    // material thinner than twice the distance says so first: a rib thinner
+    // than 2d shelled inward is that configuration, and the assembly's own
+    // message names only the symptom. A refusal that already names its cause
+    // keeps it. The crossing is looked for here, on the failure path only.
+    match result {
+        // A refusal that already names its CAUSE keeps its own sentence; one
+        // that names a symptom ("connector edge left its plane", an assembly
+        // message) is worth a cause in front of it. Reading the whole prefix as
+        // "anything this module wrote" was too wide: the twin bosses came out
+        // led by a notch sentence when their cause was the shadow cascade, and
+        // the partial cone lost its junction cause behind a connector's.
+        Err(error) if !refusal_names_its_cause(&error) => {
+            if let Some(crossing) =
+                name_offset_crossing(source, opening_face_ids, distance, &shadowed_points)
+            {
+                return Err(format!(
+                    "offset_shell: {crossing}; a skin partly shadowed that way is not yet \
+                     assembled ({error})"
+                ));
+            }
+            if let Some(junction) = name_retained_opening_junction(source, opening_face_ids, distance)
+            {
+                return Err(format!("offset_shell: {junction} ({error})"));
+            }
+            // A rim the closure could not bridge, with what it measured, in
+            // front of whatever the assembly then said about the hole it left.
+            match vacated_notes.first() {
+                Some(note) => Err(format!(
+                    "offset_shell: a rim vacated by an omitted support was left open — {note} \
+                     ({error})"
+                )),
+                None => Err(error),
+            }
+        }
+        result => result,
     }
+}
+
+/// The refusals this module's own cause-naming lanes produce. Anything else is
+/// a symptom another stage reported, and takes a cause in front of it.
+fn refusal_names_its_cause(error: &str) -> bool {
+    [
+        " coincide near ",
+        "cannot tell whether",
+        "omitting the shadowed offsets of source faces",
+        "no retained face keeps any offset skin",
+        "is shadowed at every one of its",
+        "a rim vacated by an omitted support was left open",
+        "junction, so its offset ends inside the cavity",
+        "cross near",
+        // The opening-wall lane's own named refusals, so a cause of mine never
+        // arrives in front of one of theirs.
+        "folds where the carve",
+        "is curved and not a ruled surface",
+        "cannot be built",
+    ]
+    .iter()
+    .any(|name| error.contains(name))
 }
 
 fn offset_shell_impl(
@@ -153,8 +267,14 @@ fn offset_shell_impl(
     extend_oblique_carriers: bool,
     extension_fired: &mut bool,
     reflex_rebuilds: &mut usize,
+    shadowed_supports: &HashSet<u64>,
+    shadowed_points: &mut Vec<(Vec3, u64)>,
+    omitted_supports: &mut HashSet<u64>,
+    vacated_notes: &mut Vec<String>,
 ) -> Result<OffsetShellResultRecord, String> {
-    if !distance.is_finite() || distance.abs() <= 1e-7 {
+    omitted_supports.clone_from(shadowed_supports);
+    vacated_notes.clear();
+    if !distance.is_finite() || distance.abs() <= MINIMUM_DISTANCE {
         return Err("offset_shell: distance must be finite and non-zero".into());
     }
     if opening_face_ids.is_empty() {
@@ -181,10 +301,21 @@ fn offset_shell_impl(
         return Err("offset_shell: removing every face cannot produce a shell".into());
     }
     let mut carriers = Vec::new();
+    // Faces whose folded part was carved away, by source face id. Later stages
+    // that read a retained face's TRIM — the apex-cap scan below is the one —
+    // must read the carved trim, not the one the source still carries.
+    let mut carved_supports = HashMap::<u64, FaceRecord>::default();
+
     for face_id in &retained {
         let face = source_faces.iter().find(|face| face.id == *face_id).unwrap();
         if offset_support_collapsed(face, distance)? {
             os_debug!("omitting collapsed offset support for source face {face_id}");
+            continue;
+        }
+        // A support a previous pass found SHADOWED contributes no skin, and its
+        // carrier must not imprint its neighbours either — see the selection.
+        if shadowed_supports.contains(face_id) {
+            os_debug!("omitting shadowed offset support for source face {face_id}");
             continue;
         }
         // A planar carrier whose source face meets a neighbour at a REFLEX
@@ -225,7 +356,45 @@ fn offset_shell_impl(
         let extension = if distance < 0.0 {
             outward_carrier_extension(source, face, &source_faces, &opening_set, distance.abs())?
         } else {
-            crate::CarrierExtension::uniform(reflex_extension.unwrap_or(0.0))
+            let mut inward = crate::CarrierExtension::uniform(reflex_extension.unwrap_or(0.0));
+            // An INWARD carrier that falls short of the planar opening it meets
+            // is grown until it crosses that plane, so the imprint cuts the
+            // skin there instead of leaving a rim for the ruled weld to cork
+            // below the opening (`fallshort_opening_reach`).
+            if let Some((at_v_max, reach)) =
+                fallshort_opening_reach(source, face, &source_faces, &opening_set, distance)?
+            {
+                // Past the plane by a quarter of the shell's own thickness, so
+                // the section is strictly inside the carrier's trim rather than
+                // on its boundary. Measured 2026-09-17 over the offset-shell
+                // suite: every fraction from 0.01 to 2.0 of |d| gives the same
+                // 73 passing members, while a margin sized in COINCIDENCE BANDS
+                // (1 to 32 of them, 2e-5 each here) breaks the sphere-under-
+                // frustum member by 9.4e-2 — the fragile margins are the ones
+                // far below the construction's own length.
+                let grown = reach + REACH_CLEARANCE * distance.abs();
+                if at_v_max {
+                    inward.v_max = inward.v_max.max(grown);
+                } else {
+                    inward.v_min = inward.v_min.max(grown);
+                }
+                os_debug!(
+                    "carrier for src face {face_id}: inward reach to its opening plane {reach:.6}                      at v_{} ",
+                    if at_v_max { "max" } else { "min" },
+                );
+            }
+            // A CURVED opening has no such construction, and the pipeline
+            // closes the cavity with whatever completion reaches for: measured
+            // 7.6% short on the hemisphere cup shelled through its dome.
+            if let Some((opening, gap)) =
+                offset_falls_short_of_curved_opening(source, face, &source_faces, &opening_set, distance)?
+            {
+                return Err(format!(
+                    "offset_shell: the offset skin of source face {face_id} stops {gap:.3e} short of \
+                     curved opening face {opening}; only a planar opening's skin is grown to meet it"
+                ));
+            }
+            inward
         };
         if distance < 0.0 {
             os_debug!(
@@ -236,7 +405,33 @@ fn offset_shell_impl(
                 extension.v_max,
             );
         }
-        let mut carrier = carrier_solid_sided(source, *face_id, distance, &extension)?;
+        // CARVE: a support whose offset folds over PART of its trim keeps the
+        // regular part and drops the rest, instead of being built whole with
+        // the fold in it. The carrier is built over the CARVED source, so the
+        // trim it clones stops at the fold locus — and, because that trim no
+        // longer reaches past the offset's pinch, `offset_surface`'s apex-cone
+        // pinch retrim does not fire and the cloned pcurves still name the
+        // pointwise offset.
+        //
+        // A carve that cannot be made is not a licence to build the folded
+        // support anyway: the refusal is the answer, because a carrier with an
+        // inverted patch in it welds into a shell that validates and bounds the
+        // wrong solid.
+        let carved = carve_folded_support(source, face, distance)?;
+        let carrier_source = match &carved {
+            Some(carved) => {
+                os_debug!(
+                    "carving the fold off source face {face_id}: {:.1}% of its trim kept, \
+                     {} new boundary pcurve(s)",
+                    carved.kept_fraction * 100.0,
+                    carved.fold_boundary
+                );
+                carved_supports.insert(*face_id, carved.face.clone());
+                &carved.solid
+            }
+            None => source,
+        };
+        let mut carrier = carrier_solid_sided(carrier_source, *face_id, distance, &extension)?;
         if (distance < 0.0 || reflex_extension.is_some()) && face.surface.is_affine()? {
             // PADDED planes: the pad slides the plane's net while the trim's
             // loops are cloned in uv, so an INTERIOR loop (a bore or boss rim
@@ -261,6 +456,32 @@ fn offset_shell_impl(
             // class (Out) or by the on-skin filter, no seed involved.
             drop_wall_interior_loops(&mut carrier)?;
         }
+        // The rim a shadowed support's removal VACATED in this carrier's trim:
+        // a slot narrower than 2|d| that runs out through this face leaves a
+        // notch its own skin has to close, because the dilation fills the slot.
+        // The source face keeps its notch; only the carrier is bridged.
+        if distance < 0.0 && !shadowed_supports.is_empty() {
+            let report = close_vacated_rims(
+                &mut carrier,
+                source_faces
+                    .iter()
+                    .find(|face| face.id == *face_id)
+                    .copied()
+                    .unwrap_or(face),
+                &source_faces,
+                shadowed_supports,
+            )?;
+            if report.closed > 0 {
+                os_debug!(
+                    "carrier for src face {face_id}: {} vacated rim run(s) bridged",
+                    report.closed
+                );
+            }
+            for declined in &report.declined {
+                os_debug!("carrier for src face {face_id}: vacated rim left alone — {declined}");
+                vacated_notes.push(format!("source face {face_id}: {declined}"));
+            }
+        }
         carriers.push(Carrier {
             solid: carrier,
             source_face_id: *face_id,
@@ -280,7 +501,14 @@ fn offset_shell_impl(
     {
         let retained_count = carriers.len();
         for index in 0..retained_count {
-            let source_face = source_by_id_lookup(&source_faces, carriers[index].source_face_id);
+            // A CARVED support's trim is the carved one. Its coedges name edges
+            // that live only in the carved clone, so the `source.edges` lookup
+            // below finds nothing and the apex-cap lane skips the face — which
+            // is right: the carve already ended that carrier at the offset's own
+            // pinch, and there is no apex ring left to cap.
+            let carved_face = carved_supports.get(&carriers[index].source_face_id);
+            let source_face = carved_face
+                .or_else(|| source_by_id_lookup(&source_faces, carriers[index].source_face_id));
             let Some(source_face) = source_face else {
                 continue;
             };
@@ -351,11 +579,106 @@ fn offset_shell_impl(
             }
         }
     }
+    // A fold the carve's probe did not see (`outward_fold_the_carve_missed`):
+    // a band too thin for its grid is built whole, and the torus wedge grown by
+    // 1.001 then held the reflected lemon beyond its axis. Asked of every
+    // retained face the carve neither carved nor omitted, on every outward
+    // shell: a ruled wall is what first let the pipeline CLOSE such a shape,
+    // but the geometry is the trigger. Refused by name, the tangent onset
+    // included; a partial revolve of that kind is the revolved-wedge lane's
+    // question, and that lane runs in front of this pipeline.
+    if distance < 0.0 {
+        for face_id in &retained {
+            if carved_supports.contains_key(face_id)
+                || !carriers.iter().any(|carrier| carrier.source_face_id == *face_id)
+            {
+                continue;
+            }
+            let face = source_by_id_lookup(&source_faces, *face_id).unwrap();
+            if let Some(fold) = outward_fold_the_carve_missed(face, distance)? {
+                return Err(format!(
+                    "offset_shell: the outward offset of source face {face_id} folds where the carve \
+                     saw no fold (area factor {:.3e} at u={:.6}, v={:.6}); a fold band that thin is \
+                     not built",
+                    fold.factor, fold.u, fold.v
+                ));
+            }
+        }
+    }
+    // Wall carriers built as a RULED opening face extended along itself, by
+    // carrier index: the in-front guard reads their sides off the surface
+    // normal where it would read a plane's.
+    let mut ruled_walls = HashSet::default();
+    // OUTWARD through a CURVED opening. A ruled one — the cone a revolved
+    // straight profile edge sweeps, a cylinder — has its wall built as the
+    // opening face held in place and EXTENDED along itself, exactly as a plane
+    // is padded (`extended_ruled_wall`); the pad is the plane's, read off the
+    // same convex junctions. Built first, so the planar walls know which
+    // neighbours are ruled walls.
+    //
+    // Any other curved opening is refused by name. Its wall used to be the
+    // unpadded source face, which never reaches the grown offset: on a torus
+    // wedge whose chord revolves to a cone, the pair offset x cone cut 0
+    // pieces, the cone's one fragment was dropped as a void cross-section, and
+    // the result read "completion produced non-integral genus" with 12 open
+    // edges. No outward shell in the kernel suites or the case corpus closed
+    // through that wall (census, 2026-09-17).
+    let mut ruled_built = HashMap::<u64, BrepSolid>::default();
+    if distance < 0.0 {
+        for face_id in opening_face_ids {
+            let source_face = source_by_id_lookup(&source_faces, *face_id).unwrap();
+            if source_face.surface.is_affine()? {
+                continue;
+            }
+            if !ruled_opening(source_face)? {
+                return Err(format!(
+                    "offset_shell: opening face {face_id} is curved and not a ruled surface; an \
+                     outward wall is built only on a planar or ruled opening"
+                ));
+            }
+            let pad = outward_wall_pad(
+                source,
+                source_face,
+                &source_faces,
+                &opening_set,
+                distance.abs(),
+            )?;
+            let tolerance = 1e-7f64.max(crate::solid_scale(source) * 1e-9);
+            match extended_ruled_wall(source, source_face, pad, tolerance)? {
+                Ok(wall) => {
+                    os_debug!(
+                        "wall for opening face {face_id}: ruled, pad {pad:.4}, sides reach {:.4?}",
+                        wall.reached
+                    );
+                    ruled_built.insert(*face_id, wall.solid);
+                }
+                Err(reason) => {
+                    return Err(format!(
+                        "offset_shell: the outward wall of ruled opening face {face_id} cannot be \
+                         built: {reason}"
+                    ));
+                }
+            }
+        }
+    }
+    let ruled_openings = ruled_built
+        .keys()
+        .filter_map(|id| source_by_id_lookup(&source_faces, *id))
+        .collect::<Vec<_>>();
     for face_id in opening_face_ids {
         let source_face = source_faces
             .iter()
             .find(|face| face.id == *face_id)
             .unwrap();
+        if let Some(wall) = ruled_built.remove(face_id) {
+            ruled_walls.insert(carriers.len());
+            carriers.push(Carrier {
+                solid: wall,
+                source_face_id: *face_id,
+                kind: OffsetFaceRole::Wall,
+            });
+            continue;
+        }
         carriers.push(Carrier {
             solid: if distance < 0.0 && source_face.surface.is_affine()? {
                 let pad = outward_wall_pad(
@@ -365,8 +688,81 @@ fn offset_shell_impl(
                     &opening_set,
                     distance.abs(),
                 )?;
+                // A plane meeting a RULED opening is padded past the grown
+                // outline, not onto it. Padded by exactly the pad, its trim's
+                // arc lands ON the grown offset's section wherever the join is
+                // perpendicular, and the ruled wall's section then ENDS on that
+                // coincident pair: on the torus wedge the cap shredded into 60
+                // slivers along the grown circle. The clearance is counted in
+                // the band that decides whether the strip beyond the grown
+                // outline is wall or void, so the strip always resolves as its
+                // own fragment and is dropped as void.
+                let pad = if ruled_openings
+                    .iter()
+                    .any(|ruled| source_faces_adjacent(source_face, ruled))
+                {
+                    pad + RULED_NEIGHBOUR_CLEARANCE_BANDS
+                        * offset_skin_band(crate::solid_scale(source), distance)
+                } else {
+                    pad
+                };
                 os_debug!("wall for opening face {face_id}: outward pad {pad:.4}");
-                let mut wall = carrier_solid(source, *face_id, 0.0, pad)?;
+                // The wall is the opening's outline OFFSET by the pad in its
+                // own plane (`outline_offset.rs`). The pad used to SCALE that
+                // outline about the patch centre, which is the offset only for
+                // a rectangle filling its patch or a circle centred on it: an
+                // L-shaped opening's notch edges pass through the centre and
+                // did not move at all, so the notch faces' grown offsets
+                // crossed the plane outside the wall ("non-integral genus",
+                // `l-step-open-bottom` at d = −1.5 in the membrane census).
+                //
+                // An outline this module does not offset keeps the scaled wall,
+                // but only when that wall still COVERS the offset outline along
+                // every edge a retained face meets — which is what the sections
+                // have to land inside. Otherwise the shell refuses by name
+                // rather than assembling an open rim.
+                let mut scaled = carrier_solid(source, *face_id, 0.0, pad)?;
+                drop_wall_interior_loops(&mut scaled)?;
+                let mut wall = match offset_outline_wall(source, source_face, pad)? {
+                    Ok(outline) => {
+                        // Where the scaled wall already trims the offset
+                        // outline's own region — a rectangle filling its patch,
+                        // a circle centred on it — it is kept, so no shell that
+                        // was right before is rebuilt on a different patch.
+                        let same = walls_trim_the_same_region(
+                            &outline,
+                            &scaled,
+                            1e-9f64.max(crate::solid_scale(source) * 1e-11),
+                        )?;
+                        if same {
+                            os_debug!("wall for opening face {face_id}: scaled, which IS its outline offset");
+                            scaled
+                        } else {
+                            os_debug!("wall for opening face {face_id}: outline offset by {pad:.4}");
+                            outline
+                        }
+                    }
+                    Err(reason) => {
+                        if let Err(uncovered) = scaled_wall_covers_offset(
+                            source,
+                            source_face,
+                            &scaled,
+                            pad,
+                            &source_faces,
+                            &opening_set,
+                        )? {
+                            return Err(format!(
+                                "offset_shell: opening face {face_id}'s outline is not offset \
+                                 ({reason}), and its scaled outward wall does not cover the offset \
+                                 outline (a point of it lies {uncovered:.3e} outside)"
+                            ));
+                        }
+                        os_debug!(
+                            "wall for opening face {face_id}: scaled, which covers its offset ({reason})"
+                        );
+                        scaled
+                    }
+                };
                 // The pad extends the wall by STRETCHING the plane's 2x2 net
                 // while the trim pcurves are cloned in UV, so every loop
                 // scales about the patch centre by (w+2|d|)/w. For the OUTER
@@ -627,7 +1023,19 @@ fn offset_shell_impl(
                 &ImprintOptions {
                     tolerance,
                     maximum_fit_points: 96,
-                    local_fit: true,
+                    // The GLOBAL interpolation lane. `local_fit: true` until
+                    // 2026-09-13, which cost three orders on every smooth
+                    // section: measured on the apex cone's base circle, the
+                    // local lane needs 3,070 control points to reach 2.0e-5
+                    // where the global one reaches 1.4e-8 with 384. What the
+                    // local lane is for — a rim through a corner, where its
+                    // monotonicity limiter holds a kink the global cubic rings
+                    // across, 4.9x measured — is now the fit's own fallback:
+                    // `fit_polyline` re-runs the other lane whenever the asked
+                    // one cannot meet the tolerance and returns the better
+                    // MEASURED curve, so this flag chooses which ladder is
+                    // paid for first, never which curve is delivered.
+                    local_fit: false,
                     fit_chunk_points: None,
                     // Offset carriers can meet in short, tightly curved
                     // branches. The general SSI default (diagonal / 15) is
@@ -697,7 +1105,8 @@ fn offset_shell_impl(
                     &ImprintOptions {
                         tolerance,
                         maximum_fit_points: 96,
-                        local_fit: true,
+                        // The global lane, as above.
+                        local_fit: false,
                         fit_chunk_points: None,
                         maximum_ssi_step: Some((scale * 0.0005).max(tolerance * 100.0)),
                     },
@@ -954,7 +1363,7 @@ fn offset_shell_impl(
             (face, edges)
         })
         .collect::<Vec<_>>();
-    let offset_skin_tolerance = 2e-3f64.max(scale * 5e-5).max(distance.abs() * 1e-3);
+    let offset_skin_tolerance = offset_skin_band(scale, distance);
     // OUTWARD shells: a wall fragment lying IN FRONT of another opening —
     // past that opening's plane on its void side, within the extent of its
     // (extended) wall carrier — is not material: an opening removes
@@ -964,19 +1373,33 @@ fn offset_shell_impl(
     // face's wall, in front of the opened −X face). It sits within |distance|
     // of a retained face's corner edge, so the void-cross-section guard reads
     // it as wall thickness; only the other opening's plane tells it apart.
+    //
+    // A RULED opening's wall is curved, so it has no one plane: its front is
+    // read at the point's foot on the wall carrier, along the carrier's normal
+    // turned to the opening face's outward side. On the torus wedge that is
+    // what drops the start and end caps' strips beyond the extended chord,
+    // which lie within |distance| of the torus and in front of the cone.
     let mut opening_planes: Vec<(usize, Vec3, Vec3)> = Vec::new();
+    let mut opening_ruled: Vec<(usize, f64)> = Vec::new();
     if distance < 0.0 {
         for (index, carrier) in carriers.iter().enumerate() {
             if !matches!(carrier.kind, OffsetFaceRole::Wall) {
                 continue;
             }
             let opening = source_by_id[&carrier.source_face_id];
-            if !opening.surface.is_affine()? {
-                continue;
-            }
             let [u0, u1] = opening.surface.domain_u()?;
             let [v0, v1] = opening.surface.domain_v()?;
             let (u, v) = ((u0 + u1) * 0.5, (v0 + v1) * 0.5);
+            if ruled_walls.contains(&index) {
+                let wall = &split_carriers[index].shells[0].faces[0];
+                let probe = project_point_to_surface(&wall.surface, opening.surface.evaluate(u, v)?)?;
+                let side = face_normal(wall, probe.u, probe.v)?.dot(face_normal(opening, u, v)?);
+                opening_ruled.push((index, if side < 0.0 { -1.0 } else { 1.0 }));
+                continue;
+            }
+            if !opening.surface.is_affine()? {
+                continue;
+            }
             opening_planes.push((
                 index,
                 opening.surface.evaluate(u, v)?,
@@ -1000,51 +1423,181 @@ fn offset_shell_impl(
                 return Ok(true);
             }
         }
+        for (index, side) in &opening_ruled {
+            if *index == wall_index {
+                continue;
+            }
+            let face = &split_carriers[*index].shells[0].faces[0];
+            let projection = project_point_to_surface(&face.surface, point)?;
+            let outward = face_normal(face, projection.u, projection.v)?.scale(*side);
+            if point.sub(projection.point).dot(outward) <= band {
+                continue;
+            }
+            let uv = Vec2 {
+                x: projection.u,
+                y: projection.v,
+            };
+            if parameter_point_in_face(face, uv, 1e-8)? != PolygonClass::Outside {
+                return Ok(true);
+            }
+        }
         Ok(false)
     };
 
     let mut chosen_offsets = Vec::new();
     let mut chosen_walls = Vec::new();
+    let mut newly_shadowed = HashSet::<u64>::default();
     for (index, carrier) in carriers.iter().enumerate() {
-        let raw_seed = source_seed(source, carrier.source_face_id)?;
-        let seed = if matches!(carrier.kind, OffsetFaceRole::Offset) {
-            offset_seed(
-                source_by_id[&carrier.source_face_id],
-                raw_seed,
-                &split_carriers[index].shells[0].faces[0].surface,
-                distance,
-                2e-3f64.max(scale * 5e-5),
-            )?
-            .unwrap_or(raw_seed)
-        } else {
-            raw_seed
-        };
-        if seed.sub(raw_seed).length() > 1e-9 {
-            os_debug!(
-                "  seed[{index}] moved from ({:.4},{:.4}) to the offset image ({:.4},{:.4})",
-                raw_seed.x,
-                raw_seed.y,
-                seed.x,
-                seed.y
-            );
+        let raw_seeds = source_seeds(source, carrier.source_face_id)?;
+        let mut seeds = Vec::with_capacity(raw_seeds.len());
+        for raw_seed in raw_seeds {
+            let seed = if matches!(carrier.kind, OffsetFaceRole::Offset) {
+                offset_seed(
+                    source_by_id[&carrier.source_face_id],
+                    raw_seed,
+                    &split_carriers[index].shells[0].faces[0].surface,
+                    distance,
+                    2e-3f64.max(scale * 5e-5),
+                )?
+                .unwrap_or(raw_seed)
+            } else {
+                raw_seed
+            };
+            if seed.sub(raw_seed).length() > 1e-9 {
+                os_debug!(
+                    "  seed[{index}] moved from ({:.4},{:.4}) to the offset image ({:.4},{:.4})",
+                    raw_seed.x,
+                    raw_seed.y,
+                    seed.x,
+                    seed.y
+                );
+            }
+            seeds.push(seed);
         }
+        let seed = seeds[0];
         if matches!(carrier.kind, OffsetFaceRole::Offset) {
             // Fragments whose test point sits at the full offset distance
             // from every retained source face are the true offset-skin
             // regions. Fragments closer to some other face are shadowed
-            // pockets/strips that another carrier owns. Only fall back to the
-            // unfiltered set when nothing qualifies (numerical safety net).
-            let on_skin = fragments_by_carrier[index]
+            // pockets/strips that another carrier owns.
+            let readings = fragments_by_carrier[index]
                 .iter()
                 .map(|fragment| {
-                    point_on_offset_skin(
+                    offset_skin_reading(
                         fragment.test_point,
                         &retained_faces_with_edges,
                         distance,
                         offset_skin_tolerance,
                     )
                 })
-                .collect::<Result<Vec<_>, String>>()?;
+                .collect::<Vec<_>>();
+            for (fragment, reading) in fragments_by_carrier[index].iter().zip(&readings) {
+                if let SkinReading::Unmeasured { face, reason } = reading {
+                    return Err(unmeasured_skin_refusal(fragment.test_point, *face, reason));
+                }
+            }
+            // EVERY fragment measured nearer than the distance to some other
+            // retained face: this support's offset is SHADOWED over its whole
+            // extended carrier — the side walls of a slot narrower than 2|d|
+            // grown outward, a pocket floor within 2d of the face under it.
+            // It owns no skin. It used to switch the filter off and keep its
+            // seeded fragment anyway, which built a closed, validating shell
+            // with an inverted box inside it (+90 on a width-2 slot grown by
+            // 1.5, with the 90 of material at its centre missing). Dropping
+            // only its fragments is not enough: its carrier has already cut
+            // its neighbours, and the top skin over that slot keeps a hole
+            // nothing fills. So the pass is re-run with the support omitted
+            // before the imprint, like a collapsed one. An apex-cap sphere
+            // shares its cone's source id and is not judged here.
+            //
+            // Only the FIRST pass omits. A test point speaks for its fragment
+            // because every other carrier's imprint bounds it; omitting a
+            // carrier removes cuts, merges fragments and moves test points,
+            // but changes no distance, so a support that reads shadowed only
+            // AFTER an omission is reading a test point that no longer stands
+            // for its fragment. Measured on two bosses 1 apart grown outward
+            // by 1.5: once the facing boss walls were omitted, the plate's
+            // grown top — one uncut fragment, mostly skin — read shadowed at
+            // its single test point.
+            //
+            // "Every fragment" counts a fragment the selection would drop by
+            // CLASS as not skin, as the selection does: the extended carrier's
+            // surplus past a slot's end reads at least the distance from every
+            // face, lies inside the source, and on a slot 1 wide grown outward
+            // left the slot floor unjudged until the side walls were gone.
+            // ADRIFT: a fragment whose test point is farther from its OWN face
+            // than the distance, in the mitered metric, is not that face's skin
+            // — it is inside the cavity, past where its neighbours' offsets cut
+            // it. A rib, a pin or a divider thinner than 2d shelled inward
+            // keeps such fragments, and the assembly then fails on them.
+            let adrift = fragments_by_carrier[index]
+                .iter()
+                .map(|fragment| {
+                    point_adrift_of_its_own_offset(
+                        fragment.test_point,
+                        carrier.source_face_id,
+                        &retained_faces_with_edges,
+                        distance,
+                        offset_skin_tolerance,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut skinless = readings
+                .iter()
+                .any(|reading| matches!(reading, SkinReading::Shadowed { .. }))
+                || adrift.iter().any(|flag| *flag);
+            for (fragment, reading) in fragments_by_carrier[index].iter().zip(&readings) {
+                if !skinless {
+                    break;
+                }
+                if matches!(reading, SkinReading::On)
+                    && !adrift[fragments_by_carrier[index]
+                        .iter()
+                        .position(|other| std::ptr::eq(other, fragment))
+                        .unwrap_or(0)]
+                {
+                    let class = classify_point(fragment.test_point, source, tolerance * 10.0)?.class;
+                    skinless = (distance > 0.0 && class == PointClass::Out)
+                        || (distance < 0.0 && class == PointClass::In);
+                }
+            }
+            if skinless && !apex_cap_sources.contains(&index) {
+                if !shadowed_supports.is_empty() {
+                    let mut omitted = shadowed_supports.iter().copied().collect::<Vec<_>>();
+                    omitted.sort_unstable();
+                    return Err(format!(
+                        "offset_shell: omitting the shadowed offsets of source faces {omitted:?} \
+                         leaves the offset of source face {} shadowed at every one of its {} \
+                         fragment test points, which no longer stand for their fragments once \
+                         those carriers stop cutting it",
+                        carrier.source_face_id,
+                        readings.len()
+                    ));
+                }
+                os_debug!(
+                    "  select[{index}] src={} SHADOWED over all {} fragment(s): {:?}",
+                    carrier.source_face_id,
+                    readings.len(),
+                    readings
+                );
+                newly_shadowed.insert(carrier.source_face_id);
+                continue;
+            }
+            // Partly shadowed: keep a bounded sample of the shadowed test
+            // points, so a refusal can say where two offsets cross.
+            for (fragment, reading) in fragments_by_carrier[index].iter().zip(&readings) {
+                if shadowed_points.len() >= MAXIMUM_CROSSING_READS {
+                    break;
+                }
+                if matches!(reading, SkinReading::Shadowed { .. }) {
+                    shadowed_points.push((fragment.test_point, carrier.source_face_id));
+                }
+            }
+            let on_skin = readings
+                .iter()
+                .zip(&adrift)
+                .map(|(reading, adrift)| matches!(reading, SkinReading::On) && !adrift)
+                .collect::<Vec<_>>();
             let skin_filter_active = on_skin.iter().any(|flag| *flag);
             let mut classified = Vec::new();
             let mut viable = Vec::new();
@@ -1079,38 +1632,66 @@ fn offset_shell_impl(
                 }
                 viable.push(fragment.clone());
             }
-            os_debug!("  select[{index}] seed=({:.4},{:.4})", seed.x, seed.y);
-            let seeded = viable
-                .iter()
-                .filter(|fragment| {
-                    parameter_point_in_face(&fragment_as_trim(fragment), seed, 1e-8)
-                        .is_ok_and(|class| class != PolygonClass::Outside)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            let seeded_classified = classified
-                .iter()
-                .filter(|fragment| {
-                    parameter_point_in_face(&fragment_as_trim(fragment), seed, 1e-8)
-                        .is_ok_and(|class| class != PolygonClass::Outside)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            let selected = if viable.is_empty() {
-                if !skin_filter_active {
-                    // NOTHING on this carrier reads on-skin: every classified
-                    // fragment's test point is measurably CLOSER than the
-                    // offset distance to some retained face — a buried strip
-                    // another carrier owns. Forcing the largest one in anyway
-                    // plants a wrong skin patch that collides with the
-                    // completion phase's reconstruction (3-use edges).
-                    // Contribute nothing: `complete_opening_boundary_cycles`
-                    // rebuilds the true skin from the carrier surface, and the
-                    // watertight gate still refuses if it cannot.
-                    None
-                } else {
-                    let mut by_area = classified
-                        .into_iter()
+            // One skin per REGION of the source face (see `source_seeds`):
+            // every region of a pinched face is offset like a face of its
+            // own, and the selection below answers each region's seed. An
+            // ordinary face has the one seed and the one answer it always had.
+            let mut region_skins = Vec::new();
+            for &seed in &seeds {
+                os_debug!("  select[{index}] seed=({:.4},{:.4})", seed.x, seed.y);
+                let seeded = viable
+                    .iter()
+                    .filter(|fragment| {
+                        parameter_point_in_face(&fragment_as_trim(fragment), seed, 1e-8)
+                            .is_ok_and(|class| class != PolygonClass::Outside)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let seeded_classified = classified
+                    .iter()
+                    .filter(|fragment| {
+                        parameter_point_in_face(&fragment_as_trim(fragment), seed, 1e-8)
+                            .is_ok_and(|class| class != PolygonClass::Outside)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let selected = if viable.is_empty() {
+                    if !skin_filter_active {
+                        // NOTHING on this carrier reads on-skin: every classified
+                        // fragment's test point is measurably CLOSER than the
+                        // offset distance to some retained face — a buried strip
+                        // another carrier owns. Forcing the largest one in anyway
+                        // plants a wrong skin patch that collides with the
+                        // completion phase's reconstruction (3-use edges).
+                        // Contribute nothing: `complete_opening_boundary_cycles`
+                        // rebuilds the true skin from the carrier surface, and the
+                        // watertight gate still refuses if it cannot.
+                        None
+                    } else {
+                        let mut by_area = classified
+                            .iter()
+                            .cloned()
+                            .map(|fragment| {
+                                let area = parameter_space_area(&fragment_as_trim(&fragment))?.abs();
+                                Ok((fragment, area))
+                            })
+                            .collect::<Result<Vec<_>, String>>()?;
+                        by_area.sort_by(|a, b| b.1.total_cmp(&a.1));
+                        by_area.into_iter().next().map(|entry| entry.0)
+                    }
+                } else if !seeded_classified.is_empty() {
+                    let mut candidates = seeded_classified;
+                    candidates.sort_by(|a, b| {
+                        a.test_uv
+                            .sub(seed)
+                            .length()
+                            .total_cmp(&b.test_uv.sub(seed).length())
+                    });
+                    candidates.into_iter().next()
+                } else if viable.len() > 2 {
+                    let mut by_area = viable
+                        .iter()
+                        .cloned()
                         .map(|fragment| {
                             let area = parameter_space_area(&fragment_as_trim(&fragment))?.abs();
                             Ok((fragment, area))
@@ -1118,39 +1699,74 @@ fn offset_shell_impl(
                         .collect::<Result<Vec<_>, String>>()?;
                     by_area.sort_by(|a, b| b.1.total_cmp(&a.1));
                     by_area.into_iter().next().map(|entry| entry.0)
+                } else {
+                    let mut candidates = if seeded.is_empty() { viable.clone() } else { seeded };
+                    candidates.sort_by(|a, b| {
+                        a.test_uv
+                            .sub(seed)
+                            .length()
+                            .total_cmp(&b.test_uv.sub(seed).length())
+                    });
+                    candidates.into_iter().next()
+                };
+                if let Some(fragment) = &selected {
+                    os_debug!(
+                        "  select[{index}] src={} chosen test point departs its own face's offset \
+                         distance by {:?}",
+                        carrier.source_face_id,
+                        own_offset_departure(
+                            fragment.test_point,
+                            carrier.source_face_id,
+                            &retained_faces_with_edges,
+                            distance
+                        )
+                    );
+                    os_debug!(
+                        "  select[{index}] src={} chosen test point departs in the MITER metric by {:?}",
+                        carrier.source_face_id,
+                        own_miter_departure(
+                            fragment.test_point,
+                            carrier.source_face_id,
+                            &retained_faces_with_edges,
+                            distance
+                        )
+                    );
+                    if let Some((other, separation)) = coincident_offset_face(
+                        fragment.test_point,
+                        carrier.source_face_id,
+                        &retained_faces_with_edges,
+                        distance,
+                        offset_skin_tolerance,
+                    )? {
+                        return Err(format!(
+                            "offset_shell: the offsets of source faces {} and {other} coincide near \
+                             ({:.4}, {:.4}, {:.4}) — the material between those faces is twice the \
+                             shell distance thick (separation {separation:.6} against {:.6}, band \
+                             {offset_skin_tolerance:.1e}), so the cavity between them has no \
+                             thickness there; a cavity pinched to zero thickness is not supported",
+                            carrier.source_face_id,
+                            fragment.test_point.x,
+                            fragment.test_point.y,
+                            fragment.test_point.z,
+                            distance.abs(),
+                        ));
+                    }
                 }
-            } else if !seeded_classified.is_empty() {
-                let mut candidates = seeded_classified;
-                candidates.sort_by(|a, b| {
-                    a.test_uv
-                        .sub(seed)
-                        .length()
-                        .total_cmp(&b.test_uv.sub(seed).length())
-                });
-                candidates.into_iter().next()
-            } else if viable.len() > 2 {
-                let mut by_area = viable
-                    .into_iter()
-                    .map(|fragment| {
-                        let area = parameter_space_area(&fragment_as_trim(&fragment))?.abs();
-                        Ok((fragment, area))
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
-                by_area.sort_by(|a, b| b.1.total_cmp(&a.1));
-                by_area.into_iter().next().map(|entry| entry.0)
-            } else {
-                let mut candidates = if seeded.is_empty() { viable } else { seeded };
-                candidates.sort_by(|a, b| {
-                    a.test_uv
-                        .sub(seed)
-                        .length()
-                        .total_cmp(&b.test_uv.sub(seed).length())
-                });
-                candidates.into_iter().next()
-            };
-            if let Some(fragment) = selected {
-                chosen_offsets.push(fragment);
+                if let Some(fragment) = selected {
+                    // A pinched face's seeds each find their own region; a
+                    // fallback that ignores the seed can answer the same
+                    // fragment twice, and one skin must enter once.
+                    if !region_skins
+                        .iter()
+                        .any(|other: &FaceFragmentRecord| {
+                            other.test_point.sub(fragment.test_point).length() <= 1e-12
+                        })
+                    {
+                        region_skins.push(fragment);
+                    }
+                }
             }
+            chosen_offsets.extend(region_skins);
         } else {
             // Keep arrangement order stable. Besides making the result
             // reproducible, this matches the reference kernel's Set insertion
@@ -1367,6 +1983,39 @@ fn offset_shell_impl(
             );
         }
     }
+    if !newly_shadowed.is_empty() {
+        let mut omitted = shadowed_supports.clone();
+        omitted.extend(newly_shadowed.iter().copied());
+        os_debug!(
+            "re-running without shadowed offset supports {:?} (omitted before: {:?})",
+            newly_shadowed,
+            shadowed_supports
+        );
+        // What this pass sampled belongs to carriers the next pass may not
+        // build.
+        shadowed_points.clear();
+        return offset_shell_impl(
+            source,
+            opening_face_ids,
+            distance,
+            extend_oblique_carriers,
+            extension_fired,
+            reflex_rebuilds,
+            &omitted,
+            shadowed_points,
+            omitted_supports,
+            vacated_notes,
+        );
+    }
+    if chosen_offsets.is_empty() && !shadowed_supports.is_empty() {
+        let mut omitted = shadowed_supports.iter().copied().collect::<Vec<_>>();
+        omitted.sort_unstable();
+        return Err(format!(
+            "offset_shell: no retained face keeps any offset skin once the shadowed offsets of \
+             source faces {omitted:?} are omitted — the solid is nowhere thicker than twice the \
+             shell distance, so there is no cavity to shell"
+        ));
+    }
     if chosen_offsets.is_empty() {
         return Err("offset_shell: carrier intersections produced no offset boundary".into());
     }
@@ -1494,10 +2143,18 @@ fn offset_shell_impl(
     // is the seam-rim consistency step the offset pipeline previously lacked.
     let welded_rims = weld_coplanar_orphan_rims(&mut solid, 2e-3f64.max(scale * 5e-5))?;
     os_debug!("welded {welded_rims} coplanar orphan rims into opening caps");
-    // Weld oblique-wall offset rims (truncated cone) into a ruled frustum
-    // opening-wall band, rebuilding the flat cap the pipeline mis-builds.
-    let ruled_rims = weld_ruled_offset_rims(&mut solid, 2e-3f64.max(scale * 5e-5))?;
-    os_debug!("welded {ruled_rims} non-coplanar offset rims into ruled bands");
+    // A rim that is not a circle: a free-form or non-iso rim whose offset image
+    // falls short of the opening. It runs after every earlier weld because it
+    // only ever sees rims none of them closed.
+    let rim_band = weld_free_form_rim_bands(
+        &mut solid,
+        &mut face_images,
+        &carriers,
+        source,
+        2e-3f64.max(scale * 5e-5),
+    )?;
+    let rim_bands = rim_band.welded;
+    os_debug!("welded {rim_bands} free-form rim bands");
     // Weld leftover coaxial coplanar rim PAIRS (a through-hole's exposed wall
     // thickness at each opening) into new planar annulus faces.
     let pair_rims =
@@ -1581,9 +2238,17 @@ fn offset_shell_impl(
     // No faceted fallback here: an offset shell must be made of real analytic
     // surfaces. Failing loudly beats silently returning a tessellated BREP
     // with destroyed face provenance.
-    let mut solid = finalize_assembled_solid(solid, assembly_tolerance)?;
-    if ruled_rims + pair_rims > 0 {
-        // A ruled-band or rim-pair weld joins independently-oriented skins;
+    // A shell the rim band lane recognized but could not close fails here as it
+    // always did; the refusal now carries the lane's reason.
+    let mut solid = finalize_assembled_solid(solid, assembly_tolerance).map_err(|error| {
+        let message = String::from(error);
+        match &rim_band.decline {
+            Some(reason) => format!("{message}; offset_shell: {reason}"),
+            None => message,
+        }
+    })?;
+    if rim_bands + pair_rims > 0 {
+        // A rim-band or rim-pair weld joins independently-oriented skins;
         // put the whole finalized manifold on one normal convention so the
         // shell reports its exact wall volume (coplanar-only shells keep
         // their assembled sense).
@@ -1720,6 +2385,11 @@ fn offset_shell_impl(
             ));
         }
     }
+    // The shell's single exit. An offset skin that crosses another wall, or
+    // folds through itself where the source turned tighter than the distance,
+    // leaves a body that validates and measures — so it is asked here, and
+    // repaired or refused by name rather than returned.
+    let solid = crate::accept_sound(solid, "offsetShell")?;
     Ok(OffsetShellResultRecord { solid, face_images })
 }
 
@@ -1745,7 +2415,16 @@ pub fn offset_shell_with_diagnostics(
     diagnostics.count_n("collect.opening_faces", opening_face_ids.len() as u64);
     diagnostics.measure_max("offset.distance", distance.abs());
     diagnostics.measure_max("tolerance.model", policy.model);
+    // Tally every pcurve fit the shell makes (its own re-trims and any boolean
+    // it runs) so `pcurve.unmet_floor` reports a trim that stopped at the
+    // sample ceiling instead of passing it off as one that met the floor.
+    let fit_scope = crate::PcurveFitScope::open();
+    // Same for the polyline fits of its carrier×carrier sections, which is
+    // where a marched rim's accuracy is decided (`geometry/fit.rs`).
+    let polyline_scope = crate::PolylineFitScope::open();
     let result = offset_shell(source, opening_face_ids, distance)?;
+    fit_scope.close().report_into(&mut diagnostics);
+    polyline_scope.close().report_into(&mut diagnostics);
     diagnostics.count_n(
         "sew.output_faces",
         result

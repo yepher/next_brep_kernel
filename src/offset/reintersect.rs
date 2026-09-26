@@ -2,15 +2,14 @@
 //!
 //! # What this is, and where it sits in the offset-unification plan
 //!
-//! The audit
-//! ([offset-unification-audit.md](../../../docs/developer/kernel-plans/offset-unification-audit.md))
-//! splits the shared machinery into three: offsetting a surface pointwise
-//! ([`crate::OffsetEvaluator`], `offset/point.rs`, slice 1), re-trimming a face
-//! whose boundary has already moved (`offset/retrim.rs`, slice 2), and
-//! **intersecting carriers to remake the boundary in the first place** — the
-//! step that has to happen *between* those two, and the one push-face did not
-//! have in general form. §2.3's matrix is the work list: offset-shell
-//! re-intersects arbitrary carriers, push-face refuses most neighbour classes.
+//! The audit splits the shared machinery into three: offsetting a surface
+//! pointwise ([`crate::OffsetEvaluator`], `offset/point.rs`, slice 1),
+//! re-trimming a face whose boundary has already moved (`offset/retrim.rs`,
+//! slice 2), and **intersecting carriers to remake the boundary in the first
+//! place** — the step that has to happen *between* those two, and the one
+//! push-face did not have in general form. §2.3's matrix is the work list:
+//! offset-shell re-intersects arbitrary carriers, push-face refuses most
+//! neighbour classes.
 //!
 //! # Why this is not an extraction of offset-shell's arrangement
 //!
@@ -29,11 +28,7 @@
 //! fall back to the marched surface/surface intersection** — `driver.rs:225`
 //! (`intersect_analytic_pair`) then `driver.rs:398` (`intersect_surfaces`) then
 //! `driver.rs:644` (`fit_polyline`). That two-lane structure is the generality;
-//! the arrangement around it is offset-shell's own bookkeeping. This module is
-//! that structure and nothing else, so nothing here collides with
-//! [offset-shell-tail.md](../../../docs/developer/kernel-plans/offset-shell-tail.md)
-//! §4, whose slices rewrite `carrier_rebuild.rs`, `connectors.rs`, the
-//! pre-fragmentation carrier set and `offset.rs`'s outward pad.
+//! the arrangement around it is offset-shell's own bookkeeping.
 //!
 //! `intersect_analytic_pair`'s own contract already names the fallback —
 //! "*or `None` when the pair is not handled and the caller must fall back to
@@ -44,8 +39,9 @@
 //!
 //! Slice 1 found that a shared helper with one hard-coded convention silently
 //! moves a caller (audit §9.6.2), and slices 2 and 2b carried that forward as
-//! explicit [`crate::offset_retrim::PcurveFit`] and
-//! `OffsetPairDegeneracy`. The same discipline here:
+//! an explicit pcurve fit lane (since retired: that lane's planar/ruled split
+//! turned out to be a defect, not a convention) and `OffsetPairDegeneracy`.
+//! The same discipline here:
 //!
 //! * **The analytic lane is bit-identical to calling
 //!   [`crate::intersect_analytic_pair`] directly**, with the same arguments in
@@ -339,6 +335,16 @@ pub(crate) fn reintersect_carriers(
 /// Refuses rather than guesses when the two ends land on the same sample or
 /// adjacent ones: an arc that short is not a trim boundary, and fitting it
 /// would invent a curve out of two points.
+///
+/// The one exception is `from` and `to` the SAME point exactly — the caller's single relocated
+/// vertex at both ends — which asks for the WHOLE section re-origined at that
+/// corner: a hole whose rim is ONE closed edge pinned to the neighbour's seam
+/// (the imprint stores a closed marched rim as one edge since 2026-09-14,
+/// where it used to cut it again at the march's parameterization origin). A
+/// full loop passes every point, so `through` cannot pick its direction the
+/// way it picks an arc's; for this case the caller passes a point the old edge
+/// reaches EARLY (a quarter of the way along), and the direction that reaches
+/// it in the first half of the loop is the one the edge ran.
 /// Where a relocated corner vertex goes on a marched section: the section's own
 /// sample nearest the vertex it replaces.
 ///
@@ -391,6 +397,17 @@ pub(crate) fn arc_of_section(
     let start = nearest_index(from);
     let end = nearest_index(to);
     let count = ring.len();
+    if from.sub(to).length() == 0.0 {
+        let early = (nearest_index(through) + count - start) % count;
+        let step: isize = if early <= count / 2 { 1 } else { -1 };
+        let mut chosen: Vec<Vec3> = (0..count as isize)
+            .map(|offset| ring[(start as isize + step * offset).rem_euclid(count as isize) as usize])
+            .collect();
+        chosen[0] = from;
+        chosen.push(from);
+        let fit = fit_polyline(&chosen, tolerance.max(1e-7), MAXIMUM_FIT_POINTS, false)?;
+        return close_exactly(&fit.curve, tolerance);
+    }
     let forward_len = (end + count - start) % count;
     if forward_len < 2 || count - forward_len < 2 {
         return Err(
@@ -532,4 +549,3 @@ pub(crate) fn match_marched_rim_direction(
     Ok(rim)
 }
 
-// BREP private tests: 75ec2704e898e397

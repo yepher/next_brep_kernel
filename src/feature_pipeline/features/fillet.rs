@@ -2,7 +2,6 @@
 //!
 //! Edge and face selections resolve to one solid and are blended together,
 //! including shared convex corners. Cross-solid selections return no changes.
-//! Only AUTO and INSET directions are supported.
 //!
 //! The result retains the target's name. Generated faces use the shared
 //! `{featureID || 'F'}:BLEND:{edgeName}` naming scheme, with corner patches
@@ -19,8 +18,6 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
 }
 
 fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
-    common::require_blend_direction(ctx, "fillet")?;
-
     let selection = common::resolve_blend_selection(ctx)?;
     let mut result = FeatureResult::empty(ctx.id.clone(), ctx.feature_type.clone());
     result.unresolved = selection.unresolved;
@@ -118,18 +115,8 @@ pub fn schema() -> serde_json::Value {
             "step": 0.1,
             "default_value": 0,
             "hint": "Optional end radius for a VARIABLE (tapered) fillet. 0 = constant radius. When > 0 and different from radius, each selected edge tapers from radius at its start to this value at its end (kernel-exact path; corners are not rounded in variable mode)."
-        },
-        "direction": {
-            "type": "options",
-            "options": [
-                "AUTO",
-                "INSET"
-            ],
-            "default_value": "AUTO",
-            "hint": "AUTO classifies each selected edge as inside/outside and applies subtract/union automatically."
         }
     }
 })
 }
 
-// BREP private tests: c47b57c8274b747f

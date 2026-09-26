@@ -2,7 +2,7 @@ use super::*;
 
 /// An orthonormal placement frame (STEP AXIS2_PLACEMENT_3D): origin plus the
 /// local x/y/z axes (z = `axis`, x = `ref_direction` projected orthogonal to z).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct Frame {
     pub(super) origin: Vec3,
     pub(super) x: Vec3,
@@ -391,6 +391,40 @@ pub(super) struct Resolver<'a> {
     /// `GLOBAL_UNIT_ASSIGNED_CONTEXT` length unit (`SI_UNIT` prefix or
     /// `CONVERSION_BASED_UNIT` measure); 1.0 (assume mm) when absent.
     pub(super) length_scale: f64,
+    /// Radians per one of the file's `PLANE_ANGLE_UNIT`, or `None` when the
+    /// file declares none this parser can resolve. Only supplied pcurves read
+    /// it: every angle the importer reads from a geometric entity is either
+    /// already dimensionless or range-disambiguated, while a supplied pcurve's
+    /// angular coordinate is neither. See `supplied::derive_angle_scale`.
+    ///
+    /// LAZY, and that is load-bearing rather than tidy. Deriving it sweeps
+    /// every entity in the file — twice, when the first sweep finds no
+    /// `GLOBAL_UNIT_ASSIGNED_CONTEXT` — and `Resolver::new` is called inside a
+    /// loop over assembly edges, so computing it eagerly made importing an
+    /// assembly O(edges x entities) for a value the default importer never
+    /// reads. `OnceLock` rather than `OnceCell` because `bodies.rs` hands a
+    /// `&Resolver` to a rayon `par_iter`, which requires `Sync`.
+    angle_scale: std::sync::OnceLock<Option<f64>>,
+}
+
+impl<'a> Resolver<'a> {
+    /// The resolver for one representation context: its length unit in
+    /// millimetres. The plane-angle unit is derived on first use.
+    pub(super) fn new(entities: &'a HashMap<usize, Entity>, length_scale: f64) -> Self {
+        Self {
+            entities,
+            length_scale,
+            angle_scale: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Radians per one of the file's `PLANE_ANGLE_UNIT`, derived once per
+    /// resolver on the first call and never at all when nothing asks.
+    pub(super) fn angle_scale(&self) -> Option<f64> {
+        *self
+            .angle_scale
+            .get_or_init(|| derive_angle_scale(self.entities))
+    }
 }
 
 /// Millimetres per one of the given unit entity (an entity carrying
@@ -443,6 +477,57 @@ pub(super) fn unit_length_scale_mm(
         return Some(value * base);
     }
     None
+}
+
+/// Every precision the file states — each
+/// `UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(x), #unit, name, description)`
+/// — in MILLIMETRES, sorted ascending and deduplicated. Empty when the file
+/// states none, or none of them resolves to a length.
+///
+/// The figure is in the unit ITS OWN second argument names, and it is scaled
+/// through the same [`unit_length_scale_mm`] the coordinates go through: 31
+/// of the 48 corpus fixtures that state a precision declare metres, so a raw
+/// `1.E-6` there is 1e-3 mm, and comparing it unscaled against millimetre
+/// measurements inverts the answer. The unit is read off the uncertainty
+/// entity rather than off a context, so a file that states several figures
+/// in several contexts (`BIMExample-Site.step`: five values over four
+/// orders) yields them all; the consistency check compares against the
+/// LOOSEST (`precision::stated_precision_diagnostics`).
+///
+/// A file states the figure once per `REPRESENTATION_CONTEXT`; entity ids
+/// are visited in ascending order so the result is deterministic whatever
+/// the map's iteration order.
+pub(super) fn stated_precisions_mm(entities: &HashMap<usize, Entity>) -> Vec<f64> {
+    let mut ids: Vec<usize> = entities
+        .iter()
+        .filter(|(_, entity)| entity.has("UNCERTAINTY_MEASURE_WITH_UNIT"))
+        .map(|(&id, _)| id)
+        .collect();
+    ids.sort_unstable();
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(args) = entities.get(&id).and_then(|e| e.find("UNCERTAINTY_MEASURE_WITH_UNIT")) else {
+            continue;
+        };
+        let value = match args.first() {
+            Some(Value::Typed(_, inner)) => inner.first().and_then(|v| v.as_real().ok()),
+            Some(other) => other.as_real().ok(),
+            None => None,
+        };
+        let scale = args
+            .get(1)
+            .and_then(|unit| unit.as_ref_id().ok())
+            .and_then(|unit| unit_length_scale_mm(entities, unit, 0));
+        if let (Some(value), Some(scale)) = (value, scale) {
+            let mm = value * scale;
+            if mm.is_finite() && mm > 0.0 {
+                out.push(mm);
+            }
+        }
+    }
+    out.sort_by(f64::total_cmp);
+    out.dedup();
+    out
 }
 
 /// One REPRESENTATION_CONTEXT's length unit → mm factor: the first
@@ -555,7 +640,7 @@ impl<'a> Resolver<'a> {
             .collect()
     }
 
-    fn direction(&self, id: usize) -> Result<Vec3, String> {
+    pub(super) fn direction(&self, id: usize) -> Result<Vec3, String> {
         let entity = self.get(id)?;
         let coords = entity
             .find("DIRECTION")
@@ -1400,7 +1485,7 @@ pub(super) fn directed_periodic_curve_piece(
     }
 }
 
-fn expand_knots(multiplicities: &[Value], knot_values: &[Value]) -> Result<Vec<f64>, String> {
+pub(super) fn expand_knots(multiplicities: &[Value], knot_values: &[Value]) -> Result<Vec<f64>, String> {
     if multiplicities.len() != knot_values.len() {
         return Err("step_import: knot multiplicity/value length mismatch".into());
     }

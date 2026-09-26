@@ -45,17 +45,67 @@ impl Bounds {
     }
 }
 
+/// The box of the carrier's control points, in their order; the first control
+/// point that is not a point is the error. Read without collecting them: it
+/// is paid on every call, and a view ray through a fitted carrier of a gear
+/// asks it thousands of times.
 fn surface_bounds(surface: &NurbsSurface) -> Result<Bounds, String> {
-    Ok(Bounds::from_points(
-        surface
-            .control_points
-            .iter()
-            .flatten()
-            .map(|point| point.point())
-            .collect::<Result<Vec<_>, _>>()?,
-    ))
+    let mut bounds = Bounds::from_points([]);
+    for point in surface.control_points.iter().flatten() {
+        let point = point.point()?;
+        bounds.minimum.x = bounds.minimum.x.min(point.x);
+        bounds.minimum.y = bounds.minimum.y.min(point.y);
+        bounds.minimum.z = bounds.minimum.z.min(point.z);
+        bounds.maximum.x = bounds.maximum.x.max(point.x);
+        bounds.maximum.y = bounds.maximum.y.max(point.y);
+        bounds.maximum.z = bounds.maximum.z.max(point.z);
+    }
+    Ok(bounds)
 }
 
+
+/// The box of each knot-span patch's control points: the surface over span
+/// `[u_i, u_i+1) x [v_j, v_j+1)` lies in the convex hull of the
+/// `(p + 1) x (q + 1)` control points that support it (positive weights), so
+/// a curve segment clear of every span box is clear of the surface.
+///
+/// The whole-net box cannot say that for a carrier that winds: an eight-turn
+/// helical tube's box is the whole coil, every sample segment of a ray through
+/// the coil passes it, and every one seeded a Newton that starts from a global
+/// projection onto a 1280-point net — 21 of the 26 s the 2026-09-26 coil
+/// fillet report's interference check took, for about one hit in forty seeds.
+fn span_bounds(surface: &NurbsSurface) -> Result<Vec<Bounds>, String> {
+    let (p, q) = (surface.degree_u, surface.degree_v);
+    let rows = surface.control_points.len();
+    let columns = surface.control_points.first().map_or(0, Vec::len);
+    let spans = |knots: &[f64], degree: usize, count: usize| -> Vec<usize> {
+        (degree..count).filter(|&i| i + 1 < knots.len() && knots[i] < knots[i + 1]).collect()
+    };
+    let (spans_u, spans_v) = (spans(&surface.knots_u, p, rows), spans(&surface.knots_v, q, columns));
+    // A malformed net has no span structure to trust: the whole-net box stands.
+    if spans_u.is_empty() || spans_v.is_empty() {
+        return Ok(vec![surface_bounds(surface)?]);
+    }
+    let mut boxes = Vec::with_capacity(spans_u.len() * spans_v.len());
+    for &i in &spans_u {
+        for &j in &spans_v {
+            let mut bounds = Bounds::from_points([]);
+            for row in &surface.control_points[i - p..=i] {
+                for control in &row[j - q..=j] {
+                    let point = control.point()?;
+                    bounds.minimum.x = bounds.minimum.x.min(point.x);
+                    bounds.minimum.y = bounds.minimum.y.min(point.y);
+                    bounds.minimum.z = bounds.minimum.z.min(point.z);
+                    bounds.maximum.x = bounds.maximum.x.max(point.x);
+                    bounds.maximum.y = bounds.maximum.y.max(point.y);
+                    bounds.maximum.z = bounds.maximum.z.max(point.z);
+                }
+            }
+            boxes.push(bounds);
+        }
+    }
+    Ok(boxes)
+}
 
 fn fit_parameter(value: f64, minimum: f64, maximum: f64, closed: bool) -> f64 {
     if closed {
@@ -125,7 +175,11 @@ fn newton_curve_surface(
                 return Ok([t, u, v]);
             }
             t = next_t;
-            let projection = project_point_to_surface(surface, curve.evaluate(t)?)?;
+            // The next iterate's foot, continued from this one's: the Newton
+            // is on ONE sheet, and the nearest point of the whole surface to
+            // the stepped curve point can be on another.
+            let projection =
+                crate::projection::project_point_to_surface_from_seed(surface, curve.evaluate(t)?, [u, v])?;
             u = projection.u;
             v = projection.v;
             continue;
@@ -159,6 +213,14 @@ pub struct CurveSurfaceIntersection {
     pub tangential: bool,
 }
 
+/// Whether the duplicate guard's parameter tolerance is capped by the curve's
+/// domain. `BREP_CS_DUPLICATE_CAP=0` restores the uncapped tolerance, which at
+/// a stationary parameter is 1e6 and swallows every other hit on the curve.
+fn duplicate_cap_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("BREP_CS_DUPLICATE_CAP").as_deref() != Ok("0"))
+}
+
 pub fn intersect_curve_surface(
     curve: &NurbsCurve,
     surface: &NurbsSurface,
@@ -173,10 +235,13 @@ pub fn intersect_curve_surface(
         let t = t0 + (t1 - t0) * index as f64 / sample_count as f64;
         samples.push((t, curve.evaluate(t)?));
     }
+    let span_boxes = span_bounds(surface)?;
     let mut seeds = Vec::new();
     for pair in samples.windows(2) {
         let segment_box = Bounds::from_points([pair[0].1, pair[1].1]).expanded(tolerance * 10.0);
-        if segment_box.intersects(surface_box) {
+        if segment_box.intersects(surface_box)
+            && span_boxes.iter().any(|span_box| segment_box.intersects(span_box.expanded(tolerance * 10.0)))
+        {
             seeds.push((pair[0].0 + pair[1].0) * 0.5);
         }
     }
@@ -190,12 +255,54 @@ pub fn intersect_curve_surface(
             continue;
         }
         let tangent = curve.deriv1(t)?.1;
-        let parameter_tolerance =
-            ((tolerance / tangent.length().max(EPSILON)) * 10.0).max((t1 - t0) * 1e-9);
-        if results.iter().any(|result| {
+        // Two hits are the SAME hit when they are at the same PLACE, and the
+        // chord test below is what measures that. This parameter test only has
+        // to absorb two seeds landing on one root a few ulps apart — and it
+        // converts the caller's 3D tolerance into a parameter tolerance by
+        // dividing by the curve's speed, a quotient that is unbounded where the
+        // speed is not. At a stationary parameter the `EPSILON` floor makes it
+        // `1e-7 / 1e-12 * 10 = 1e6`, wider than any curve's domain, so every
+        // earlier hit on the curve reads as a duplicate and a legitimate
+        // intersection AT a cusp is discarded unless it happens to be first.
+        // An involute flank's speed is `r_base * t`, so a gear profile carries
+        // one such cusp per flank per tooth: this is the 2026-09-14 herringbone
+        // report's root cause one lane over, where it is silent rather than
+        // loud.
+        //
+        // The cap is the curve's OWN domain, which is the only scale this test
+        // has: 1e-6 of it keeps the ulp-absorbing job (nine orders above the
+        // `1e-15 * (t1 - t0)` stall the Newton above exits on, three above the
+        // 1e-9 floor this rule already had) and drops the unbounded one. Two
+        // seeds on the same cusp root can land further apart than that in
+        // parameter, but not in space, and the chord test catches them.
+        // Escape hatch for tamper-verification:
+        // BREP_CS_DUPLICATE_CAP=0 restores the uncapped tolerance.
+        let uncapped = ((tolerance / tangent.length().max(EPSILON)) * 10.0).max((t1 - t0) * 1e-9);
+        let capped = uncapped.min((t1 - t0) * 1e-6);
+        let parameter_tolerance = if duplicate_cap_enabled() { capped } else { uncapped };
+        if let Some(result) = results.iter().find(|result| {
             (result.t - t).abs() <= parameter_tolerance
                 || result.point.sub(on_curve).length() <= tolerance * 10.0
         }) {
+            // The only drops the cap changes: a PARAMETER-only match (the two
+            // hits are apart in space) that the capped tolerance would keep. A
+            // hit dropped here leaves no trace anywhere else, so name it when
+            // asked: `BREP_DEBUG_CS_DUPLICATE=1`. With the cap on this prints
+            // nothing by construction; under `BREP_CS_DUPLICATE_CAP=0` it counts
+            // what the cap recovers.
+            let chord = result.point.sub(on_curve).length();
+            let gap = (result.t - t).abs();
+            if chord > tolerance * 10.0
+                && gap > capped
+                && std::env::var("BREP_DEBUG_CS_DUPLICATE").is_ok()
+            {
+                eprintln!(
+                    "cs-duplicate: dropped t={t:.12} against t={:.12} gap={gap:.6e} ptol={parameter_tolerance:.6e} \
+                     chord={chord:.6e} |tangent|={:.6e} domain=[{t0:.6},{t1:.6}] tolerance={tolerance:.3e}",
+                    result.t,
+                    tangent.length(),
+                );
+            }
             continue;
         }
         let normal = surface.normal(u, v).ok();
@@ -220,4 +327,3 @@ pub fn intersect_curve_surface(
     Ok(results)
 }
 
-// BREP private tests: 60c495752367c789

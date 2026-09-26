@@ -184,6 +184,31 @@ impl<'s> EntityTolerances<'s> {
         self.floor
     }
 
+    /// The raw `d_meas(E)` for edge `id`: the largest 3D disagreement between
+    /// the edge's curve and its pcurve images, over every coedge that
+    /// references it — UNCLAMPED, neither floored nor capped, so a defective
+    /// entity (measured above `cap_E`) reads as what it is rather than as the
+    /// cap. `None` for an unknown or degenerate edge, one no coedge
+    /// references, or one whose every measurement failed.
+    ///
+    /// For REPORTING (the import's stated-precision consistency check, a
+    /// census). It is never a band: the band is [`Self::edge`], and nothing a
+    /// caller reads here may widen anything (I1/I2 in the module doc).
+    pub fn measured_edge_deviation(&mut self, id: u64) -> Option<f64> {
+        self.raw_edge(id)
+    }
+
+    /// The raw `g_meas(V)` for vertex `id`: the largest gap between the
+    /// vertex's point and the ends of the edge curves that claim it —
+    /// unclamped, as [`Self::measured_edge_deviation`] is for edges. `None`
+    /// for an unknown vertex or one no non-degenerate edge ends at.
+    ///
+    /// On an imported solid this is the gap AFTER endpoint healing
+    /// (`heal_imported_edge_endpoints`), not the vendor's raw miss.
+    pub fn measured_vertex_gap(&mut self, id: u64) -> Option<f64> {
+        self.raw_vertex(id).map(|(gap, _)| gap)
+    }
+
     fn measure_edge(&mut self, id: u64) -> f64 {
         self.ensure_index();
         let Some(edge) = self.edge_index.as_ref().and_then(|index| index.get(&id)) else {
@@ -194,6 +219,20 @@ impl<'s> EntityTolerances<'s> {
             return self.floor;
         }
         let cap = self.edge_cap(edge);
+        // A measurement that failed says nothing, so it must not widen
+        // anything: the floor stands (I2).
+        let worst = self.raw_edge(id).unwrap_or(0.0);
+        clamp_band(self.floor, worst, cap)
+    }
+
+    /// The unclamped edge measurement behind [`Self::measure_edge`]; see
+    /// [`Self::measured_edge_deviation`] for the contract.
+    fn raw_edge(&mut self, id: u64) -> Option<f64> {
+        self.ensure_index();
+        let edge = *self.edge_index.as_ref()?.get(&id)?;
+        if edge.degenerate {
+            return None;
+        }
         // The band handed to the sampler DRIVES ITS REFINEMENT (it subdivides
         // while the deviation is non-linear relative to this number), it is not
         // a verdict the measurement is judged against. So it must be the TIGHT
@@ -202,10 +241,8 @@ impl<'s> EntityTolerances<'s> {
         // which is the same aliasing `offset/measure.rs` documents, arriving
         // through the band instead of through the sample grid.
         let probe_band = self.floor;
-        let Some(uses) = self.coedges.as_ref().and_then(|map| map.get(&id)) else {
-            return self.floor;
-        };
-        let mut worst = 0.0f64;
+        let uses = self.coedges.as_ref()?.get(&id)?;
+        let mut worst: Option<f64> = None;
         for use_record in uses {
             match measure_edge_against_pcurve_image(
                 use_record.surface,
@@ -214,33 +251,37 @@ impl<'s> EntityTolerances<'s> {
                 use_record.forward,
                 probe_band,
             ) {
-                // A measurement that failed says nothing, so it must not widen
-                // anything: skip it and let the floor stand (I2).
                 Err(_) => continue,
                 Ok(measured) => {
                     let deviation = measured.deviation();
                     if deviation.is_finite() {
-                        worst = worst.max(deviation);
+                        worst = Some(worst.map_or(deviation, |w| w.max(deviation)));
                     }
                 }
             }
         }
-        clamp_band(self.floor, worst, cap)
+        worst
     }
 
     /// O(edges) per query and deliberately index-free: the vertex band needs
     /// only curve endpoints, not the coedge index the edge band builds, and a
     /// caller that asks for one vertex should not pay for the other structure.
     fn measure_vertex(&mut self, id: u64) -> f64 {
-        let Some(point) = self
+        match self.raw_vertex(id) {
+            None => self.floor,
+            Some((gap, shortest)) => clamp_band(self.floor, gap, VERTEX_CAP_FRACTION * shortest),
+        }
+    }
+
+    /// `(g_meas(V), shortest incident edge length)`, unclamped; `None` when
+    /// the vertex is unknown or no non-degenerate edge ends at it.
+    fn raw_vertex(&mut self, id: u64) -> Option<(f64, f64)> {
+        let point = self
             .solid
             .vertices
             .iter()
             .find(|vertex| vertex.id == id)
-            .map(|vertex| vertex.point)
-        else {
-            return self.floor;
-        };
+            .map(|vertex| vertex.point)?;
         let mut gap = 0.0f64;
         let mut shortest = f64::INFINITY;
         for edge in &self.solid.edges {
@@ -264,9 +305,9 @@ impl<'s> EntityTolerances<'s> {
             }
         }
         if !shortest.is_finite() {
-            return self.floor;
+            return None;
         }
-        clamp_band(self.floor, gap, VERTEX_CAP_FRACTION * shortest)
+        Some((gap, shortest))
     }
 
     /// `cap_E = min(EDGE_CAP_FRACTION * len(E), PCURVE_ACCEPTANCE_REL * D)`.
@@ -344,4 +385,3 @@ fn edge_length(edge: &EdgeRecord) -> f64 {
     }
 }
 
-// BREP private tests: 4b1e0c9a72d6f38e

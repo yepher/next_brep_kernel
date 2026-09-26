@@ -538,4 +538,3 @@ pub fn schema_chamfer() -> serde_json::Value {
     })
 }
 
-// BREP private tests: 993ac3ad8b7d6fe7

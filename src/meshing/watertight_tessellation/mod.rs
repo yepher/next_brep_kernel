@@ -16,10 +16,9 @@ use crate::{KnotVector, Mesh, Vec3};
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 
-// BREP private tests: 5b8dbab14848b185
 
-// BREP private tests: 75b2922c00a6fa73
 
+mod profile;
 mod triangulate;
 mod periodic;
 mod edge_sampling;
@@ -28,12 +27,12 @@ mod orient;
 mod sphere_atlas;
 mod stride_encode;
 
+use profile::*;
 use triangulate::*;
 use periodic::*;
 use edge_sampling::*;
 use face_tess::*;
 use sphere_atlas::*;
-// BREP private tests: 43810ff8a2fe5b0b
 
 pub use face_tess::triangulate_planar_region;
 pub use orient::tessellate_brep_watertight;
@@ -42,4 +41,3 @@ pub use stride_encode::{
     tessellate_brep_watertight_face_stride_with_samples,
 };
 
-// BREP private tests: 35e3c1298e02da0b

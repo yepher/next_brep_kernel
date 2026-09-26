@@ -261,7 +261,10 @@ pub(in crate::blend) fn blend_closed_edge_keep(
     };
     let seed0 = {
         let rim_point = edge.curve.evaluate(seed_t)?;
-        let rim_tangent = edge.curve.derivatives(seed_t, 1)?[1].normalized()?;
+        let rim_tangent = edge
+            .curve
+            .unit_tangent(seed_t, edge.t0, edge.t1)
+            .map_err(|error| format!("blend keep: edge {}: {error}", edge.id))?;
         let into1 = crate::fillet::into_face_direction(
             first.face,
             rim_point,
@@ -274,6 +277,13 @@ pub(in crate::blend) fn blend_closed_edge_keep(
         let projection = crate::project_point_to_surface(&first.face.surface, nudged)?;
         [projection.u, projection.v, seed_s]
     };
+    // The section plane at `t` — the extended point and the edge's unit
+    // tangent, the one-sided limit where the parameterization is stationary.
+    let section_frame = |t: f64| -> Result<(Vec3, Vec3), String> {
+        edge.curve
+            .point_and_unit_tangent_extended(t, edge.t0, edge.t1)
+            .map_err(|error| format!("blend keep: edge {}: {error}", edge.id))
+    };
     if open_preserved {
         // OPEN keep march: run along the WHOLE blended edge [t0, t1]
         // (clamped, not periodic), solving the rest point s freely per
@@ -285,8 +295,7 @@ pub(in crate::blend) fn blend_closed_edge_keep(
         let mid_index = STATIONS / 2;
         let section_at = |index: usize| -> Result<(Vec3, Vec3), String> {
             let t = edge.t0 + span * index as f64 / STATIONS as f64;
-            let derivatives = edge.curve.derivatives_extended(t, 1)?;
-            Ok((derivatives[0], derivatives[1].normalized()?))
+            section_frame(t)
         };
         let mut solutions = vec![[0.0f64; 3]; STATIONS + 1];
         let (mid_point, mid_tangent) = section_at(mid_index)?;
@@ -348,15 +357,15 @@ pub(in crate::blend) fn blend_closed_edge_keep(
         {
             let mut x = [edge.t0, seed0[0], seed0[1]];
             let residual_at = |x: &[f64; 3]| -> Result<[f64; 3], String> {
-                let derivatives = edge.curve.derivatives_extended(x[0], 1)?;
+                let (section_point, section_tangent) = section_frame(x[0])?;
                 let (residual, ..) = keep_residual(
                     surface1,
                     boundary,
                     rho1,
                     radius,
                     [x[1], x[2], anchor_s],
-                    derivatives[0],
-                    derivatives[1].normalized()?,
+                    section_point,
+                    section_tangent,
                 )?;
                 Ok(residual)
             };
@@ -398,9 +407,7 @@ pub(in crate::blend) fn blend_closed_edge_keep(
         let mut previous = [seed0[0], seed0[1], anchor_s];
         for index in 0..=STATIONS {
             let t = t_start + span * index as f64 / STATIONS as f64;
-            let derivatives = edge.curve.derivatives_extended(t, 1)?;
-            let section_point = derivatives[0];
-            let section_tangent = derivatives[1].normalized()?;
+            let (section_point, section_tangent) = section_frame(t)?;
             let x = solve_keep_station(
                 surface1,
                 boundary,
@@ -447,7 +454,7 @@ pub(in crate::blend) fn blend_closed_edge_keep(
     if open_preserved {
         // Clamped open fit + dedicated open surgery (two transverse seams,
         // F1 boundary trims, F2 consumed, preserved edge reused).
-        let rows = fit_open_rows(&full_stations, &parameters, chamfer)?;
+        let rows = fit_open_rows(&full_stations, &parameters, chamfer, None, None)?;
         return build_keep_open_surgery(
             solid,
             edge,

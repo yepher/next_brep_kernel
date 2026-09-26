@@ -85,6 +85,30 @@ pub(super) fn winding_band_integral_with(
         (false, true) => false,
         _ => return Ok(None),
     };
+    Ok(Some(winding_loops_integral(face, kinds, p_is_u, refine)?))
+}
+
+/// The boundary integral itself: `∮ −G du` (or `∮ H dv`) over every loop of
+/// `face`, `G` the antiderivative across the cross parameter from the domain
+/// start, every pcurve span cut at the surface's knot levels. Orientation is
+/// normalised through the area, so the result is the material between the
+/// winding loops read positively. `refine` subdivides every span (a
+/// convergence check); the integrators call with 1.
+///
+/// The caller decides that the face's loops wind in `p_is_u` and that the
+/// region between them is the one wanted: [`winding_band_integral_with`]
+/// for a singly periodic surface (where the choice is forced), and the
+/// bi-periodic band path (`biperiodic_band_integral`) for a torus strip
+/// whose rims are not iso lines, where `complement` has already been read
+/// off the rims' orientation and only the strip's quadrature is needed.
+pub(super) fn winding_loops_integral(
+    face: &FaceRecord,
+    kinds: &[Integrand],
+    p_is_u: bool,
+    refine: usize,
+) -> Result<Vec<f64>, String> {
+    let [u0, u1] = face.surface.domain_u()?;
+    let [v0, v1] = face.surface.domain_v()?;
     let sign = if face.same_sense { 1.0 } else { -1.0 };
     let (u_breaks, v_breaks) = surface_breaks(&face.surface)?;
     // Along a pcurve the integrand is `G(u(t), v(t))`, and `G` changes
@@ -102,9 +126,12 @@ pub(super) fn winding_band_integral_with(
         .collect();
     let mut totals = vec![0.0f64; all_kinds.len()];
     let mut inner = vec![0.0f64; all_kinds.len()];
+    // The antiderivative crosses the same knot spans at every station; its
+    // weight roots are read once per cell here.
+    let mut rules = rule::SurfaceRules::new(&face.surface)?;
     for loop_record in &face.loops {
         for coedge in &loop_record.coedges {
-            let mut spans = split_at_surface_breaks(&coedge.pcurve, curve_breaks(&coedge.pcurve)?, level_breaks, level_period, p_is_u)?;
+            let mut spans = split_at_surface_breaks(&coedge.pcurve, curve_breaks(&coedge.pcurve)?, level_breaks, level_period, p_is_u, true)?;
             if refine > 1 {
                 let coarse = std::mem::take(&mut spans);
                 for pair in coarse.windows(2) {
@@ -115,20 +142,22 @@ pub(super) fn winding_band_integral_with(
                 spans.push(*coarse.last().unwrap());
             }
             for pair in spans.windows(2) {
-                let half = (pair[1] - pair[0]) * 0.5;
-                let middle = (pair[1] + pair[0]) * 0.5;
-                for i in 0..GAUSS_X.len() {
-                    let (uv, tangent) = coedge.pcurve.deriv1(middle + half * GAUSS_X[i])?;
-                    let weight = GAUSS_W[i] * half;
-                    if p_is_u {
-                        antiderivative(face, &all_kinds, uv.x, v0, uv.y, &v_breaks, sign, true, &mut inner)?;
-                        for (total, value) in totals.iter_mut().zip(&inner) {
-                            *total -= weight * tangent.x * value;
-                        }
-                    } else {
-                        antiderivative(face, &all_kinds, uv.y, u0, uv.x, &u_breaks, sign, false, &mut inner)?;
-                        for (total, value) in totals.iter_mut().zip(&inner) {
-                            *total += weight * tangent.y * value;
+                // The pcurve's own weights decide this span's panels and
+                // order; the antiderivative across the cross parameter asks
+                // the SURFACE's weights the same question.
+                for panel in rule::curve_panels(&coedge.pcurve, pair[0], pair[1])? {
+                    for (parameter, weight) in panel.stations() {
+                        let (uv, tangent) = coedge.pcurve.deriv1(parameter)?;
+                        if p_is_u {
+                            antiderivative(face, &all_kinds, uv.x, v0, uv.y, &v_breaks, sign, true, &mut inner, &mut rules)?;
+                            for (total, value) in totals.iter_mut().zip(&inner) {
+                                *total -= weight * tangent.x * value;
+                            }
+                        } else {
+                            antiderivative(face, &all_kinds, uv.y, u0, uv.x, &u_breaks, sign, false, &mut inner, &mut rules)?;
+                            for (total, value) in totals.iter_mut().zip(&inner) {
+                                *total += weight * tangent.y * value;
+                            }
                         }
                     }
                 }
@@ -136,7 +165,7 @@ pub(super) fn winding_band_integral_with(
         }
     }
     let orientation = totals[kinds.len()].signum();
-    Ok(Some(totals[..kinds.len()].iter().map(|v| v * orientation).collect()))
+    Ok(totals[..kinds.len()].iter().map(|v| v * orientation).collect())
 }
 
 /// The pcurve's spans cut further wherever its `u` (`take_u`) or `v`
@@ -144,12 +173,39 @@ pub(super) fn winding_band_integral_with(
 /// period so a pcurve carried beyond the domain (a crease crossing the seam)
 /// meets the same levels. Crossings are bracketed on 32 samples per span
 /// and bisected; a segment lying on a level is not a crossing.
-pub(super) fn split_at_surface_breaks(
+///
+/// `cut_on_level` decides what a sample sitting exactly ON a level is. For
+/// this module's integrand it is a cut: the antiderivative `G` is taken
+/// ACROSS the surface's knot spans, so a trim lying on a level changes piece
+/// there. For a caller whose integrand is a function of the point and the
+/// tangent alone — `brep/soundness.rs`'s vector-area closure — it is not:
+/// nothing about the integrand changes ALONG a level, and cutting there turns
+/// one iso-line trim into thirty-one spans that integrate to what one span
+/// already read.
+///
+/// Both readings still cut where the trim CROSSES a level, which is the cut
+/// that carries the accuracy: the surface's derivative jumps across a knot
+/// line, so a Gauss rule read straight through one has a kink inside it.
+/// Measured on the notched cap's `F7` (`vector_area_census document`, 18
+/// faces), the three readings of the same shell:
+///
+/// ```text
+/// no cut at a knot at all      residual 4.941978e-6   error bar 6.820e-7      0.72 s
+/// cut at every on-level sample residual 5.106706e-6   error bar 4.196e-10   807,012 spans, 9.37 s
+/// this, the lying-on skipped   residual 5.106706e-6   error bar 4.204e-10    29,428 spans, 0.34 s
+/// ```
+///
+/// The residual is the same number to seven figures either way it is cut, and
+/// the error bar under it is the same 4.2e-10; what the skip drops is 27x the
+/// spans and 27x the wall clock. Without any cut the residual is only seven
+/// times its own error bar, which is not a measurement.
+pub(crate) fn split_at_surface_breaks(
     pcurve: &NurbsCurve,
     spans: Vec<f64>,
     levels: &[f64],
     period: f64,
     take_u: bool,
+    cut_on_level: bool,
 ) -> Result<Vec<f64>, String> {
     let interior: Vec<f64> = levels[1..levels.len().saturating_sub(1)].to_vec();
     let coordinate = |t: f64| -> Result<f64, String> {
@@ -164,12 +220,18 @@ pub(super) fn split_at_surface_breaks(
             continue;
         }
         const SAMPLES: usize = 32;
+        // Taken up front because the on-level decision below reads the NEXT
+        // sample as well as the previous one.
+        let mut sampled = Vec::with_capacity(SAMPLES + 1);
+        for k in 0..=SAMPLES {
+            sampled.push(coordinate(a + (b - a) * k as f64 / SAMPLES as f64)?);
+        }
         let mut previous_t = a;
-        let mut previous_c = coordinate(a)?;
+        let mut previous_c = sampled[0];
         let mut cuts = Vec::new();
         for k in 1..=SAMPLES {
             let t = a + (b - a) * k as f64 / SAMPLES as f64;
-            let c = coordinate(t)?;
+            let c = sampled[k];
             let (lo, hi) = (previous_c.min(c), previous_c.max(c));
             // Every level image `l + n·period` inside (lo, hi).
             let first = ((lo - levels[0]) / period).floor() as i64 - 1;
@@ -181,7 +243,20 @@ pub(super) fn split_at_surface_breaks(
                         // A sample sitting on the level (a pole line's quarter
                         // points on 32 samples) is the crossing itself; the
                         // span ends are cut already.
-                        if k < SAMPLES {
+                        //
+                        // Which of the two readings applies is the caller's
+                        // `cut_on_level`. For the antiderivative every such
+                        // sample is a piece boundary. For a boundary integral
+                        // only a sample where the curve LEAVES the level is —
+                        // a neighbour off the level — so a trim lying along an
+                        // iso-line takes no cut at all while one that crosses
+                        // at a sample still takes its one. Without that second
+                        // clause the crossing would be lost entirely: this
+                        // sample pushes nothing and the next one sees
+                        // `previous_c == level` and skips the bisection.
+                        let leaves_the_level = previous_c != level
+                            || sampled.get(k + 1).map(|next| *next != level).unwrap_or(true);
+                        if k < SAMPLES && (cut_on_level || leaves_the_level) {
                             cuts.push(t);
                         }
                     } else if previous_c != level && (previous_c - level) * (c - level) < 0.0 {
@@ -230,6 +305,7 @@ pub(super) fn antiderivative(
     sign: f64,
     across_v: bool,
     out: &mut [f64],
+    rules: &mut rule::SurfaceRules,
 ) -> Result<(), String> {
     for value in out.iter_mut() {
         *value = 0.0;
@@ -248,16 +324,16 @@ pub(super) fn antiderivative(
     }
     edges.push(hi);
     for pair in edges.windows(2) {
-        let half = (pair[1] - pair[0]) * 0.5;
-        let middle = (pair[1] + pair[0]) * 0.5;
-        for j in 0..GAUSS_X.len() {
-            let s = middle + half * GAUSS_X[j];
-            let (u, v) = if across_v { (fixed, s) } else { (s, fixed) };
-            let (point, su, sv) = face.surface.deriv1_extended(u, v)?;
-            let weighted_normal = su.cross(sv).scale(sign);
-            let weight = GAUSS_W[j] * half * direction;
-            for (slot, kind) in kinds.iter().enumerate() {
-                out[slot] += weight * integrand_value(*kind, point, weighted_normal);
+        let panels = rules.direction_panels(&face.surface, !across_v, pair[0], pair[1], fixed)?;
+        for panel in panels {
+            for (s, span_weight) in panel.stations() {
+                let (u, v) = if across_v { (fixed, s) } else { (s, fixed) };
+                let (point, su, sv) = face.surface.deriv1_extended(u, v)?;
+                let weighted_normal = su.cross(sv).scale(sign);
+                let weight = span_weight * direction;
+                for (slot, kind) in kinds.iter().enumerate() {
+                    out[slot] += weight * integrand_value(*kind, point, weighted_normal);
+                }
             }
         }
     }

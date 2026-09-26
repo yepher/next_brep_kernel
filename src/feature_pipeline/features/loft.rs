@@ -370,7 +370,7 @@ pub fn schema() -> serde_json::Value {
             ],
             "multiple": false,
             "default_value": null,
-            "label": "Guide curve (optional)",
+            "label": "Guide curve",
             "hint": "Optional single guide curve (§5.8): the loft's spine follows it, bending the sections along the guide instead of the straight centroid-to-centroid path."
         },
         "rotateToGuide": {
@@ -384,4 +384,3 @@ pub fn schema() -> serde_json::Value {
 })
 }
 
-// BREP private tests: 164c65fe4766f06b

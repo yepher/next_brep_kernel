@@ -22,6 +22,23 @@
 //!   * the allowance gap is `allowance` wide; the fold centerline runs down its
 //!     middle, at the edge offset outward by `allowance / 2`.
 //!
+//! ## Clipping to the material region
+//!
+//! A [`Hole`](super::tree::Hole) baked by SM.CUTOUT may reach OUTSIDE its flat's
+//! outline — the feature calls that an edge notch, and it is how a trim takes a
+//! bite out of a blank rather than punching a window in it. Neither the outline
+//! nor the hole loop is then a cut boundary on its own: the eaten stretch of the
+//! outline is air, and the stretch of the hole loop beyond the outline bounds
+//! nothing at all. The folded solid resolves this with a boolean; the 2D walk
+//! resolves it in [`Region`], which samples the flat's outline and every hole
+//! loop once, splits each drawn line at every crossing, and keeps only the pieces
+//! with metal on exactly one side. A blank nothing overhangs, and a hole that
+//! sits inside one, come through the clip verbatim.
+//!
+//! The clip refuses exactly one thing: a cut that eats into a FOLD edge, where
+//! the bend's own lines would have to be split with it. See
+//! [`Region::check_fold_edge_uncut`].
+//!
 //! ## Output line categories / roles
 //!
 //! Every emitted line falls into one of three [`LoopRole`]s (DXF layer + colour +
@@ -47,7 +64,7 @@
 //! wall region).
 
 use super::tree::{Flat, HoleBendKind, SheetTree};
-use crate::NurbsCurve;
+use crate::{point_in_polygon, segment_intersection, NurbsCurve, Vec2};
 
 /// A 2D segment (its two endpoints) in the common root-plane frame.
 type Seg = ([f64; 2], [f64; 2]);
@@ -175,19 +192,26 @@ fn walk(
 ) -> Result<(), String> {
     let n = flat.outline.len();
 
+    // 0. The flat's MATERIAL region: its outline and every hole loop, sampled once
+    //    in flat-local coordinates. A cut may overhang the outline (SM.CUTOUT calls
+    //    that an edge notch), so neither the outline nor a hole loop is a cut
+    //    boundary on its own — every emitted line below is clipped to the part of
+    //    it that actually separates material from air.
+    let region = Region::sample(flat)?;
+
     // 1. The outer cut profile. Every outline edge is a solid cut EXCEPT one that
     //    carries a bend (its tangent is drawn by `emit_bend`) or one that is this
     //    flat's seam to its parent (the parent's `emit_bend` draws it as the
     //    child-side tangent). Those are dropped here so they never render as a cut.
-    emit_outline(flat, place, seam, out)?;
+    emit_outline(flat, &region, place, seam, out)?;
 
-    // 2. Hole loops (outer + islands). A blind pocket's rim is emitted as a cut
-    //    loop too — consistent with the `fold = 0` plate, which carries the same
-    //    hole; a through/blind distinction is not drawn in v1.
+    // 2. Hole loops (outer + islands), clipped to the blank. A blind pocket's rim
+    //    is emitted as a cut loop too — consistent with the `fold = 0` plate, which
+    //    carries the same hole; a through/blind distinction is not drawn in v1.
     for hole in &flat.holes {
-        out.polylines.push(loop_polyline(&hole.outer, place)?);
+        emit_loop(&hole.outer, &region, place, out)?;
         for island in &hole.islands {
-            out.polylines.push(loop_polyline(island, place)?);
+            emit_loop(island, &region, place, out)?;
         }
     }
 
@@ -270,9 +294,12 @@ fn walk(
 /// tangent), so it is NOT a cut. With no such edge the whole outline is one closed
 /// cut loop; otherwise each maximal run of consecutive cut edges is emitted as an
 /// open cut chain (the side edges from `emit_bend` bridge the runs into the full
-/// closed profile).
+/// closed profile). Every run is CLIPPED to `region`: the stretch of an outline
+/// edge that a cut has eaten is air, not a cut line (the hole loop's own arc
+/// across the opening is the cut there, emitted by [`emit_loop`]).
 fn emit_outline(
     flat: &Flat,
+    region: &Region,
     place: Placement,
     seam: Option<Seg>,
     out: &mut FlatPattern,
@@ -299,14 +326,25 @@ fn emit_outline(
         })
         .collect();
 
+    // A fold line the cut has eaten into would leave `emit_bend` drawing a tangent
+    // and two side edges across air — the bend region is not developable there at
+    // all. SM.CUTOUT refuses a region that enters a bend-wedge footprint, so this
+    // is unreachable through the feature; say so loudly rather than draw it.
+    for (i, &is_fold) in suppressed.iter().enumerate() {
+        if is_fold {
+            region.check_fold_edge_uncut(
+                flat.outline[i],
+                flat.outline[(i + 1) % n],
+                &flat.id,
+                flat.edges.get(i).map_or("", |edge| edge.id.as_str()),
+            )?;
+        }
+    }
+
     if suppressed.iter().all(|&drop| !drop) {
         // No fold-zone boundary — the whole outline is one closed cut loop.
         let outline = flat.densified_outline()?;
-        out.polylines.push(Polyline {
-            points: outline.iter().map(|p| place.map(*p)).collect(),
-            closed: true,
-            role: LoopRole::Cut,
-        });
+        push_clipped(&outline, true, region, place, LoopRole::Cut, out);
         return Ok(());
     }
 
@@ -317,7 +355,7 @@ fn emit_outline(
     for step in 0..n {
         let i = (start + 1 + step) % n;
         if suppressed[i] {
-            flush_run(&mut run, place, out);
+            flush_run(&mut run, region, place, out);
         } else {
             let pts = edge_points(flat, i)?;
             if run.is_empty() {
@@ -328,20 +366,54 @@ fn emit_outline(
             }
         }
     }
-    flush_run(&mut run, place, out);
+    flush_run(&mut run, region, place, out);
     Ok(())
 }
 
-/// Push the accumulated cut run (≥ 2 points) as an open cut polyline and reset it.
-fn flush_run(run: &mut Vec<[f64; 2]>, place: Placement, out: &mut FlatPattern) {
+/// Push the accumulated cut run (≥ 2 points), clipped to the material region, and
+/// reset it.
+fn flush_run(run: &mut Vec<[f64; 2]>, region: &Region, place: Placement, out: &mut FlatPattern) {
     if run.len() >= 2 {
-        out.polylines.push(Polyline {
-            points: run.iter().map(|p| place.map(*p)).collect(),
-            closed: false,
-            role: LoopRole::Cut,
-        });
+        push_clipped(run, false, region, place, LoopRole::Cut, out);
     }
     run.clear();
+}
+
+/// Sample a closed exact-curve loop (a hole's outer or island loop) and push the
+/// stretches of it that really bound material. A loop wholly inside the blank is
+/// emitted unchanged; one that overhangs the outline (an edge notch) contributes
+/// only its inboard arc, and one wholly outside contributes nothing.
+fn emit_loop(
+    curves: &[NurbsCurve],
+    region: &Region,
+    place: Placement,
+    out: &mut FlatPattern,
+) -> Result<(), String> {
+    let points = sample_loop(curves)?;
+    push_clipped(&points, true, region, place, LoopRole::Cut, out);
+    Ok(())
+}
+
+/// Clip one flat-local chain to the material region and push what survives,
+/// mapped into the root plane. An untouched chain is pushed verbatim.
+fn push_clipped(
+    points: &[[f64; 2]],
+    closed: bool,
+    region: &Region,
+    place: Placement,
+    role: LoopRole,
+    out: &mut FlatPattern,
+) {
+    for (run, run_closed) in region.clip(points, closed) {
+        if run.len() < 2 || (run_closed && run.len() < 3) {
+            continue;
+        }
+        out.polylines.push(Polyline {
+            points: run.iter().map(|p| place.map(*p)).collect(),
+            closed: run_closed,
+            role,
+        });
+    }
 }
 
 /// The flat-local points of outline edge `i`, endpoints INCLUSIVE — a straight
@@ -500,21 +572,22 @@ fn readable_angle(mut deg: f64) -> f64 {
 
 
 /// Sample a closed exact-curve loop (a hole's outer or island loop, control points
-/// at local `z = 0`) into a mapped 2D polyline — 16 points per curve, head-to-tail.
-fn loop_polyline(curves: &[NurbsCurve], place: Placement) -> Result<Polyline, String> {
+/// at local `z = 0`) into a FLAT-LOCAL 2D polygon — 16 points per curve,
+/// head-to-tail, the closing edge implicit.
+fn sample_loop(curves: &[NurbsCurve]) -> Result<Vec<[f64; 2]>, String> {
     let mut points = Vec::new();
     for curve in curves {
         let [t0, t1] = curve.domain()?;
         for step in 0..16 {
             let t = t0 + (t1 - t0) * (step as f64) / 16.0;
             let p = curve.evaluate(t)?;
-            points.push(place.map([p.x, p.y]));
+            points.push([p.x, p.y]);
         }
     }
     if points.len() < 3 {
         return Err("sheet-metal flat pattern: degenerate hole loop".into());
     }
-    Ok(Polyline { points, closed: true, role: LoopRole::Cut })
+    Ok(points)
 }
 
 /// The two flat-local endpoints of a hole-rim segment (its curve's domain ends).
@@ -531,6 +604,308 @@ fn bend_allowance(angle_deg: f64, inside_radius: f64, k_factor: f64, thickness: 
     let mid = (inside_radius + thickness * 0.5).max(1e-6);
     let neutral = mid + (k_factor - 0.5) * thickness;
     angle_deg.to_radians().abs() * neutral
+}
+
+// ===========================================================================
+// The material region — clipping the drawn lines to what actually bounds metal
+// ===========================================================================
+
+/// Node-merge / crossing tolerance for the 2D clip. Sheet-metal features are
+/// millimetres and the loops are exact curves sampled at f64, so a crossing
+/// nearer than this to a shared vertex IS that vertex.
+const CLIP_TOL: f64 = 1e-9;
+
+/// How far off a candidate line the material test is taken. Large enough that
+/// [`crate::point_in_polygon`] never reports `boundary` against the very loop the
+/// line came from (which sits exactly `CLIP_TOL` ≪ this away), small enough that
+/// it cannot step across a different loop: every crossing has already split the
+/// line, so the nearest other boundary is at least half a piece away.
+const PROBE_EPS: f64 = 1e-6;
+
+/// One flat's MATERIAL region in flat-local coordinates: the outline polygon and
+/// every hole loop, sampled once.
+///
+/// The tree stores a cut as a [`Hole`](super::tree::Hole) whose loop may reach
+/// OUTSIDE the outline — SM.CUTOUT's edge notch. The folded solid resolves that
+/// with a boolean; the 2D walk has to resolve it here, or the flat pattern draws
+/// a blank that was never notched plus a stray closed loop hanging off its edge.
+struct Region {
+    /// The blank's boundary, densified (16 samples per curved outline segment).
+    outline: Ring,
+    /// Per hole: its outer loop and the island loops that keep material inside it.
+    holes: Vec<(Ring, Vec<Ring>)>,
+}
+
+/// One sampled closed loop, kept in both the forms the clip needs — the `Vec2`
+/// ring [`crate::point_in_polygon`] takes and the raw vertices the splitter walks
+/// — plus its bounding box. A perforated panel puts hundreds of loops in a
+/// [`Region`] and every drawn line is tested against all of them, so the box is
+/// what keeps that from being quadratic in the loop COUNT times their size.
+struct Ring {
+    points: Vec<[f64; 2]>,
+    ring: Vec<Vec2>,
+    min: [f64; 2],
+    max: [f64; 2],
+}
+
+impl Ring {
+    fn new(points: Vec<[f64; 2]>) -> Self {
+        let mut min = [f64::INFINITY; 2];
+        let mut max = [f64::NEG_INFINITY; 2];
+        for p in &points {
+            for axis in 0..2 {
+                min[axis] = min[axis].min(p[axis]);
+                max[axis] = max[axis].max(p[axis]);
+            }
+        }
+        let ring = points.iter().map(|p| Vec2 { x: p[0], y: p[1] }).collect();
+        Ring { points, ring, min, max }
+    }
+
+    /// Strictly inside this loop (a point on its boundary is neither in nor out —
+    /// the probe points [`Region::bounds_material`] tests never sit there).
+    fn contains(&self, p: [f64; 2]) -> bool {
+        if p[0] < self.min[0] - CLIP_TOL
+            || p[0] > self.max[0] + CLIP_TOL
+            || p[1] < self.min[1] - CLIP_TOL
+            || p[1] > self.max[1] + CLIP_TOL
+        {
+            return false;
+        }
+        point_in_polygon(Vec2 { x: p[0], y: p[1] }, &self.ring, CLIP_TOL) == "in"
+    }
+
+    /// Whether the box `min..max` can reach this loop at all.
+    fn box_overlaps(&self, min: [f64; 2], max: [f64; 2]) -> bool {
+        min[0] <= self.max[0] + CLIP_TOL
+            && max[0] >= self.min[0] - CLIP_TOL
+            && min[1] <= self.max[1] + CLIP_TOL
+            && max[1] >= self.min[1] - CLIP_TOL
+    }
+}
+
+impl Region {
+    /// Sample `flat`'s outline and hole loops into one clippable region.
+    fn sample(flat: &Flat) -> Result<Self, String> {
+        let outline = Ring::new(flat.densified_outline()?);
+        let mut holes = Vec::with_capacity(flat.holes.len());
+        for hole in &flat.holes {
+            let outer = Ring::new(sample_loop(&hole.outer)?);
+            let islands = hole
+                .islands
+                .iter()
+                .map(|island| sample_loop(island).map(Ring::new))
+                .collect::<Result<Vec<_>, _>>()?;
+            holes.push((outer, islands));
+        }
+        Ok(Region { outline, holes })
+    }
+
+    /// Every loop of this region: the outline, then each hole with its islands.
+    fn rings(&self) -> impl Iterator<Item = &Ring> {
+        std::iter::once(&self.outline).chain(
+            self.holes
+                .iter()
+                .flat_map(|(outer, islands)| std::iter::once(outer).chain(islands)),
+        )
+    }
+
+    /// Whether `p` — which must not lie ON any loop — is metal: inside the blank,
+    /// and not inside a hole except where one of that hole's islands restores it
+    /// (the even-odd sketch-region semantics [`Hole::islands`] records).
+    fn material(&self, p: [f64; 2]) -> bool {
+        if !self.outline.contains(p) {
+            return false;
+        }
+        !self.holes.iter().any(|(outer, islands)| {
+            outer.contains(p) && !islands.iter().any(|island| island.contains(p))
+        })
+    }
+
+    /// Whether the straight piece `a -> b` — split at every crossing already, so
+    /// no other loop passes through its interior — separates metal from air.
+    /// Sampling both sides also drops a line that bounds nothing: a hole edge
+    /// outside the blank, or an outline edge a cut has eaten through.
+    fn bounds_material(&self, a: [f64; 2], b: [f64; 2]) -> bool {
+        let d = [b[0] - a[0], b[1] - a[1]];
+        let length = (d[0] * d[0] + d[1] * d[1]).sqrt();
+        if length <= CLIP_TOL {
+            return false;
+        }
+        let eps = PROBE_EPS.min(length * 0.25);
+        let n = [-d[1] / length * eps, d[0] / length * eps];
+        let mid = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
+        self.material([mid[0] + n[0], mid[1] + n[1]])
+            != self.material([mid[0] - n[0], mid[1] - n[1]])
+    }
+
+    /// Refuse when a cut has eaten into a fold edge. The bend hanging off that
+    /// edge is drawn from the edge's two raw endpoints — tangent lines, side edges
+    /// and centerline all span the FULL edge — so a partly eaten fold line would
+    /// silently draw a bend across air.
+    ///
+    /// This is REACHABLE, on a knife edge: SM.CUTOUT's guard rejects a region that
+    /// ENTERS a bend-wedge footprint, so a cut is refused as soon as it passes the
+    /// fold tangent, but a cut that stops EXACTLY on it is admitted (measured on
+    /// the reporter's fork: a cut to y = 106.999 cuts, y = 107.001 is refused by
+    /// SM.CUTOUT, y = 107.000 lands here). Drawing that case right means splitting
+    /// the fold line — the eaten stretch bounds the notch against an uncut bend
+    /// strip and is a CUT, the rest stays the tangent — and splitting the bend
+    /// annotation with it. Until that exists, refuse: the clip alone would drop
+    /// the coincident stretch from both the outline and the hole loop and leave a
+    /// gap in the profile.
+    fn check_fold_edge_uncut(
+        &self,
+        a: [f64; 2],
+        b: [f64; 2],
+        flat_id: &str,
+        edge_id: &str,
+    ) -> Result<(), String> {
+        let cut = self
+            .split(a, b)
+            .into_iter()
+            .any(|(pa, pb)| !self.bounds_material(pa, pb));
+        if cut {
+            return Err(format!(
+                "sheet-metal flat pattern: a cut on flat `{flat_id}` eats into fold edge \
+                 `{edge_id}` — a fold line cannot be cut (the bend's tangent lines, side \
+                 edges and centerline all span the whole edge)"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Split `a -> b` at every point where another loop of this region crosses it,
+    /// returning the pieces head-to-tail (endpoints preserved exactly).
+    fn split(&self, a: [f64; 2], b: [f64; 2]) -> Vec<([f64; 2], [f64; 2])> {
+        let av = Vec2 { x: a[0], y: a[1] };
+        let bv = Vec2 { x: b[0], y: b[1] };
+        let length = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+        if length <= CLIP_TOL {
+            return Vec::new();
+        }
+        let parameter_tol = (CLIP_TOL / length).min(0.25);
+        let min = [a[0].min(b[0]), a[1].min(b[1])];
+        let max = [a[0].max(b[0]), a[1].max(b[1])];
+        let mut cuts: Vec<f64> = Vec::new();
+        for loop_ring in self.rings() {
+            // Cheap rejects: a whole loop, then a segment, whose box misses this
+            // line's box cannot cross it.
+            if !loop_ring.box_overlaps(min, max) {
+                continue;
+            }
+            let poly = &loop_ring.points;
+            for i in 0..poly.len() {
+                let (c, d) = (poly[i], poly[(i + 1) % poly.len()]);
+                if c[0].min(d[0]) > max[0] + CLIP_TOL
+                    || c[0].max(d[0]) < min[0] - CLIP_TOL
+                    || c[1].min(d[1]) > max[1] + CLIP_TOL
+                    || c[1].max(d[1]) < min[1] - CLIP_TOL
+                {
+                    continue;
+                }
+                let hit = segment_intersection(
+                    av,
+                    bv,
+                    Vec2 { x: c[0], y: c[1] },
+                    Vec2 { x: d[0], y: d[1] },
+                    CLIP_TOL,
+                );
+                // A shared vertex lands on 0 or 1 and is not an interior split; a
+                // collinear overlap returns nothing here and is split instead by
+                // the transverse segments at its two ends.
+                if let Some([t, _]) = hit {
+                    if t > parameter_tol && t < 1.0 - parameter_tol {
+                        cuts.push(t);
+                    }
+                }
+            }
+        }
+        cuts.sort_by(f64::total_cmp);
+        let mut parameters = vec![0.0];
+        for t in cuts {
+            if t - parameters[parameters.len() - 1] > parameter_tol {
+                parameters.push(t);
+            }
+        }
+        if 1.0 - parameters[parameters.len() - 1] <= parameter_tol {
+            parameters.pop();
+        }
+        parameters.push(1.0);
+        let at = |t: f64| -> [f64; 2] {
+            match t {
+                t if t == 0.0 => a,
+                t if t == 1.0 => b,
+                t => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t],
+            }
+        };
+        parameters
+            .windows(2)
+            .map(|pair| (at(pair[0]), at(pair[1])))
+            .collect()
+    }
+
+    /// Clip one flat-local chain to the material boundary. Returns the surviving
+    /// runs as `(points, closed)`. A chain no cut touches comes back verbatim —
+    /// same vertices, same order, same closed flag — so a hole that sits inside
+    /// its blank, and a blank nothing overhangs, are drawn exactly as before.
+    fn clip(&self, points: &[[f64; 2]], closed: bool) -> Vec<(Vec<[f64; 2]>, bool)> {
+        let n = points.len();
+        if n < 2 || (closed && n < 3) {
+            return Vec::new();
+        }
+        let mut pieces: Vec<([f64; 2], [f64; 2], bool)> = Vec::new();
+        let mut split_any = false;
+        let last = if closed { n } else { n - 1 };
+        for i in 0..last {
+            let (a, b) = (points[i], points[(i + 1) % n]);
+            let parts = self.split(a, b);
+            split_any |= parts.len() != 1;
+            for (pa, pb) in parts {
+                let keep = self.bounds_material(pa, pb);
+                pieces.push((pa, pb, keep));
+            }
+        }
+        if pieces.is_empty() {
+            return Vec::new();
+        }
+        if pieces.iter().all(|piece| piece.2) {
+            if !split_any {
+                return vec![(points.to_vec(), closed)];
+            }
+            let mut chain: Vec<[f64; 2]> = pieces.iter().map(|piece| piece.0).collect();
+            if !closed {
+                chain.push(pieces[pieces.len() - 1].1);
+            }
+            return vec![(chain, closed)];
+        }
+        // Something was dropped. Start just past a dropped piece so an open run
+        // never wraps across the gap (an open chain already starts at its head).
+        let start = if closed {
+            pieces.iter().position(|piece| !piece.2).unwrap() + 1
+        } else {
+            0
+        };
+        let mut runs = Vec::new();
+        let mut run: Vec<[f64; 2]> = Vec::new();
+        for step in 0..pieces.len() {
+            let (a, b, keep) = pieces[(start + step) % pieces.len()];
+            if keep {
+                if run.is_empty() {
+                    run.push(a);
+                }
+                run.push(b);
+            } else if run.len() >= 2 {
+                runs.push((std::mem::take(&mut run), false));
+            } else {
+                run.clear();
+            }
+        }
+        if run.len() >= 2 {
+            runs.push((run, false));
+        }
+        runs
+    }
 }
 
 /// Unit vector, or `[0, 0]` for a (near-)zero input.
@@ -772,4 +1147,3 @@ text-anchor=\"middle\" dy=\"{:.6}\" fill=\"#ffd400\" font-size=\"{font:.6}\">{}<
     s
 }
 
-// BREP private tests: 6046ba4249ba7320

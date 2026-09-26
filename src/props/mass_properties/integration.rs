@@ -1,7 +1,7 @@
 pub(super) use crate::curve::interior_knots;
 use super::*;
 
-pub(super) fn curve_breaks(curve: &NurbsCurve) -> Result<Vec<f64>, String> {
+pub(crate) fn curve_breaks(curve: &NurbsCurve) -> Result<Vec<f64>, String> {
     let [start, end] = curve.domain()?;
     let mut result = vec![start];
     result.extend(interior_knots(&curve.knots, curve.degree));
@@ -14,15 +14,132 @@ pub fn parameter_space_area(face: &FaceRecord) -> Result<f64, String> {
     for loop_record in &face.loops {
         for coedge in &loop_record.coedges {
             for pair in curve_breaks(&coedge.pcurve)?.windows(2) {
-                let half = (pair[1] - pair[0]) * 0.5;
-                let middle = (pair[1] + pair[0]) * 0.5;
-                for index in 0..GAUSS_X.len() {
-                    let parameter = middle + half * GAUSS_X[index];
-                    let (point, tangent) = coedge.pcurve.deriv1(parameter)?;
-                    area +=
-                        GAUSS_W[index] * half * 0.5 * (point.x * tangent.y - point.y * tangent.x);
+                for panel in rule::curve_panels(&coedge.pcurve, pair[0], pair[1])? {
+                    for (parameter, weight) in panel.stations() {
+                        let (point, tangent) = coedge.pcurve.deriv1(parameter)?;
+                        area += weight * 0.5 * (point.x * tangent.y - point.y * tangent.x);
+                    }
                 }
             }
+        }
+    }
+    Ok(area)
+}
+
+/// The escape hatch for [`closed_parameter_space_area`]: `BREP_OPEN_PLANAR_LOOPS=1`
+/// reads every planar face's trim loops open again, as they were read before
+/// the closing chords, so the two readings are two cells of one binary.
+fn open_planar_loops() -> bool {
+    static OPEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OPEN.get_or_init(|| std::env::var_os("BREP_OPEN_PLANAR_LOOPS").is_some())
+}
+
+/// Every straight uv chord that closes a trim loop of `face`: from where one
+/// coedge's pcurve ends to where the next one's begins, the last back to the
+/// first. A loop whose pcurves meet contributes chords of zero length.
+pub(super) fn loop_closing_chords(face: &FaceRecord) -> Result<Vec<(Vec3, Vec3)>, String> {
+    let mut chords = Vec::new();
+    if open_planar_loops() {
+        return Ok(chords);
+    }
+    for loop_record in &face.loops {
+        let count = loop_record.coedges.len();
+        for index in 0..count {
+            let [_, end] = loop_record.coedges[index].pcurve.domain()?;
+            let [start, _] = loop_record.coedges[(index + 1) % count].pcurve.domain()?;
+            chords.push((
+                loop_record.coedges[index].pcurve.evaluate(end)?,
+                loop_record.coedges[(index + 1) % count].pcurve.evaluate(start)?,
+            ));
+        }
+    }
+    Ok(chords)
+}
+
+/// [`parameter_space_area`] with every trim loop CLOSED by its chords
+/// ([`loop_closing_chords`]). The mass lane of a planar face reads its area
+/// here.
+///
+/// `½∮(u dv − v du)` is independent of where the uv origin sits only over a
+/// closed path. Summed over pcurves whose ends miss one another by `δ`, it
+/// reads `½(e × δ)` too much or too little at each joint `e`, so the same
+/// region read about a translated parameterization gives a different area.
+/// The offset shell's planar faces carry such joints — the pcurve ends of the
+/// box-bore-sphere shells' opening cork miss their vertices by up to 5.6e-5
+/// while the 3D vertices are exact — and on `offsetShellProblem` that alone
+/// put the cork's area 6.680e-4 short and the solid's volume 4.453e-3 short of
+/// a kernel-free integral. Closed, the same face reads within 1e-8 of it.
+///
+/// The chord closes what the face record names. The curved lane's trim
+/// polygons close the same way, implicitly, which is why a curved face with
+/// the same gaps already read true. [`parameter_space_area`] itself stays
+/// OPEN: its other callers read its SIGN as a loop's winding, and on a
+/// periodic carrier a loop that wraps once is not closed in uv by design.
+pub(crate) fn closed_parameter_space_area(face: &FaceRecord) -> Result<f64, String> {
+    let mut area = parameter_space_area(face)?;
+    for (end, start) in loop_closing_chords(face)? {
+        area += 0.5 * (end.x * start.y - start.x * end.y);
+    }
+    Ok(area)
+}
+
+/// The fraction of a face's own extent within which two parameter points are the SAME
+/// point of the carrier. It separates a SEAM — where a loop steps from one edge of the
+/// domain to the other and both parameters name one 3D point, so their evaluations agree
+/// to floating-point rounding — from a trim that misses its own joint.
+///
+/// Set from the separation the population shows, not picked: across 92,000 readings of
+/// this kernel's corpus and both suites, a seam or pole joint's two images agree to
+/// ~1e-14 of the face's extent, while the smallest real miss measured is 1.06e-7 — five
+/// orders above this bar, and a hundred above double-precision evaluation noise.
+const SEAM_COINCIDENCE_REL: f64 = 1e-12;
+
+/// [`parameter_space_area`] with every joint that MISSES closed by a chord, and every
+/// joint that steps across a SEAM left open — the reading a caller on a carrier that may
+/// be periodic or have a pole needs.
+///
+/// The affine lane closes every joint ([`closed_parameter_space_area`]) because a plane has
+/// neither. A general carrier has both: a loop that wraps a closed direction steps a whole
+/// period at one joint by design, and a chord there cancels the sweep — measured on the lib
+/// suite, such a reading collapses to 5e-17 — while a pole's degenerate edge steps a whole
+/// domain edge that is one point. Both are recognised the same way, and by GEOMETRY rather
+/// than by a flag: the two parameters name one point or they do not. `closed_directions()`
+/// is analytic-keyed and answers `false` for a FITTED periodic patch, which is exactly the
+/// carrier a flag-keyed test would mistake.
+///
+/// Nothing is evaluated for a joint whose pcurves meet exactly, which is all but 216 of the
+/// 15,443 calls one corpus replay makes through here.
+pub(crate) fn closed_parameter_space_area_on_carrier(face: &FaceRecord) -> Result<f64, String> {
+    let mut area = parameter_space_area(face)?;
+    let mut coincidence: Option<f64> = None;
+    for loop_record in &face.loops {
+        let count = loop_record.coedges.len();
+        for index in 0..count {
+            let [_, end] = loop_record.coedges[index].pcurve.domain()?;
+            let [start, _] = loop_record.coedges[(index + 1) % count].pcurve.domain()?;
+            let here = loop_record.coedges[index].pcurve.evaluate(end)?;
+            let next = loop_record.coedges[(index + 1) % count].pcurve.evaluate(start)?;
+            if here.x == next.x && here.y == next.y {
+                continue;
+            }
+            let bar = *coincidence.get_or_insert_with(|| {
+                SEAM_COINCIDENCE_REL
+                    * crate::tolerance::model_scale(
+                        face.surface
+                            .control_points
+                            .iter()
+                            .flatten()
+                            .filter_map(|control| control.point().ok()),
+                    )
+            });
+            let (image_here, image_next) = (
+                face.surface.evaluate_extended(here.x, here.y)?,
+                face.surface.evaluate_extended(next.x, next.y)?,
+            );
+            if image_here.sub(image_next).length() <= bar {
+                continue;
+            }
+            area += 0.5 * (here.x * next.y - next.x * here.y);
         }
     }
     Ok(area)
@@ -33,7 +150,7 @@ pub(super) fn is_affine(surface: &NurbsSurface) -> Result<bool, String> {
     surface.is_affine()
 }
 
-pub(super) fn surface_breaks(surface: &NurbsSurface) -> Result<(Vec<f64>, Vec<f64>), String> {
+pub(crate) fn surface_breaks(surface: &NurbsSurface) -> Result<(Vec<f64>, Vec<f64>), String> {
     let ku = crate::KnotVector::new(surface.knots_u.clone(), surface.degree_u)?;
     let kv = crate::KnotVector::new(surface.knots_v.clone(), surface.degree_v)?;
     let [u0, u1] = ku.domain();
@@ -65,39 +182,191 @@ pub(super) fn integrand_value(kind: Integrand, point: Vec3, weighted_normal: Vec
     }
 }
 
-pub(super) fn evaluate_integrand(face: &FaceRecord, u: f64, v: f64, kind: Integrand) -> Result<f64, String> {
-    let (point, su, sv) = face.surface.deriv1(u, v)?;
-    let sign = if face.same_sense { 1.0 } else { -1.0 };
-    let weighted_normal = su.cross(sv).scale(sign);
-    Ok(integrand_value(kind, point, weighted_normal))
+
+/// Stations per direction in a fixed tensor Gauss block.
+pub(super) const GAUSS_COUNT: usize = GAUSS_X.len();
+
+/// The tensor-block station evaluator is on unless `BREP_MASS_TENSOR_BLOCK=0`
+/// turns it off. It is bit-identical to the per-station path by construction
+/// (`NurbsSurface::deriv1_tensor_each`), so the switch buys nothing but a
+/// paired A/B timing of the two in ONE binary under ONE load — which is the
+/// only honest way to quote a speed-up on a box that runs eight agents.
+pub(super) fn tensor_blocks_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BREP_MASS_TENSOR_BLOCK").as_deref() != Ok("0"))
 }
 
-pub(super) fn integrate_untrimmed(face: &FaceRecord, kind: Integrand) -> Result<f64, String> {
-    let (u_breaks, v_breaks) = surface_breaks(&face.surface)?;
-    let mut total = 0.0;
-    for upair in u_breaks.windows(2) {
-        let half_u = (upair[1] - upair[0]) * 0.5;
-        let middle_u = (upair[1] + upair[0]) * 0.5;
-        for vpair in v_breaks.windows(2) {
-            let half_v = (vpair[1] - vpair[0]) * 0.5;
-            let middle_v = (vpair[1] + vpair[0]) * 0.5;
-            for i in 0..GAUSS_X.len() {
-                for j in 0..GAUSS_X.len() {
-                    total += GAUSS_W[i]
+/// Accumulate every `kind` over ONE parameter cell by tensor Gauss–Legendre,
+/// with every station's weight scaled — the trimmed path's full cells carry
+/// their winding and the sweep's orientation there. `scale` multiplies FIRST,
+/// as every call site has always written the product, so a cell read at the
+/// base rule is bit-identical to the one-block rule it replaces.
+///
+/// Identical arithmetic to the per-station loop it replaces (kept as the
+/// tests' reference sweep) — the same stations in the same i-outer/j-inner
+/// order, the same `weight_u * weight_v * half_u * half_v * value` product and
+/// the same running sum per slot — but each of the block's u and v
+/// spans/basis rows is evaluated ONCE rather than once per station it takes
+/// part in, which at the base rule is eight rows each instead of sixty-four
+/// evaluations.
+pub(super) fn integrate_cell_scaled(
+    face: &FaceRecord,
+    cell: [f64; 4],
+    scale: f64,
+    kinds: &[Integrand],
+    totals: &mut [f64],
+    rules: &mut rule::SurfaceRules,
+) -> Result<usize, String> {
+    // A rational carrier's cell is read on the panels and at the orders its
+    // own weights ask for (`rule`); a polynomial one keeps ONE base-order
+    // block over the whole cell.
+    let (u_panels, v_panels) = rules.panels(&face.surface, cell)?;
+    let mut stations = 0;
+    for u_panel in &u_panels {
+        for v_panel in &v_panels {
+            integrate_block(face, *u_panel, *v_panel, scale, kinds, totals)?;
+            stations += u_panel.order * v_panel.order;
+        }
+    }
+    Ok(stations)
+}
+
+/// One tensor Gauss block: every station of `u_panel × v_panel`, every kind.
+fn integrate_block(
+    face: &FaceRecord,
+    u_panel: rule::Panel,
+    v_panel: rule::Panel,
+    scale: f64,
+    kinds: &[Integrand],
+    totals: &mut [f64],
+) -> Result<(), String> {
+    let half_u = (u_panel.hi - u_panel.lo) * 0.5;
+    let middle_u = (u_panel.hi + u_panel.lo) * 0.5;
+    let half_v = (v_panel.hi - v_panel.lo) * 0.5;
+    let middle_v = (v_panel.hi + v_panel.lo) * 0.5;
+    let (u_x, u_w) = u_panel.nodes();
+    let (v_x, v_w) = v_panel.nodes();
+    let sign = if face.same_sense { 1.0 } else { -1.0 };
+    // The base rule, written against the fixed-size tables: its trip count is
+    // a constant the compiler unrolls, and reading the nodes through a slice
+    // of run-time length instead cost 0.28 µs a station on a 900 000-station
+    // import (measured 2026-09-15). Every polynomial carrier is on this path,
+    // and it is the arithmetic the one-block rule always did.
+    let base_rule = u_x.len() == GAUSS_COUNT && v_x.len() == GAUSS_COUNT;
+    if base_rule && tensor_blocks_on() && face.surface.deriv1_tensor_supported() {
+        let mut u_stations = [0.0f64; GAUSS_COUNT];
+        let mut v_stations = [0.0f64; GAUSS_COUNT];
+        for index in 0..GAUSS_COUNT {
+            u_stations[index] = middle_u + half_u * GAUSS_X[index];
+            v_stations[index] = middle_v + half_v * GAUSS_X[index];
+        }
+        return face
+            .surface
+            .deriv1_tensor_each(&u_stations, &v_stations, |i, j, point, su, sv| {
+                let weighted_normal = su.cross(sv).scale(sign);
+                for (slot, kind) in kinds.iter().enumerate() {
+                    totals[slot] += scale
+                        * GAUSS_W[i]
                         * GAUSS_W[j]
                         * half_u
                         * half_v
-                        * evaluate_integrand(
-                            face,
-                            middle_u + half_u * GAUSS_X[i],
-                            middle_v + half_v * GAUSS_X[j],
-                            kind,
-                        )?;
+                        * integrand_value(*kind, point, weighted_normal);
+                }
+                Ok(())
+            });
+    }
+    if base_rule && !face.surface.deriv1_tensor_supported() {
+        for i in 0..GAUSS_COUNT {
+            for j in 0..GAUSS_COUNT {
+                let (point, su, sv) = face
+                    .surface
+                    .deriv1(middle_u + half_u * GAUSS_X[i], middle_v + half_v * GAUSS_X[j])?;
+                let weighted_normal = su.cross(sv).scale(sign);
+                for (slot, kind) in kinds.iter().enumerate() {
+                    totals[slot] += scale
+                        * GAUSS_W[i]
+                        * GAUSS_W[j]
+                        * half_u
+                        * half_v
+                        * integrand_value(*kind, point, weighted_normal);
                 }
             }
         }
+        return Ok(());
     }
-    Ok(total)
+    if tensor_blocks_on() && face.surface.deriv1_tensor_supported() {
+        let mut u_stations = [0.0f64; rule::MAX_ORDER];
+        let mut v_stations = [0.0f64; rule::MAX_ORDER];
+        for index in 0..u_x.len() {
+            u_stations[index] = middle_u + half_u * u_x[index];
+        }
+        for index in 0..v_x.len() {
+            v_stations[index] = middle_v + half_v * v_x[index];
+        }
+        return face.surface.deriv1_tensor_each(
+            &u_stations[..u_x.len()],
+            &v_stations[..v_x.len()],
+            |i, j, point, su, sv| {
+                let weighted_normal = su.cross(sv).scale(sign);
+                for (slot, kind) in kinds.iter().enumerate() {
+                    totals[slot] += scale
+                        * u_w[i]
+                        * v_w[j]
+                        * half_u
+                        * half_v
+                        * integrand_value(*kind, point, weighted_normal);
+                }
+                Ok(())
+            },
+        );
+    }
+    for i in 0..u_x.len() {
+        for j in 0..v_x.len() {
+            let (point, su, sv) = face
+                .surface
+                .deriv1(middle_u + half_u * u_x[i], middle_v + half_v * v_x[j])?;
+            let weighted_normal = su.cross(sv).scale(sign);
+            for (slot, kind) in kinds.iter().enumerate() {
+                totals[slot] += scale
+                    * u_w[i]
+                    * v_w[j]
+                    * half_u
+                    * half_v
+                    * integrand_value(*kind, point, weighted_normal);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every `kind` over the whole (untrimmed) knot-span grid in ONE sweep.
+/// `solid_mass_properties` asks an untrimmed face for its area and its volume
+/// flux; two single-kind sweeps evaluated every station twice for a second
+/// integrand that costs a multiply.
+pub(super) fn integrate_untrimmed_multi(
+    face: &FaceRecord,
+    kinds: &[Integrand],
+) -> Result<Vec<f64>, String> {
+    let (u_breaks, v_breaks) = surface_breaks(&face.surface)?;
+    let mut totals = vec![0.0f64; kinds.len()];
+    let mut rules = rule::SurfaceRules::new(&face.surface)?;
+    for upair in u_breaks.windows(2) {
+        for vpair in v_breaks.windows(2) {
+            integrate_cell_scaled(
+                face,
+                [upair[0], upair[1], vpair[0], vpair[1]],
+                1.0,
+                kinds,
+                &mut totals,
+                &mut rules,
+            )?;
+        }
+    }
+    Ok(totals)
+}
+
+pub(super) fn integrate_untrimmed(face: &FaceRecord, kind: Integrand) -> Result<f64, String> {
+    Ok(integrate_untrimmed_multi(face, &[kind])?[0])
 }
 
 /// A bi-periodic band face (surface closed in both u and v, exactly two loops
@@ -109,15 +378,38 @@ pub(super) fn integrate_untrimmed(face: &FaceRecord, kind: Integrand) -> Result<
 #[derive(Clone, Copy)]
 pub(super) struct BiBand {
     /// Which parameter is the periodic (full-wrap) one.
-    p_is_u: bool,
+    pub(super) p_is_u: bool,
     /// The two rim cross-levels, ascending (q_lo <= q_hi) in the cross param.
-    q_lo: f64,
-    q_hi: f64,
+    pub(super) q_lo: f64,
+    pub(super) q_hi: f64,
     /// True when the material band is the CROSS-SEAM COMPLEMENT of [q_lo, q_hi]
     /// rather than the between-rims strip (mirrors the tessellator's
     /// `close_periodic_trim_dir` orientation test).
-    complement: bool,
+    pub(super) complement: bool,
+    /// The larger of the two rims' cross-parameter extents, as a fraction of
+    /// the cross domain. Zero (to double noise) for the rim circles OCC/STEP
+    /// emit as exact iso lines; a few 1e-3 for a rim PROJECTED from a vendor
+    /// 3D curve that sits off the carrier, whose pcurve then wanders in the
+    /// cross parameter. Decides between the seam-cut rectangle and the
+    /// rim-following strip — see [`biperiodic_band_integral`].
+    pub(super) rim_wobble: f64,
 }
+
+/// Above this fraction of the cross domain a rim is not an iso line, and the
+/// band between the rims is integrated along the rims' own pcurves instead
+/// of over the rectangle between their mean levels.
+///
+/// The bar is double noise, not a geometric tolerance: a rim that IS an iso
+/// line measures ~1e-15 here, and the two paths agree on it to quadrature
+/// precision, so nothing that reads exactly today moves. Set at 1e-9 rather
+/// than at the noise floor so a level rim of a large-domain surface is never
+/// pushed onto the pcurve walk by rounding alone. `importTestWorking`
+/// SOLID_03 face 90 (record `kernel-step-precision-and-importtestworking-
+/// 2026-09-12.md`): a torus fillet strip whose upper rim was projected from
+/// an edge 2.2e-3 mm off the torus wanders over v ∈ [0.746903, 0.750195] —
+/// 3.3e-3 of the period — and the rectangle at the mean level 0.748549 read
+/// the strip 9.67e-3 mm² (0.09%) small and its origin flux 0.388 low.
+pub(super) const BAND_RIM_LEVEL_TOLERANCE_REL: f64 = 1e-9;
 
 /// Detect the bi-periodic band configuration of `face` and choose which of the
 /// two regions its rims bound is material. The choice replicates the watertight
@@ -145,7 +437,9 @@ pub(super) fn biperiodic_band_range(face: &FaceRecord) -> Result<Option<BiBand>,
         let mut points = Vec::new();
         for coedge in &loop_record.coedges {
             let [d0, d1] = coedge.pcurve.domain()?;
-            let samples = 12;
+            // 32 per coedge: enough to see a projected rim wander, which a
+            // 12-sample read of a smooth pcurve could straddle.
+            let samples = 32;
             for k in 0..=samples {
                 let t = d0 + (d1 - d0) * k as f64 / samples as f64;
                 let p = coedge.pcurve.evaluate(t)?;
@@ -197,6 +491,7 @@ pub(super) fn biperiodic_band_range(face: &FaceRecord) -> Result<Option<BiBand>,
         // clean full-wrap constant-cross-level rim in this p direction.
         let mut rings: Vec<(f64, i32)> = Vec::with_capacity(2);
         let mut clean = true;
+        let mut rim_wobble = 0.0f64;
         for points in &loop_points {
             let (mut pmin, mut pmax, mut qmin, mut qmax) = (
                 f64::INFINITY,
@@ -215,6 +510,7 @@ pub(super) fn biperiodic_band_range(face: &FaceRecord) -> Result<Option<BiBand>,
                 clean = false;
                 break;
             }
+            rim_wobble = rim_wobble.max((qmax - qmin) / q_extent);
             let mut net = 0.0;
             for pair in points.windows(2) {
                 let mut delta = coord(&pair[1]).0 - coord(&pair[0]).0;
@@ -248,6 +544,7 @@ pub(super) fn biperiodic_band_range(face: &FaceRecord) -> Result<Option<BiBand>,
             q_lo,
             q_hi,
             complement,
+            rim_wobble,
         }));
     }
     Ok(None)
@@ -277,30 +574,21 @@ pub(super) fn integrate_rectangle(
     };
     let u_breaks = clamp(&u_full, u_lo, u_hi);
     let v_breaks = clamp(&v_full, v_lo, v_hi);
-    let mut total = 0.0;
+    let mut totals = [0.0f64];
+    let mut rules = rule::SurfaceRules::new(&face.surface)?;
     for upair in u_breaks.windows(2) {
-        let half_u = (upair[1] - upair[0]) * 0.5;
-        let middle_u = (upair[1] + upair[0]) * 0.5;
         for vpair in v_breaks.windows(2) {
-            let half_v = (vpair[1] - vpair[0]) * 0.5;
-            let middle_v = (vpair[1] + vpair[0]) * 0.5;
-            for i in 0..GAUSS_X.len() {
-                for j in 0..GAUSS_X.len() {
-                    total += GAUSS_W[i]
-                        * GAUSS_W[j]
-                        * half_u
-                        * half_v
-                        * evaluate_integrand(
-                            face,
-                            middle_u + half_u * GAUSS_X[i],
-                            middle_v + half_v * GAUSS_X[j],
-                            kind,
-                        )?;
-                }
-            }
+            integrate_cell_scaled(
+                face,
+                [upair[0], upair[1], vpair[0], vpair[1]],
+                1.0,
+                &[kind],
+                &mut totals,
+                &mut rules,
+            )?;
         }
     }
-    Ok(total)
+    Ok(totals[0])
 }
 
 /// Integrate each of `kinds` over a bi-periodic band face, or return None when
@@ -308,6 +596,17 @@ pub(super) fn integrate_rectangle(
 /// periodic span × the cross-level strip; the complement is the full-domain
 /// integral MINUS that strip (the two tile the closed cross period, so no
 /// domain-extended evaluation is needed).
+///
+/// Two readings of the strip. Rims that ARE iso lines (every rim circle a
+/// kernel-built or exactly exported torus carries) integrate over the
+/// seam-cut rectangle between their levels. A rim that wanders in the cross
+/// parameter — a pcurve PROJECTED from a vendor edge that sits off the
+/// carrier — is not at any one level, and the rectangle at its mean level
+/// mis-reads the strip by the wander times the rim length; such a band is
+/// integrated along the rims' own pcurves by the winding boundary integral
+/// (`∮ −G du`, [`super::winding::winding_loops_integral`]), which reads the
+/// trim exactly as given. The material choice (`complement`) is the same in
+/// both readings; only the strip's quadrature differs.
 pub(super) fn biperiodic_band_integral(
     face: &FaceRecord,
     kinds: &[Integrand],
@@ -322,9 +621,16 @@ pub(super) fn biperiodic_band_integral(
     } else {
         (band.q_lo, band.q_hi, v0, v1)
     };
+    let strips: Vec<f64> = if band.rim_wobble <= BAND_RIM_LEVEL_TOLERANCE_REL {
+        kinds
+            .iter()
+            .map(|&kind| integrate_rectangle(face, u_lo, u_hi, v_lo, v_hi, kind))
+            .collect::<Result<_, _>>()?
+    } else {
+        super::winding::winding_loops_integral(face, kinds, band.p_is_u, 1)?
+    };
     let mut out = Vec::with_capacity(kinds.len());
-    for &kind in kinds {
-        let strip = integrate_rectangle(face, u_lo, u_hi, v_lo, v_hi, kind)?;
+    for (&kind, strip) in kinds.iter().zip(strips) {
         let value = if band.complement {
             integrate_untrimmed(face, kind)? - strip
         } else {

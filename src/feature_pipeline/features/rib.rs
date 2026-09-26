@@ -66,18 +66,41 @@
 //!
 //! # Name fidelity (contract rule 2)
 //!
-//! The feature does NOT re-stamp faces — it lets the kernel-fused face names
-//! (target faces + rib-slab faces, propagated through the union) stand. It is a
-//! MODIFY, not a create: the fused solid is registered under the TARGET's own
-//! name and the target is consumed, so the scene sees the same body with a rib on
-//! it rather than a new body named after the feature. That is the same
+//! Every face the rib makes is named from the feature id and the input it came
+//! from, never from the order the kernel's booleans met it (`crate::RibNames`
+//! holds the table). With `{id}` the feature id and `{segment}` the sketch
+//! segment a profile curve came from (`{sketchId}:G{gid}`, the name the sketch
+//! publishes for it — resolved against the OWNING sketch, so a segment pick and a
+//! whole-sketch pick name the same faces):
+//!
+//! - Parallel to Sketch: the two walls `{id}:A` (the sketch normal's negative
+//!   side) and `{id}:B`, the top `{id}:{segment}_TOP` per segment, the ends
+//!   `{id}:START` / `{id}:END` at the chain's start and end;
+//! - Normal to Sketch: the walls `{id}:{segment}_A` / `_B` per segment (`_B` on
+//!   the left of the chain seen from the side the sketch normal points to), the
+//!   top on the sketch plane `{id}:TOP`, the ends `{id}:START` / `{id}:END`.
+//!
+//! A part face the rib SPLITS keeps its name on its first fragment in side order
+//! (the rib's A side, straddling, B side) and then along the chain; every other
+//! fragment is `{id}:{name}_{side}{k}`, `k` its place in its side's count with the
+//! kept fragment included (`_B1`, `_A2`, …) — never by size, which an unrelated
+//! hole moves. The
+//! result goes through `common::register_added`, so its derived edge names are
+//! stamped from the result's own faces here rather than by whichever feature
+//! consumes it next.
+//!
+//! It is a MODIFY, not a create: the fused solid is registered under the TARGET's
+//! own name and the target is consumed, so the scene sees the same body with a
+//! rib on it rather than a new body named after the feature. That is the same
 //! removed-then-added-under-one-name shape chamfer, fillet, hole and the boolean
 //! fold all use. The source sketch is consumed too, by default
 //! (`consumeProfileSketch`).
 
 use crate::feature_pipeline::features::common;
-use crate::feature_pipeline::{AddedSolid, FeatureContext, FeatureResult};
-use crate::{rib_from_profile, NurbsCurve, PointClass, RibExtrusion, SolidClassifier, Vec3};
+use crate::feature_pipeline::{FeatureContext, FeatureResult};
+use crate::{
+    rib_from_profile, NurbsCurve, PointClass, RibExtrusion, RibNames, SolidClassifier, Vec3,
+};
 
 pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     match build(ctx) {
@@ -140,6 +163,11 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     let extrude_dir =
         resolve_extrude_dir(ctx, &profile, plane_normal, extrusion, target_handle)?;
 
+    let names = RibNames {
+        feature: if ctx.id.is_empty() { "RIB".to_string() } else { ctx.id.clone() },
+        segments: profile_segment_names(ctx, &profile_name, profile.len()),
+    };
+
     // Thicken + grow up to the part. Short borrow — no held registry.
     let fused = crate::with_registered_solid_str(target_handle, |target| {
         rib_from_profile(
@@ -149,7 +177,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
             extrude_dir,
             plane_normal,
             extrusion,
-            None,
+            &names,
         )
     })?;
 
@@ -159,17 +187,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     // `common::finalize_solid`, hole): removed-then-added under the same name, so
     // every downstream reference to that body still resolves and the scene tree
     // shows the part the user ribbed rather than a new body called `RIB3`.
-    let solid_name = target_name.clone();
-    let face_names = common::collect_face_names(&fused);
-    let edge_names = common::collect_edge_names(&fused);
-    let handle = crate::register_solid_value(fused);
-    result.added.push(AddedSolid {
-        handle,
-        name: solid_name,
-        face_names,
-        edge_names,
-        ..AddedSolid::default()
-    });
+    result.added.push(common::register_added(fused, &target_name));
     // The rib REPLACES the target (removed: [target]).
     result.removed = vec![target_name];
     // ...and (by default) consumes the source sketch for display cleanup
@@ -179,6 +197,33 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     // display knows — not the segment.
     common::consume_sketch(ctx, &common::sketch_base_name(ctx, &profile_name), &mut result);
     Ok(result)
+}
+
+/// The source name of each profile curve, index-aligned with the chain
+/// `common::resolve_path` resolved: the per-segment names the OWNING sketch
+/// published (`{sketchId}:G{gid}`), so picking the sketch or one of its segments
+/// names the rib's faces identically. A profile with no published names (a
+/// resident solid edge) is named by the reference itself.
+fn profile_segment_names(ctx: &FeatureContext, profile_name: &str, count: usize) -> Vec<String> {
+    let owner = common::sketch_base_name(ctx, profile_name);
+    let published = ctx
+        .scene
+        .resolve_path_segment_names(profile_name)
+        .or_else(|| ctx.scene.resolve_path_segment_names(&owner));
+    (0..count)
+        .map(|index| {
+            published
+                .and_then(|names| names.get(index).cloned().flatten())
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if count == 1 {
+                        profile_name.to_string()
+                    } else {
+                        format!("{profile_name}[{index}]")
+                    }
+                })
+        })
+        .collect()
 }
 
 /// The requested SolidWorks **Extrusion Direction**. Absent means
@@ -496,4 +541,3 @@ pub fn schema() -> serde_json::Value {
 })
 }
 
-// BREP private tests: fd0c3f12ba961505

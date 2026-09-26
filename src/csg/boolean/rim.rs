@@ -137,257 +137,295 @@ pub(super) fn insert_periodic_band_seam_edges(
     }
     let mut plans: Vec<SeamPlan> = Vec::new();
     for (shell_index, shell) in solid.shells.iter().enumerate() {
-        'faces: for (face_index, face) in shell.faces.iter().enumerate() {
-            if face.loops.len() != 2 {
+        'faces: for (face_index, original) in shell.faces.iter().enumerate() {
+            if original.loops.len() != 2 {
                 continue;
             }
-            let (closed_u, closed_v) = match face.surface.closed_directions() {
+            let (closed_along_u, closed_along_v) = match original.surface.closed_directions() {
                 Ok(value) => value,
                 Err(_) => continue,
             };
-            if !closed_u {
-                band_dbg!(face, "skip: not closed_u");
-                continue;
-            }
-            let Ok([u0, u1]) = face.surface.domain_u() else {
-                continue;
-            };
-            let Ok([v0, v1]) = face.surface.domain_v() else {
-                continue;
-            };
-            let u_eps = (u1 - u0).abs() * 1e-6;
-            let v_eps = (v1 - v0).abs() * 1e-6;
-            // No degenerate edges and no existing seam-like column coedge
-            // (a pcurve running along u=u0 or u=u1 with real v-extent).
-            for coedge in face
-                .loops
-                .iter()
-                .flat_map(|loop_record| &loop_record.coedges)
-            {
-                let Some(edge) = edges_by_id.get(&coedge.edge_id) else {
-                    continue 'faces;
-                };
-                if edge.degenerate {
-                    band_dbg!(face, "skip: degenerate edge {}", edge.id);
-                    continue 'faces;
-                }
-                let Ok([d0, d1]) = coedge.pcurve.domain() else {
-                    continue 'faces;
-                };
-                let (Ok(start), Ok(middle), Ok(end)) = (
-                    coedge.pcurve.evaluate(d0),
-                    coedge.pcurve.evaluate((d0 + d1) * 0.5),
-                    coedge.pcurve.evaluate(d1),
-                ) else {
-                    continue 'faces;
-                };
-                for extreme in [u0, u1] {
-                    if (start.x - extreme).abs() <= u_eps
-                        && (middle.x - extreme).abs() <= u_eps
-                        && (end.x - extreme).abs() <= u_eps
-                        && (end.y - start.y).abs() > v_eps
-                    {
-                        band_dbg!(face, "skip: existing seam-like column coedge (edge {})", coedge.edge_id);
+            // A band whose rims run along v (a pipe elbow imported as a torus
+            // patch: rims at two u levels, closed in v, no seam edge) is the
+            // same band in the transposed chart. It is planned there and the
+            // plan is read back in the face's own chart: the seam is the
+            // carrier's v = v0 iso-curve, the seam coedges' pcurves are rows,
+            // and the rim coedges are the face's own. Without it a section
+            // crossing the carrier's v seam is split there with no edge for
+            // the face's arrangement to close against
+            // (`boolean_fuzz_corpus/06_fragmentation-incomplete_t12`).
+            // Escape hatch `BREP_BAND_SEAM_V=0`.
+            let mut transposed_chart: Option<FaceRecord> = None;
+            'charts: for transposed in [false, true] {
+                let (face, closed_u, closed_v) = if transposed {
+                    if !closed_along_v || std::env::var("BREP_BAND_SEAM_V").as_deref() == Ok("0") {
                         continue 'faces;
                     }
-                }
-            }
-            let Ok(Some(pair_a)) =
-                band_wrap_pair(&face.loops[0], &edges_by_id, [u0, u1], u_eps, v_eps)
-            else {
-                band_dbg!(face, "skip: band_wrap_pair loop0 -> None");
-                continue;
-            };
-            let Ok(Some(pair_b)) =
-                band_wrap_pair(&face.loops[1], &edges_by_id, [u0, u1], u_eps, v_eps)
-            else {
-                band_dbg!(face, "skip: band_wrap_pair loop1 -> None");
-                continue;
-            };
-            // The two rims must arrive at OPPOSITE domain extremes (one rim
-            // traversed +u, the other -u) and sit at distinct levels/vertices.
-            if pair_a.arrive_at_max == pair_b.arrive_at_max
-                || pair_a.vertex_id == pair_b.vertex_id
-                || (pair_a.v - pair_b.v).abs() <= v_eps * 10.0
-            {
-                band_dbg!(face, "skip: rim pair mismatch (same_extreme={} same_vertex={} dv={:.3e})",
-                    pair_a.arrive_at_max == pair_b.arrive_at_max,
-                    pair_a.vertex_id == pair_b.vertex_id,
-                    (pair_a.v - pair_b.v).abs());
-                continue;
-            }
-            // The seam column between the rims must run through face INTERIOR
-            // on both sides of the seam (a true full-period band).
-            let v_mid = 0.5 * (pair_a.v + pair_b.v);
-            let inset = (u1 - u0) * 1e-3;
-            let interior_at = |u: f64, v: f64| -> bool {
-                matches!(
-                    parameter_point_in_face(face, Vec2 { x: u, y: v }, 1e-9),
-                    Ok(PolygonClass::Inside)
-                )
-            };
-            // COVERING-PLANE STRIP: `normalize_covering_rim_strips` selected
-            // this face as a two-rim strip on an OPEN-v surface (disjoint rim
-            // v-hulls), where the material can only be the BETWEEN strip — a
-            // complement is unrepresentable on open v — and folded the rims
-            // in-domain. But each rim now winds a full period on its own, so
-            // `interior_at`'s `wrapped_horizon` classifier bails (it only
-            // closes a NET-zero loop, which is exactly the MERGED loop this
-            // pass is about to build). Trust the plain path for those known
-            // bands.
-            let plain = known_band_faces.contains(&face.id)
-                || (interior_at(u0 + inset, v_mid) && interior_at(u1 - inset, v_mid));
-            // WRAPPED-BAND VARIANT: when the surface is ALSO closed in v and
-            // one rim sits exactly ON the v-seam, the material can be the
-            // wrapped COMPLEMENT of the inter-rim window (trial 35's torus
-            // face: rims at v=0.25/1.0, material v∈[0,0.25]) — the plain
-            // column midpoint then reads Outside and the band was skipped,
-            // leaving the flat arrangement unable to close the seam-wrapping
-            // fragment (one-use cascade). The material column arc is then
-            // fully in-domain on the OTHER side of the seam rim ([v0, va] for
-            // a rim at v1, [vb, v1] for a rim at v0), so the same seam-edge
-            // construction applies with the on-seam rim's foot wrapped to the
-            // opposite domain edge. Escape hatch: BREP_BAND_SEAM_WRAP=0.
-            let (mut foot_a, mut foot_b) = (pair_a.v, pair_b.v);
-            let mut wrapped = false;
-            if !plain
-                && closed_v
-                && std::env::var("BREP_BAND_SEAM_WRAP").as_deref() != Ok("0")
-            {
-                let (va, vb) = (pair_a.v.min(pair_b.v), pair_a.v.max(pair_b.v));
-                let rim_at_top = (vb - v1).abs() <= v_eps * 10.0;
-                let rim_at_bottom = (va - v0).abs() <= v_eps * 10.0;
-                if rim_at_top ^ rim_at_bottom {
-                    let wrapped_mid = if rim_at_top {
-                        0.5 * (v0 + va)
-                    } else {
-                        0.5 * (vb + v1)
+                    let Ok(chart) = transposed_band_chart(original) else {
+                        continue 'faces;
                     };
-                    if interior_at(u0 + inset, wrapped_mid) && interior_at(u1 - inset, wrapped_mid)
-                    {
-                        let wrap_foot = |v: f64| -> f64 {
-                            if rim_at_top && (v - vb).abs() <= v_eps * 10.0 {
-                                v0
-                            } else if rim_at_bottom && (v - va).abs() <= v_eps * 10.0 {
-                                v1
-                            } else {
-                                v
-                            }
-                        };
-                        foot_a = wrap_foot(pair_a.v);
-                        foot_b = wrap_foot(pair_b.v);
-                        wrapped = true;
+                    (&*transposed_chart.insert(chart), closed_along_v, closed_along_u)
+                } else {
+                    (original, closed_along_u, closed_along_v)
+                };
+                if !closed_u {
+                    band_dbg!(face, "skip: not closed_u");
+                    continue 'charts;
+                }
+                let Ok([u0, u1]) = face.surface.domain_u() else {
+                    continue 'charts;
+                };
+                let Ok([v0, v1]) = face.surface.domain_v() else {
+                    continue 'charts;
+                };
+                let u_eps = (u1 - u0).abs() * 1e-6;
+                let v_eps = (v1 - v0).abs() * 1e-6;
+                // No degenerate edges and no existing seam-like column coedge
+                // (a pcurve running along u=u0 or u=u1 with real v-extent).
+                for coedge in face
+                    .loops
+                    .iter()
+                    .flat_map(|loop_record| &loop_record.coedges)
+                {
+                    let Some(edge) = edges_by_id.get(&coedge.edge_id) else {
+                        continue 'charts;
+                    };
+                    if edge.degenerate {
+                        band_dbg!(face, "skip: degenerate edge {}", edge.id);
+                        continue 'charts;
+                    }
+                    let Ok([d0, d1]) = coedge.pcurve.domain() else {
+                        continue 'charts;
+                    };
+                    let (Ok(start), Ok(middle), Ok(end)) = (
+                        coedge.pcurve.evaluate(d0),
+                        coedge.pcurve.evaluate((d0 + d1) * 0.5),
+                        coedge.pcurve.evaluate(d1),
+                    ) else {
+                        continue 'charts;
+                    };
+                    for extreme in [u0, u1] {
+                        if (start.x - extreme).abs() <= u_eps
+                            && (middle.x - extreme).abs() <= u_eps
+                            && (end.x - extreme).abs() <= u_eps
+                            && (end.y - start.y).abs() > v_eps
+                        {
+                            band_dbg!(face, "skip: existing seam-like column coedge (edge {})", coedge.edge_id);
+                            continue 'charts;
+                        }
                     }
                 }
+                let Ok(Some(pair_a)) =
+                    band_wrap_pair(&face.loops[0], &edges_by_id, [u0, u1], u_eps, v_eps)
+                else {
+                    band_dbg!(face, "skip: band_wrap_pair loop0 -> None");
+                    continue 'charts;
+                };
+                let Ok(Some(pair_b)) =
+                    band_wrap_pair(&face.loops[1], &edges_by_id, [u0, u1], u_eps, v_eps)
+                else {
+                    band_dbg!(face, "skip: band_wrap_pair loop1 -> None");
+                    continue 'charts;
+                };
+                // The two rims must arrive at OPPOSITE domain extremes (one rim
+                // traversed +u, the other -u) and sit at distinct levels/vertices.
+                if pair_a.arrive_at_max == pair_b.arrive_at_max
+                    || pair_a.vertex_id == pair_b.vertex_id
+                    || (pair_a.v - pair_b.v).abs() <= v_eps * 10.0
+                {
+                    band_dbg!(face, "skip: rim pair mismatch (same_extreme={} same_vertex={} dv={:.3e})",
+                        pair_a.arrive_at_max == pair_b.arrive_at_max,
+                        pair_a.vertex_id == pair_b.vertex_id,
+                        (pair_a.v - pair_b.v).abs());
+                    continue 'charts;
+                }
+                // The seam column between the rims must run through face INTERIOR
+                // on both sides of the seam (a true full-period band).
+                let v_mid = 0.5 * (pair_a.v + pair_b.v);
+                let inset = (u1 - u0) * 1e-3;
+                // Containment is asked of the face in its own chart, whose
+                // lanes are the ones the arrangement reads.
+                let interior_at = |u: f64, v: f64| -> bool {
+                    let point = if transposed { Vec2 { x: v, y: u } } else { Vec2 { x: u, y: v } };
+                    matches!(
+                        parameter_point_in_face(original, point, 1e-9),
+                        Ok(PolygonClass::Inside)
+                    )
+                };
+                // COVERING-PLANE STRIP: `normalize_covering_rim_strips` selected
+                // this face as a two-rim strip on an OPEN-v surface (disjoint rim
+                // v-hulls), where the material can only be the BETWEEN strip — a
+                // complement is unrepresentable on open v — and folded the rims
+                // in-domain. But each rim now winds a full period on its own, so
+                // `interior_at`'s `wrapped_horizon` classifier bails (it only
+                // closes a NET-zero loop, which is exactly the MERGED loop this
+                // pass is about to build). Trust the plain path for those known
+                // bands.
+                let plain = known_band_faces.contains(&face.id)
+                    || (interior_at(u0 + inset, v_mid) && interior_at(u1 - inset, v_mid));
+                // WRAPPED-BAND VARIANT: when the surface is ALSO closed in v and
+                // one rim sits exactly ON the v-seam, the material can be the
+                // wrapped COMPLEMENT of the inter-rim window (trial 35's torus
+                // face: rims at v=0.25/1.0, material v∈[0,0.25]) — the plain
+                // column midpoint then reads Outside and the band was skipped,
+                // leaving the flat arrangement unable to close the seam-wrapping
+                // fragment (one-use cascade). The material column arc is then
+                // fully in-domain on the OTHER side of the seam rim ([v0, va] for
+                // a rim at v1, [vb, v1] for a rim at v0), so the same seam-edge
+                // construction applies with the on-seam rim's foot wrapped to the
+                // opposite domain edge. Escape hatch: BREP_BAND_SEAM_WRAP=0.
+                let (mut foot_a, mut foot_b) = (pair_a.v, pair_b.v);
+                let mut wrapped = false;
+                if !plain
+                    && closed_v
+                    && std::env::var("BREP_BAND_SEAM_WRAP").as_deref() != Ok("0")
+                {
+                    let (va, vb) = (pair_a.v.min(pair_b.v), pair_a.v.max(pair_b.v));
+                    let rim_at_top = (vb - v1).abs() <= v_eps * 10.0;
+                    let rim_at_bottom = (va - v0).abs() <= v_eps * 10.0;
+                    if rim_at_top ^ rim_at_bottom {
+                        let wrapped_mid = if rim_at_top {
+                            0.5 * (v0 + va)
+                        } else {
+                            0.5 * (vb + v1)
+                        };
+                        if interior_at(u0 + inset, wrapped_mid) && interior_at(u1 - inset, wrapped_mid)
+                        {
+                            let wrap_foot = |v: f64| -> f64 {
+                                if rim_at_top && (v - vb).abs() <= v_eps * 10.0 {
+                                    v0
+                                } else if rim_at_bottom && (v - va).abs() <= v_eps * 10.0 {
+                                    v1
+                                } else {
+                                    v
+                                }
+                            };
+                            foot_a = wrap_foot(pair_a.v);
+                            foot_b = wrap_foot(pair_b.v);
+                            wrapped = true;
+                        }
+                    }
+                }
+                if !plain && !wrapped {
+                    band_dbg!(face, "skip: interior probe failed (plain=false wrapped=false, closed_v={closed_v}, v_a={:.6} v_b={:.6})", pair_a.v, pair_b.v);
+                    continue 'charts;
+                }
+                // 3D consistency: both seam feet are model vertices sitting on
+                // the seam meridian.
+                let (Some(&point_a), Some(&point_b)) = (
+                    vertex_points.get(&pair_a.vertex_id),
+                    vertex_points.get(&pair_b.vertex_id),
+                ) else {
+                    continue 'charts;
+                };
+                let on_meridian = |v: f64, point: Vec3| -> bool {
+                    face.surface
+                        .evaluate(u0, v)
+                        .map(|at| at.sub(point).length() <= 1e-6 * (1.0 + point.length()))
+                        .unwrap_or(false)
+                };
+                if !on_meridian(pair_a.v, point_a) || !on_meridian(pair_b.v, point_b) {
+                    band_dbg!(face, "skip: wrap vertex not on seam meridian");
+                    continue 'charts;
+                }
+                // The chart's u = u0 iso-curve; in a transposed chart it is the
+                // face's own v = v0 row, read off the face's surface.
+                let iso = if transposed {
+                    original.surface.iso_curve_v(u0)
+                } else {
+                    face.surface.iso_curve_u(u0)
+                };
+                let Ok(iso) = iso else {
+                    continue 'charts;
+                };
+                let seam_matches = |v: f64, point: Vec3| -> bool {
+                    iso.evaluate(v)
+                        .map(|at| at.sub(point).length() <= 1e-6 * (1.0 + point.length()))
+                        .unwrap_or(false)
+                };
+                if !seam_matches(pair_a.v, point_a) || !seam_matches(pair_b.v, point_b) {
+                    band_dbg!(face, "skip: iso seam curve does not match wrap vertices");
+                    continue 'charts;
+                }
+                // Seam edge oriented bottom(v)->top(v). The feet are the pair
+                // levels in the material column's chart (identical to the pair
+                // levels in the plain case; the on-seam rim wrapped to the
+                // opposite domain edge in the wrapped case).
+                let (v_bottom, bottom_vertex, v_top, top_vertex) = if foot_a < foot_b {
+                    (foot_a, pair_a.vertex_id, foot_b, pair_b.vertex_id)
+                } else {
+                    (foot_b, pair_b.vertex_id, foot_a, pair_a.vertex_id)
+                };
+                let edge = EdgeRecord {
+                    id: next_edge_id,
+                    curve: iso,
+                    t0: v_bottom,
+                    t1: v_top,
+                    start_vertex_id: bottom_vertex,
+                    end_vertex_id: top_vertex,
+                    degenerate: false,
+                    name: None,
+                };
+                next_edge_id += 1;
+                let rotate = |loop_record: &LoopRecord, start: usize| -> Vec<CoedgeRecord> {
+                    let mut coedges = loop_record.coedges.clone();
+                    coedges.rotate_left(start);
+                    coedges
+                };
+                // Loop A rotated to END at its seam arrival, then the seam column
+                // at A's arrival extreme (traversed vA->vB), then loop B rotated
+                // to depart from that same extreme, then the seam column at the
+                // opposite extreme (traversed vB->vA), closing at A's departure.
+                let column_a = if pair_a.arrive_at_max { u1 } else { u0 };
+                let column_b = if pair_a.arrive_at_max { u0 } else { u1 };
+                let chart_point = |u: f64, v: f64| -> Vec3 {
+                    if transposed {
+                        Vec3::new(v, u, 0.0)
+                    } else {
+                        Vec3::new(u, v, 0.0)
+                    }
+                };
+                let (Ok(pcurve_up), Ok(pcurve_down)) = (
+                    crate::make_line(chart_point(column_a, foot_a), chart_point(column_a, foot_b)),
+                    crate::make_line(chart_point(column_b, foot_b), chart_point(column_b, foot_a)),
+                ) else {
+                    continue 'charts;
+                };
+                // The rim coedges in the face's own chart (the transposed
+                // chart keeps their order).
+                let mut coedges = rotate(&original.loops[0], pair_a.depart_index);
+                coedges.push(CoedgeRecord {
+                    id: next_coedge_id,
+                    edge_id: edge.id,
+                    forward: foot_a < foot_b,
+                    pcurve: pcurve_up,
+                });
+                next_coedge_id += 1;
+                coedges.extend(rotate(&original.loops[1], pair_b.depart_index));
+                coedges.push(CoedgeRecord {
+                    id: next_coedge_id,
+                    edge_id: edge.id,
+                    forward: foot_b < foot_a,
+                    pcurve: pcurve_down,
+                });
+                next_coedge_id += 1;
+                if std::env::var("BREP_DEBUG_BOOL").is_ok() {
+                    eprintln!(
+                        "band_seams: face {} gets seam (wrapped={wrapped} transposed={transposed} feet=[{foot_a:.6},{foot_b:.6}])",
+                        face.id
+                    );
+                }
+                plans.push(SeamPlan {
+                    shell_index,
+                    face_index,
+                    edge,
+                    merged_loop: LoopRecord {
+                        id: face.loops[0].id,
+                        coedges,
+                    },
+                });
+                continue 'faces;
             }
-            if !plain && !wrapped {
-                band_dbg!(face, "skip: interior probe failed (plain=false wrapped=false, closed_v={closed_v}, v_a={:.6} v_b={:.6})", pair_a.v, pair_b.v);
-                continue;
-            }
-            // 3D consistency: both seam feet are model vertices sitting on
-            // the seam meridian.
-            let (Some(&point_a), Some(&point_b)) = (
-                vertex_points.get(&pair_a.vertex_id),
-                vertex_points.get(&pair_b.vertex_id),
-            ) else {
-                continue;
-            };
-            let on_meridian = |v: f64, point: Vec3| -> bool {
-                face.surface
-                    .evaluate(u0, v)
-                    .map(|at| at.sub(point).length() <= 1e-6 * (1.0 + point.length()))
-                    .unwrap_or(false)
-            };
-            if !on_meridian(pair_a.v, point_a) || !on_meridian(pair_b.v, point_b) {
-                band_dbg!(face, "skip: wrap vertex not on seam meridian");
-                continue;
-            }
-            let Ok(iso) = face.surface.iso_curve_u(u0) else {
-                continue;
-            };
-            let seam_matches = |v: f64, point: Vec3| -> bool {
-                iso.evaluate(v)
-                    .map(|at| at.sub(point).length() <= 1e-6 * (1.0 + point.length()))
-                    .unwrap_or(false)
-            };
-            if !seam_matches(pair_a.v, point_a) || !seam_matches(pair_b.v, point_b) {
-                band_dbg!(face, "skip: iso seam curve does not match wrap vertices");
-                continue;
-            }
-            // Seam edge oriented bottom(v)->top(v). The feet are the pair
-            // levels in the material column's chart (identical to the pair
-            // levels in the plain case; the on-seam rim wrapped to the
-            // opposite domain edge in the wrapped case).
-            let (v_bottom, bottom_vertex, v_top, top_vertex) = if foot_a < foot_b {
-                (foot_a, pair_a.vertex_id, foot_b, pair_b.vertex_id)
-            } else {
-                (foot_b, pair_b.vertex_id, foot_a, pair_a.vertex_id)
-            };
-            let edge = EdgeRecord {
-                id: next_edge_id,
-                curve: iso,
-                t0: v_bottom,
-                t1: v_top,
-                start_vertex_id: bottom_vertex,
-                end_vertex_id: top_vertex,
-                degenerate: false,
-                name: None,
-            };
-            next_edge_id += 1;
-            let rotate = |loop_record: &LoopRecord, start: usize| -> Vec<CoedgeRecord> {
-                let mut coedges = loop_record.coedges.clone();
-                coedges.rotate_left(start);
-                coedges
-            };
-            // Loop A rotated to END at its seam arrival, then the seam column
-            // at A's arrival extreme (traversed vA->vB), then loop B rotated
-            // to depart from that same extreme, then the seam column at the
-            // opposite extreme (traversed vB->vA), closing at A's departure.
-            let column_a = if pair_a.arrive_at_max { u1 } else { u0 };
-            let column_b = if pair_a.arrive_at_max { u0 } else { u1 };
-            let (Ok(pcurve_up), Ok(pcurve_down)) = (
-                crate::make_line(
-                    Vec3::new(column_a, foot_a, 0.0),
-                    Vec3::new(column_a, foot_b, 0.0),
-                ),
-                crate::make_line(
-                    Vec3::new(column_b, foot_b, 0.0),
-                    Vec3::new(column_b, foot_a, 0.0),
-                ),
-            ) else {
-                continue;
-            };
-            let mut coedges = rotate(&face.loops[0], pair_a.depart_index);
-            coedges.push(CoedgeRecord {
-                id: next_coedge_id,
-                edge_id: edge.id,
-                forward: foot_a < foot_b,
-                pcurve: pcurve_up,
-            });
-            next_coedge_id += 1;
-            coedges.extend(rotate(&face.loops[1], pair_b.depart_index));
-            coedges.push(CoedgeRecord {
-                id: next_coedge_id,
-                edge_id: edge.id,
-                forward: foot_b < foot_a,
-                pcurve: pcurve_down,
-            });
-            next_coedge_id += 1;
-            if std::env::var("BREP_DEBUG_BOOL").is_ok() {
-                eprintln!(
-                    "band_seams: face {} gets seam (wrapped={wrapped} feet=[{foot_a:.6},{foot_b:.6}])",
-                    face.id
-                );
-            }
-            plans.push(SeamPlan {
-                shell_index,
-                face_index,
-                edge,
-                merged_loop: LoopRecord {
-                    id: face.loops[0].id,
-                    coedges,
-                },
-            });
         }
     }
     drop(edges_by_id);
@@ -398,6 +436,35 @@ pub(super) fn insert_periodic_band_seam_edges(
         face.loops = vec![plan.merged_loop];
     }
     Ok(inserted)
+}
+
+/// A copy of `face` in the transposed chart: the control net and every
+/// coedge pcurve with u and v exchanged. Geometry and loop order are the
+/// face's own; only the band-seam planner reads it.
+fn transposed_band_chart(face: &FaceRecord) -> Result<FaceRecord, KernelRefusal> {
+    let surface = &face.surface;
+    let rows_v = surface.control_points.first().map(|row| row.len()).unwrap_or(0);
+    let mut control_points = vec![Vec::with_capacity(surface.control_points.len()); rows_v];
+    for row in &surface.control_points {
+        for (column, point) in row.iter().enumerate() {
+            control_points[column].push(*point);
+        }
+    }
+    let mut chart = face.clone();
+    chart.surface = crate::NurbsSurface::new(
+        surface.degree_v,
+        surface.degree_u,
+        surface.knots_v.clone(),
+        surface.knots_u.clone(),
+        control_points,
+    )
+    .or_refuse(KernelStage::Sew, "csg.boolean.rim")?;
+    for coedge in chart.loops.iter_mut().flat_map(|loop_record| &mut loop_record.coedges) {
+        for control in &mut coedge.pcurve.control_points {
+            std::mem::swap(&mut control.x, &mut control.y);
+        }
+    }
+    Ok(chart)
 }
 
 /// Traversal-aligned subcurve of a p-curve over a fraction of its domain
@@ -851,10 +918,10 @@ fn normalize_covering_rim_strips(solid: &mut BrepSolid) -> Result<Vec<u64>, Kern
 /// whole solid if the normalized topology validates WORSE than the input
 /// (soft-fail: the boolean then proceeds exactly as before).
 pub(super) fn normalize_operand_band_seams(solid: &mut BrepSolid) -> Result<(), KernelRefusal> {
-    // Cheap pre-scan: candidates are 2-loop faces on closed-u carriers.
+    // Cheap pre-scan: candidates are 2-loop faces on carriers closed in u or v.
     let has_candidate = solid.shells.iter().flat_map(|shell| &shell.faces).any(|face| {
         face.loops.len() == 2
-            && matches!(face.surface.closed_directions(), Ok((true, _)))
+            && matches!(face.surface.closed_directions(), Ok((true, _) | (_, true)))
     });
     if !has_candidate {
         return Ok(());

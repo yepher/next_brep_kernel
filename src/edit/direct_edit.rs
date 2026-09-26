@@ -73,6 +73,21 @@
 //!   clip against); taken together the walls close a cycle of three carriers
 //!   and each strip's corner end is where its own recovered edge meets the
 //!   third wall (`direct_edit/corner_heal.rs`).
+//! - COVERED, as a SET: a CLOSED BAND — any ring of faces whose free boundary
+//!   is one closed run on each of exactly two survivors, such as a stepped nut
+//!   pocket sunk over a through bore. It is the closed transition strip with
+//!   many faces: the two survivors are extended, re-intersected in closed
+//!   form, and each run collapses onto the rim, so the bore runs on up to the
+//!   face the pocket opened through (`direct_edit/closed_band.rs`).
+//! - COVERED, as a SET: a whole BLEND NETWORK over planar faces — the strips,
+//!   vertex blends and mitres a fillet left around a gusset's foot, with more
+//!   than one corner and strips that end on other strips. Each cluster of end
+//!   edges shrinks to the vertex its planes meet in, and each strip becomes the
+//!   sharp edge between its two clusters (`direct_edit/blend_network_heal.rs`).
+//!   A cylindrical strip the selection leaves standing is KEPT: where it mitred
+//!   into a deleted strip it now ends on the cap plane square to its axis, on
+//!   that plane's circular section; any other curved face left beside a network
+//!   is refused by name.
 //! - COVERED, as a SET (see [`delete_faces_and_heal`] and
 //!   `direct_edit/delete_faces.rs`): a BLIND pocket, a blind bore, or a boss —
 //!   every face of the feature selected together. One face at a time these are
@@ -96,7 +111,7 @@
 
 use crate::topology::{CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, VertexRecord};
 use crate::transform_topology::{transform_curve, transform_surface};
-use crate::offset_retrim::{boundary_samples, retrim_face_in_solid, PcurveFit};
+use crate::offset_retrim::{boundary_samples, retrim_face_in_solid};
 use crate::offset_reintersect::{
     arc_of_section, edge_seeds, match_marched_rim_direction, reintersect_carriers, section_corner,
     MarchPolicy, ReintersectRefusal, RimLane,
@@ -104,9 +119,10 @@ use crate::offset_reintersect::{
 use crate::{
     build_pcurve_on_surface, build_pcurve_on_surface_range, intersect_analytic_pair,
     intersect_curve_surface, make_line, make_revolution, parameter_space_area,
+    plane_ruled_section_arc,
     project_point_to_curve, solid_model_scale, solid_signed_volume, AffineTransform,
     AnalyticSurface, BrepSolid,
-    NurbsCurve, NurbsSurface, OffsetEvaluator, OffsetNormal, Vec3,
+    NurbsCurve, NurbsSurface, OffsetEvaluator, OffsetNormal, SurfaceSide, Vec3,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -118,6 +134,12 @@ mod delete_face;
 mod delete_faces;
 #[path = "direct_edit/face_move.rs"]
 mod face_move;
+#[path = "direct_edit/face_move_carrier.rs"]
+mod face_move_carrier;
+#[path = "direct_edit/face_move_recut.rs"]
+mod face_move_recut;
+#[path = "direct_edit/face_rotate.rs"]
+mod face_rotate;
 #[path = "direct_edit/face_offset.rs"]
 mod face_offset;
 #[path = "direct_edit/face_offset_sphere.rs"]
@@ -134,23 +156,44 @@ mod closed_heal;
 mod open_carriers;
 #[path = "direct_edit/open_heal.rs"]
 mod open_heal;
+#[path = "direct_edit/open_heal_census.rs"]
+mod open_heal_census;
+#[path = "direct_edit/closed_heal_census.rs"]
+mod closed_heal_census;
+#[path = "direct_edit/triple_point.rs"]
+mod triple_point;
 #[path = "direct_edit/corner_heal.rs"]
 mod corner_heal;
+#[path = "direct_edit/closed_band.rs"]
+mod closed_band;
+#[path = "direct_edit/blend_network_heal.rs"]
+mod blend_network_heal;
 
-// BREP private tests: d369bdef09751ed4
-// BREP private tests: ea86eda3ee482e19
-// BREP private tests: 0e4ec467b54259ed
 
+use blend_network_heal::*;
+use closed_band::*;
 use closed_heal::*;
+use closed_heal_census::*;
 use corner_heal::*;
 use delete_face::*;
+use face_move_carrier::*;
 use geom::*;
 use open_carriers::*;
 use open_heal::*;
+use open_heal_census::*;
+use triple_point::*;
 
 pub use delete_face::{delete_face_and_heal, resolve_face_by_point};
 pub use delete_faces::delete_faces_and_heal;
 pub use face_move::move_faces;
+pub use face_rotate::rotate_faces;
+// The ROUTING reading: which faces a moved selection would have to open a new
+// hole in, measured before anything is built. Public so the matrix probe can
+// print the partition over every cell without the road being wired to it.
+pub use face_move_carrier::{route_reading, RouteReading};
+// The RE-CUT road: the same edit performed from the original body and the
+// motion, for a translation whose answer needs the topology to change.
+pub use face_move_recut::{recut_moved_planes, recut_moved_planes_rigid};
 pub use face_offset::offset_ruled_face;
 pub use face_offset_sphere::offset_sphere_face;
 pub use face_offset_torus::offset_torus_face;

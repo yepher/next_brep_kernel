@@ -13,7 +13,7 @@ pub use tolerance::{
     curve_model_scale, model_scale, report_scale_migration, solid_model_scale, solid_scale,
     offset_construction_band, vertex_tolerance_from_edges, KernelTolerances,
     MeasuredTolerance, OFFSET_CONSTRUCTION_FLOOR, OFFSET_CONSTRUCTION_REL,
-    VERTEX_MATCH_FLOOR,
+    VERTEX_MATCH_FLOOR, VOLUME_DRIFT_ABS, VOLUME_DRIFT_REL,
 };
 // Per-entity measured tolerances (`per-entity-tolerances.md` slice S1): the
 // lazy, capped band an individual edge or vertex earns from its own redundant
@@ -34,7 +34,7 @@ mod polygon;
 mod curve;
 pub use curve::{
     make_arc, make_circle, make_hyperbola, make_line, make_parabola, uniform_clamped_knots,
-    KnotVector, NurbsCurve, Vec4,
+    KnotVector, NurbsCurve, Vec4, KNOT_DEDUP_EPS, KNOT_IDENTITY_TOL,
 };
 #[path = "blending/blend/mod.rs"]
 mod blend;
@@ -46,8 +46,9 @@ pub use blend::{
 mod fillet;
 pub use fillet::{
     chamfer_edge, chamfer_edge_angle, chamfer_edge_asymmetric, chamfer_edges_angle,
-    chamfer_edges_asymmetric, fillet_edge, fillet_edges, fillet_edges_variable,
-    fillet_edges_variable_law, fillet_edges_variable_vertex_radii,
+    chamfer_edges_asymmetric, fillet_edge, fillet_edges, fillet_edges_reported,
+    fillet_edges_variable, fillet_edges_variable_law, fillet_edges_variable_vertex_radii,
+    BlendSelection,
 };
 #[path = "blending/law.rs"]
 mod law;
@@ -55,9 +56,10 @@ pub use law::{LawSegment, RadiusLaw};
 #[path = "geometry/fit.rs"]
 mod fit;
 pub use fit::{
-    fit_polyline, interpolate_curve, interpolate_curve_closed, interpolate_curve_local,
-    interpolate_curve_thinned, interpolate_curve_with_end_tangents, simplify_polyline,
-    solve_banded, solve_dense, PolylineFit,
+    fit_polyline, fit_polyline_at, interpolate_curve, interpolate_curve_closed,
+    interpolate_curve_local, interpolate_curve_thinned, interpolate_curve_with_end_tangents,
+    simplify_polyline, simplify_polyline_indices, solve_banded, solve_dense, PolylineFit,
+    PolylineFitExit, PolylineFitLedger, PolylineFitReport, PolylineFitScope, MAX_FIT_STATIONS,
 };
 #[path = "geometry/image_curve.rs"]
 mod image_curve;
@@ -67,13 +69,26 @@ mod surface;
 pub use surface::{
     carrier_preview_patch, make_cone_surface, make_cylinder_surface, make_extrusion, make_plane,
     make_revolution, make_sphere_surface, make_sphere_surface_framed, make_torus_surface,
-    NurbsSurface,
+    ExtendRefusal, NurbsSurface, SurfaceSide, WeightSite, MAXIMUM_FOLD_ANGLE,
+    MAXIMUM_GROWTH_RATIO,
 };
+#[path = "geometry/coons.rs"]
+mod coons;
+pub use coons::{
+    coons_bilinear, coons_bilinear_reported, coons_with_ribbons, CompatWork, CoonsRefusal,
+    CoonsReport, RibbonReport,
+};
+#[path = "geometry/gordon.rs"]
+mod gordon;
+pub use gordon::{gordon_surface, gordon_surface_reported, GordonRefusal, GordonReport};
 #[path = "geometry/analytic_surface.rs"]
 mod analytic_surface;
 pub use analytic_surface::{
-    circle_angle_to_parameter, intersect_analytic_pair, revolution_structure, AnalyticSurface,
-    RevolutionFrame, RevolutionStructure,
+    circle_angle_to_parameter, intersect_analytic_pair, plane_ruled_section_arc,
+    revolution_structure, AnalyticSurface, RevolutionFrame, RevolutionStructure,
+};
+pub(crate) use analytic_surface::{
+    intersect_analytic_pair_with, ruled_gate, ruled_gate_census, RuledGate,
 };
 #[path = "geometry/sphere_chart.rs"]
 mod sphere_chart;
@@ -95,8 +110,11 @@ pub use topology::{
 #[path = "brep/soundness.rs"]
 mod soundness;
 pub use soundness::{
-    solid_connectivity, solid_self_intersections, ConnectivityReport, FaceCrossing,
-    SelfIntersectionOptions, SelfIntersectionReport, ShellConnectivity,
+    face_self_intersections, loop_self_crossings, shell_vector_areas, solid_connectivity,
+    solid_euler, solid_self_intersections, ConnectivityReport, CrossingConfirmation, EulerReport,
+    FaceCrossing, FaceFold, FaceVectorArea,
+    LoopCrossing, LoopCrossingReport, SelfIntersectionOptions, SelfIntersectionReport,
+    ClosureReading, ShellConnectivity, ShellVectorArea, VectorAreaReport,
 };
 #[path = "brep/topology_arena.rs"]
 mod topology_arena;
@@ -113,7 +131,12 @@ pub use analytic_topology::{
 mod sweep_topology;
 pub use sweep_topology::{
     extrude_profile_brep, extrude_profile_brep_draft, fit_helix_curve, helix_sample_points,
-    profile_anchor, rib_from_profile, RibExtrusion,
+    profile_anchor, rib_from_profile, sweep_bend_profile, sweep_closure, BendStation,
+    JointContinuity, PathJoint, SweepClosure,
+    RibExtrusion, RibNames, SweepPath, MAX_JOINT_TANGENT_BREAK, SWEEP_TIGHT_BEND_REFUSAL,
+    SWEEP_TWIST_CLOSURE_REFUSAL,
+    build_swept_envelope, recognize_swept_envelope, swept_envelope_volume, SweptEnvelope,
+    SWEEP_ENVELOPE_REFUSAL, sweep_envelope_bodies,
     sweep_profile_along_chain, sweep_profile_along_chain_with_stations, sweep_profile_along_path,
     sweep_profile_along_path_anchored,
     sweep_profile_helix,
@@ -128,6 +151,7 @@ pub use loft_topology::{
     loft_profile_brep, loft_profile_brep_closed, loft_profile_brep_guided,
     loft_profile_brep_guided_frame, loft_profile_brep_tangent,
 };
+pub(crate) use loft_topology::loft_profile_brep_closed_shifted;
 #[path = "brep/transform_topology.rs"]
 mod transform_topology;
 pub use transform_topology::{mirror_brep, transform_brep, AffineTransform};
@@ -140,9 +164,10 @@ pub use split::{
 mod mass_properties;
 pub use mass_properties::{
     curve_arc_length, edge_arc_length, face_area, face_boundary_length, face_volume_contribution,
-    parameter_space_area, solid_edge_length_total, solid_mass_properties,
+    face_set_identity, mass_caller, parameter_space_area, solid_edge_length_total,
+    solid_mass_properties,
     solid_mass_properties_full, solid_signed_volume, trim_polygons, DensityMassProperties,
-    FullMassProperties, MassProperties,
+    FaceSetIdentity, FullMassProperties, MassCaller, MassProperties,
 };
 #[path = "meshing/tessellation.rs"]
 mod tessellation;
@@ -161,6 +186,10 @@ pub use watertight_tessellation::{
 mod feature_pipeline;
 pub use feature_pipeline::execute_history_json;
 pub use feature_pipeline::{first_reference_name, reference_names};
+// Transform Face's default pivot (the selection's boundary centre) over the
+// results of a replayed prefix, so the gizmo and the stored `pivot` agree with
+// the feature by construction.
+pub use feature_pipeline::face_transform_pivot;
 // Typed, in-process pipeline surface for native consumers (brep-render): run a
 // whole history and read the results without a JSON round trip.
 pub use feature_pipeline::{
@@ -172,10 +201,34 @@ pub use feature_pipeline::{
 // routing report (per-connection status / length / route, per-segment bundle),
 // and the sided-port vocabulary the spline attachments share.
 pub use feature_pipeline::wire_harness::{
-    bundle_diameter, Attachment as SplineAttachment, PortSide, RouteResult, RouteStatus,
+    bundle_diameter, Attachment as SplineAttachment, BundleStatus, PortSide, RouteResult,
+    RouteStatus,
     WireHarnessBundle, WireHarnessConnection,
-    WireHarnessEndpoint, WireHarnessReport, WireHarnessState, WIRE_HARNESS_FEATURE_ID,
-    WIRE_HARNESS_FEATURE_TYPE,
+    WireHarnessEndpoint, WireHarnessReport, WireHarnessState, BUNDLE_SOLID_PREFIX,
+    WIRE_HARNESS_FEATURE_ID, WIRE_HARNESS_FEATURE_TYPE,
+};
+// A part's pins ARE its declared connection points, bound BY NAME within one
+// symbol unit and its port group: the report of what does not pair, following
+// an edit on one side to the other, the unit-to-group mapping, and a placed
+// part's pin resolved to a point ADDRESS (refused by name when it names none).
+pub use feature_pipeline::part_pins::{
+    declarations as declared_ports, declared_endpoints as declared_point_endpoints,
+    declared_points, endpoint_occurrence, follow_pin_edit, follow_point_edit, pin_labels,
+    pin_point_report, pins,
+    point_renames, port_group_for_unit, resolve_component_pin, resolve_part_pin,
+    unit_count as symbol_unit_count, unit_groups, DeclaredPin, DeclaredPoint, PinPoint,
+    PinPointChange, PinPointProblem, PinPointReport, PointRenames, DEFAULT_PORT_NAME,
+    DEFAULT_PORT_PURPOSE, PADS_BLOCK, SYMBOL_BLOCK,
+};
+// The declared-ports block itself: the schema a part document carries, the
+// address scheme, the unit map and the encapsulation-boundary rule — and the
+// SEAT, the frame a point's placement is an offset in, with the two mappings
+// an editor needs to put a gizmo on one and write the drag back.
+pub use feature_pipeline::ports::{
+    address as port_address, document_is_boundary, seat_of as port_seat_of, seat_point,
+    seat_vector, seated_direction, split_address, unit_map, unseat_point, unseat_vector,
+    world_seat, PortDeclaration, PortPoint, PortPointRow, PortSeat, PortsReport, UnitProblem,
+    BOUNDARY_KEY, PORTS_BLOCK, PORTS_FEATURE_ID, PORTS_FEATURE_TYPE,
 };
 // PMI: the document's `pmi` block (views + annotations), the type table with
 // its schemas / selection predicates, the tail's resolved report, and the
@@ -207,9 +260,9 @@ pub use feature_pipeline::scene_metadata_colors_json;
 // The assemblies parts library (unique part payloads for ACOMP instances):
 // insert / update-refresh mutations and the save-side serialization surface.
 pub use feature_pipeline::{
-    add_part_to_library, install_parts_library, missing_library_parts, parts_library_json,
-    parts_library_map, parts_library_revision, refresh_library_entry, stable_json_hash, PartsLibraryEntry,
-    PartsLibraryMap,
+    add_part_to_library, add_part_to_library_impl, install_parts_library, missing_library_parts,
+    parts_library_json, parts_library_map, parts_library_revision, refresh_library_entry,
+    refresh_library_entry_impl, same_build, stable_json_hash, PartsLibraryEntry, PartsLibraryMap,
 };
 // Assembly constraint state + exported ABI (state/statuses/DOF/overlay reads,
 // constraint CRUD with auto-solve, the document pose/isFixed write-back fold).
@@ -222,6 +275,12 @@ pub use feature_pipeline::assembly::{
     assembly_set_constraint_enabled_json, assembly_set_constraint_open_json,
     assembly_state_json, assembly_statuses_json, assembly_update_constraint_json,
     constraint_schema_catalogue,
+    // The native doors: the same mutations with their errors as text. A native
+    // caller must use these — a `JsValue` error aborts a native build.
+    assembly_add_constraint_impl, assembly_apply_document_impl, assembly_move_constraint_impl,
+    assembly_remove_constraint_impl, assembly_run_solve_impl,
+    assembly_set_constraint_enabled_impl, assembly_set_constraint_open_impl,
+    assembly_update_constraint_impl,
 };
 pub use feature_pipeline::{AssemblyState, ConstraintEntry};
 // The ONE matrix → `{translate, rotateEulerDeg}` (intrinsic XYZ, degrees) pose
@@ -230,6 +289,9 @@ pub use feature_pipeline::assembly::transform_to_pose_params;
 // The feature-schema catalogue (feature definitions: name + `inputParamsSchema`),
 // so a native UI can drive schema-driven feature dialogs without the JSON export.
 pub use feature_pipeline::feature_schema_catalogue;
+// The dialog field-visibility hook that pairs with the catalogue: given a feature
+// type + current param values, which params the schema dialog should hide.
+pub use feature_pipeline::feature_hidden_params;
 // Selection-context applicability: the context bar's per-feature/-constraint
 // show/no-show predicates, plus the constraint type table they pair with.
 pub use feature_pipeline::assembly::{constraint_type, ConstraintTypeDef, CONSTRAINT_TYPES};
@@ -267,6 +329,11 @@ pub use projection::{
     project_point_to_curve, project_point_to_surface, project_point_to_surface_seeded,
     CurveProjection, SurfaceProjection,
 };
+#[doc(hidden)]
+pub use projection::{
+    project_point_to_surface_basin_census, project_point_to_surface_general_lanes, BasinCensus,
+    GlobalStats,
+};
 #[path = "intersect/curve_surface_intersection.rs"]
 mod curve_surface_intersection;
 pub use curve_surface_intersection::{intersect_curve_surface, CurveSurfaceIntersection};
@@ -283,9 +350,14 @@ pub(crate) use surface_surface_intersection::TRANSVERSE_SEED_CROSS;
 #[path = "brep/classification.rs"]
 mod classification;
 pub use classification::{
-    classify_point, parameter_point_in_face, PointClass, PointClassification, PolygonClass,
-    SolidClassifier,
+    classify_point, containment_lane, horizon_cross_frame, parameter_point_in_face,
+    trim_sample_count, trim_station, ContainmentLane, PointClass, PointClassification,
+    PolygonClass, SolidClassifier, COVERING_RIM_STRIP_SWITCH, HORIZON_CONTAINMENT_SWITCH,
+    HORIZON_CROSS_FRAME_SWITCH, HORIZON_SINGLE_LOOP_SWITCH, NO_SPHERE_CHART_TRIM_SWITCH,
+    SEAM_BAND_MERGED_SWITCH,
 };
+#[doc(hidden)]
+pub use classification::parameter_point_in_face_scan;
 #[path = "geometry/spatial.rs"]
 mod spatial;
 pub use spatial::{Aabb, Bvh};
@@ -305,7 +377,9 @@ pub use arrangement::{
 mod pcurve;
 pub use pcurve::{
     build_pcurve_on_surface, build_pcurve_on_surface_marched, build_pcurve_on_surface_range,
-    build_pcurve_on_surface_range_dense,
+    build_pcurve_on_surface_range_dense, build_pcurve_on_surface_stations, fit_pcurve_on_surface,
+    fit_pcurve_on_surface_marched, PcurveFit, PcurveFitExit, PcurveFitLedger, PcurveFitReport,
+    PcurveFitScope,
 };
 #[path = "csg/imprint.rs"]
 mod imprint;
@@ -325,7 +399,7 @@ pub use fragment::{
 #[path = "csg/boolean/mod.rs"]
 mod boolean;
 pub use boolean::{
-    boolean_operation, boolean_operation_nary, boolean_operation_with_diagnostics,
+    boolean_operation, boolean_operation_nary, boolean_operation_with_diagnostics, boolean_split_operands,
     BooleanOperation, BooleanOptions,
 };
 #[path = "csg/oracle.rs"]
@@ -336,6 +410,18 @@ pub use oracle::{
 };
 #[path = "healing/heal.rs"]
 mod heal;
+// The soundness ACCEPTANCE: the one place a construction lane asks "is this
+// result sound enough to return", repairs it where it can and refuses it by
+// name where it cannot. Declared beside the heal pre-pass it is the mirror of
+// — that one removes noise from an operand before the work, this one refuses a
+// wrong answer after it.
+#[path = "healing/accept.rs"]
+mod accept;
+pub use accept::{
+    accept_sound, accept_sound_against, resolve_face_crossing, resolve_face_crossing_between,
+    take_crossing_repairs,
+    CrossingRepairRecord,
+};
 // The pointwise offset evaluator — ONE definition of "the offset of a surface
 // at a parameter", shared by `offset_surface`'s Greville sampling, the blend
 // march's tangency residual, and the push-face offset residual gates. Declared
@@ -390,6 +476,27 @@ pub use offset::{
     offset_surface_measured, offset_surface_measured_sided, CarrierDeviation, CarrierExtension,
     MeasuredOffsetSurface, OffsetFaceCarrier, OffsetSurfaceLane,
 };
+// Region-scoped offset REGULARITY — ONE definition of "does the equidistant
+// surface fold over THIS trimmed region", shared by the sheet thickener's gate
+// and offset-shell's carrier-collapse lane. Both used to sweep a fixed grid
+// over the whole surface DOMAIN, which answers about the carrier instead of the
+// face. Crate-internal: no consumer outside the kernel names these.
+#[path = "offset/regularity.rs"]
+mod offset_regularity;
+// The fold LOCUS — the curve `1 − d·k = 0` itself, marched out of the brackets
+// the regularity scan above already finds on its own grid. `regularity` answers
+// "does this region fold"; this answers "WHERE does it stop folding", which is
+// the boundary a partially-folded trim has to be split along. Crate-internal:
+// no consumer outside the kernel names these.
+#[path = "offset/fold_locus.rs"]
+mod offset_fold_locus;
+// The CARVE — split a trim along the fold locus, keep the regular side, hand
+// back the folded one. The two modules above decide THAT a region folds and
+// WHERE it stops; this is what both are for, and it is shared by the sheet
+// thickener and offset shell for the same reason the scan is. Crate-internal:
+// no consumer outside the kernel names these.
+#[path = "offset/carve.rs"]
+mod offset_carve;
 #[path = "offset/thicken.rs"]
 mod thicken;
 pub use thicken::{thicken_face_sheet, thicken_trimmed_sheet};
@@ -404,7 +511,7 @@ mod face_merge;
 #[path = "healing/faceted_repair.rs"]
 mod faceted_repair;
 pub use face_merge::{merge_same_surface_faces, merge_same_surface_faces_excluding};
-pub use faceted_repair::mesh_to_faceted_brep;
+pub use faceted_repair::{mesh_to_faceted_brep, repair_triangle_soup, MeshRepairReport};
 #[path = "offset/offset_shell.rs"]
 mod offset_shell;
 pub use offset_shell::{
@@ -418,8 +525,8 @@ mod step;
 pub use step::{
     assembly_export_tree, audit_step_manifold, audit_step_pcurves, export_step,
     export_step_assembly, export_step_assembly_report, export_step_report,
-    export_step_report_named, Mat4, StepAssemblyExport, StepExportOccurrence, StepExportProduct,
-    StepExportReport, StepPmi,
+    export_step_report_named, Mat4, StepAssemblyExport, StepColors, StepExportOccurrence,
+    StepExportProduct, StepExportReport, StepPmi, PART_ATTRIBUTES, PART_NUMBER,
 };
 // Imported appearance (colour) — the carrier between an importer that READ a
 // colour and the pipeline that stamps it as name-keyed scene metadata. Not a
@@ -430,8 +537,11 @@ pub use appearance::{BodyAppearance, ImportedColor, COLOR_METADATA_KEY};
 #[path = "io/step_import/mod.rs"]
 mod step_import;
 pub use step_import::{
-    import_step, import_step_report, import_step_with_appearance, read_step_assembly,
-    read_step_pmi, StepAssembly, StepOccurrence, StepProduct,
+    import_step, import_step_report, import_step_trim_readings, import_step_with_appearance,
+    occurrence_ref_parts, read_step_assembly, read_step_pmi, rewrite_occurrence_refs,
+    StepAssembly, StepBodyTrimReadings, StepEdgeReading, StepFaceReading, StepImportReport,
+    StepOccurrence, StepProduct, StepSuppliedTrim, StepTrimReadings, OCCURRENCE_REF_PREFIX,
+    STATED_PRECISION_INCONSISTENCY_RATIO,
 };
 /// Test seams for the Part 21 text codec of the PMI writer / reader.
 #[doc(hidden)]
@@ -450,6 +560,22 @@ mod mesh_io;
 pub use mesh_io::{
     read_binary_stl, read_obj, write_binary_stl, write_obj, ObjReadResult, StlReadResult,
 };
+// 3MF (3D Manufacturing Format) import, core specification only: the OPC/ZIP
+// container, the model XML, and the build's instances flattened into one
+// millimetre triangle soup for the SAME mesh-to-solid chain STL and OBJ use.
+// The container, the deflate decoder and the XML reader are hand-rolled and
+// bounded — see the module doc for the dependency review behind that.
+#[path = "io/three_mf/mod.rs"]
+mod three_mf;
+pub use three_mf::{
+    read_3mf, ThreeMfError, ThreeMfInstance, ThreeMfMesh, ThreeMfReadResult, ThreeMfUnit,
+};
+// Binary glTF 2.0 of the DISPLAY mesh — tessellated exchange for viewers, with
+// the axis convention and the unit carried by the root node's transform and the
+// colours converted from sRGB to glTF's linear `baseColorFactor`.
+#[path = "io/glb.rs"]
+mod glb;
+pub use glb::{write_glb, GlbReport, GlbSolid, GlbUpAxis, GLB_MAGIC};
 // Native serialized exact-BREP snapshot: the assemblies parts-library fast
 // lane (instant component insert from a cached payload; fails detectably so
 // the ACOMP self-heal lane can re-execute the embedded part document).
@@ -487,7 +613,8 @@ mod direct_edit;
 pub use direct_edit::{
     delete_face_and_heal, delete_faces_and_heal, move_faces, offset_freeform_face,
     offset_revolution_face, offset_ruled_face, offset_sphere_face, offset_torus_face,
-    resolve_face_by_point,
+    recut_moved_planes, recut_moved_planes_rigid, resolve_face_by_point, rotate_faces,
+    route_reading, RouteReading,
 };
 #[path = "healing/sew.rs"]
 mod sew;
@@ -691,5 +818,3 @@ pub fn make_cylinder(radius: f64, height: f64, segments: usize) -> Mesh {
 mod abi;
 pub use abi::*;
 
-// BREP private tests: e9a96ee1118285df
-// BREP private tests: 802ecfa7fc0314e2

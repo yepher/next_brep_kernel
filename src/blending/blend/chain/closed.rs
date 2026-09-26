@@ -67,6 +67,14 @@ pub fn blend_smooth_chain_if_closed(
 
 /// Blend a CLOSED chain of conjugated edges with one rolling-ball blend
 /// face (Golovanov §6.9.5: all conjugated edges processed together).
+///
+/// A wall whose ball-centre curve turns tighter than the ball FOLDS, and the
+/// envelope a plain march sweeps is then not the blend (`blend/fold.rs`).  It
+/// is not refused here any more where the fold is a lens the wall closes on
+/// itself: the chain is re-marched up a measured ladder of budgets and the lens
+/// is carved out along the crease (`blend/carve.rs`).  The re-march is the
+/// whole of the extra cost and only a folding wall pays it — the first march is
+/// the ordinary one, and its refusal is what asks for the second.
 fn blend_closed_smooth_chain(
     solid: &BrepSolid,
     segments: &[ChainSegment<'_>],
@@ -74,12 +82,273 @@ fn blend_closed_smooth_chain(
     chamfer: bool,
     name: Option<&str>,
 ) -> Result<BrepSolid, String> {
-    let samples = march_chain(segments, radius, false)?;
+    let bar = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
+    // The plain collar climbs the same measured ladder the carve does, from the
+    // same first rung: a budget picked once is a resolution request in disguise.
+    let mut per_segment = CHAIN_PER_SEGMENT;
+    let first = loop {
+        let rung = build_closed_smooth_chain(
+            solid,
+            segments,
+            radius,
+            chamfer,
+            name,
+            per_segment,
+            FoldPolicy::Refuse,
+            bar,
+        );
+        match rung {
+            Ok(Rung::TooCoarse { deviation }) => {
+                crate::blend::carve::carve_trace(format_args!(
+                    "blend chain: {per_segment} stations per segment leaves the rails \
+                     {deviation:.6e} from the rolling ball, against {bar:.3e}"
+                ));
+                if per_segment * 2 > CHAIN_CARVE_MAX_PER_SEGMENT {
+                    return Err(format!(
+                        "blend: at {per_segment} stations per segment — the top of the chain's \
+                         ladder — this collar's fitted rails are still {deviation:.6e} from the \
+                         rolling ball's own contacts against a bar of {bar:.3e}, so there is no \
+                         wall accurate enough to build"
+                    ));
+                }
+                per_segment *= 2;
+            }
+            other => break other,
+        }
+    };
+    if let Err(error) = &first {
+        crate::blend::carve::carve_trace(format_args!(
+            "blend chain: the march at {per_segment} stations per segment refused: {error}"
+        ));
+    }
+    match first {
+        Ok(Rung::Built(built)) => Ok(built),
+        Ok(Rung::TooCoarse { .. }) => {
+            Err("blend: the chain ladder left an accuracy rung unhandled".into())
+        }
+        // A fold that reaches a RAIL is not a lens: every section of that wall
+        // is singular somewhere between its contacts, so there is nothing to cut
+        // away and keep, and the ladder below would only re-march it to its top
+        // before the carve refused the same band. Its refusal names the face it
+        // cannot cross, and it is terminal as it stands (`blend/fold.rs`).
+        Err(error) if crate::blend::fold::is_rail_fold(&error) => Err(error),
+        // A CHAMFER section is a straight line and has no ball centre to read
+        // the fold locus against, so its fold stays the refusal it was.
+        Err(error) if crate::blend::is_wall_fold(&error) && !chamfer => {
+            carve_ladder(solid, segments, radius, name, bar)
+                // A CARVE THAT FAILS IS STILL A FOLD, and the fold is terminal.
+                // If the carve's own refusal did not read as one, the ladder
+                // below would answer a proven-folding centre curve with the
+                // cutter's unrelated complaint — which is the exact failure
+                // `fold.rs` was made terminal to stop. So every exit from this
+                // branch carries the fold's own prefix, with the carve's reason
+                // inside it.
+                .map_err(|carve_error| {
+                    if crate::blend::is_wall_fold(&carve_error) {
+                        carve_error
+                    } else {
+                        format!(
+                            "{} {} fits this edge: the wall folds, and the fold band could not \
+                             be carved — {carve_error}",
+                            crate::blend::WALL_FOLDS,
+                            radius.abs()
+                        )
+                    }
+                })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Re-march a folding chain up a ladder of station budgets and carve at the
+/// first rung whose wall IS the rolling ball's to `bar`.
+///
+/// The budget is not chosen: a larger or a tighter fillet needs a different
+/// rung, and a number picked once from one fixture would be a resolution
+/// request in disguise. Each rung is measured by the rolling ball itself — its
+/// contacts re-solved halfway between stations, where an interpolant is worst —
+/// against the fitted rails, and the ladder stops at the first rung inside
+/// `intersection_fit`. A wall that still misses at the top is refused by name.
+fn carve_ladder(
+    solid: &BrepSolid,
+    segments: &[ChainSegment<'_>],
+    radius: f64,
+    name: Option<&str>,
+    bar: f64,
+) -> Result<BrepSolid, String> {
+    let mut per_segment = CHAIN_PER_SEGMENT;
+    loop {
+        match build_closed_smooth_chain(
+            solid,
+            segments,
+            radius,
+            false,
+            name,
+            per_segment,
+            FoldPolicy::Carve,
+            bar,
+        )? {
+            Rung::Built(built) => {
+                crate::blend::carve::carve_trace(format_args!(
+                    "blend carve: {per_segment} stations per segment is the first rung inside \
+                     {bar:.3e}"
+                ));
+                return Ok(built);
+            }
+            Rung::TooCoarse { deviation } => {
+                crate::blend::carve::carve_trace(format_args!(
+                    "blend carve: {per_segment} stations per segment leaves the rails \
+                     {deviation:.6e} from the rolling ball, against {bar:.3e}"
+                ));
+                if per_segment * 2 > CHAIN_CARVE_MAX_PER_SEGMENT {
+                    return Err(format!(
+                        "{} {} fits this edge: the wall folds, and at {per_segment} stations \
+                         per segment — the top of the carve's ladder — its fitted rails are \
+                         still {deviation:.6e} from the rolling ball's own contacts against a \
+                         bar of {bar:.3e}, so there is no wall accurate enough to carve",
+                        crate::blend::WALL_FOLDS,
+                        radius.abs()
+                    ));
+                }
+                per_segment *= 2;
+            }
+        }
+    }
+}
+
+/// One rung of a chain build: the finished solid, or — for a carve — the
+/// measured reason this budget is not enough.
+enum Rung {
+    Built(BrepSolid),
+    TooCoarse { deviation: f64 },
+}
+
+/// The worst distance from the rolling ball's halfway contacts to the fitted
+/// rails `cr` and `cs`, each found by a closest-point Newton from the
+/// parameter the chord map assigns the midpoint.
+///
+/// THE NEWTON STAYS WHERE IT WAS SEEDED. The foot of a halfway contact is
+/// inside the station interval it was solved in, so every step is bounded by
+/// that interval's own length in the fit's parameter, clamped to the rail's
+/// domain, and taken only when it brings the rail closer. A plain Newton stops
+/// wherever the distance is stationary along the curve, which a rail that
+/// turns sharply at a chain junction offers well away from the foot. Measured
+/// on a 20 cube rounded at r = 3 with a bottom edge at r = 4 (the wall folds at
+/// the arcs' rails, so this is the ladder's reading with that refusal set
+/// aside): unguarded, every rung read the distance from the halfway contact
+/// beside a junction to the junction itself — 2.927709e-1 at 24 stations per
+/// segment against a half interval of 0.291667, halving per rung to
+/// 9.128591e-3 at 768 — and on two of the eight mirror-image edges a foot
+/// across the chain, 1.299089e1. Guarded, all eight read 6.961233e-3 at 24
+/// and 6.920006e-6 to 6.920008e-6 at 768, falling fourfold per rung as a
+/// cubic's does. A far foot can read short as well as long, which would pass
+/// a rung that misses.
+fn rail_deviation(
+    samples: &[ChainSample],
+    cr: &NurbsCurve,
+    cs: &NurbsCurve,
+    fit_low: f64,
+    fit_range: f64,
+) -> Result<f64, String> {
+    let parameter_of = |segment: usize, position: isize| -> Option<f64> {
+        samples
+            .iter()
+            .find(|sample| sample.segment == segment && sample.position == position)
+            .map(|sample| sample.parameter)
+    };
+    let closest = |curve: &NurbsCurve, target: Vec3, seed: f64, reach: f64| -> Result<f64, String> {
+        let [low, high] = curve.domain()?;
+        let distance = |u: f64| -> Result<f64, String> {
+            Ok(curve.derivatives_extended(u, 0)?[0].sub(target).length())
+        };
+        let mut u = seed.clamp(low, high);
+        let mut best = distance(u)?;
+        for _ in 0..40 {
+            let derivatives = curve.derivatives_extended(u, 2)?;
+            let offset = derivatives[0].sub(target);
+            let slope = offset.dot(derivatives[1]);
+            let curvature = derivatives[1].dot(derivatives[1]) + offset.dot(derivatives[2]);
+            // Off a minimum's basin the Newton step points the wrong way; walk
+            // downhill by the bound instead and let the test below shorten it.
+            let mut step = if curvature > 0.0 {
+                (slope / curvature).clamp(-reach, reach)
+            } else {
+                reach.copysign(slope)
+            };
+            let mut trial = (u - step).clamp(low, high);
+            let mut trial_distance = distance(trial)?;
+            for _ in 0..30 {
+                if trial_distance < best {
+                    break;
+                }
+                step *= 0.5;
+                trial = (u - step).clamp(low, high);
+                trial_distance = distance(trial)?;
+            }
+            if !(trial_distance < best) {
+                break;
+            }
+            let moved = (trial - u).abs();
+            u = trial;
+            best = trial_distance;
+            if moved < 1e-15 {
+                break;
+            }
+        }
+        Ok(best)
+    };
+    let mut worst: f64 = 0.0;
+    // Each segment's worst halfway contact, for `BREP_BLEND_CARVE_TRACE=1`: where
+    // along the chain a rung misses is what tells a junction from a bend.
+    let mut per_segment: Vec<(f64, isize, f64, f64, Vec3, Vec3)> = Vec::new();
+    for sample in samples {
+        let Some([p1, p2]) = sample.midpoint else {
+            continue;
+        };
+        let Some(next) = parameter_of(sample.segment, sample.position + 1) else {
+            continue;
+        };
+        let global = (0.5 * (sample.parameter + next)).rem_euclid(1.0);
+        let seed = (global - fit_low) / fit_range;
+        let reach = (next - sample.parameter).abs() / fit_range;
+        let (miss1, miss2) = (closest(cr, p1, seed, reach)?, closest(cs, p2, seed, reach)?);
+        worst = worst.max(miss1).max(miss2);
+        if per_segment.len() <= sample.segment {
+            per_segment.resize(
+                sample.segment + 1,
+                (0.0, 0, 0.0, 0.0, Vec3::default(), Vec3::default()),
+            );
+        }
+        if miss1.max(miss2) >= per_segment[sample.segment].0 {
+            per_segment[sample.segment] = (miss1.max(miss2), sample.position, miss1, miss2, p1, p2);
+        }
+    }
+    for (segment, (miss, position, miss1, miss2, p1, p2)) in per_segment.iter().enumerate() {
+        crate::blend::carve::carve_trace(format_args!(
+            "  rail miss segment {segment}: worst {miss:.6e} after station {position} \
+             (cr {miss1:.6e} at ({:.6}, {:.6}, {:.6}), cs {miss2:.6e} at ({:.6}, {:.6}, {:.6}))",
+            p1.x, p1.y, p1.z, p2.x, p2.y, p2.z
+        ));
+    }
+    Ok(worst)
+}
+
+fn build_closed_smooth_chain(
+    solid: &BrepSolid,
+    segments: &[ChainSegment<'_>],
+    radius: f64,
+    chamfer: bool,
+    name: Option<&str>,
+    per_segment: usize,
+    fold: FoldPolicy,
+    bar: f64,
+) -> Result<Rung, String> {
+    let samples = march_chain(segments, radius, false, per_segment, fold)?;
 
     // Global rows from the in-segment samples (wrapped-overlap closed fit).
     let mut global: Vec<(f64, &ChainSample)> = samples
         .iter()
-        .filter(|sample| (0..CHAIN_PER_SEGMENT as isize).contains(&sample.position))
+        .filter(|sample| (0..per_segment as isize).contains(&sample.position))
         .map(|sample| (sample.parameter.rem_euclid(1.0), sample))
         .collect();
     global.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -138,6 +407,47 @@ fn blend_closed_smooth_chain(
     };
     let u_domain = cr.domain()?;
     let surface = crate::blend::rows::surface_from_rows(degree, &cr, &cs, mid.as_ref(), true)?;
+
+    // The CARVE.  A wall that folds carries a lens of parameter inside the
+    // swept ball volume; the blend is that wall with the lens cut away along
+    // the crease where the two sheets meet, and the crease becomes an edge of
+    // the blend with two coedges on this one face.  Traced on the surface that
+    // was just fitted — not on the ideal envelope — so the two kept sheets
+    // meet EXACTLY on the curve the trim is built from (`blend/carve.rs`).
+    // EVERY rung is measured before anything is built on it, carve or not: the
+    // rails are interpolants through the stations, and between stations they
+    // can leave the rolling ball's own contacts — and so the carriers they are
+    // supposed to ride — by far more than the kernel's intersection-fit
+    // contract. A carve pays for surgery only on an accurate rung; a plain
+    // collar pays nothing more than the measurement unless it misses.
+    let deviation = rail_deviation(&samples, &cr, &cs, low, range)?;
+    if deviation > bar {
+        return Ok(Rung::TooCoarse { deviation });
+    }
+    crate::blend::carve::carve_trace(format_args!(
+        "blend chain: {per_segment} stations per segment leaves the rails {deviation:.6e} \
+         from the rolling ball, inside {bar:.3e}"
+    ));
+    let crease = if fold == FoldPolicy::Carve {
+        // THE BAR IS THE KERNEL'S OWN CONTRACT FOR THE QUANTITY MEASURED. What
+        // the fit is held to is "does this coedge's curve-on-surface, pushed
+        // back to 3-D, still trace the same locus as the edge's 3-D curve?",
+        // which is `pcurve_consistency` — not `intersection_fit`, which is the
+        // accuracy of a fitted intersection CURVE and is what the re-marched
+        // wall itself is held to (`carve_ladder`). Measured on the
+        // 2026-09-02 collar the crease's pcurves reach 5.4e-6 against that
+        // 4e-3, so the margin is three decades and the bar is not what decides
+        // the case either way.
+        let bar = crate::KernelTolerances::for_solid(solid, 1e-7).pcurve_consistency;
+        let Some(carved) = crate::blend::carve::trace_wall_crease(&surface, radius.abs())? else {
+            return Err(format!(
+                "blend carve: the wall re-marched at {per_segment} stations per segment carries                  no fold to carve, but the march at {CHAIN_PER_SEGMENT} refused one"
+            ));
+        };
+        Some(crate::blend::carve::fit_crease(&surface, &carved, bar)?)
+    } else {
+        None
+    };
 
     // Single-face sides (e.g. one cap around the whole rim) get ONE uv
     // fit in the rows' own normalized space — identical parameterization
@@ -213,7 +523,7 @@ fn blend_closed_smooth_chain(
         pcurves2.push((low, high, fit_uv(&|station| station.uv2)?));
     }
 
-    chain_surgery(
+    Ok(Rung::Built(chain_surgery(
         solid,
         segments,
         ChainRows {
@@ -226,9 +536,10 @@ fn blend_closed_smooth_chain(
             pcurves1,
             pcurves2,
             whole_pcurves,
+            crease,
         },
         name,
-    )
+    )?))
 }
 
 pub(super) struct ChainRows {
@@ -247,6 +558,9 @@ pub(super) struct ChainRows {
     pub(super) pcurves2: Vec<(f64, f64, NurbsCurve)>,
     /// Whole-chain uv fits (rows' fit space) for single-face sides.
     pub(super) whole_pcurves: [Option<NurbsCurve>; 2],
+    /// The crease a CARVED wall is cut along: the inner loop of the blend
+    /// face, one edge carrying two coedges of that same face.
+    pub(super) crease: Option<crate::blend::carve::CarvedCrease>,
 }
 
 impl ChainRows {
@@ -376,16 +690,32 @@ pub(super) fn project_piece_pcurve(
     let [d0, d1] = piece.domain()?;
     // Dense reference projection; the pcurve is fit from an adaptively
     // thinned subset kept as coarse as tolerance allows.
-    const DENSE: usize = 96;
-    let mut proj_u = Vec::with_capacity(DENSE + 1);
-    let mut proj_v = Vec::with_capacity(DENSE + 1);
-    let mut point3 = Vec::with_capacity(DENSE + 1);
-    let mut params = Vec::with_capacity(DENSE + 1);
+    //
+    // The track is as dense as the PIECE is, not a fixed 96. A carved wall's
+    // re-marched rail carries hundreds of control points (574 on the
+    // 2026-09-02 two-torus collar), and a pcurve fitted and checked at 97
+    // samples of it was accepted 1.19e-3 off the rail it claims.
+    let dense = (8 * piece.control_points.len()).clamp(96, 4096);
+    let mut proj_u = Vec::with_capacity(dense + 1);
+    let mut proj_v = Vec::with_capacity(dense + 1);
+    let mut point3 = Vec::with_capacity(dense + 1);
+    let mut params = Vec::with_capacity(dense + 1);
     let mut previous_u: Option<f64> = None;
-    for section in 0..=DENSE {
-        let t = d0 + (d1 - d0) * section as f64 / DENSE as f64;
+    // The foot each sample continues from: the track is ONE branch of the
+    // carrier, so after the first sample each inversion starts from its
+    // neighbour's foot rather than asking for the nearest point of the whole
+    // surface, which on a carrier that comes back near itself is another sheet.
+    let mut previous_foot: Option<[f64; 2]> = None;
+    let mut feet: Vec<[f64; 2]> = Vec::with_capacity(dense + 1);
+    for section in 0..=dense {
+        let t = d0 + (d1 - d0) * section as f64 / dense as f64;
         let point = piece.evaluate(t)?;
-        let projection = crate::project_point_to_surface(surface, point)?;
+        let projection = match previous_foot {
+            None => crate::project_point_to_surface(surface, point)?,
+            Some(seed) => crate::projection::project_point_to_surface_from_seed(surface, point, seed)?,
+        };
+        previous_foot = Some([projection.u, projection.v]);
+        feet.push([projection.u, projection.v]);
         let mut u = projection.u;
         if let Some(previous) = previous_u {
             while u - previous > period * 0.5 {
@@ -399,7 +729,7 @@ pub(super) fn project_piece_pcurve(
         proj_u.push(u);
         proj_v.push(projection.v);
         point3.push(point);
-        params.push(section as f64 / DENSE as f64);
+        params.push(section as f64 / dense as f64);
     }
     // A biperiodic carrier needs the SAME unwrap in v, or a track that walks up
     // to the v seam comes back as 0 at the far end and the fit swings across
@@ -408,7 +738,7 @@ pub(super) fn project_piece_pcurve(
     // inverts to either boundary at the solver's whim, and letting that
     // coin flip anchor the chain would shift the whole piece a period.
     if closed_v {
-        for index in 2..=DENSE {
+        for index in 2..=dense {
             while proj_v[index] - proj_v[index - 1] > period_v * 0.5 {
                 proj_v[index] -= period_v;
             }
@@ -425,7 +755,7 @@ pub(super) fn project_piece_pcurve(
     }
     // Interior mean decides which meridian a crossing endpoint sits on, and
     // whether the whole track needs a full-period shift into the domain.
-    let mean_u: f64 = proj_u[1..DENSE].iter().sum::<f64>() / (DENSE - 1) as f64;
+    let mean_u: f64 = proj_u[1..dense].iter().sum::<f64>() / (dense - 1) as f64;
     let seam_u = if mean_u - u0 > u1 - mean_u { u1 } else { u0 };
     // Pin a crossing endpoint onto the seam it actually crosses.  Each
     // candidate keeps the OTHER coordinate as projected, so the losing axis
@@ -463,9 +793,9 @@ pub(super) fn project_piece_pcurve(
         proj_v[0] = v;
     }
     if end_is_crossing {
-        let (u, v) = pinned(DENSE, DENSE - 1, &proj_u, &proj_v)?;
-        proj_u[DENSE] = u;
-        proj_v[DENSE] = v;
+        let (u, v) = pinned(dense, dense - 1, &proj_u, &proj_v)?;
+        proj_u[dense] = u;
+        proj_v[dense] = v;
     }
     let mut shift = 0.0;
     while mean_u + shift > u1 + 1e-9 {
@@ -478,7 +808,7 @@ pub(super) fn project_piece_pcurve(
         *u += shift;
     }
     if closed_v {
-        let mean_v: f64 = proj_v[1..DENSE].iter().sum::<f64>() / (DENSE - 1) as f64;
+        let mean_v: f64 = proj_v[1..dense].iter().sum::<f64>() / (dense - 1) as f64;
         let mut shift_v = 0.0;
         while mean_v + shift_v > v1 + 1e-9 {
             shift_v -= period_v;
@@ -490,33 +820,62 @@ pub(super) fn project_piece_pcurve(
             *v += shift_v;
         }
     }
-    // Coarsest interpolation whose fitted pcurve stays inside HALF the
-    // validator's pcurve/edge tolerance everywhere along the dense track.
-    let tolerance = 0.002;
-    let mut best: Option<NurbsCurve> = None;
-    for sections in [8usize, 12, 16, 24, 32, 48, 64, 96] {
-        if sections > DENSE {
-            break;
-        }
-        let indices: Vec<usize> = (0..=sections)
-            .map(|k| (k * DENSE / sections).min(DENSE))
-            .collect();
-        let points: Vec<Vec4> = indices
-            .iter()
-            .map(|&i| Vec4::from_point(Vec3::new(proj_u[i], proj_v[i], 0.0), 1.0))
-            .collect();
-        let knot_params: Vec<f64> = indices.iter().map(|&i| params[i]).collect();
-        let curve = fit::interpolate_homogeneous(&points, FIT_DEGREE, &knot_params)?;
-        let mut max_deviation: f64 = 0.0;
-        for i in 0..=DENSE {
-            let uv = curve.evaluate(params[i])?;
-            let on_surface = surface.evaluate(uv.x, uv.y)?;
-            max_deviation = max_deviation.max(on_surface.sub(point3[i]).length());
-        }
-        best = Some(curve);
-        if max_deviation <= tolerance {
-            break;
-        }
+    // Coarsest interpolation whose fitted pcurve reproduces the projected TRACK
+    // to the kernel's pcurve refinement floor — the floor every other pcurve fit
+    // is held to, and the one the shell vector-area bar is built from.
+    //
+    // It used to stop at 0.002 absolute ("half the validator's tolerance"),
+    // which is `pcurve_consistency / 2` on any model under 20 units and so four
+    // decades looser than any other trim: a torus face carrying a collar's rail
+    // was accepted 1.19e-3 off it, and that one coedge was the whole of a
+    // 1.94e-4 shell vector-area residual, 14.5x its face's bar.
+    //
+    // The deviation is measured against the projected track, not the piece's
+    // 3D points: a pcurve lies on its surface by construction, so a piece that
+    // is itself off the carrier would hold the ladder at its top however fine
+    // the fit, and that is a RAIL defect for the march to answer, not this fit.
+    let tolerance = crate::pcurve::PCURVE_REFINEMENT_TOLERANCE;
+    // The ladder is the one verified fitter (`track_fit`), which checks every
+    // rung at the MIDPOINTS between dense samples, projected on their own —
+    // checked at the dense samples, the top rung, which interpolates every one
+    // of them, reads zero by construction and passes whatever lies between (on
+    // the 574-control-point collar rail it read 9.6e-15) — and breaks the fit,
+    // C1, where the track crosses a knot line of the carrier.
+    let at = |fraction: f64| piece.evaluate(d0 + (d1 - d0) * fraction);
+    let mut track = crate::blend::track_fit::Track {
+        fractions: params,
+        uv: proj_u.iter().zip(&proj_v).map(|(u, v)| [*u, *v]).collect(),
+        feet,
+        breaks: Vec::new(),
+    };
+    let breaks = crate::blend::track_fit::curve_breaks(piece, d0, d1, true);
+    crate::blend::track_fit::polish_track(surface, &at, &mut track)?;
+    crate::blend::track_fit::insert_knot_crossings(surface, &at, &mut track, &breaks)?;
+    let fit = crate::blend::track_fit::fit_track(surface, &track, &at, tolerance)?;
+    if std::env::var("BREP_DEBUG_TRACK_FIT").is_ok() {
+        eprintln!(
+            "TRACK_FIT closed-chain piece: miss {:.3e} at {} samples of {} ({} breaks), on floor {}",
+            fit.miss,
+            fit.samples,
+            track.fractions.len(),
+            track.breaks.len(),
+            fit.on_floor
+        );
     }
-    best.ok_or_else(|| "blend: piece pcurve projection failed".to_string())
+    // A fit off the floor is refused, not handed on as the best rung. Before the
+    // fitter broke at knot lines this ladder returned its best rung silently,
+    // and on the 2026-09-02 two-torus collar that was 1.07e-7 to 8.46e-7 off at
+    // the top rung on every collar that builds (measured 2026-09-17); broken,
+    // each of them reaches the floor. What still misses is a rail the march tore
+    // (2.7 to 3.3 on the oversized radii, a body refused or rejected anyway).
+    if !fit.on_floor {
+        return Err(format!(
+            "{} a closed chain's support piece misses its pcurve by {:.3e} at {} samples, \
+             against a floor of {tolerance:.1e}",
+            crate::blend::PCURVE_OFF_FLOOR,
+            fit.miss,
+            fit.samples
+        ));
+    }
+    Ok(fit.curve)
 }

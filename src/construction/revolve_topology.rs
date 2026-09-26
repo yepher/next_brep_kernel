@@ -86,10 +86,151 @@ struct RevolveProfile {
     input_indices: Vec<usize>,
 }
 
+/// A straight two-point segment: moving either end keeps it straight.
+fn is_segment(curve: &NurbsCurve) -> bool {
+    curve.degree == 1 && curve.control_points.len() == 2
+}
+
+/// True when the curve interpolates its first (`at_start`) or last control
+/// point, so that control point IS the curve's end.
+fn clamped_at(curve: &NurbsCurve, at_start: bool) -> bool {
+    let order = curve.degree + 1;
+    let knots = &curve.knots;
+    if at_start {
+        knots[..order].iter().all(|knot| *knot == knots[0])
+    } else {
+        knots[knots.len() - order..].iter().all(|knot| *knot == knots[knots.len() - 1])
+    }
+}
+
+fn end_control_point(curve: &NurbsCurve, at_start: bool) -> Vec3 {
+    let point = if at_start {
+        curve.control_points[0]
+    } else {
+        curve.control_points[curve.control_points.len() - 1]
+    };
+    Vec3::new(point.x / point.w, point.y / point.w, point.z / point.w)
+}
+
+/// Move a clamped end to `target`, its weight kept.
+fn move_end(curve: &mut NurbsCurve, at_start: bool, target: Vec3) -> Result<(), String> {
+    let mut control_points = curve.control_points.clone();
+    let index = if at_start { 0 } else { control_points.len() - 1 };
+    control_points[index] = Vec4::from_point(target, control_points[index].w);
+    *curve = NurbsCurve::new(curve.degree, curve.knots.clone(), control_points)?;
+    Ok(())
+}
+
+/// Make every junction of the closed chain exact. Where a straight segment
+/// meets a curve that is not one, the segment's end moves (it stays straight
+/// and the curve stays exact); otherwise the next curve's start moves onto
+/// the previous curve's end, the sketch chainer's convention. Junctions whose
+/// ends are not clamped are left as they are. Returns whether anything moved.
+fn weld_junctions(curves: &mut [NurbsCurve]) -> Result<bool, String> {
+    let count = curves.len();
+    let mut moved = false;
+    for index in 0..count {
+        let next = (index + 1) % count;
+        if !clamped_at(&curves[index], false) || !clamped_at(&curves[next], true) {
+            continue;
+        }
+        let end = end_control_point(&curves[index], false);
+        let start = end_control_point(&curves[next], true);
+        if end.x == start.x && end.y == start.y && end.z == start.z {
+            continue;
+        }
+        if is_segment(&curves[index]) && !is_segment(&curves[next]) {
+            move_end(&mut curves[index], false, start)?;
+        } else {
+            move_end(&mut curves[next], true, end)?;
+        }
+        moved = true;
+    }
+    Ok(moved)
+}
+
+/// A partial revolve builds a radial generatrix's side face on a plane
+/// perpendicular to the axis (`radial_plane_face`), while its edges are the
+/// profile's own curves. `is_straight_radial` admits a slope, so without this
+/// the plane sits between the segment's two axial coordinates and every edge
+/// of the face stands off it by up to half their difference. Each run of
+/// consecutive radial segments is given one axial coordinate: that of the
+/// run's end vertices whose outer neighbour is not a straight segment (moving
+/// such a vertex would bend the curve), their mean if there are two, and the
+/// mean over the run's vertices when every neighbour is straight. Returns
+/// whether anything moved.
+fn flatten_radial_generatrices(
+    curves: &mut [NurbsCurve],
+    radial: &[bool],
+    axis_point: Vec3,
+    axis: Vec3,
+) -> Result<bool, String> {
+    let count = curves.len();
+    let Some(first) = (0..count).find(|index| !radial[*index]) else {
+        return Ok(false);
+    };
+    let axial = |point: Vec3| point.sub(axis_point).dot(axis);
+    let mut moved = false;
+    let mut offset = 1;
+    while offset <= count {
+        let begin = (first + offset) % count;
+        if !radial[begin] {
+            offset += 1;
+            continue;
+        }
+        let mut run = vec![begin];
+        while radial[(run[run.len() - 1] + 1) % count] {
+            run.push((run[run.len() - 1] + 1) % count);
+        }
+        offset += run.len();
+        // Vertex k of the run is the start of run[k]; the last is the end of the run.
+        let last = run[run.len() - 1];
+        if run.iter().any(|index| !clamped_at(&curves[*index], true) || !clamped_at(&curves[*index], false)) {
+            continue;
+        }
+        let mut vertices: Vec<Vec3> = run.iter().map(|index| end_control_point(&curves[*index], true)).collect();
+        vertices.push(end_control_point(&curves[last], false));
+        let before = (begin + count - 1) % count;
+        let after = (last + 1) % count;
+        let mut fixed = Vec::new();
+        if !is_segment(&curves[before]) {
+            fixed.push(axial(vertices[0]));
+        }
+        if !is_segment(&curves[after]) {
+            fixed.push(axial(vertices[vertices.len() - 1]));
+        }
+        let pool: Vec<f64> = if fixed.is_empty() { vertices.iter().map(|point| axial(*point)).collect() } else { fixed };
+        let target = pool.iter().sum::<f64>() / pool.len() as f64;
+        for (k, vertex) in vertices.iter().enumerate() {
+            let shift = target - axial(*vertex);
+            if shift == 0.0 {
+                continue;
+            }
+            let point = vertex.add(axis.scale(shift));
+            let (incoming, outgoing) = if k == 0 {
+                (before, run[0])
+            } else if k == run.len() {
+                (last, after)
+            } else {
+                (run[k - 1], run[k])
+            };
+            if clamped_at(&curves[incoming], false) {
+                move_end(&mut curves[incoming], false, point)?;
+            }
+            if clamped_at(&curves[outgoing], true) {
+                move_end(&mut curves[outgoing], true, point)?;
+            }
+            moved = true;
+        }
+    }
+    Ok(moved)
+}
+
 fn prepare_profile(
     input: &[NurbsCurve],
     axis_point: Vec3,
     axis_direction: Vec3,
+    flatten_radial: bool,
 ) -> Result<RevolveProfile, String> {
     if input.len() < 2 {
         return Err("profile needs at least 2 curves".into());
@@ -232,6 +373,14 @@ fn prepare_profile(
             .map(|point| radial_distance(*point) <= TOLERANCE * 100.0)
             .collect();
     }
+    // The closure test accepts a junction within TOLERANCE, and every builder
+    // below reads a junction from both sides: face i trims at curve i's end,
+    // face i+1 and the junction edge at curve i+1's start. A gap kept here is a
+    // trim gap along the whole junction rim, and the shell does not close.
+    // Hatch: `BREP_REVOLVE_WELD=0`.
+    if std::env::var("BREP_REVOLVE_WELD").as_deref() != Ok("0") && weld_junctions(&mut curves)? {
+        points = closure_points(&curves)?;
+    }
     let axis_curves = curves
         .iter()
         .map(curve_on_axis)
@@ -240,16 +389,25 @@ fn prepare_profile(
     // perpendicular to the axis: its two endpoints share an axial coordinate,
     // so the revolved patch is a flat disk/annulus sector (a plane), not a
     // cone.  Curves that lie ON the axis produce no side face and are excluded.
-    let radial_curves = curves
-        .iter()
-        .enumerate()
-        .map(|(index, curve)| {
-            if axis_curves[index] {
-                return Ok(false);
-            }
-            Ok(is_straight_radial(curve, axis)?)
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    let radial_of = |curves: &[NurbsCurve]| {
+        curves
+            .iter()
+            .enumerate()
+            .map(|(index, curve)| {
+                if axis_curves[index] {
+                    return Ok(false);
+                }
+                Ok(is_straight_radial(curve, axis)?)
+            })
+            .collect::<Result<Vec<_>, String>>()
+    };
+    let mut radial_curves = radial_of(&curves)?;
+    // Hatch: `BREP_REVOLVE_FLAT_RADIAL=0`.
+    let flatten_radial = flatten_radial && std::env::var("BREP_REVOLVE_FLAT_RADIAL").as_deref() != Ok("0");
+    if flatten_radial && flatten_radial_generatrices(&mut curves, &radial_curves, axis_point, axis)? {
+        points = closure_points(&curves)?;
+        radial_curves = radial_of(&curves)?;
+    }
     Ok(RevolveProfile {
         curves,
         points,
@@ -423,11 +581,44 @@ pub fn revolve_profile_brep_named(
         ));
     }
     let full_turn = angle > std::f64::consts::TAU - 1e-9;
-    let profile = prepare_profile(input, axis_point, axis_direction)?;
-    if full_turn {
-        revolve_full(profile, axis_point, side_names)
-    } else {
-        revolve_partial(profile, axis_point, angle, side_names, cap_names)
+    let built = prepare_profile(input, axis_point, axis_direction, !full_turn).and_then(|profile| {
+        if full_turn {
+            revolve_full(profile, axis_point, side_names)
+        } else {
+            revolve_partial(profile, axis_point, angle, side_names, cap_names)
+        }
+    });
+    dump_revolve(input, axis_point, axis_direction, angle, &built);
+    built
+}
+
+/// `BREP_REVOLVE_DUMP` names a directory. Every revolve then writes its input
+/// profile, axis and angle, with the solid it built or its error, as
+/// `<pid>-<serial>.json`, so a probe can rebuild the same inputs on another
+/// kernel and read each shell's closure (`revolve_shell_probe dumped`).
+fn dump_revolve(
+    input: &[NurbsCurve],
+    axis_point: Vec3,
+    axis_direction: Vec3,
+    angle: f64,
+    built: &Result<BrepSolid, String>,
+) {
+    static SERIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let Some(directory) = std::env::var("BREP_REVOLVE_DUMP").ok().filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let record = serde_json::json!({
+        "curves": input,
+        "axis_point": axis_point,
+        "axis_direction": axis_direction,
+        "angle": angle,
+        "solid": built.as_ref().ok(),
+        "error": built.as_ref().err(),
+    });
+    let path = std::path::Path::new(&directory).join(format!("{}-{serial:05}.json", std::process::id()));
+    if let Err(error) = std::fs::write(&path, record.to_string()) {
+        eprintln!("BREP_REVOLVE_DUMP {}: {error}", path.display());
     }
 }
 
@@ -832,4 +1023,3 @@ fn revolve_partial(
     }
 }
 
-// BREP private tests: 36d0585030357ab9

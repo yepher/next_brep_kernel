@@ -1,5 +1,47 @@
 use super::*;
 
+/// Which recovered branch an open heal keeps, decided by GEOMETRY.
+///
+/// `corners[i]` are candidate `i`'s crossings of the two caps, and `contacts`
+/// the strip's own contact with each cap (the midpoint of the boundary edge it
+/// shares with that cap). A candidate is rated by the worse of its two corners'
+/// distances from those contacts, and the least rating wins: the recovered edge
+/// is the one the strip was cut from, so it runs past the strip on both caps.
+///
+/// Refuses (`Err((chosen, rival))`) when a DISTINCT candidate — one whose corners
+/// do not both coincide with the winner's within `tolerance` — rates within
+/// `tolerance` of the least rating. Nothing about the strip tells two such
+/// branches apart, and keeping whichever the intersector happened to list first
+/// would make the heal a property of that order. Candidates whose corners do
+/// coincide are one branch found twice, and the first is kept. The decision
+/// reads every candidate before it decides, so it does not depend on the order
+/// they arrive in either.
+pub(super) fn nearest_branch(
+    corners: &[[Vec3; 2]],
+    contacts: [Vec3; 2],
+    tolerance: f64,
+) -> Result<Option<usize>, (usize, usize)> {
+    let rating = |pair: &[Vec3; 2]| {
+        pair[0]
+            .sub(contacts[0])
+            .length()
+            .max(pair[1].sub(contacts[1]).length())
+    };
+    let Some(chosen) = (0..corners.len()).min_by(|a, b| rating(&corners[*a]).total_cmp(&rating(&corners[*b])))
+    else {
+        return Ok(None);
+    };
+    let least = rating(&corners[chosen]);
+    for rival in 0..corners.len() {
+        let same_branch = corners[rival][0].sub(corners[chosen][0]).length() <= tolerance
+            && corners[rival][1].sub(corners[chosen][1]).length() <= tolerance;
+        if !same_branch && rating(&corners[rival]) - least <= tolerance {
+            return Err((chosen, rival));
+        }
+    }
+    Ok(Some(chosen))
+}
+
 /// Heal after deleting an OPEN blend strip (a fillet/chamfer along an open
 /// edge chain) when at least one flanking neighbour is a CURVED analytic
 /// carrier — the curved generalization of the all-planar path above, for
@@ -32,6 +74,9 @@ pub(super) fn heal_open_transition_mixed(
     boundary: &[(u64, bool)],
     neighbour_ids: &[u64; 4],
 ) -> Result<BrepSolid, String> {
+    if let Some(directory) = census_directory() {
+        record_open_heal_census(&directory, solid, shell_index, face_index, boundary, neighbour_ids);
+    }
     let op = "delete_face_and_heal";
     let solid = solid.clone();
     let scale = solid_model_scale(&solid);
@@ -51,10 +96,10 @@ pub(super) fn heal_open_transition_mixed(
         } else if surface.analytic().is_some() {
             carriers.push(OpenNeighbourCarrier::Curved);
         } else {
-            return Err(format!(
-                "{op}: neighbour face {neighbour_id} is a free-form surface — open-chain \
-                 healing needs analytic carriers on every neighbour (deferred)"
-            ));
+            // A FITTED patch. It grows by `extend_natural` (a real surface with
+            // a real domain) and re-intersects through the marched lane, so the
+            // heal no longer stops at the first imported B-spline neighbour.
+            carriers.push(OpenNeighbourCarrier::FreeForm);
         }
     }
     if debug {
@@ -63,6 +108,7 @@ pub(super) fn heal_open_transition_mixed(
             .map(|carrier| match carrier {
                 OpenNeighbourCarrier::Planar(_) => "plane",
                 OpenNeighbourCarrier::Curved => "curved",
+                OpenNeighbourCarrier::FreeForm => "free-form",
             })
             .collect();
         eprintln!("HEAL open mixed: strip {face_id} neighbours {neighbour_ids:?} kinds {kinds:?}");
@@ -106,17 +152,28 @@ pub(super) fn heal_open_transition_mixed(
     // caps' carriers within the strip's region gate. Each candidate pairing
     // is tried on a clone (carrier extension mutates the solid) and exactly
     // one pairing must qualify — mirroring the planar path's `plan_heal`.
+    //
+    // The strip is sampled at nine stations of equal ARC LENGTH per boundary
+    // edge (`arc_length_stations`), in the loop's own traversal order. These
+    // points decide how far a curved or fitted primary is grown and seed the
+    // march, and a sample taken at uniform PARAMETER would make both depend on
+    // how the rails happen to be parameterised rather than on where they are.
     let mut strip_points: Vec<Vec3> = Vec::new();
-    for (edge_id, _) in boundary {
+    // The strip's contact with each neighbour, as the midpoint of the boundary
+    // edge they share: what a recovered corner is measured against below.
+    let mut contacts: Vec<Vec3> = Vec::with_capacity(4);
+    for (edge_id, forward) in boundary {
         let edge = solid
             .edges
             .iter()
             .find(|edge| edge.id == *edge_id)
             .ok_or_else(|| format!("{op}: missing edge {edge_id}"))?;
-        for sample in 0..=8 {
-            let t = edge.t0 + (edge.t1 - edge.t0) * sample as f64 / 8.0;
-            strip_points.push(edge.curve.evaluate(t)?);
-        }
+        strip_points.extend(arc_length_stations(edge, 9, *forward)?);
+        contacts.push(
+            edge_point(&solid, edge.start_vertex_id)?
+                .add(edge_point(&solid, edge.end_vertex_id)?)
+                .scale(0.5),
+        );
     }
     let neighbour_surface = |id: u64, solid: &BrepSolid| -> Result<NurbsSurface, String> {
         let (shell, face) =
@@ -131,20 +188,48 @@ pub(super) fn heal_open_transition_mixed(
         crossings: [(f64, Vec3); 2],
     }
     let mut plans: Vec<MixedHealPlan> = Vec::new();
+    // Why a pairing was dropped, kept so a refusal can name the reason rather
+    // than only the symptom ("no branch spans the strip").
+    let mut refusals: Vec<String> = Vec::new();
     for start in 0..2usize {
         let primary = [start, start + 2];
         let lateral = [(start + 1) % 4, (start + 3) % 4];
         let mut candidate = solid.clone();
-        if primary.iter().any(|&index| {
-            matches!(carriers[index], OpenNeighbourCarrier::Curved)
-                && extend_ruled_neighbour_over(
+        let mut extension_refusal: Option<()> = None;
+        for &index in &primary {
+            let grown = match carriers[index] {
+                OpenNeighbourCarrier::Planar(_) => Ok(()),
+                OpenNeighbourCarrier::Curved => extend_ruled_neighbour_over(
                     &mut candidate,
                     neighbour_ids[index],
                     &strip_points,
                     tolerance,
-                )
-                .is_err()
-        }) {
+                ),
+                // A fitted carrier is continued by its own terminal Bézier
+                // span, far enough to cover the strip and no further, with the
+                // coverage VERIFIED against the grown domain.
+                OpenNeighbourCarrier::FreeForm => extend_freeform_neighbour_over(
+                    &mut candidate,
+                    neighbour_ids[index],
+                    &strip_points,
+                    tolerance,
+                ),
+            };
+            if let Err(message) = grown {
+                // Only the FREE-FORM lane records a reason. The analytic lanes
+                // dropped a pairing silently before this slice and must keep
+                // dropping it silently, so their refusal text stays byte-identical.
+                if matches!(carriers[index], OpenNeighbourCarrier::FreeForm) {
+                    if debug {
+                        eprintln!("HEAL open mixed: primaries {primary:?} not extendable: {message}");
+                    }
+                    refusals.push(message);
+                }
+                extension_refusal = Some(());
+                break;
+            }
+        }
+        if extension_refusal.is_some() {
             continue;
         }
         let Ok(surface_a) = neighbour_surface(neighbour_ids[primary[0]], &candidate) else {
@@ -173,6 +258,58 @@ pub(super) fn heal_open_transition_mixed(
                 };
                 vec![segment]
             }
+            (OpenNeighbourCarrier::FreeForm, _) | (_, OpenNeighbourCarrier::FreeForm) => {
+                // No closed form exists for a fitted pair. `reintersect_carriers`
+                // is the shared surface-type-blind seam: it tries the analytic
+                // lane first (which declines here) and marches otherwise, with a
+                // residual gate on the fitted section. Seed it on the strip's own
+                // boundary — the branch being recovered runs right beside it.
+                //
+                // A PLANAR partner goes in as a patch covering the region gate
+                // rather than as its own trimmed carrier: the marcher clamps to
+                // both domains, and a plane patch that stops at the sharp edge
+                // leaves the branch on its own boundary (see
+                // `planar_region_patch`).
+                let widen = |carrier: &OpenNeighbourCarrier,
+                             surface: &NurbsSurface|
+                 -> Option<NurbsSurface> {
+                    match carrier {
+                        OpenNeighbourCarrier::Planar(plane) => {
+                            planar_region_patch(plane, f_center, f_reach).ok()
+                        }
+                        _ => Some(surface.clone()),
+                    }
+                };
+                let (Some(first), Some(second)) = (
+                    widen(&carriers[primary[0]], &surface_a),
+                    widen(&carriers[primary[1]], &surface_b),
+                ) else {
+                    continue;
+                };
+                let policy = MarchPolicy {
+                    tolerance,
+                    residual_tolerance: plane_tolerance,
+                    seeds: strip_points.clone(),
+                };
+                match reintersect_carriers(&first, &second, &policy) {
+                    Ok(rim) => rim.curves(),
+                    Err(refusal) => {
+                        if debug {
+                            eprintln!(
+                                "HEAL open mixed: primaries {primary:?} do not re-intersect: {}",
+                                refusal.describe()
+                            );
+                        }
+                        refusals.push(format!(
+                            "the fitted carriers of faces {} and {} do not re-intersect ({})",
+                            neighbour_ids[primary[0]],
+                            neighbour_ids[primary[1]],
+                            refusal.describe()
+                        ));
+                        continue;
+                    }
+                }
+            }
             _ => {
                 let Some(branches) = intersect_analytic_pair(&surface_a, &surface_b, tolerance)
                 else {
@@ -196,7 +333,9 @@ pub(super) fn heal_open_transition_mixed(
                 branches.len()
             );
         }
-        let mut best: Option<(NurbsCurve, [(f64, Vec3); 2], f64)> = None;
+        // Every branch that crosses both caps inside the region gate is a
+        // candidate; `nearest_branch` picks among them by geometry.
+        let mut candidates: Vec<(NurbsCurve, [(f64, Vec3); 2])> = Vec::new();
         for curve in branches {
             let Some(first) = curve_cap_crossing_near(
                 &curve,
@@ -221,17 +360,37 @@ pub(super) fn heal_open_transition_mixed(
             let Ok(mid) = curve.evaluate((first.0 + second.0) * 0.5) else {
                 continue;
             };
-            let rating = mid.sub(f_center).length();
-            if rating <= f_reach
-                && best
-                    .as_ref()
-                    .map(|(_, _, known)| rating < *known)
-                    .unwrap_or(true)
-            {
-                best = Some((curve, [first, second], rating));
+            if mid.sub(f_center).length() > f_reach {
+                continue;
             }
+            candidates.push((curve, [first, second]));
         }
-        if let Some((branch, crossings, _)) = best {
+        let corners: Vec<[Vec3; 2]> = candidates
+            .iter()
+            .map(|(_, crossings)| [crossings[0].1, crossings[1].1])
+            .collect();
+        let best = match nearest_branch(&corners, [contacts[lateral[0]], contacts[lateral[1]]], tolerance) {
+            Ok(Some(index)) => Some(candidates.swap_remove(index)),
+            Ok(None) => None,
+            Err((chosen, rival)) => {
+                let point = |p: Vec3| format!("({:.6}, {:.6}, {:.6})", p.x, p.y, p.z);
+                return Err(format!(
+                    "{op}: two re-intersection branches of faces {} and {} are equally near the \
+                     strip's contacts with faces {} and {} (corners {} and {} against {} and {}) \
+                     — refusing rather than choosing one by the order the intersector returned \
+                     them",
+                    neighbour_ids[primary[0]],
+                    neighbour_ids[primary[1]],
+                    neighbour_ids[lateral[0]],
+                    neighbour_ids[lateral[1]],
+                    point(corners[chosen][0]),
+                    point(corners[chosen][1]),
+                    point(corners[rival][0]),
+                    point(corners[rival][1])
+                ));
+            }
+        };
+        if let Some((branch, crossings)) = best {
             plans.push(MixedHealPlan {
                 solid: candidate,
                 primary,
@@ -244,9 +403,14 @@ pub(super) fn heal_open_transition_mixed(
     let plan = match plans.len() {
         1 => plans.pop().unwrap(),
         0 => {
+            let detail = if refusals.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", refusals.join("; "))
+            };
             return Err(format!(
                 "{op}: no re-intersection branch of the extended carriers spans the deleted \
-                 strip — refusing rather than emitting an invalid solid"
+                 strip — refusing rather than emitting an invalid solid{detail}"
             ))
         }
         _ => {
@@ -352,6 +516,7 @@ pub(super) fn heal_open_transition_mixed(
     // along its own stored curve when that reaches the corner, otherwise
     // re-derive the edge in closed form from its two flanking carriers.
     let mut relocated: HashSet<u64> = HashSet::default();
+    let unmoved = solid.edges.clone();
     let pending = pending_edge_relocations(&solid, &boundary_edge_ids, &collapse, &vertex_points);
     for (index, start_target, end_target) in pending {
         let mut record = solid.edges[index].clone();
@@ -390,6 +555,17 @@ pub(super) fn heal_open_transition_mixed(
         relocated.insert(record.id);
         solid.edges[index] = record;
     }
+    // The planar neighbours, each on the one plane the gate reads it as and the
+    // re-trim below rebuilds it on.
+    let retrimmed: HashMap<u64, Plane> = neighbour_ids
+        .iter()
+        .zip(&carriers)
+        .filter_map(|(&id, carrier)| match carrier {
+            OpenNeighbourCarrier::Planar(plane) => Some((id, *plane)),
+            _ => None,
+        })
+        .collect();
+    moved_edges_lie_on_their_faces(&unmoved, &solid, &relocated, &retrimmed, plane_tolerance, op)?;
 
     // Index the (now relocated) edges for loop rewrites.
     let mut edges_by_id: HashMap<u64, EdgeRecord> = solid
@@ -481,11 +657,11 @@ pub(super) fn heal_open_transition_mixed(
         .collect();
     let mut touched: HashSet<u64> = relocated.clone();
     touched.insert(sharp_edge_id);
-    for (index, &neighbour_id) in neighbour_ids.iter().enumerate() {
+    for &neighbour_id in neighbour_ids {
         let (ns, nf) = find_face(&solid, neighbour_id)
             .ok_or_else(|| format!("{op}: missing neighbour {neighbour_id}"))?;
-        match &carriers[index] {
-            OpenNeighbourCarrier::Planar(plane) => {
+        match retrimmed.get(&neighbour_id) {
+            Some(plane) => {
                 retrim_planar_face(
                     &mut solid.shells[ns].faces[nf],
                     plane,
@@ -512,9 +688,14 @@ pub(super) fn heal_open_transition_mixed(
                     op,
                 )?;
             }
-            OpenNeighbourCarrier::Curved => {
-                // Carrier untouched (or exactly extended); only the widened
-                // and newly created edges need fresh pcurves.
+            None => {
+                // Carrier untouched, exactly extended, or naturally extended —
+                // all three keep the original parameterization, so the face's
+                // existing pcurves are still its own trims and only the widened
+                // and newly created edges need fresh ones. This is what makes
+                // the natural extension usable here at all: it appends a span
+                // rather than refining the net, so nothing already drawn on the
+                // face has to be remapped.
                 refit_touched_pcurves(
                     &mut solid.shells[ns].faces[nf],
                     &final_edges,

@@ -1,5 +1,8 @@
 //! Publish a helical curve as `{id}` / `{id}:HelixEdge`, its endpoints as
-//! `{id}:Start` / `{id}:End`, and its axis as `{id}:Axis`.
+//! `{id}:Start` / `{id}:End`, and its axis as `{id}:Axis`. The axis also rides
+//! beside the curve as its SCREW AXIS (`path_segment_axes`), so a sweep carrying
+//! a profile by the path's own motion screws it up this axis instead of rolling
+//! it on a rotation-minimizing frame.
 //!
 //! Radius varies linearly from `radius` to `endRadius`. Height always applies;
 //! turns mode derives pitch as height/turns, and pitch mode derives turns as
@@ -58,7 +61,13 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         .push((base.to_string(), vec![Some(edge_name.clone())]));
     result
         .path_segment_names
-        .push((edge_name.clone(), vec![Some(edge_name)]));
+        .push((edge_name.clone(), vec![Some(edge_name.clone())]));
+    // The curve IS a helix about `axis`, and only this feature knows it — the
+    // published curve is a cubic fit. A sweep carrying a profile along it by the
+    // path's own motion needs that screw axis: the rotation-minimizing frame a
+    // free curve gets rolls away from the screw by the helix's torsion.
+    result.path_segment_axes.push((base.to_string(), vec![Some(axis)]));
+    result.path_segment_axes.push((edge_name, vec![Some(axis)]));
     result
         .points
         .push((format!("{base}:Start"), crate::feature_pipeline::ScenePoint::model(start)));
@@ -347,4 +356,3 @@ pub fn schema() -> serde_json::Value {
 })
 }
 
-// BREP private tests: ab55cc15d7b7faa9

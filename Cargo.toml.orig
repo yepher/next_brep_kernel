@@ -1,19 +1,28 @@
 [package]
 name = "BREP_kernel"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license-file = "LICENSE.md"
 description = "A boundary representation (BREP) geometry kernel for building CAD applications."
 repository = "https://github.com/mmiscool/NURBS_BREP_kernel"
+homepage = "https://v2.brep.io"
 readme = "README.md"
 keywords = ["cad", "brep", "geometry", "nurbs", "kernel"]
 categories = ["mathematics", "graphics", "algorithms"]
 # Only production sources and package metadata are published.
+# The `!` entries are a backstop: test code never ships. The publish snapshot
+# `cargo package` of this manifest from shipping test files.
 include = [
     "src/**/*.rs",
+    "/build.rs",
     "/Cargo.toml",
     "/README.md",
     "/LICENSE.md",
+    "!src/**/tests/**",
+    "!**/tests.rs",
+    "!**/*_tests.rs",
+    "!**/test_support.rs",
+    "!**/testdata/**",
 ]
 
 [lib]
@@ -51,5 +60,3 @@ wasm-bindgen-rayon = { version = "1", optional = true }
 parallel = ["dep:rayon"]
 wasm-threads = ["parallel", "dep:wasm-bindgen-rayon"]
 
-# BREP private manifest: 0
-# BREP private manifest: 1

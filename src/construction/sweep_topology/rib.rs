@@ -583,6 +583,12 @@ pub enum RibExtrusion {
 /// publishes the plane it was drawn on). `None` falls back to deriving the plane
 /// from the chain's bends, which no single straight segment can supply.
 ///
+/// # Face names
+///
+/// Every face of the result is named, and every name is a pure function of
+/// `names` and the geometry — never of the order the booleans met the faces in.
+/// See [`RibNames`] for the table.
+///
 /// V1 SCOPE: POLYLINE profiles only — arcs/curves return a clear Err.
 pub fn rib_from_profile(
     solid: &BrepSolid,
@@ -591,14 +597,18 @@ pub fn rib_from_profile(
     extrude_dir: Vec3,
     plane_normal: Option<Vec3>,
     extrusion: RibExtrusion,
-    name: Option<&str>,
+    names: &RibNames,
 ) -> Result<BrepSolid, String> {
-    // The union carries face names from its operands; accept `name` for ABI
-    // symmetry with the other builders (the app stamps names post-hoc).
-    let _ = name;
     let tolerance = 1e-6;
     if profile.is_empty() {
         return Err("rib: profile needs at least 1 curve forming an open chain".into());
+    }
+    if names.segments.len() != profile.len() {
+        return Err(format!(
+            "rib: {} segment names for {} profile curves",
+            names.segments.len(),
+            profile.len()
+        ));
     }
     if !(thickness > 0.0) {
         return Err("rib: thickness must be positive".into());
@@ -685,7 +695,7 @@ pub fn rib_from_profile(
 
     // --- 5. Build the over-long slab for the requested extrusion direction.  The
     //        two arms differ only in which axis carries the thickness.
-    let slab = match extrusion {
+    let mut slab = match extrusion {
         RibExtrusion::ParallelToSketch => {
             // The growth direction lies IN the plane; anything out of plane is a
             // caller error, not something to silently project away.
@@ -714,8 +724,32 @@ pub fn rib_from_profile(
         }
         RibExtrusion::NormalToSketch => extrude_dir.normalized()?,
     };
+
+    // Both operands go through the cut and the fuse carrying SOURCE TOKENS, not
+    // names: the booleans number split fragments in the order they meet them,
+    // and a part may already hold a `Floor` and a `Floor_1`, so a propagated name
+    // cannot say which face a fragment came from. The tokens can, and
+    // `restamp_rib_faces` turns them into names once the result exists.
+    let roles = slab_face_names(names, extrusion, profile.len());
+    let slab_faces: usize = slab.shells.iter().map(|shell| shell.faces.len()).sum();
+    if slab_faces != roles.len() {
+        return Err(format!(
+            "rib: the slab builder produced {slab_faces} faces, expected {}",
+            roles.len()
+        ));
+    }
+    let (part, part_names) = tokenised(solid, TARGET_TOKEN);
+    for (index, face) in slab.shells.iter_mut().flat_map(|shell| shell.faces.iter_mut()).enumerate() {
+        face.name = Some(format!("{SOURCE_TOKEN}{RIB_TOKEN}{index}"));
+    }
+    let sources = FaceSources {
+        part: part_names,
+        rib: roles,
+    };
+
     let seeds = chain_probe_seeds(profile)?;
-    let rib = up_to_next(solid, &slab, &seeds, along, reach)?;
+    let rib = up_to_next(&part, &slab, &seeds, along, reach)
+        .map_err(|error| sources.detokenise(&error))?;
     let Some(rib) = rib else {
         // Every bit of the sweep was already material: the rib adds nothing, and
         // the part is its own answer.  Not an error — the same document with a
@@ -723,13 +757,32 @@ pub fn rib_from_profile(
         return Ok(solid.clone());
     };
 
-    boolean_operation(
-        solid,
+    let mut fused = boolean_operation(
+        &part,
         &rib,
         BooleanOperation::Union,
         &BooleanOptions::default(),
     )
-    .map_err(|error| format!("rib: union of the rib into the part failed: {error}"))
+    .map_err(|error| {
+        format!(
+            "rib: union of the rib into the part failed: {}",
+            sources.detokenise(&error.to_string())
+        )
+    })?;
+    let chord = vertices[count - 1].sub(vertices[0]).normalized()?;
+    let frame = RibFrame {
+        origin: vertices[0],
+        thickness: match extrusion {
+            RibExtrusion::ParallelToSketch => np,
+            RibExtrusion::NormalToSketch => np.cross(chord).normalized()?,
+        },
+        chord,
+        growth: along,
+        quantum: 1e-7 * reach.max(1.0),
+    };
+    restamp_rib_faces(&mut fused, &sources, &names.feature, &frame);
+    crate::feature_pipeline::features::common::stamp_derived_edge_names(&mut fused);
+    Ok(fused)
 }
 
 /// Twice the part's bounding diagonal, measured from the chain too so a sketch
@@ -1002,5 +1055,253 @@ fn solid_from_shell(source: &BrepSolid, shell: &ShellRecord) -> BrepSolid {
         edges,
         shells: vec![shell.clone()],
         genus: 0,
+    }
+}
+
+// ===========================================================================
+// Face names
+// ===========================================================================
+
+/// What a rib calls its faces: the feature id every name starts with, and the
+/// source name of each profile curve (`{sketchId}:G{gid}` for a sketch segment),
+/// index-aligned with the profile.
+///
+/// | face | Parallel to Sketch | Normal to Sketch |
+/// |---|---|---|
+/// | the rib's two walls | `{id}:A` (−thickness axis), `{id}:B` (+) | `{id}:{segment}_A`, `{id}:{segment}_B` per segment |
+/// | the rib's top (on the sketch) | `{id}:{segment}_TOP` per segment | `{id}:TOP` |
+/// | its ends, at the chain's start and end | `{id}:START`, `{id}:END` | `{id}:START`, `{id}:END` |
+/// | the far end (cut away by Up To Next) | `{id}:{segment}_FAR` | `{id}:FAR` |
+///
+/// The thickness axis is the sketch plane's authored normal for a Parallel rib,
+/// and for a Normal rib the in-plane normal `plane normal × segment direction` —
+/// the left of the chain seen from the side the normal points to.
+///
+/// A face the rib SPLITS is named by [`restamp_rib_faces`]: one fragment keeps
+/// the name and the others are named after the rib and the side they are on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RibNames {
+    pub feature: String,
+    pub segments: Vec<String>,
+}
+
+impl RibNames {
+    /// Names for a caller with no segment identity to offer: `SEG{i}`.
+    pub fn positional(feature: &str, count: usize) -> Self {
+        Self {
+            feature: feature.to_string(),
+            segments: (0..count).map(|index| format!("SEG{index}")).collect(),
+        }
+    }
+}
+
+/// The slab's face names in `extrude_profile_brep`'s face order: the region's
+/// sides in input order, then the base cap, then the far cap.
+///
+/// Parallel region: `[segments…, end line, far segments reversed…, start line]`,
+/// base cap at −thickness/2 along the normal. Normal region: `[+offset
+/// segments…, end cap, −offset segments reversed…, start cap]`, base cap on the
+/// sketch plane.
+fn slab_face_names(names: &RibNames, extrusion: RibExtrusion, count: usize) -> Vec<String> {
+    let id = &names.feature;
+    let segment = |index: usize, role: &str| format!("{id}:{}_{role}", names.segments[index]);
+    let mut faces = Vec::with_capacity(2 * count + 4);
+    let (near, far, base, top) = match extrusion {
+        RibExtrusion::ParallelToSketch => ("TOP", "FAR", format!("{id}:A"), format!("{id}:B")),
+        RibExtrusion::NormalToSketch => ("B", "A", format!("{id}:TOP"), format!("{id}:FAR")),
+    };
+    faces.extend((0..count).map(|index| segment(index, near)));
+    faces.push(format!("{id}:END"));
+    faces.extend((0..count).rev().map(|index| segment(index, far)));
+    faces.push(format!("{id}:START"));
+    faces.push(base);
+    faces.push(top);
+    faces
+}
+
+/// Leads every source token, so no authored or derived name can spell one.
+const SOURCE_TOKEN: char = '\u{1}';
+const TARGET_TOKEN: char = 'T';
+const RIB_TOKEN: char = 'R';
+
+/// A copy of `solid` whose faces carry `{SOURCE_TOKEN}{kind}{index}` instead of
+/// their names, plus the names, index-aligned.
+fn tokenised(solid: &BrepSolid, kind: char) -> (BrepSolid, Vec<Option<String>>) {
+    let mut copy = solid.clone();
+    let mut names = Vec::new();
+    for face in copy.shells.iter_mut().flat_map(|shell| shell.faces.iter_mut()) {
+        names.push(face.name.take());
+        face.name = Some(format!("{SOURCE_TOKEN}{kind}{}", names.len() - 1));
+    }
+    (copy, names)
+}
+
+/// Where each token points: the part's own face names and the slab's roles.
+struct FaceSources {
+    part: Vec<Option<String>>,
+    rib: Vec<String>,
+}
+
+impl FaceSources {
+    /// `(kind, index)` of a token-named face. The booleans append `_n` to the
+    /// later fragments of a split face; the digits after the kind end the index.
+    fn parse(name: &str) -> Option<(char, usize)> {
+        let mut chars = name.strip_prefix(SOURCE_TOKEN)?.chars();
+        let kind = chars.next()?;
+        let digits: String = chars.take_while(|c| c.is_ascii_digit()).collect();
+        Some((kind, digits.parse().ok()?))
+    }
+
+    fn name(&self, kind: char, index: usize) -> Option<&str> {
+        match kind {
+            TARGET_TOKEN => self.part.get(index)?.as_deref(),
+            RIB_TOKEN => self.rib.get(index).map(String::as_str),
+            _ => None,
+        }
+    }
+
+    /// A boolean's refusal text with every token put back as the name it stands for.
+    fn detokenise(&self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != SOURCE_TOKEN {
+                out.push(c);
+                continue;
+            }
+            let kind = chars.next();
+            let mut digits = String::new();
+            while let Some(digit) = chars.peek().copied().filter(char::is_ascii_digit) {
+                digits.push(digit);
+                chars.next();
+            }
+            match (kind, digits.parse::<usize>()) {
+                (Some(kind), Ok(index)) => out.push_str(self.name(kind, index).unwrap_or("<unnamed>")),
+                _ => {
+                    out.extend(kind);
+                    out.push_str(&digits);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The rib's own frame, which orders the fragments of a split face: the
+/// thickness axis first (which SIDE of the rib a fragment is on), then along
+/// the chord from the chain's start, then along the growth direction.
+struct RibFrame {
+    origin: Vec3,
+    thickness: Vec3,
+    chord: Vec3,
+    growth: Vec3,
+    /// Coordinates closer than this are equal (a fragment's position is
+    /// recomputed by every rebuild; its last bits are not its identity).
+    quantum: f64,
+}
+
+/// Replace every source token on `fused` with the face's final name.
+///
+/// A source face that reaches the result as ONE face keeps its name. A face
+/// that arrives in several fragments keeps its name on ONE of them and names
+/// the rest after the rib, by position in the rib's own frame rather than by
+/// the order the boolean met them or by their sizes (both change with edits
+/// that have nothing to do with the rib — moving a hole from one half of a
+/// floor to the other swaps which half is larger):
+///
+/// - a PART face split by the rib: its fragments are sorted by side (the rib's
+///   A side, straddling, then its B side), then along the chord, then along the
+///   growth direction. The first keeps the part's name; every other is
+///   `{id}:{name}_{side}{k}`, `k` counting that side's fragments from 1 in the
+///   same order — so a floor a rib crosses stays `Floor` on the A side and
+///   becomes `{id}:Floor_B1` on the B side.
+/// - one of the rib's OWN faces in several pieces (the part interrupts the rib):
+///   along the chord, then the growth direction; the first keeps the name and
+///   the others are `{name}_2`, `{name}_3`, …
+///
+/// A part face that had no name keeps none.
+fn restamp_rib_faces(fused: &mut BrepSolid, sources: &FaceSources, feature: &str, frame: &RibFrame) {
+    use std::collections::{BTreeMap, HashMap};
+    let points: HashMap<u64, Vec3> = fused.vertices.iter().map(|vertex| (vertex.id, vertex.point)).collect();
+    let ends: HashMap<u64, (u64, u64)> = fused
+        .edges
+        .iter()
+        .map(|edge| (edge.id, (edge.start_vertex_id, edge.end_vertex_id)))
+        .collect();
+    let quantise = |value: f64| (value / frame.quantum).round() as i64;
+    // (shell, face) positions per source, each with its sort key.
+    let mut groups: BTreeMap<(char, usize), Vec<((i64, i64, i64), (usize, usize))>> = BTreeMap::new();
+    for (shell_index, shell) in fused.shells.iter().enumerate() {
+        for (face_index, face) in shell.faces.iter().enumerate() {
+            let Some(source) = face.name.as_deref().and_then(FaceSources::parse) else {
+                continue;
+            };
+            let mut ids: Vec<u64> = face
+                .loops
+                .iter()
+                .flat_map(|loop_record| &loop_record.coedges)
+                .filter_map(|coedge| ends.get(&coedge.edge_id))
+                .flat_map(|(start, end)| [*start, *end])
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            let mut centre = Vec3::default();
+            for id in &ids {
+                if let Some(point) = points.get(id) {
+                    centre = centre.add(*point);
+                }
+            }
+            let centre = centre.scale(1.0 / ids.len().max(1) as f64).sub(frame.origin);
+            let key = (
+                quantise(centre.dot(frame.thickness)),
+                quantise(centre.dot(frame.chord)),
+                quantise(centre.dot(frame.growth)),
+            );
+            groups.entry(source).or_default().push((key, (shell_index, face_index)));
+        }
+    }
+    for ((kind, index), mut fragments) in groups {
+        let original = sources.name(kind, index).map(str::to_string);
+        let side = |key: &(i64, i64, i64)| match key.0.signum() {
+            -1 => ('A', 0),
+            0 => ('M', 1),
+            _ => ('B', 2),
+        };
+        let named: Vec<((usize, usize), Option<String>)> = match &original {
+            None => fragments.into_iter().map(|(_, at)| (at, None)).collect(),
+            Some(name) if fragments.len() == 1 => vec![(fragments[0].1, Some(name.clone()))],
+            Some(name) if kind == RIB_TOKEN => {
+                fragments.sort_by_key(|(key, _)| (key.1, key.2, key.0));
+                fragments
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, (_, at))| {
+                        (at, Some(if rank == 0 { name.clone() } else { format!("{name}_{}", rank + 1) }))
+                    })
+                    .collect()
+            }
+            Some(name) => {
+                fragments.sort_by_key(|(key, _)| (side(key).1, key.1, key.2, key.0));
+                let mut per_side: BTreeMap<char, usize> = BTreeMap::new();
+                fragments
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, (key, at))| {
+                        let letter = side(&key).0;
+                        let ordinal = per_side.entry(letter).or_insert(0);
+                        *ordinal += 1;
+                        let spelled = if rank == 0 {
+                            name.clone()
+                        } else {
+                            format!("{feature}:{name}_{letter}{ordinal}")
+                        };
+                        (at, Some(spelled))
+                    })
+                    .collect()
+            }
+        };
+        for ((shell_index, face_index), name) in named {
+            fused.shells[shell_index].faces[face_index].name = name;
+        }
     }
 }

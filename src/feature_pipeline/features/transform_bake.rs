@@ -123,4 +123,3 @@ fn reference_name(value: Option<&serde_json::Value>) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-// BREP private tests: ac5994ee9601961e

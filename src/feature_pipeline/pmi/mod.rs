@@ -69,7 +69,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-use crate::feature_pipeline::{Env, HistoryRequest, SceneMap, SelectionProbe};
+use crate::feature_pipeline::{Env, HistoryRequest, SceneMap};
 
 pub use annotations::{pmi_schema_catalogue, pmi_type, PmiTypeDef, PMI_TYPES};
 
@@ -897,11 +897,3 @@ fn annotation_plane(
     }))
 }
 
-/// The kind-level selection summary a PMI type predicate reads: how many
-/// named entities of each kind are selected. Both plain and component
-/// geometry count (PMI annotates either).
-pub fn selection_total(probe: &SelectionProbe) -> usize {
-    probe.faces + probe.edges + probe.vertices + probe.planes + probe.solids
-}
-
-// BREP private tests: d0001cf5a2544890

@@ -477,7 +477,7 @@ pub fn schema() -> serde_json::Value {
                 "vector distance"
             ],
             "default_value": "vector distance",
-            "label": "Linear Input",
+            "label": "Linear input",
             "hint": "Use transform controls or a selected direction plus distance"
         },
         "count": {
@@ -493,7 +493,7 @@ pub fn schema() -> serde_json::Value {
                 "count and span"
             ],
             "default_value": "count and pitch",
-            "label": "Count Mode",
+            "label": "Count mode",
             "hint": "Use the distance/angle as the per-step pitch, or divide it across the full span"
         },
         "offset": {
@@ -554,7 +554,7 @@ pub fn schema() -> serde_json::Value {
         "totalAngleDeg": {
             "type": "number",
             "default_value": 360,
-            "hint": "Angle between circular instances, or total span when Count Mode is count and span"
+            "hint": "Angle between circular instances, or total span when Count mode is count and span"
         },
         "booleanMode": {
             "type": "options",
@@ -569,4 +569,3 @@ pub fn schema() -> serde_json::Value {
 })
 }
 
-// BREP private tests: bf921cccd1d60ba0

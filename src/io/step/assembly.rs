@@ -47,18 +47,35 @@
 //! A part's bodies, faces and edges keep the part's OWN names — `Extrude1_top`,
 //! not `ACOMP3:Extrude1_top` — because they are written into the part's product,
 //! where the component namespace does not apply. The document still refers to
-//! them by the namespaced name, so [`occurrence_paths`] walks the graph and
-//! registers every entity under EVERY chained occurrence path that reaches it
-//! (`ACOMP3:`, `ACOMP5:ACOMP1:`), with the vertex points moved into root space
-//! so a `{body}@x,y,z` reference still matches. Two instances of one part share
-//! the part's entities, so `ACOMP3:top` and `ACOMP4:top` resolve to the SAME
-//! `ADVANCED_FACE`: an annotation on one instance is an annotation on the part.
+//! them by the namespaced name, so [`StepAssemblyExport::occurrence_paths`]
+//! walks the graph and registers every entity under EVERY chained occurrence
+//! path that reaches it (`ACOMP3:`, `ACOMP5:ACOMP1:`), with the vertex points
+//! moved into root space so a `{body}@x,y,z` reference still matches. Two
+//! instances of one part share the part's entities, so `ACOMP3:top` and
+//! `ACOMP4:top` resolve to the SAME `ADVANCED_FACE`.
+//!
+//! They are not the same ANNOTATION, though, and PMI is written accordingly:
+//!
+//! - a PART's own annotations ([`StepExportProduct::pmi`], from the part
+//!   document's `pmi` block) are written into that part's product, with the
+//!   part's own names and its own draughting model — once, however many
+//!   instances place it;
+//! - the ROOT document's annotations are written through the occurrence paths,
+//!   and a reference that reaches a part through an occurrence hangs its
+//!   `SHAPE_ASPECT` off THAT occurrence's `PRODUCT_DEFINITION_SHAPE` (the
+//!   `'NAUO PRDDFN'` one), not the part's. The `GEOMETRIC_ITEM_SPECIFIC_USAGE`
+//!   still points at the part's face; only the owner says which instance is
+//!   meant, and it is the only place that can say it.
+//!
+//! `io/step_import/assembly_pmi.rs` reads exactly that distinction back, which
+//! is what makes an assembly's PMI survive export → import unchanged.
 
 use super::{
-    finish_step_file, id_list, mat4_mul, pmi, step_string, write_file_contexts, write_product,
-    write_product_geometry, Mat4, StepExportReport, StepItemOwner, StepNameMaps, StepPmi,
-    StepWriter, MAT4_IDENTITY,
+    finish_step_file, id_list, mat4_mul, pmi, step_string, styles, write_file_contexts,
+    write_product, write_product_geometry, Mat4, StepColors, StepExportReport, StepItemOwner,
+    StepNameMaps, StepPmi, StepWriter, MAT4_IDENTITY,
 };
+use crate::feature_pipeline::pmi::{PmiReport, PmiState};
 use crate::{BrepSolid, Vec3};
 
 /// One product of an exported structure: a part, a sub-assembly, or the root
@@ -67,11 +84,18 @@ use crate::{BrepSolid, Vec3};
 pub struct StepExportProduct {
     /// `PRODUCT.name` — the parts-library entry name, or the document name.
     pub name: String,
-    /// `PRODUCT.id` — the vendor part number. The name is used when empty.
+    /// `PRODUCT.id` — the vendor part number: a library part's BOM
+    /// `Part_Number` attribute, else its `sourceKey` (`export_tree.rs`). The
+    /// name is used when empty.
     pub id: String,
     /// This product's own solids and their part-local scene names. Empty for a
     /// pure assembly node, which is then written as a bare `SHAPE_REPRESENTATION`.
     pub bodies: Vec<(String, BrepSolid)>,
+    /// This product's OWN PMI — the part document's `pmi` block, resolved
+    /// against the part's own geometry (`export_tree.rs` runs it). Written
+    /// into THIS product, with the part's own names and its own draughting
+    /// model, which is where a structured import reads it back from.
+    pub pmi: Option<(PmiState, PmiReport)>,
 }
 
 /// One placement of `child` inside `parent` — a `NEXT_ASSEMBLY_USAGE_OCCURRENCE`.
@@ -171,18 +195,24 @@ impl StepAssemblyExport {
     ///
     /// Depth-first from the root, guarding the path's own ancestors, so a
     /// structure that somehow still carries a cycle terminates.
-    fn occurrence_paths(&self, root: usize) -> Vec<Vec<(String, Mat4)>> {
-        let mut paths: Vec<Vec<(String, Mat4)>> = vec![Vec::new(); self.products.len()];
+    fn occurrence_paths(&self, root: usize) -> Vec<Vec<OccurrencePath>> {
+        let mut paths: Vec<Vec<OccurrencePath>> = vec![Vec::new(); self.products.len()];
         let mut total = 0usize;
-        let mut stack: Vec<(usize, String, Mat4, Vec<usize>)> =
-            vec![(root, String::new(), MAT4_IDENTITY, vec![root])];
-        while let Some((product, prefix, world, ancestors)) = stack.pop() {
+        let mut stack: Vec<(usize, OccurrencePath, Vec<usize>)> = vec![(
+            root,
+            OccurrencePath {
+                prefix: String::new(),
+                world: MAT4_IDENTITY,
+                last: None,
+            },
+            vec![root],
+        )];
+        while let Some((product, path, ancestors)) = stack.pop() {
             if total >= MAX_OCCURRENCE_PATHS {
                 break;
             }
             total += 1;
-            paths[product].push((prefix.clone(), world));
-            for occurrence in &self.occurrences {
+            for (slot, occurrence) in self.occurrences.iter().enumerate() {
                 if occurrence.parent != product || ancestors.contains(&occurrence.child) {
                     continue;
                 }
@@ -190,14 +220,30 @@ impl StepAssemblyExport {
                 ancestors.push(occurrence.child);
                 stack.push((
                     occurrence.child,
-                    format!("{prefix}{}:", occurrence.designator),
-                    mat4_mul(&world, &occurrence.placement),
+                    OccurrencePath {
+                        prefix: format!("{}{}:", path.prefix, occurrence.designator),
+                        world: mat4_mul(&path.world, &occurrence.placement),
+                        last: Some(slot),
+                    },
                     ancestors,
                 ));
             }
+            paths[product].push(path);
         }
         paths
     }
+}
+
+/// One way the document's geometry reaches a product: the component namespace
+/// that names it (`ACOMP5:ACOMP1:`, `""` at the root), the transform into root
+/// space, and the LAST occurrence on the way — the instance an annotation
+/// written against this namespace is an annotation on.
+#[derive(Clone)]
+struct OccurrencePath {
+    prefix: String,
+    world: Mat4,
+    /// Index into [`StepAssemblyExport::occurrences`]; `None` at the root.
+    last: Option<usize>,
 }
 
 /// A placement is rigid when its linear block is orthonormal with a positive
@@ -257,7 +303,7 @@ pub fn export_step_assembly(
     unit: &str,
     timestamp: &str,
 ) -> Result<String, String> {
-    export_step_assembly_report(assembly, unit, timestamp, None).map(|report| report.text)
+    export_step_assembly_report(assembly, unit, timestamp, None, None).map(|report| report.text)
 }
 
 /// Write a product structure as an AP242 Part 21 document: one product per
@@ -272,6 +318,7 @@ pub fn export_step_assembly_report(
     unit: &str,
     timestamp: &str,
     pmi: Option<&StepPmi<'_>>,
+    colors: Option<&StepColors>,
 ) -> Result<StepExportReport, String> {
     let root = assembly.root()?;
     if assembly
@@ -318,7 +365,7 @@ pub fn export_step_assembly_report(
     let mut representations = Vec::with_capacity(assembly.products.len());
     for (index, product) in assembly.products.iter().enumerate() {
         let mut items = vec![contexts.axis];
-        items.extend(&geometries[index].solids);
+        items.extend(geometries[index].solids.iter().map(|(_, id)| *id));
         for (slot, occurrence) in assembly.occurrences.iter().enumerate() {
             if occurrence.parent == index {
                 items.push(placement_axes[slot]);
@@ -360,7 +407,11 @@ pub fn export_step_assembly_report(
         definitions.push(ids);
     }
 
-    // 5 — the occurrences themselves.
+    // 5 — the occurrences themselves. Each one's `PRODUCT_DEFINITION_SHAPE` is
+    // kept: it is what an OCCURRENCE-scoped annotation's shape aspect hangs
+    // off (step 7), and the entity a reader tells "this instance" from "this
+    // part" by.
+    let mut nauo_shapes: Vec<usize> = Vec::with_capacity(assembly.occurrences.len());
     for (slot, occurrence) in assembly.occurrences.iter().enumerate() {
         let parent = definitions[occurrence.parent].definition;
         let child = definitions[occurrence.child].definition;
@@ -370,6 +421,7 @@ pub fn export_step_assembly_report(
         ));
         let nauo_shape =
             writer.add(format!("PRODUCT_DEFINITION_SHAPE('','NAUO PRDDFN',#{nauo})"));
+        nauo_shapes.push(nauo_shape);
         let identity = contexts.axis;
         let placement = placement_axes[slot];
         let transformation = writer.add(format!(
@@ -389,17 +441,89 @@ pub fn export_step_assembly_report(
         ));
     }
 
-    // 6 — PMI on the root, resolving through every occurrence path.
-    if let Some(pmi) = pmi {
-        let paths = assembly.occurrence_paths(root);
-        let mut names = StepNameMaps::default();
+    // 6 — geometry colour. A product's entities are known to the DOCUMENT under
+    // every occurrence namespace that reaches it, so the colour lookup resolves
+    // through the same paths the PMI references do — sorted, so which of a
+    // repeated part's namespaces supplies the colour does not depend on the
+    // walk's stack order.
+    // ONE walk for both consumers below — each product's occurrence namespaces —
+    // and only when one of them needs it: the walk is capped at
+    // `MAX_OCCURRENCE_PATHS`, so an export that carries neither colour nor PMI
+    // must not pay for it.
+    let colors = colors.filter(|colors| !colors.is_empty());
+    let paths = (pmi.is_some() || colors.is_some())
+        .then(|| assembly.occurrence_paths(root))
+        .unwrap_or_default();
+    if let Some(colors) = colors {
+        let mut items = Vec::new();
         for (index, geometry) in geometries.iter().enumerate() {
-            let owner = StepItemOwner {
+            let mut prefixes: Vec<String> =
+                paths[index].iter().map(|path| path.prefix.clone()).collect();
+            prefixes.sort();
+            items.extend(styles::styled_items(geometry, colors, &prefixes));
+        }
+        report.styled_items = styles::write_geometry_styles(&mut writer, geometry_context, &items)?;
+    }
+
+    // 7a — each PART's own PMI, written into that part's product with the
+    // part's own names. A part shared by six instances carries its annotations
+    // ONCE, which is the same rule the importer reads them back under.
+    for (index, geometry) in geometries.iter().enumerate() {
+        let Some((state, part_report)) = &assembly.products[index].pmi else {
+            continue;
+        };
+        let mut names = StepNameMaps::default();
+        names.register(
+            geometry,
+            StepItemOwner {
                 product_shape: definitions[index].product_shape,
                 representation: representations[index],
-            };
-            for (prefix, world) in &paths[index] {
-                names.register(geometry, owner, prefix, world);
+            },
+            "",
+            &MAT4_IDENTITY,
+        );
+        let context = pmi::StepContext {
+            product_shape: definitions[index].product_shape,
+            representation: representations[index],
+            geometry_context,
+            length_unit: contexts.length_unit,
+            angle_unit: contexts.angle_unit,
+            faces: &names.faces,
+            edges: &names.edges,
+            vertices: &names.vertices,
+        };
+        report.pmi_unresolved_references += pmi::write_pmi(
+            &mut writer,
+            &context,
+            &StepPmi {
+                state,
+                report: part_report,
+            },
+        )?;
+    }
+
+    // 7b — PMI on the ROOT document, resolving through every occurrence path.
+    //
+    // A reference that reaches a part THROUGH an occurrence hangs its shape
+    // aspect off that occurrence's `PRODUCT_DEFINITION_SHAPE`, not the part's:
+    // `ACOMP3:top` and `ACOMP4:top` name the SAME `ADVANCED_FACE` (two
+    // instances share the part's geometry, and the `GEOMETRIC_ITEM_SPECIFIC_-
+    // USAGE` still points at it), but they are annotations on two different
+    // INSTANCES, and the owner is the only place that distinction can live.
+    // It is also what the importer reads the distinction back out of
+    // (`io/step_import/assembly_pmi.rs`), which is what closes the round trip.
+    if let Some(pmi) = pmi {
+        let mut names = StepNameMaps::default();
+        for (index, geometry) in geometries.iter().enumerate() {
+            for path in &paths[index] {
+                let owner = StepItemOwner {
+                    product_shape: match path.last {
+                        Some(slot) => nauo_shapes[slot],
+                        None => definitions[index].product_shape,
+                    },
+                    representation: representations[index],
+                };
+                names.register(geometry, owner, &path.prefix, &path.world);
             }
         }
         let context = pmi::StepContext {
@@ -412,7 +536,7 @@ pub fn export_step_assembly_report(
             edges: &names.edges,
             vertices: &names.vertices,
         };
-        report.pmi_unresolved_references = pmi::write_pmi(&mut writer, &context, pmi)?;
+        report.pmi_unresolved_references += pmi::write_pmi(&mut writer, &context, pmi)?;
     }
 
     finish_step_file(
@@ -424,4 +548,3 @@ pub fn export_step_assembly_report(
     Ok(report)
 }
 
-// BREP private tests: f9fc1e069685c113

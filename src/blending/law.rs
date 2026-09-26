@@ -552,4 +552,3 @@ fn end_slope(h0: f64, h1: f64, s0: f64, s1: f64) -> f64 {
     d
 }
 
-// BREP private tests: f33a417b723bffa9

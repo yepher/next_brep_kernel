@@ -33,7 +33,7 @@ pub(super) fn blend_open_smooth_chain(
 ) -> Result<BrepSolid, String> {
     let segments = &chain.segments;
     let last_seg = segments.len() - 1;
-    let samples = march_chain(segments, radius, true)?;
+    let samples = march_chain(segments, radius, true, CHAIN_PER_SEGMENT, FoldPolicy::Refuse)?;
 
     // Global 3D rows: segment 0's low overshoot + every in-segment station +
     // the last segment's high overshoot.  Interior overshoot is dropped (it

@@ -34,6 +34,13 @@ struct ImprintProfile {
     march: Duration,
     clip_and_fit: Duration,
     process_curve: Duration,
+    /// `clip_and_fit` split: the swapped-order rescue marches, the trim clip,
+    /// the shared-boundary test, the polyline fit, and `process_curve`.
+    rescue_march: Duration,
+    clip: Duration,
+    shared_boundary: Duration,
+    fit: Duration,
+    process: Duration,
 }
 
 impl ImprintProfile {
@@ -72,6 +79,14 @@ impl ImprintProfile {
             ms(self.march),
             ms(self.clip_and_fit),
             ms(self.process_curve),
+        );
+        eprintln!(
+            "imprint.clip_fit rescue_march={:.2} clip={:.2} shared_boundary={:.2} fit={:.2} process={:.2}",
+            ms(self.rescue_march),
+            ms(self.clip),
+            ms(self.shared_boundary),
+            ms(self.fit),
+            ms(self.process),
         );
     }
 }
@@ -263,6 +278,13 @@ pub struct ImprintResultRecord {
     /// the boolean's legitimate-empty adjudication requires this to be false.
     #[serde(default)]
     pub section_evidence: bool,
+    /// Every face pair the imprint read as ONE surface and exchanged boundary
+    /// curves across instead of intersecting (`cosurface_pair`, or the sampled
+    /// pair classification's `Cosurface`). Selection holds a fragment whose
+    /// point lies in such a partner's trim On against it, so the coincidence
+    /// the sections were built on is the one the fragments are kept by.
+    #[serde(default)]
+    pub cosurface_pairs: Vec<(FaceKey, FaceKey)>,
 }
 
 #[path = "imprint/support.rs"]
@@ -279,7 +301,8 @@ mod sections;
 mod tangent_contact;
 #[path = "imprint/driver.rs"]
 mod driver;
-// BREP private tests: 926d1ffe6a42f122
+#[path = "imprint/gate_census.rs"]
+mod gate_census;
 
 use builder::*;
 use junctions::*;
@@ -290,4 +313,3 @@ use tangent_contact::classify_tangent_contact;
 pub use driver::build_imprints;
 pub(crate) use self_touch::self_touch_edge_splits;
 
-// BREP private tests: 4efc8161f2a59e6e

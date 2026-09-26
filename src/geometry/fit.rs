@@ -1,11 +1,4 @@
-use crate::{KnotVector, NurbsCurve, Vec3, Vec4};
-
-#[derive(Clone, Debug)]
-pub struct PolylineFit {
-    pub curve: NurbsCurve,
-    pub parameters: Vec<f64>,
-    pub kept: Vec<Vec3>,
-}
+use crate::{DiagnosticSeverity, KernelDiagnostics, KernelStage, KnotVector, NurbsCurve, Vec3, Vec4};
 
 pub fn solve_dense(mut matrix: Vec<Vec<f64>>, mut rhs: Vec<f64>) -> Result<Vec<f64>, String> {
     let count = rhs.len();
@@ -434,9 +427,17 @@ fn chord_parameters(points: &[Vec3]) -> Vec<f64> {
     parameters
 }
 
-pub fn simplify_polyline(points: &[Vec3], tolerance: f64) -> Vec<Vec3> {
+/// Douglas–Peucker against `tolerance`, as INDICES into `points`.
+///
+/// The indices are what a FIT needs: they carry the correspondence between an
+/// interpolation station and the input station it came from, and that
+/// correspondence is what lets [`fit_polyline`] measure its own result against
+/// the input points BETWEEN its stations without a global projection per point.
+/// [`simplify_polyline`] is a thin wrapper over this; the arithmetic is
+/// unchanged.
+pub fn simplify_polyline_indices(points: &[Vec3], tolerance: f64) -> Vec<usize> {
     if points.len() <= 2 {
-        return points.to_vec();
+        return (0..points.len()).collect();
     }
     let mut keep = vec![false; points.len()];
     keep[0] = true;
@@ -466,11 +467,16 @@ pub fn simplify_polyline(points: &[Vec3], tolerance: f64) -> Vec<Vec3> {
             stack.push((index, end));
         }
     }
-    points
-        .iter()
-        .copied()
-        .zip(keep)
-        .filter_map(|(point, keep)| keep.then_some(point))
+    keep.into_iter()
+        .enumerate()
+        .filter_map(|(index, keep)| keep.then_some(index))
+        .collect()
+}
+
+pub fn simplify_polyline(points: &[Vec3], tolerance: f64) -> Vec<Vec3> {
+    simplify_polyline_indices(points, tolerance)
+        .into_iter()
+        .map(|index| points[index])
         .collect()
 }
 
@@ -553,83 +559,825 @@ pub fn interpolate_curve_local(
     NurbsCurve::new(3, knots, control_points)
 }
 
+/// How far past the caller's own station budget the ladder may climb.
+///
+/// The budget a caller passes is its declaration of what it can afford
+/// DOWNSTREAM, and downstream cost is not linear in a section curve's span
+/// count: measured on the torus×torus singular pair, 4x the stations (80 → 320)
+/// took one imprint from 1.4 s to over 200 s, because every pcurve fit on the
+/// section then needs more samples than `MAX_PCURVE_SAMPLES` allows and takes
+/// the raised pass, 400 times over. So the ladder may DOUBLE the caller's
+/// budget and no more. With the input's own band as the floor
+/// ([`PolylineFitReport::floor`]) that meets 275 of the 282 fits in the case
+/// population; the other 7 are all `offset_shell` sections that stop at 192
+/// stations holding 2.33e-7 to 3.42e-6, and they REPORT it
+/// ([`PolylineFitExit::StationCeiling`]) instead of widening to it. Meeting every
+/// bar is not this bound's job — capping the cost of the ones it cannot at 2x
+/// what the caller chose, rather than at an absolute this module invented, is.
+const LADDER_BUDGET_FACTOR: usize = 2;
+
+/// Absolute station ceiling, whatever the caller's budget.
+///
+/// The ladder doubles the interpolation budget from what the caller asked for
+/// while the MEASUREMENT says the curve misses its tolerance, and stops here —
+/// or at the input's own station count, whichever comes first.
+///
+/// 1024 is a COST cap, not a geometric one. As SHIPPED it is a BACKSTOP that
+/// nothing in the corpus reaches, because [`LADDER_BUDGET_FACTOR`] binds first
+/// for every caller here (80 → 160 for the imprint driver, 96 → 192 for
+/// `offset_shell`). The reading below is the ladder let OFF that bound, kept
+/// because it is what the ceiling exists for. Measured over the 55-row case
+/// population: 282 fits, 21 of which miss at the caller's own budget; 16 of
+/// those reach their tolerance inside the ladder, and 5 do not — three at this
+/// ceiling with 3,070 control points and two stalled at 2,302 — every one of
+/// them an `offset_shell` section on the LOCAL interpolation lane, which
+/// converges at h² and cannot reach 1e-7 on a curved section at any station
+/// count this input offers. The lane is the fix there, not the ceiling; raising
+/// the ceiling buys accuracy in the fourth significant figure and pays for it
+/// in control points on every consumer downstream. A fit that stops here
+/// reports [`PolylineFitExit::StationCeiling`] with the deviation it actually
+/// holds, the way a pcurve fit reports its sample ceiling.
+pub const MAX_FIT_STATIONS: usize = 1024;
+
+/// Newton steps spent per point when the measurement locates the curve's
+/// nearest point to an input station. Three is enough on a seed that is already
+/// inside the right span (the seed comes from the station correspondence, not
+/// from a search), and the best iterate is kept, so a non-convergent step can
+/// only cost time.
+const MEASURE_NEWTON_STEPS: usize = 3;
+
+/// Fractions of every station span the measurement probes BETWEEN the input's
+/// own stations — the same three the pcurve refinement probes (`probe_residual`
+/// in `geometry/pcurve.rs`), and for the same reason: an interpolant that
+/// passes exactly through every station it was built from can still bulge in
+/// between, and that bulge is what becomes topology.
+const MEASURE_SPAN_FRACTIONS: [f64; 3] = [0.25, 0.5, 0.75];
+
+/// A rung must beat the one below it by this factor to be worth the next
+/// doubling. Global cubic interpolation improves 16x per doubling and the local
+/// lane 4x, so anything above 0.9 says the input — not the station count — is
+/// what binds, and the ladder stops with [`PolylineFitExit::Stalled`].
+const STALL_FACTOR: f64 = 0.9;
+
+/// What a polyline fit ACHIEVED, returned beside the curve so a budget exit can
+/// never be mistaken for a met tolerance.
+///
+/// [`fit_polyline`] is handed a tolerance by every caller that fits a marched
+/// section. Until 2026-09-13 that tolerance only ever reached
+/// [`simplify_polyline`] and the conditioning floor — the INPUT side — and the
+/// returned curve was never compared against it, while `maximum_points`
+/// DECIMATED the input before interpolation. A cap on the number of
+/// interpolation points is not a tolerance: on the 5,925-point marched base
+/// circle of an offset apex cone the delivered rim sagged 2.179e-3 against a
+/// requested 1e-7, four orders, silently, and the shell's volume read 4.23e-7
+/// relative where its analytically recognized sibling read 2.40e-11.
+///
+/// This report is a MEASUREMENT taken at a construction, not a band. Nothing
+/// may read `deviation` as the acceptance tolerance of the curve it describes;
+/// its consumers are the [`PolylineFitLedger`] (operation diagnostics) and the
+/// ladder's own stopping decision.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PolylineFitReport {
+    /// Largest distance from an input point to the returned curve, over every
+    /// point of the input run. THE acceptance measurement: the points the
+    /// decimation dropped are the ones that read it.
+    pub deviation: f64,
+    /// Root mean square of the same sample set.
+    pub rms: f64,
+    /// Largest distance from the curve to the input POLYLINE, sampled between
+    /// the fit's own stations. Reported, never compared against the tolerance:
+    /// see [`measure_polyline_fit`] — its floor is the input's chord sag.
+    pub between_stations: f64,
+    /// The deviation the caller asked for.
+    pub tolerance: f64,
+    /// The deviation the ladder actually chased: `tolerance.max(dropped_band)`.
+    ///
+    /// A fit cannot demonstrate fidelity finer than its own INPUT's band. The
+    /// conditioning that produced the station pool drops points up to
+    /// `dropped_band` from the polyline through the survivors, so a curve that
+    /// reproduces the pool to 1e-8 while the pool stands 3.75e-7 from the input
+    /// is not a 1e-8 curve — it is a 3.75e-7 curve with an expensive interior.
+    /// Refining past the band buys control points and nothing else, and control
+    /// points are not free: the imprint's cost in a section curve's span count
+    /// is superlinear (measured on the torus×torus singular pair, where 4x the
+    /// stations cost two orders of magnitude of `process_curve` time).
+    pub floor: f64,
+    /// Interpolation stations in the returned curve.
+    pub stations: usize,
+    /// Control points in the returned curve — what the fit costs downstream.
+    pub controls: usize,
+    /// Points in the input run.
+    pub input_points: usize,
+    /// Stations the input offers after [`simplify_polyline`] and conditioning:
+    /// the ceiling the ladder can climb to on this input.
+    pub pool_points: usize,
+    /// Largest distance from an input point DROPPED by the simplification to
+    /// the polyline through the stations that survived it — the part of
+    /// `deviation` no interpolation can remove, since those points are not
+    /// stations any more. The analogue of [`crate::PcurveFitReport::off_surface`]:
+    /// a value near `tolerance` says the input's own band explains the
+    /// residual. Zero when the simplification dropped nothing.
+    pub dropped_band: f64,
+    /// Rungs the ladder spent. One means rung zero met the tolerance, or
+    /// nothing was refined.
+    pub rungs: usize,
+    /// Whether the returned curve came from the LOCAL interpolation lane. Not
+    /// always the lane the caller asked for: a ladder that ends unmet is
+    /// re-run in the other lane and the better MEASURED result is returned
+    /// (see [`fit_polyline`]).
+    pub local_lane: bool,
+    /// Whether that is the other lane — the caller's own ladder could not meet
+    /// the tolerance and this one measured better.
+    pub lane_switched: bool,
+    /// Why the ladder stopped.
+    pub exit: PolylineFitExit,
+}
+
+impl PolylineFitReport {
+    /// Whether the returned curve reaches the floor the fit chased — the
+    /// caller's tolerance, or the input's own band where that is coarser (see
+    /// [`PolylineFitReport::floor`]).
+    pub fn met_tolerance(&self) -> bool {
+        self.deviation <= self.floor
+    }
+
+    /// Whether the caller's own tolerance was reached, band or no band.
+    pub fn met_requested_tolerance(&self) -> bool {
+        self.deviation <= self.tolerance
+    }
+
+    /// Whether every station the input offers is an interpolation station — in
+    /// which case `deviation` is the interpolation SOLVE's residual and not a
+    /// statement about the curve between the input's samples.
+    ///
+    /// This matters for reading a met tolerance honestly. A fit has no oracle
+    /// but its input: on the exact-circle bench the pool-exhausted rung reads
+    /// 8.9e-16 in both lanes while the curves are 5.61e-7 (local) and 2.36e-13
+    /// (global) from the true circle. So a saturated `Converged` says "this
+    /// curve reproduces every point the marcher produced", which is the most a
+    /// fit can claim — not "this curve is within the tolerance of the section".
+    pub fn saturated(&self) -> bool {
+        self.stations >= self.pool_points
+    }
+}
+
+/// Why a polyline fit's refinement stopped. Only
+/// [`PolylineFitExit::Converged`] means the tolerance was met; every other
+/// variant is a BUDGET exit whose deviation was measured on the curve actually
+/// returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PolylineFitExit {
+    /// A measured rung came in at or under the tolerance.
+    Converged,
+    /// [`MAX_FIT_STATIONS`] bound with the tolerance unmet and the input still
+    /// holding stations the ladder never used.
+    StationCeiling,
+    /// Every station the input offers is an interpolation station and the
+    /// tolerance is still unmet. More points cannot help; a different lane, a
+    /// finer march or a looser bar can.
+    InputExhausted,
+    /// A doubling failed to improve the deviation by [`STALL_FACTOR`], so the
+    /// input rather than the station count is what binds. The better of the two
+    /// curves is returned.
+    Stalled,
+    /// No refinement was attempted: [`fit_polyline_at`] fits exactly one rung,
+    /// and `BREP_POLYLINE_FIT_REFINE=0` makes [`fit_polyline`] do the same.
+    Unrefined,
+}
+
+#[derive(Clone, Debug)]
+pub struct PolylineFit {
+    pub curve: NurbsCurve,
+    pub parameters: Vec<f64>,
+    pub kept: Vec<Vec3>,
+    /// What this fit achieved against the tolerance it was given.
+    pub report: PolylineFitReport,
+}
+
+/// The interpolation stations a fit is ENTITLED to on this input: the points
+/// [`simplify_polyline`] keeps at `tolerance`, conditioned against
+/// near-duplicates (a station a fraction of a step from its neighbour, or from
+/// either end, rings the interpolant). Indices into `points`, ascending.
+///
+/// The decimation to a point BUDGET is deliberately not here
+/// ([`decimate_stations`]): the ladder lifts the budget and never the pool, so
+/// this runs once per fit however many rungs it takes.
+fn station_pool(points: &[Vec3], tolerance: f64) -> Vec<usize> {
+    let simplified = simplify_polyline_indices(points, tolerance);
+    if simplified.len() > 2 {
+        let total: f64 = simplified
+            .windows(2)
+            .map(|pair| points[pair[1]].sub(points[pair[0]]).length())
+            .sum();
+        let floor = (tolerance * 0.01).max(total * 1e-4);
+        let first = points[simplified[0]];
+        let last = points[simplified[simplified.len() - 1]];
+        let mut conditioned = vec![simplified[0]];
+        for index in &simplified[1..simplified.len() - 1] {
+            let point = points[*index];
+            if point.sub(first).length() > floor
+                && point.sub(last).length() > floor
+                && point.sub(points[*conditioned.last().unwrap()]).length() > floor
+            {
+                conditioned.push(*index);
+            }
+        }
+        conditioned.push(simplified[simplified.len() - 1]);
+        conditioned
+    } else {
+        let mut distinct: Vec<usize> = Vec::new();
+        for index in simplified {
+            if distinct.last().is_none_or(|previous: &usize| {
+                points[index].sub(points[*previous]).length() > tolerance * 0.01
+            }) {
+                distinct.push(index);
+            }
+        }
+        distinct
+    }
+}
+
+/// `maximum_points` stations spread evenly over the pool, both ends kept.
+fn decimate_stations(pool: &[usize], maximum_points: usize) -> Vec<usize> {
+    if pool.len() <= maximum_points {
+        return pool.to_vec();
+    }
+    let step = (pool.len() - 1) as f64 / (maximum_points - 1) as f64;
+    (0..maximum_points)
+        .map(|index| pool[(index as f64 * step).round() as usize])
+        .collect()
+}
+
+/// Normalized chord-length parameters for `stations`, or `None` when they span
+/// no length at all.
+fn station_parameters(points: &[Vec3], stations: &[usize]) -> Option<Vec<f64>> {
+    let total: f64 = stations
+        .windows(2)
+        .map(|pair| points[pair[1]].sub(points[pair[0]]).length())
+        .sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let mut parameters = vec![0.0; stations.len()];
+    let mut accumulated = 0.0;
+    for index in 1..stations.len() {
+        accumulated += points[stations[index]]
+            .sub(points[stations[index - 1]])
+            .length();
+        parameters[index] = accumulated / total;
+    }
+    *parameters.last_mut().unwrap() = 1.0;
+    Some(parameters)
+}
+
+fn distance_to_segment(point: Vec3, from: Vec3, to: Vec3) -> f64 {
+    let direction = to.sub(from);
+    let length_squared = direction.length_squared();
+    if length_squared <= 0.0 {
+        return point.sub(from).length();
+    }
+    let fraction = (point.sub(from).dot(direction) / length_squared).clamp(0.0, 1.0);
+    point.sub(from.add(direction.scale(fraction))).length()
+}
+
+/// Distance from `point` to `curve`, minimized inside `[lower, upper]` from a
+/// seed that is already in the right span.
+///
+/// NOT [`crate::project_point_to_curve`]: that one sweeps `4.max(degree + 2)`
+/// samples of EVERY span before its Newton — 1,700 evaluations on a
+/// 286-control fit, per query, where this is a fixed four — and it stops
+/// refining at a 1e-7 residual, which is exactly the bar this measurement has
+/// to resolve.
+fn distance_to_curve_near(
+    curve: &NurbsCurve,
+    point: Vec3,
+    seed: f64,
+    lower: f64,
+    upper: f64,
+) -> Result<f64, String> {
+    let mut parameter = seed.clamp(lower, upper);
+    let mut best = f64::INFINITY;
+    for _ in 0..MEASURE_NEWTON_STEPS {
+        let derivatives = curve.derivatives_small(parameter, 2)?;
+        let residual = derivatives[0].sub(point);
+        best = best.min(residual.length_squared());
+        let slope = derivatives[1].dot(residual);
+        let curvature = derivatives[2].dot(residual) + derivatives[1].length_squared();
+        if curvature.abs() <= f64::MIN_POSITIVE {
+            break;
+        }
+        let next = (parameter - slope / curvature).clamp(lower, upper);
+        if next == parameter {
+            break;
+        }
+        parameter = next;
+    }
+    let residual = curve.evaluate(parameter)?.sub(point).length_squared();
+    Ok(best.min(residual).sqrt())
+}
+
+/// Deviation of `curve` from the input run: `(max, rms, between_stations)`.
+///
+/// `max` and `rms` are taken AT the input's own stations — the distance from
+/// every input point to the curve. That is the acceptance measurement, and it
+/// is the one the decimation defeats: a curve interpolating 96 of 5,925 marched
+/// points reproduces those 96 exactly and misses the other 5,829 by however far
+/// the interpolant sags, 2.179e-3 on the apex cone's base circle.
+///
+/// `between_stations` is the same curve sampled at [`MEASURE_SPAN_FRACTIONS`] of
+/// every station span and measured against the input POLYLINE. It is reported
+/// and deliberately NOT compared against the tolerance, because its floor is
+/// the input's own sampling: a polyline through exact samples of a circle of
+/// radius R taken every h cuts the corner by h²/(8R), so the perfect curve —
+/// the circle itself — reads 9.6e-7 against a 7.2e-3-step march of a
+/// radius-6.798 section. Measuring acceptance against chords would make the
+/// bar unreachable for being right. What it does catch is a curve that wanders
+/// between the points it was given by much MORE than that sag.
+///
+/// `stations` are indices into `points` and `parameters` their curve
+/// parameters, so every query starts from a seed inside the right span and
+/// nothing here searches the whole curve.
+fn measure_polyline_fit(
+    curve: &NurbsCurve,
+    points: &[Vec3],
+    stations: &[usize],
+    parameters: &[f64],
+    arc: &[f64],
+) -> Result<(f64, f64, f64), String> {
+    let mut worst = 0.0_f64;
+    let mut sum_squares = 0.0_f64;
+    let mut samples = 0usize;
+    let mut between = 0.0_f64;
+    let last = stations.len() - 1;
+    for span in 0..last {
+        let (from, to) = (stations[span], stations[span + 1]);
+        let (t0, t1) = (parameters[span], parameters[span + 1]);
+        // One span each side, so a station's nearest point may sit past its own
+        // span's end without the bracket cutting the minimization short.
+        let lower = parameters[span.saturating_sub(1)];
+        let upper = parameters[(span + 2).min(last)];
+        // AT the input's stations: every input point of this span, the left end
+        // included (the right end belongs to the next span, and the very last
+        // one is taken after the loop).
+        let length = arc[to] - arc[from];
+        for index in from..to {
+            let seed = if length > 0.0 {
+                t0 + (t1 - t0) * (arc[index] - arc[from]) / length
+            } else {
+                t0
+            };
+            let distance = distance_to_curve_near(curve, points[index], seed, lower, upper)?;
+            worst = worst.max(distance);
+            sum_squares += distance * distance;
+            samples += 1;
+        }
+        // BETWEEN them: the curve's own span samples against the input run, in
+        // the index window this span covers, widened by one segment each side.
+        let window_start = from.saturating_sub(1);
+        let window_end = (to + 1).min(points.len() - 1);
+        for fraction in MEASURE_SPAN_FRACTIONS {
+            let sample = curve.evaluate(t0 + (t1 - t0) * fraction)?;
+            let mut nearest = f64::INFINITY;
+            for index in window_start..window_end {
+                nearest = nearest.min(distance_to_segment(
+                    sample,
+                    points[index],
+                    points[index + 1],
+                ));
+            }
+            if nearest.is_finite() {
+                between = between.max(nearest);
+            }
+        }
+    }
+    let distance = distance_to_curve_near(
+        curve,
+        points[stations[last]],
+        parameters[last],
+        parameters[last.saturating_sub(1)],
+        parameters[last],
+    )?;
+    worst = worst.max(distance);
+    sum_squares += distance * distance;
+    samples += 1;
+    let rms = (sum_squares / samples as f64).sqrt();
+    Ok((worst, rms, between))
+}
+
+/// Largest distance from an input point the simplification DROPPED to the
+/// polyline through the stations that survived — the input-side floor under
+/// every rung of the ladder. See [`PolylineFitReport::dropped_band`].
+fn dropped_band(points: &[Vec3], pool: &[usize]) -> f64 {
+    let mut worst = 0.0_f64;
+    for span in 0..pool.len() - 1 {
+        let (from, to) = (pool[span], pool[span + 1]);
+        for index in from + 1..to {
+            worst = worst.max(distance_to_segment(
+                points[index],
+                points[from],
+                points[to],
+            ));
+        }
+    }
+    worst
+}
+
+/// Cumulative chord length of `points`, in the input's own order.
+fn cumulative_chord(points: &[Vec3]) -> Vec<f64> {
+    let mut arc = vec![0.0; points.len()];
+    for index in 1..points.len() {
+        arc[index] = arc[index - 1] + points[index].sub(points[index - 1]).length();
+    }
+    arc
+}
+
+/// ONE rung: interpolate `stations` and measure the result against the input.
+fn fit_rung(
+    points: &[Vec3],
+    pool: &[usize],
+    arc: &[f64],
+    maximum_points: usize,
+    local_interpolation: bool,
+) -> Result<(NurbsCurve, Vec<usize>, Vec<f64>, f64, f64, f64), String> {
+    let stations = decimate_stations(pool, maximum_points);
+    let parameters = station_parameters(points, &stations)
+        .ok_or_else(|| "fit_polyline: degenerate polyline".to_string())?;
+    let kept = stations.iter().map(|index| points[*index]).collect::<Vec<_>>();
+    let curve = if local_interpolation {
+        interpolate_curve_local(&kept, &parameters, 1.0)?
+    } else {
+        interpolate_curve(&kept, 3usize.min(kept.len() - 1), &parameters)?
+    };
+    let (deviation, rms, between) =
+        measure_polyline_fit(&curve, points, &stations, &parameters, arc)?;
+    Ok((curve, stations, parameters, deviation, rms, between))
+}
+
+/// Fit ONE rung at the given station budget and measure it — no refinement.
+///
+/// This is [`fit_polyline`] before the ladder: the bench that pins the fit's
+/// convergence orders drives it directly, because the ladder by design does
+/// NOT return a 96-station curve when 96 stations miss the tolerance. Its
+/// report always exits [`PolylineFitExit::Unrefined`] when the tolerance is
+/// unmet.
+pub fn fit_polyline_at(
+    points: &[Vec3],
+    tolerance: f64,
+    maximum_points: usize,
+    local_interpolation: bool,
+) -> Result<PolylineFit, String> {
+    let fit = fit_polyline_inner(points, tolerance, maximum_points, local_interpolation, false)?;
+    record_polyline_fit(&fit.report);
+    Ok(fit)
+}
+
+/// Interpolate a curve through a polyline and REFINE it until the curve itself
+/// is within `tolerance` of that polyline.
+///
+/// `tolerance` is the deviation the RESULT must reach; `maximum_points` is
+/// where the station ladder STARTS, not where it ends. Rung zero is exactly
+/// the fit this routine returned before the ladder existed — same
+/// simplification, same conditioning, same decimation, same parameters — so a
+/// section that already met its tolerance returns the identical curve, to the
+/// bit. Only a MEASURED miss spends anything: the budget doubles, each rung is
+/// measured, and the best is kept, up to [`MAX_FIT_STATIONS`] or the input's
+/// own station count.
+///
+/// Where it cannot get there it says so, in [`PolylineFit::report`], rather
+/// than returning silently — the interpolant becomes a trim boundary and every
+/// mass property downstream is read off it, so "within a step of the marched
+/// points" is not good enough. This is the same contract
+/// [`offset::fold_locus::fit_locus_pcurve`] already keeps for a traced locus
+/// and [`crate::PcurveFitReport`] for a pcurve.
+///
+/// THE LANE IS ALSO MEASURED. `local_interpolation` is the lane the ladder
+/// STARTS in, not the lane that is returned: where the caller's own ladder ends
+/// unmet, the other lane's ladder is run on the same input and the better
+/// MEASURED result is returned. Neither lane wins in general and the two fail
+/// differently — measured on the exact-circle bench and the kink bench below:
+///
+/// * on a SMOOTH section the global cubic converges at h⁴ and the local lane at
+///   h², so at the 96 stations `offset_shell` asks for the local lane delivers
+///   286 control points 2.179e-3 from the input and the global one delivers 96
+///   at 3.700e-6 — 589x better with a third of the controls, and the local lane
+///   cannot reach 1e-7 there at any station count;
+/// * at a KINK — a rim through a corner — the local lane's monotonicity limiter
+///   holds the corner where the global cubic rings across it: 8.377e-2 against
+///   4.095e-1 at the same 32 stations, 4.9x.
+///
+/// So the flag is a caller's PREFERENCE — which ladder is paid for first — and
+/// never a decision about which curve is delivered. `offset_shell` asks for the
+/// global lane since 2026-09-13 because its sections are mostly smooth and the
+/// global rungs are three times cheaper per station; its corner sections reach
+/// the local lane through this fallback instead. This is the
+/// same shape as `degenerate_apex_frustum`'s branch selection in
+/// `geometry/analytic_surface/intersect.rs`: a deterministic choice between two
+/// constructions on their measured error, never a tolerance, and it can only
+/// return the more accurate of the two.
+///
+/// Escape hatch: `BREP_POLYLINE_FIT_REFINE=0` fits rung zero alone, for
+/// bisecting a moved number against the pre-ladder tree.
+///
+/// [`offset::fold_locus::fit_locus_pcurve`]: crate::offset
 pub fn fit_polyline(
     points: &[Vec3],
     tolerance: f64,
     maximum_points: usize,
     local_interpolation: bool,
 ) -> Result<PolylineFit, String> {
-    let mut kept = simplify_polyline(points, tolerance);
-    if kept.len() > 2 {
-        let total: f64 = kept
-            .windows(2)
-            .map(|pair| pair[1].sub(pair[0]).length())
-            .sum();
-        let floor = (tolerance * 0.01).max(total * 1e-4);
-        let first = kept[0];
-        let last = kept[kept.len() - 1];
-        let mut conditioned = vec![first];
-        for point in &kept[1..kept.len() - 1] {
-            if point.sub(first).length() > floor
-                && point.sub(last).length() > floor
-                && point.sub(*conditioned.last().unwrap()).length() > floor
-            {
-                conditioned.push(*point);
-            }
-        }
-        conditioned.push(last);
-        kept = conditioned;
-    } else {
-        let mut distinct = Vec::new();
-        for point in kept {
-            if distinct
-                .last()
-                .is_none_or(|previous: &Vec3| point.sub(*previous).length() > tolerance * 0.01)
-            {
-                distinct.push(point);
-            }
-        }
-        kept = distinct;
+    let refine = std::env::var("BREP_POLYLINE_FIT_REFINE").as_deref() != Ok("0");
+    let asked = fit_polyline_inner(points, tolerance, maximum_points, local_interpolation, refine)?;
+    if asked.report.met_tolerance() || !refine {
+        record_polyline_fit(&asked.report);
+        return Ok(asked);
     }
-    if kept.len() < 2 {
+    let mut other =
+        fit_polyline_inner(points, tolerance, maximum_points, !local_interpolation, refine)?;
+    let spent = asked.report.rungs + other.report.rungs;
+    let mut best = if other.report.deviation < asked.report.deviation {
+        other.report.lane_switched = true;
+        other
+    } else {
+        asked
+    };
+    // Every rung of BOTH ladders was paid for, whichever curve is returned.
+    best.report.rungs = spent;
+    record_polyline_fit(&best.report);
+    Ok(best)
+}
+
+fn fit_polyline_inner(
+    points: &[Vec3],
+    tolerance: f64,
+    maximum_points: usize,
+    local_interpolation: bool,
+    refine: bool,
+) -> Result<PolylineFit, String> {
+    let pool = station_pool(points, tolerance);
+    if pool.len() < 2 {
         return Err("fit_polyline: degenerate polyline".into());
     }
-    let maximum_points = maximum_points.max(2);
-    if kept.len() > maximum_points {
-        let step = (kept.len() - 1) as f64 / (maximum_points - 1) as f64;
-        kept = (0..maximum_points)
-            .map(|index| kept[(index as f64 * step).round() as usize])
-            .collect();
-    }
-    let total: f64 = kept
-        .windows(2)
-        .map(|pair| pair[1].sub(pair[0]).length())
-        .sum();
-    if total <= 0.0 {
-        return Err("fit_polyline: degenerate polyline".into());
-    }
-    let mut parameters = vec![0.0; kept.len()];
-    let mut accumulated = 0.0;
-    for index in 1..kept.len() {
-        accumulated += kept[index].sub(kept[index - 1]).length();
-        parameters[index] = accumulated / total;
-    }
-    *parameters.last_mut().unwrap() = 1.0;
-    let curve = if local_interpolation {
-        interpolate_curve_local(&kept, &parameters, 1.0)?
+    let arc = cumulative_chord(points);
+    let band = dropped_band(points, &pool);
+    let floor = tolerance.max(band);
+    let mut budget = maximum_points.max(2);
+    let ceiling = pool
+        .len()
+        .min(MAX_FIT_STATIONS)
+        .min(budget.saturating_mul(LADDER_BUDGET_FACTOR))
+        .max(budget);
+    let (mut curve, mut stations, mut parameters, mut deviation, mut rms, mut between) =
+        fit_rung(points, &pool, &arc, budget, local_interpolation)?;
+    let mut rungs = 1usize;
+    let mut exit = if deviation <= floor {
+        PolylineFitExit::Converged
     } else {
-        interpolate_curve(&kept, 3usize.min(kept.len() - 1), &parameters)?
+        PolylineFitExit::Unrefined
+    };
+    while refine && deviation > floor {
+        if budget >= ceiling {
+            exit = if ceiling >= pool.len() {
+                PolylineFitExit::InputExhausted
+            } else {
+                PolylineFitExit::StationCeiling
+            };
+            break;
+        }
+        budget = (budget * 2).min(ceiling);
+        let rung = fit_rung(points, &pool, &arc, budget, local_interpolation)?;
+        rungs += 1;
+        if rung.3 >= deviation * STALL_FACTOR {
+            if rung.3 < deviation {
+                (curve, stations, parameters, deviation, rms, between) = rung;
+            }
+            // A rung can stall INSIDE the tolerance — it bought little because
+            // there was little left to buy. The exit names what the curve is,
+            // so `met_tolerance()` and `exit` can never disagree.
+            exit = if deviation <= floor {
+                PolylineFitExit::Converged
+            } else {
+                PolylineFitExit::Stalled
+            };
+            break;
+        }
+        (curve, stations, parameters, deviation, rms, between) = rung;
+        if deviation <= floor {
+            exit = PolylineFitExit::Converged;
+        }
+    }
+    let report = PolylineFitReport {
+        deviation,
+        rms,
+        between_stations: between,
+        tolerance,
+        floor,
+        stations: stations.len(),
+        controls: curve.control_points.len(),
+        input_points: points.len(),
+        pool_points: pool.len(),
+        dropped_band: band,
+        rungs,
+        local_lane: local_interpolation,
+        lane_switched: false,
+        exit,
     };
     Ok(PolylineFit {
         curve,
         parameters,
-        kept,
+        kept: stations.iter().map(|index| points[*index]).collect(),
+        report,
     })
 }
 
-// BREP private tests: 7d3d630bf075d2f1
+/// Per-operation tally of polyline fits and how many missed their tolerance.
+///
+/// The same shape, and for the same reason, as [`crate::PcurveFitLedger`]:
+/// [`fit_polyline`] is called from the imprint driver and from the offset
+/// reintersection, neither of which has a diagnostics record to write into. An
+/// operation that returns [`KernelDiagnostics`] opens a [`PolylineFitScope`];
+/// every fit made on that thread while the scope is open is tallied here, and
+/// closing it hands the tally back for [`PolylineFitLedger::report_into`].
+/// Scopes nest — closing a child folds it into its parent — and a scope DROPPED
+/// without being closed is discarded, so a refused boolean attempt does not
+/// leave its fits on the caller's tally. With no scope open, recording is a
+/// no-op.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PolylineFitLedger {
+    /// Fits recorded, met ones included.
+    pub fits: u64,
+    /// Fits whose returned curve did not reach its tolerance.
+    pub unmet: u64,
+    /// Unmet fits that stopped at [`MAX_FIT_STATIONS`].
+    pub station_ceiling: u64,
+    /// Unmet fits that had already used every station the input offers.
+    pub input_exhausted: u64,
+    /// Unmet fits whose last doubling bought nothing.
+    pub stalled: u64,
+    /// Unmet fits that never refined (a single-rung fit, or the escape hatch).
+    pub unrefined: u64,
+    /// Fits that spent more than one rung, met or not.
+    pub refined: u64,
+    /// Fits that met their tolerance only with every station the input offers —
+    /// a SATURATED reading (see [`PolylineFitReport::saturated`]).
+    pub met_at_pool: u64,
+    /// Fits returned from the lane the caller did NOT ask for, because the
+    /// caller's own ladder ended unmet and the other lane measured better.
+    pub lane_switched: u64,
+    /// Extra rungs spent over every fit — what the ladder cost.
+    pub extra_rungs: u64,
+    /// Largest deviation among the unmet fits; zero when there are none.
+    pub worst_unmet_deviation: f64,
+    /// Largest [`PolylineFitReport::dropped_band`] over every fit.
+    pub worst_dropped_band: f64,
+}
 
-// BREP private tests: 05cf36d4895e74b7
+impl PolylineFitLedger {
+    fn record(&mut self, report: &PolylineFitReport) {
+        self.fits += 1;
+        self.extra_rungs += (report.rungs - 1) as u64;
+        if report.rungs > 1 {
+            self.refined += 1;
+        }
+        self.worst_dropped_band = self.worst_dropped_band.max(report.dropped_band);
+        if report.lane_switched {
+            self.lane_switched += 1;
+        }
+        if report.met_tolerance() {
+            if report.saturated() {
+                self.met_at_pool += 1;
+            }
+            return;
+        }
+        self.unmet += 1;
+        match report.exit {
+            PolylineFitExit::Converged => {}
+            PolylineFitExit::StationCeiling => self.station_ceiling += 1,
+            PolylineFitExit::InputExhausted => self.input_exhausted += 1,
+            PolylineFitExit::Stalled => self.stalled += 1,
+            PolylineFitExit::Unrefined => self.unrefined += 1,
+        }
+        self.worst_unmet_deviation = self.worst_unmet_deviation.max(report.deviation);
+    }
+
+    fn fold(&mut self, child: &PolylineFitLedger) {
+        self.fits += child.fits;
+        self.unmet += child.unmet;
+        self.station_ceiling += child.station_ceiling;
+        self.input_exhausted += child.input_exhausted;
+        self.stalled += child.stalled;
+        self.unrefined += child.unrefined;
+        self.refined += child.refined;
+        self.met_at_pool += child.met_at_pool;
+        self.lane_switched += child.lane_switched;
+        self.extra_rungs += child.extra_rungs;
+        self.worst_unmet_deviation = self.worst_unmet_deviation.max(child.worst_unmet_deviation);
+        self.worst_dropped_band = self.worst_dropped_band.max(child.worst_dropped_band);
+    }
+
+    /// Write the tally into an operation's diagnostics: the `fit.polyline.*`
+    /// counters always, plus one `fit.polyline.unmet_tolerance` event at
+    /// [`DiagnosticSeverity::Degraded`] when any fit missed its tolerance.
+    /// Degraded, not Error: the curve is still the kernel's best interpolant of
+    /// the points it was given and the solid stays shippable, but it no longer
+    /// claims the accuracy the caller asked for.
+    pub fn report_into(&self, diagnostics: &mut KernelDiagnostics) {
+        diagnostics.count_n("fit.polyline.fits", self.fits);
+        diagnostics.count_n("fit.polyline.unmet_tolerance", self.unmet);
+        diagnostics.count_n("fit.polyline.exit.station_ceiling", self.station_ceiling);
+        diagnostics.count_n("fit.polyline.exit.input_exhausted", self.input_exhausted);
+        diagnostics.count_n("fit.polyline.exit.stalled", self.stalled);
+        diagnostics.count_n("fit.polyline.exit.unrefined", self.unrefined);
+        diagnostics.count_n("fit.polyline.refined", self.refined);
+        diagnostics.count_n("fit.polyline.met_at_pool", self.met_at_pool);
+        diagnostics.count_n("fit.polyline.lane_switched", self.lane_switched);
+        diagnostics.count_n("fit.polyline.extra_rungs", self.extra_rungs);
+        diagnostics.measure_max("fit.polyline.worst_unmet_deviation", self.worst_unmet_deviation);
+        diagnostics.measure_max("fit.polyline.worst_dropped_band", self.worst_dropped_band);
+        if self.unmet > 0 {
+            diagnostics.event(
+                DiagnosticSeverity::Degraded,
+                KernelStage::Intersect,
+                "fit.polyline.unmet_tolerance",
+                format!(
+                    "{} of {} polyline fits did not reach the tolerance they were given \
+                     (station ceiling {}, input exhausted {}, stalled {}, unrefined {}); \
+                     worst deviation {:.3e}; the simplification's own band reaches {:.3e}",
+                    self.unmet,
+                    self.fits,
+                    self.station_ceiling,
+                    self.input_exhausted,
+                    self.stalled,
+                    self.unrefined,
+                    self.worst_unmet_deviation,
+                    self.worst_dropped_band,
+                ),
+            );
+        }
+    }
+}
+
+thread_local! {
+    /// The open [`PolylineFitScope`]s on this thread, innermost last.
+    static POLYLINE_FIT_SCOPES: std::cell::RefCell<Vec<PolylineFitLedger>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// An open tally of the polyline fits made on this thread — see
+/// [`PolylineFitLedger`]. Open it where an operation starts, [`close`] it where
+/// the operation returns its diagnostics; a `?` that unwinds past it drops the
+/// tally.
+///
+/// [`close`]: PolylineFitScope::close
+pub struct PolylineFitScope {
+    /// Not `Send`: the scope must close on the thread that opened it.
+    _thread_bound: std::marker::PhantomData<*const ()>,
+}
+
+impl PolylineFitScope {
+    pub fn open() -> Self {
+        POLYLINE_FIT_SCOPES.with(|scopes| scopes.borrow_mut().push(PolylineFitLedger::default()));
+        Self {
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+
+    /// Take the tally, folding it into the enclosing scope if there is one.
+    pub fn close(self) -> PolylineFitLedger {
+        let ledger = POLYLINE_FIT_SCOPES.with(|scopes| {
+            let mut scopes = scopes.borrow_mut();
+            let ledger = scopes.pop().unwrap_or_default();
+            if let Some(parent) = scopes.last_mut() {
+                parent.fold(&ledger);
+            }
+            ledger
+        });
+        std::mem::forget(self);
+        ledger
+    }
+}
+
+impl Drop for PolylineFitScope {
+    fn drop(&mut self) {
+        POLYLINE_FIT_SCOPES.with(|scopes| {
+            scopes.borrow_mut().pop();
+        });
+    }
+}
+
+fn record_polyline_fit(report: &PolylineFitReport) {
+    // Per-fit trace for the fit bench and the lane census, the way
+    // `BREP_DEBUG_PCURVE_FIT` traces a pcurve fit.
+    if std::env::var_os("BREP_DEBUG_POLYLINE_FIT").is_some() {
+        eprintln!("POLYLINE-FIT {report:?}");
+    }
+    POLYLINE_FIT_SCOPES.with(|scopes| {
+        if let Some(open) = scopes.borrow_mut().last_mut() {
+            open.record(report);
+        }
+    });
+}
+
+
 
 /// Cox–de Boor basis over a RAW (possibly unclamped) knot array — the local
 /// helper the periodic interpolation needs; `KnotVector` validation rightly
@@ -786,4 +1534,3 @@ pub fn interpolate_curve_closed(points: &[Vec3], parameters: &[f64]) -> Result<N
     NurbsCurve::new(degree, clamped_knots, clamped_controls)
 }
 
-// BREP private tests: aa6a4fea97fb3e37

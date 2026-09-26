@@ -64,7 +64,6 @@ mod project;
 mod loop_ids;
 mod regions;
 mod pipeline;
-// BREP private tests: 5060d54b5a840829
 
 pub use loop_ids::assign_sketch_loop_ids;
 pub use pipeline::{execute, schema};

@@ -13,8 +13,8 @@
 //! `path` is a `multiple` `["SKETCH","EDGE"]` selection, resolved by
 //! `common::resolve_path_chain`:
 //!   - a whole SKETCH resolves to its published chain — its longest open run, or a
-//!     lone closed loop, which the fold-back rule below then refuses — so one
-//!     selection covers the entire trajectory. `SKETCH` is a real pick lane
+//!     lone closed loop, which `translate` refuses and `pathAlign` sweeps as a
+//!     capless ring (see below) — so one selection covers the entire trajectory. `SKETCH` is a real pick lane
 //!     (`SelectionFilter::sketch`), so clicking the sketch's sheet in the 3D view
 //!     picks the whole sketch while clicking one of its drawn segments picks that
 //!     edge;
@@ -44,9 +44,15 @@
 //! (nearly) inside the profile plane (the builder refuses a direction within ~6°
 //! of it — `|n̂·d̂| < 0.1`), and must ADVANCE THROUGH THE PROFILE THE SAME WAY as the first — the
 //! profile does not rotate, so a segment that reverses relative to it drives the
-//! profile back through material already swept. A CLOSED path always reverses
-//! somewhere (its advances must sum to zero) and is refused by the same rule.
-//! Every refusal names the offending segment.
+//! profile back through material already swept. Every refusal names the
+//! offending segment.
+//!
+//! A CLOSED path is refused under `translate` BY ITS CLOSURE, not by the segment
+//! that happens to reverse: the path classification
+//! (`common::resolve_sweep_path`) says the run is a ring, and the refusal points
+//! at `pathAlign`, which builds one. Going round a loop without rotating the
+//! profile cannot work — the advances must sum to zero — so this is a real
+//! boundary between the modes rather than a missing port.
 //!
 //! That one rule is also what makes the cap naming exact: with all segments
 //! advancing the same way, portion `i` occupies `[s_i, s_{i+1}]` through the
@@ -94,6 +100,11 @@
 //!     result — the keyed spelling is what they would carry if one ever did.
 //!   - hole walls → `${id}:HOLE:{loop key}:${segment}`, with `${id}:HOLE:{loop key}`
 //!     as their container — the same per-segment treatment as the sidewalls.
+//!   - a RING (a closed path under `pathAlign`) has NO caps, so it names none and
+//!     registers neither cap name nor cap container: a container standing for a
+//!     face that does not exist is a name a later feature can select and nothing
+//!     can resolve. Its walls take the same un-keyed container spelling every
+//!     `pathAlign` wall does.
 //! where `tag` = `""` for an empty id, else `${id}:`,
 //! and `faceName` is the sketch profile face name `{sketchId}:PROFILE`.
 //!
@@ -114,13 +125,21 @@
 //! | the path is | mode | what it builds |
 //! |---|---|---|
 //! | cornered (straight segments meeting at an angle) | `translate` | one oblique prism per segment, unioned; the corner is handled; per-SEGMENT wall names |
+//! | cornered, and the profile must FOLLOW it | `pathAlign` | one MITRE per joint: the section swept along each segment, both sweeps trimmed to the joint's bisector plane and sharing ONE face loop there — inner side folded, outer side extended, no bulkhead; per-SEGMENT wall names |
 //! | smooth — curved, or segments meeting tangentially | `pathAlign` | ONE tube: the profile is CARRIED by the path's own rigid motion, keeping the position and angle it was drawn at; per-PROFILE-EDGE wall names |
-//! | cornered AND the profile must follow it | neither | unbuilt (a mitred corner); refused by name |
+//! | smooth AND CLOSED, and PLANAR | `pathAlign` | ONE RING: the same carry, all the way round and back to the section it started as — no end caps, `V − E + F = 0` |
+//! | cornered AND CLOSED, and PLANAR | `pathAlign` | a picture FRAME: `n` mitres for `n` segments, the closing joint mitred like the rest, and NO caps — `V − E + F = 0`; per-SEGMENT wall names |
+//! | cornered at a CURVED segment | neither | unbuilt (no single direction for a bisector plane to bisect, and no lane that mixes mitring with skinning); refused by name |
+//! | smooth AND CLOSED, and SPATIAL | `pathAlign` | ONE RING, closed by a COUNTER-TWIST: carried once round, the section comes back rolled by the path's HOLONOMY (the solid angle its tangent indicatrix encloses, mod 2π), and minus that angle is laid down linearly in arc length so the ring meets itself (`sweep_closure` reports both) |
+//! | cornered AND CLOSED, and SPATIAL | `pathAlign` | a FRAME closed the same way: the counter-twist is shared over the sides by length, each share rolled over the middle half of its side as an exact twisted wall, so the mitres stay exact and there is still one wall per (segment × profile edge); a loop whose holonomy is zero (a mirror-symmetric one) is a plain frame |
 //!
-//! The gate between them is the JOINT ANGLE, not curvature: an all-straight
-//! cornered polyline is refused under `pathAlign` for the same reason a curved one
-//! is. `translate` refuses a CURVED segment for the mirror reason — a chord does
-//! not follow a curve.
+//! The gate between the two LANES of `pathAlign` is the JOINT ANGLE, not
+//! curvature: a joint inside the tangent-break band is skinned as one tube, and
+//! one past it is a corner — mitred when both its segments are straight,
+//! refused when either is curved. `translate` refuses a CURVED segment for the
+//! mirror reason — a chord does not follow a curve. So the two modes now differ
+//! on a cornered polyline only in WHERE the section sits: `translate` slides it
+//! without rotating, `pathAlign` turns it through each joint.
 //!
 //! # What `pathAlign` means, exactly
 //!
@@ -142,7 +161,16 @@
 //!     modes agree on a straight path rather than merely agreeing in volume;
 //!   - a circular ARC has `R` = the rotation about the ARC'S OWN CENTRE AXIS, so
 //!     the profile is carried round that pivot and the end cap keeps the angle to
-//!     the tangent the start cap had. A full circle is exactly a revolve.
+//!     the tangent the start cap had. A full circle is exactly a revolve;
+//!   - a HELIX has `R` = the SCREW about its own axis, so the profile keeps its
+//!     place relative to the coil's axis and a whole number of turns lands the end
+//!     cap on the start cap lifted by the height. The helix's axis comes WITH the
+//!     path — the HX feature publishes it beside its edge, and
+//!     `common::resolve_sweep_path` carries it onto `SweepPath::screw_axes` — and
+//!     without it a helical curve is framed like any other curve, by the
+//!     rotation-minimizing frame, which rolls away from the screw by the helix's
+//!     integrated torsion. That roll was the hosted-app report of 2026-09-15 ("Sweep
+//!     seems to rotate the profile in an unexpected way as it follows the path").
 //! The START cap therefore lies in the sketch plane. The path need not start on
 //! the profile, or touch it: an offset profile sweeps the ring its offset traces.
 //!
@@ -168,16 +196,29 @@
 //!   curved path TODAY, as one tube, and skips the straight-segment loop below
 //!   outright (`filter(|_| !path_align)`), so the refusal is never reached in that
 //!   mode.
-//! - a path that DOUBLES BACK through the profile, a closed path included (see
-//!   above) — sweep the run one direction at a time.
-//! - `orientationMode: "pathAlign"` on a CORNERED path. The mode itself is built
-//!   (see below); what is not built is the MITRE. Rotating the profile at a joint
-//!   and mitring the corner is what this codebase has always meant by pathAlign,
-//!   and the one-tube build cannot do the second half: it skins between sampled
-//!   stations, so a corner would be rounded off rather than mitred. Refused by
-//!   name, pointing at `translate` — which handles corners, at the cost of not
-//!   rotating the profile. A path that is cornered AND wants the profile to
-//!   follow it is genuinely unbuilt, and the refusal says so.
+//! - a path that DOUBLES BACK through the profile, under `translate` — sweep the
+//!   run one direction at a time. A CLOSED path is the special case of it that
+//!   `pathAlign` builds instead (see the mode table), and its refusal says so.
+//! - `orientationMode: "pathAlign"` on a cornered path with a CURVED segment.
+//!   An all-straight cornered polyline is MITRED (see the mode table); a corner
+//!   at a curve is not, and the reason is the mitre's own construction — it trims
+//!   both sweeps to the plane that BISECTS their directions, and a curve has no
+//!   single direction to bisect. Refused by name, saying which segment is curved.
+//! - a CLOSED cornered polyline which CROSSES ITSELF: it would build a frame that
+//!   passes through itself, and the refusal names the two sides. A SPATIAL one is
+//!   built (see the mode table), and refused only where its counter-twist has no
+//!   room: a side whose mitres reach into the middle half its share rolls over,
+//!   or a section reaching so far from the path that the roll would tilt a wall
+//!   past the 0.1 transversality floor. Both quote their measurement.
+//! - a mitre with no ROOM for it: a bend too TIGHT for the section across it (the
+//!   inner fold would reach past the far end of a segment, so the bisector plane
+//!   cuts the section a second time and the inner side self-intersects), and a
+//!   COLLAPSED bend at or past the 168.522° fold angle. Both quote the measured
+//!   quantity — the surviving wall length against the segment's own, or the angle
+//!   against the bar.
+//! - a non-zero twist on a cornered path: a twist is laid down over the sampled
+//!   stations, a mitre has none, and rolling the section between two exact pieces
+//!   would pull apart the shared loop that IS the construction.
 //! - a non-zero `twistAngle` (a no-op upstream, but a geometry-shaped param we refuse to
 //!   silently ignore) is not yet migrated.
 
@@ -241,7 +282,10 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     if path_names.is_empty() {
         return Err("sweep: requires a path edge selection".into());
     }
-    let chain = common::resolve_path_chain(ctx, &path_names)
+    // The resolved chain AND its classification — closure, the plane it lies in if
+    // it lies in one, and every joint's continuity — computed once here and read
+    // by the refusals below and by the builder (`common::resolve_sweep_path`).
+    let path = common::resolve_sweep_path(ctx, &path_names)
         .map_err(|error| format!("sweep: {error}"))?;
 
     // ---- Orientation mode, read BEFORE the straight-segment loop below.
@@ -263,37 +307,57 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     //
     // TRANSLATE ONLY: `pathAlign` sweeps the whole run as one tube and never
     // reduces a segment to a chord, so it neither needs nor may run this loop.
-    let mut steps: Vec<Step> = Vec::with_capacity(chain.len());
+    let mut steps: Vec<Step> = Vec::with_capacity(path.len());
     let mut offset = Vec3::default();
-    for segment in chain.iter().filter(|_| !path_align) {
-        // STRAIGHT segments only: a degree-1 two-control-point curve. Anything
-        // else is the curved-sweep (loft) branch, deferred loudly BY NAME.
-        if segment.curve.degree != 1 || segment.curve.control_points.len() != 2 {
-            return Err(format!(
-                "sweep: path segment '{}' is curved, and `orientationMode: translate` slides \
-                 the profile along each segment's CHORD, which would not follow the curve. \
-                 Set `orientationMode: pathAlign` to sweep this path — the profile then \
-                 rotates to follow it. (Path Sweep, SWP, builds the same shape as a \
-                 separate feature.)",
-                segment.name
-            ));
+    if !path_align {
+        // A CLOSED path, named as such. `translate` cannot sweep one and never
+        // could: the profile does not rotate, so the portions' advances through it
+        // must sum to zero and some segment has to reverse. The fold-back rule
+        // below catches that consequence — but it reports the REVERSING SEGMENT,
+        // which tells a user who drew a loop nothing about the loop. The
+        // classification knows the path is a ring, so this says so, and points at
+        // the mode that now builds one.
+        if path.closed {
+            return Err(
+                "sweep: this path is CLOSED (a ring), and `orientationMode: translate` slides \
+                 the profile along each segment's chord without rotating it — so going round a \
+                 loop it must drive the profile back through material it has already swept. \
+                 Set `orientationMode: pathAlign` to sweep a closed PLANAR path, which builds \
+                 the ring as one capless body, or sweep the run one direction at a time."
+                    .into(),
+            );
         }
-        let [t0, t1] = segment.curve.domain()?;
-        let direction = segment.curve.evaluate(t1)?.sub(segment.curve.evaluate(t0)?);
-        let distance = direction.length();
-        if distance <= 1e-12 {
-            return Err(format!(
-                "sweep: path segment '{}' has zero length",
-                segment.name
-            ));
+        for index in 0..path.len() {
+            let curve = &path.curves[index];
+            // STRAIGHT segments only: a degree-1 two-control-point curve. Anything
+            // else is the curved-sweep (loft) branch, deferred loudly BY NAME.
+            if curve.degree != 1 || curve.control_points.len() != 2 {
+                return Err(format!(
+                    "sweep: path segment '{}' is curved, and `orientationMode: translate` slides \
+                     the profile along each segment's CHORD, which would not follow the curve. \
+                     Set `orientationMode: pathAlign` to sweep this path — the profile then \
+                     rotates to follow it. (Path Sweep, SWP, builds the same shape as a \
+                     separate feature.)",
+                    path.name(index)
+                ));
+            }
+            let [t0, t1] = curve.domain()?;
+            let direction = curve.evaluate(t1)?.sub(curve.evaluate(t0)?);
+            let distance = direction.length();
+            if distance <= 1e-12 {
+                return Err(format!(
+                    "sweep: path segment '{}' has zero length",
+                    path.name(index)
+                ));
+            }
+            steps.push(Step {
+                name: path.name(index).to_string(),
+                offset,
+                direction,
+                distance,
+            });
+            offset = offset.add(direction);
         }
-        steps.push(Step {
-            name: segment.name.clone(),
-            offset,
-            direction,
-            distance,
-        });
-        offset = offset.add(direction);
     }
 
     // A segment lying exactly IN the profile plane sweeps nothing and leaves the
@@ -316,8 +380,13 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     // has already swept: the result self-intersects, and the two portions either
     // side of the reversal share a cap they now face the SAME way, so the caps
     // MERGE instead of cancelling and the surviving face's name falls to the
-    // boolean's face order. A CLOSED path always reverses somewhere (its
-    // segments' advances must sum to zero), which is why one is refused here.
+    // boolean's face order.
+    //
+    // A CLOSED path always reverses somewhere (its segments' advances must sum to
+    // zero), and this rule is what used to refuse one — reporting the reversing
+    // segment. The closure refusal above now speaks first and says what the path
+    // IS; what is left here is the OPEN chain that drifts back on itself, which is
+    // the only case this rule was ever the right reporter for.
     //
     // The profile's own plane normal (`SketchProfile::z_axis`, published by the
     // sketch and by `face_profile` alike) fixes the reference; the sign comes from
@@ -340,24 +409,23 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                     "sweep: path segment '{}' doubles back through the profile — this sweep \
                      TRANSLATES the profile without rotating it, so a segment that reverses \
                      relative to the profile drives it back through material already swept. \
-                     Every path segment must advance through the profile the same way (a CLOSED \
-                     path never can). Sweep the run one direction at a time.",
+                     Every path segment must advance through the profile the same way. Sweep \
+                     the run one direction at a time.",
                     step.name
                 ));
             }
         }
     }
 
-    // ---- Orientation guard: `pathAlign` would rotate the profile at each joint
-    // and miter the corners. This build translates instead, so on a multi-segment
-    // path the mode is refused rather than silently dropped. On ONE straight
-    // segment it changes nothing either way.
-    // `pathAlign` on a multi-segment path is BUILT (one tube, single
-    // rotation-minimizing frame). What is NOT built is a MITRED CORNER: the tube
-    // is skinned between sampled stations, so a corner would be rounded off
-    // rather than mitred. `sweep_profile_along_chain` refuses a cornered joint by
-    // name and its message points back at `translate`, which handles corners at
-    // the cost of not rotating the profile. Nothing to gate here.
+    // ---- No orientation guard: `pathAlign` is BUILT on every path shape this
+    // feature accepts. A smooth run is one tube on a single rotation-minimizing
+    // frame; a cornered POLYLINE is MITRED, one exact piece per segment joined on
+    // each joint's bisector plane. `sweep_profile_along_chain` owns both lanes and
+    // picks between them off the path's own classification — a CLOSED polyline is
+    // the same mitre lane with no caps, a picture frame — and it refuses what
+    // neither covers (a corner at a curved segment, a spatial or self-crossing
+    // frame loop, a bend with no room for its mitre) by name. Nothing to gate
+    // here.
 
     // ---- Twist guard: a non-zero twist is a no-op we refuse to silently honor.
     // Non-finite / absent / zero → treated as 0 (`Number(twist)` NaN-guard).
@@ -394,24 +462,53 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     // (see `common::CapNames`).
     let caps = common::CapNames::new(&base, &profile.regions);
     let pinned: Vec<String> = KEEP_UNMERGED.iter().map(|s| s.to_string()).collect();
+    // A CLOSED path sweeps a capless RING — no start cap, no end cap, and so no
+    // cap name and no cap container. Registering the names anyway would publish
+    // container entries standing for faces that do not exist, which is a name a
+    // later feature can select and nothing can resolve.
+    let ring = path.closed;
+    // A CORNERED POLYLINE under `pathAlign` is MITRED: one exact piece per
+    // segment, joined on each joint's bisector plane, so the build emits a wall
+    // per (segment × profile edge) and names them per segment. The ONE predicate
+    // the builder selects the lane on is the one read here
+    // (`SweepPath::cornered_polyline`), so the names and the geometry cannot
+    // disagree about which lane ran.
+    let mitred = path_align && path.cornered_polyline();
+    // The path segments a WALL NAME is keyed by: every segment under
+    // `translate`, every segment under a MITRED `pathAlign`, and none under the
+    // smooth one-tube lane (where the un-keyed container IS the wall's name).
+    let wall_segments: Vec<String> = if path_align {
+        if mitred {
+            (0..path.len()).map(|index| path.name(index).to_string()).collect()
+        } else {
+            Vec::new()
+        }
+    } else {
+        steps.iter().map(|step| step.name.clone()).collect()
+    };
     // Every cap name the build stamps, so the role pass marks an interior cap a
     // cap in the rare case one survives the union.
-    let mut start_names = caps.starts();
-    let mut end_names = caps.ends();
+    let mut start_names = if ring { Vec::new() } else { caps.starts() };
+    let mut end_names = if ring { Vec::new() } else { caps.ends() };
     // `container -> members` for the per-segment sidewall and hole-wall names.
-    let mut containers = caps.containers();
+    let mut containers = if ring { Vec::new() } else { caps.containers() };
 
-    // `pathAlign` sweeps the run as ONE tube per region, so it needs the chain as
-    // plain curves. It needs NO placement anchor: `SectionPlacement::Rigid`
+    // `pathAlign` sweeps the run as ONE tube per region — or as one RING when the
+    // path is closed. It needs NO placement anchor: `SectionPlacement::Rigid`
     // carries every loop from where it was drawn, so a hole's offset from its
     // outer loop, and a later region's offset from the first, are preserved by
     // the construction itself rather than by lending one loop's frame to the
     // rest. (That anchor exists for `Transplant`, which moves each loop onto the
     // path and would otherwise re-centre every one of them. SWP still needs it.)
-    let path_curves: Vec<_> = chain.iter().map(|s| s.curve.clone()).collect();
-    let path_segment_names: Vec<String> = chain.iter().map(|s| s.name.clone()).collect();
 
     let mut region_solids = Vec::with_capacity(profile.regions.len());
+    // Which regions the swept ENVELOPE lane built. Past `ρκ = 1` the sections
+    // cross and the kernel answers with a REVOLVE — the section disc truncated
+    // at the path's own axis — whose face set is nothing like the skinned tube's:
+    // ONE revolved wall carrying every section edge, plus the usual two caps on
+    // an open path. Read from the same recognition the builder selects the lane
+    // on, so the names and the geometry cannot disagree about which one ran.
+    let mut envelope_regions = vec![false; profile.regions.len()];
     for (region_index, region) in profile.regions.iter().enumerate() {
         let outer = region.first().ok_or("sweep: profile has no outer loop")?;
         if outer.curves.len() < 2 {
@@ -423,17 +520,35 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         let side_count = outer.curves.len();
 
         if path_align {
+            let envelope = matches!(
+                crate::recognize_swept_envelope(
+                    &outer.curves,
+                    &path,
+                    crate::SectionPlacement::Rigid,
+                ),
+                Ok(Ok(_))
+            );
+            envelope_regions[region_index] = envelope;
+            if envelope && region.len() > 1 {
+                return Err(format!(
+                    "sweep: region {} bends TIGHTER than its own section, so its swept solid is \
+                     the envelope trimmed at its own self-intersection — a revolve, not a skinned \
+                     tube — and a HOLE loop through one is not built: the hole's own envelope \
+                     would have to be trimmed against the outer one, which nothing solves. Sweep \
+                     the outer loop alone, or ease the bend",
+                    region_index + 1
+                ));
+            }
             // ONE tube for the whole run, every loop carried by the PATH'S OWN
             // rigid motion from where it was drawn (`SectionPlacement::Rigid`).
             let mut solid = crate::sweep_profile_along_chain(
                 &outer.curves,
-                &path_curves,
-                &path_segment_names,
+                &path,
                 0.0,
                 Some(&ctx.id),
                 None,
                 crate::SectionPlacement::Rigid,
-                "Set `orientationMode: translate` to sweep this path — that mode builds one portion per segment and handles the corner, at the cost of not rotating the profile to follow the path. A mitred, path-aligned corner is not built.",
+                "A corner between two STRAIGHT segments is MITRED under `pathAlign` (both sweeps trimmed to the joint's bisector plane, sharing one loop there), and `orientationMode: translate` slides the profile along each straight segment's chord without rotating it — but neither builds a corner at a CURVED segment, because a curve has no single direction for a bisector plane to bisect. Split the path at that corner and sweep each run separately, or round the corner so the joint is tangent-continuous.",
             )
             .map_err(|error| format!("sweep: {error}"))?;
 
@@ -447,13 +562,65 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
             // resolves under BOTH modes, so flipping `orientationMode` does not
             // break a downstream reference. Caps keep the loop-keyed spelling,
             // and with one portion there are no interior caps at all.
+            //
+            // A MITRED path is the exception, and it takes `translate`'s
+            // spelling: a cornered polyline is built as one exact piece per
+            // segment joined on each joint's bisector plane, so there IS a wall
+            // per (path segment × profile edge), in that order, and naming them
+            // all after the profile edge alone would hand several faces one
+            // name. The per-segment names are the same
+            // `{tag}{profileEdge}:{segment}_SW` strings `translate` stamps, under
+            // the same un-keyed container — so a reference into a mitred
+            // `pathAlign` sweep and one into a `translate` sweep of the same path
+            // resolve identically, and the container resolves under the smooth
+            // lane too.
             let mut face_names: Vec<String> = Vec::with_capacity(side_count + 2);
-            for index in 0..side_count {
-                face_names.push(wall_container_name(&tag, &outer.edge_names, index));
+            if envelope {
+                // A section CROSSING the axis leaves ONE envelope face, the image
+                // of the WHOLE section boundary — the near arc runs across both
+                // of a circle's half-arcs — so no per-edge wall exists to name.
+                // It takes the first section edge's container spelling, and
+                // every other edge's container lists that one name as its member
+                // below. A section merely TANGENT to the axis leaves one revolved
+                // wall per profile arc, and each takes its own edge's spelling.
+                let caps_here = if ring { 0 } else { 2 };
+                let walls = solid
+                    .shells
+                    .first()
+                    .map_or(0, |shell| shell.faces.len())
+                    .saturating_sub(caps_here);
+                if walls == 1 {
+                    face_names.push(wall_container_name(&tag, &outer.edge_names, 0));
+                } else {
+                    envelope_regions[region_index] = false;
+                    for index in 0..side_count {
+                        face_names.push(wall_container_name(&tag, &outer.edge_names, index));
+                    }
+                }
+            } else if mitred {
+                for segment in 0..path.len() {
+                    for index in 0..side_count {
+                        face_names.push(side_face_name(
+                            &tag,
+                            &outer.edge_names,
+                            index,
+                            path.name(segment),
+                        ));
+                    }
+                }
+            } else {
+                for index in 0..side_count {
+                    face_names.push(wall_container_name(&tag, &outer.edge_names, index));
+                }
             }
-            let (chain_start, chain_end) = &caps.per_loop[region_index];
-            face_names.push(chain_start.clone());
-            face_names.push(chain_end.clone());
+            // A RING's faces are its walls and nothing else: the closed loft
+            // emits one face per profile edge, in the same INPUT-curve order the
+            // open loft puts its walls in, and no caps.
+            if !ring {
+                let (chain_start, chain_end) = &caps.per_loop[region_index];
+                face_names.push(chain_start.clone());
+                face_names.push(chain_end.clone());
+            }
 
             let faces = &mut solid
                 .shells
@@ -462,10 +629,16 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                 .faces;
             if faces.len() != face_names.len() {
                 return Err(format!(
-                    "sweep builder produced {} faces, expected {} ({} sides + 2 caps)",
+                    "sweep builder produced {} faces, expected {} ({} {} + {})",
                     faces.len(),
                     face_names.len(),
-                    side_count
+                    if mitred {
+                        format!("{} x {side_count}", path.len())
+                    } else {
+                        side_count.to_string()
+                    },
+                    if mitred { "mitred walls" } else { "sides" },
+                    if ring { "no caps (a closed path)" } else { "2 caps" }
                 ));
             }
             for (face, name) in faces.iter_mut().zip(&face_names) {
@@ -488,13 +661,12 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                     &mut |loop_index, _depth| {
                         crate::sweep_profile_along_chain(
                             &region[loop_index].curves,
-                            &path_curves,
-                            &path_segment_names,
+                            &path,
                             0.0,
                             None,
                             None,
                             crate::SectionPlacement::Rigid,
-                            "Set `orientationMode: translate` to sweep this path — that mode builds one portion per segment and handles the corner, at the cost of not rotating the profile to follow the path. A mitred, path-aligned corner is not built.",
+                            "A corner between two STRAIGHT segments is MITRED under `pathAlign` (both sweeps trimmed to the joint's bisector plane, sharing one loop there), and `orientationMode: translate` slides the profile along each straight segment's chord without rotating it — but neither builds a corner at a CURVED segment, because a curve has no single direction for a bisector plane to bisect. Split the path at that corner and sweep each run separately, or round the corner so the joint is tangent-continuous.",
                         )
                     },
                 )?;
@@ -588,23 +760,40 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
 
     // Sidewall + hole-wall containers: the un-keyed name stands for that profile
     // edge's (or hole loop's) wall along EVERY path segment.
-    for region in &profile.regions {
+    for (region_index, region) in profile.regions.iter().enumerate() {
         let outer = &region[0];
         for index in 0..outer.curves.len() {
             let container = wall_container_name(&tag, &outer.edge_names, index);
-            let members = steps
-                .iter()
-                .map(|step| side_face_name(&tag, &outer.edge_names, index, &step.name))
-                .collect();
+            let members = if envelope_regions[region_index] {
+                // One revolved face for every section edge: edge 0's container
+                // IS its name, and the rest name it as their member.
+                if index == 0 {
+                    Vec::new()
+                } else {
+                    vec![wall_container_name(&tag, &outer.edge_names, 0)]
+                }
+            } else {
+                wall_segments
+                    .iter()
+                    .map(|segment| side_face_name(&tag, &outer.edge_names, index, segment))
+                    .collect()
+            };
             containers.push((container, members));
         }
         for loop_index in 1..region.len() {
             let key = common::hole_key(&region[loop_index], loop_index);
             let container = common::hole_face_name(&ctx.id, &key, None);
-            let members = steps
-                .iter()
-                .map(|step| common::hole_face_name(&ctx.id, &key, Some(&step.name)))
-                .collect();
+            // `pathAlign` cuts each hole ONCE along the whole run (mitred or
+            // smooth), so its cutter's faces all carry the un-keyed name and the
+            // container stands for itself; only `translate` cuts per segment.
+            let members = if path_align {
+                Vec::new()
+            } else {
+                steps
+                    .iter()
+                    .map(|step| common::hole_face_name(&ctx.id, &key, Some(&step.name)))
+                    .collect()
+            };
             containers.push((container, members));
         }
     }
@@ -728,7 +917,7 @@ pub fn schema() -> serde_json::Value {
                 "pathAlign"
             ],
             "default_value": "translate",
-            "hint": "How the profile is carried along the path. 'translate' (default): the profile keeps its orientation and slides along each segment's chord — one portion per segment, so CORNERS are handled, but straight segments only. 'pathAlign': the profile is carried by the PATH'S OWN motion, keeping the position and the angle you drew it at and turning exactly as much as the path turns — a straight path extrudes it from where it sits, an arc swings it about the arc's centre. Swept as one continuous tube; this is the mode for a CURVED path, and it REQUIRES the joints to be smooth (tangent-continuous). A mitred corner is NOT built: a cornered path under 'pathAlign' is refused and names the joint, so use 'translate' for corners."
+            "hint": "How the profile is carried along the path. 'translate' (default): the profile keeps its orientation and slides along each segment's chord — one portion per segment, so CORNERS are handled, but straight segments only. 'pathAlign': the profile is carried by the PATH'S OWN motion, keeping the position and the angle you drew it at and turning exactly as much as the path turns — a straight path extrudes it from where it sits, an arc swings it about the arc's centre, and a Helix feature's edge screws it round the helix axis and up the pitch. A smooth path is swept as one continuous tube; a CORNERED path of straight segments is MITRED, each segment's sweep trimmed to the joint's bisector plane where the two share one face loop, the inner side folded and the outer extended, like a picture frame. A CLOSED cornered path builds the whole FRAME — every joint mitred, the closing one included, and no end caps. A closed loop that is not flat comes back from one lap rolled by the path's own holonomy, and the sweep closes it with the smallest counter-twist, spread evenly along the path. Refused by name: a corner at a CURVED segment, a closed loop that crosses itself, a bend too tight for the section, and a fold at or past 168.5 degrees."
         },
         "twistAngle": {
             "type": "number",
@@ -740,4 +929,3 @@ pub fn schema() -> serde_json::Value {
 })
 }
 
-// BREP private tests: 3ea7955a1b9eaa80

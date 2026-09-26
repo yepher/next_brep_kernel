@@ -52,6 +52,12 @@ pub(super) struct ImprintBuilder<'a> {
     /// separate set from `barrier_edges` (same writer today) so the two
     /// mechanisms cannot silently couple if either gains another writer.
     pub(super) overlap_ridden_edges: HashSet<(u8, u64)>,
+    /// Ids of the pieces minted from a MARCHED run (fitted from the marcher's
+    /// polyline), as opposed to an analytic, planar-iso or boundary-copy
+    /// curve. Only these are candidates for `dissolve_section_origin_vertices`:
+    /// an exact analytic ring's origin split is the coalescer's exact-band
+    /// closure, and dissolving it moved an offset shell's corners (see there).
+    pub(super) marched_pieces: HashSet<u64>,
     pub(super) next_id: u64,
 }
 
@@ -397,14 +403,12 @@ impl<'a> ImprintBuilder<'a> {
                     format!("imprint curve-edge crossing on edge {}: {error}", edge.id)
                 }).or_refuse(KernelStage::Intersect, "csg.imprint.builder")?;
                 for hit in curve_hits {
-                    if hit.tangential && refine {
-                        continue;
-                    }
                     if hit.t < edge.t0 - 1e-9 || hit.t > edge.t1 + 1e-9 {
                         continue;
                     }
                     let mut curve_parameter = hit.s;
                     let mut edge_parameter = hit.t;
+                    let mut fuzzy_junction = None;
                     if refine {
                         let hit_point = curve.evaluate(curve_parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
                         let search_radius = 4e-3 * (1.0 + hit_point.length());
@@ -428,7 +432,7 @@ impl<'a> ImprintBuilder<'a> {
                                 if projection.distance <= 2e-3 * (1.0 + best.point.length()) {
                                     curve_parameter = projection.u;
                                     edge_parameter = best.t;
-                                    fuzzy_junctions.push((
+                                    fuzzy_junction = Some((
                                         best.point,
                                         (2.0 * projection.distance).max(2e-5).min(1.5e-3),
                                     ));
@@ -436,11 +440,34 @@ impl<'a> ImprintBuilder<'a> {
                             }
                         }
                     }
-                    self.add_edge_split(face.operand, edge, edge_parameter)?;
                     let [start, end] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
-                    if curve_parameter > start + 1e-7
+                    let interior = curve_parameter > start + 1e-7
                         && curve_parameter < end - 1e-7
-                        && !near_curve_end(curve.evaluate(curve_parameter).or_refuse(KernelStage::Intersect, "evaluate")?)
+                        && !near_curve_end(curve.evaluate(curve_parameter).or_refuse(KernelStage::Intersect, "evaluate")?);
+                    // A marched section that GRAZES an edge where it passes
+                    // through is not a junction: the tangential hit is skipped. A
+                    // section that ENDS on an edge ends at a junction whatever
+                    // the angle, so an end hit splits the edge. The hit is an end
+                    // hit when its junction (the pierce it snapped to, or the hit
+                    // itself) lies at the section's endpoint, not merely when its
+                    // parameter clamps there. A faithful fit reproduces a real
+                    // tangency at such an end: the self-crossing repair's section
+                    // on `FilletFailureWith2RasiusValues` runs along the bore's
+                    // mouth ring at both ends (the carriers read sin 5.7e-10 and
+                    // 2.0e-11), and skipping those hits left the ring whole.
+                    let junction_point = match fuzzy_junction {
+                        Some((point, _)) => point,
+                        None => curve.evaluate(curve_parameter).or_refuse(KernelStage::Intersect, "evaluate")?,
+                    };
+                    let ends_on = !interior && near_curve_end(junction_point);
+                    if hit.tangential && refine && !ends_on {
+                        continue;
+                    }
+                    if let Some(junction) = fuzzy_junction {
+                        fuzzy_junctions.push(junction);
+                    }
+                    self.add_edge_split(face.operand, edge, edge_parameter)?;
+                    if interior
                         && !split_parameters
                             .iter()
                             .any(|value: &f64| (*value - curve_parameter).abs() <= 1e-6)
@@ -544,16 +571,26 @@ impl<'a> ImprintBuilder<'a> {
                         let curve_tangent = curve.derivatives(projection.u, 1).or_refuse(KernelStage::Intersect, "derivatives")?[1];
                         let edge_tangent = edge.curve.derivatives(pierce.t, 1).or_refuse(KernelStage::Intersect, "derivatives")?[1];
                         let parallel_scale = curve_tangent.length() * edge_tangent.length();
-                        if parallel_scale > 1e-12
+                        let [start, end] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+                        let interior = projection.u > start + 1e-7
+                            && projection.u < end - 1e-7
+                            && !near_curve_end(curve.evaluate(projection.u).or_refuse(KernelStage::Intersect, "evaluate")?);
+                        // The parallel skip is for a pierce the section passes
+                        // THROUGH while running along the edge. A pierce the
+                        // section ENDS on is a junction whatever the angle, the
+                        // same rule as the tangential hit above: the edge is
+                        // split and the piece boundary is a vertex. The pierce
+                        // itself must lie at the endpoint: one past the end
+                        // projects onto it too, and the section does not end
+                        // there.
+                        let ends_on = !interior && near_curve_end(pierce.point);
+                        if !ends_on
+                            && parallel_scale > 1e-12
                             && curve_tangent.cross(edge_tangent).length() <= 1e-3 * parallel_scale
                         {
                             continue;
                         }
                         self.add_edge_split(face.operand, edge, pierce.t)?;
-                        let [start, end] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
-                        let interior = projection.u > start + 1e-7
-                            && projection.u < end - 1e-7
-                            && !near_curve_end(curve.evaluate(projection.u).or_refuse(KernelStage::Intersect, "evaluate")?);
                         if interior
                             && !split_parameters
                                 .iter()
@@ -657,6 +694,74 @@ impl<'a> ImprintBuilder<'a> {
                     previous_f = f;
                     previous_inside = inside;
                     previous_far = far;
+                }
+            }
+        }
+        // SECTION CARRIER-SEAM SPLITS. A section crossing the parameter seam of
+        // a closed revolution carrier must end there: its pcurve is built on
+        // the carrier's own period, and across the branch cut the fit clamps
+        // half of it onto the seam line (the 2026-09-14 gear's fillet torus
+        // against a box keeper: the x = 8.5 section ran azimuth -45 deg ->
+        // +45 deg over the torus's u = 0, its trim read u = 0 for the first
+        // half and its ends v = 1 and v = 0 for the rim's 0.25, and the face's
+        // arrangement tore on it). A native face carries its seam EDGE on that
+        // meridian, so the edge pierce above already splits there and this
+        // adds nothing; an imported face can carry its seam edge elsewhere and
+        // only a vertex on each rim at the carrier's seam, and then nothing
+        // did. The crossing is where the section passes through the seam's
+        // plane on the seam's half of it (`CarrierSeam`), bisected on the sign
+        // of the signed distance between two stations that stand clear of the
+        // plane by more than `overlap_limit` — a section riding IN the seam's
+        // plane (a plane through a torus's equator, whose outer circle is the
+        // v seam) reads round-off there, and a sign flip of round-off is no
+        // crossing. A crossing an existing split already stands on (within
+        // `overlap_limit`) or that is the section's own end is not added again.
+        // The stations are the domain-exit pass's. Escape hatch
+        // `BREP_SECTION_CARRIER_SEAM_SPLIT=0`.
+        if refine && std::env::var("BREP_SECTION_CARRIER_SEAM_SPLIT").as_deref() != Ok("0") {
+            const STATIONS: usize = 96;
+            for face in [first, second] {
+                for seam in CarrierSeam::of(&face.face.surface)? {
+                    let offset_at = |f: f64| -> Result<f64, KernelRefusal> {
+                        Ok(seam.offset(curve.evaluate(f).or_refuse(KernelStage::Intersect, "evaluate")?))
+                    };
+                    // The last station clear of the plane, and its offset.
+                    let mut clear: Option<(f64, f64)> = None;
+                    for index in 0..=STATIONS {
+                        let f = whole_start + (whole_end - whole_start) * (index as f64) / (STATIONS as f64);
+                        let current = offset_at(f)?;
+                        if current.abs() <= overlap_limit {
+                            continue;
+                        }
+                        let Some((previous_f, previous)) = clear.replace((f, current)) else {
+                            continue;
+                        };
+                        if (previous < 0.0) != (current < 0.0) {
+                            let (mut lo, mut hi) = (previous_f, f);
+                            let lo_negative = previous < 0.0;
+                            for _ in 0..48 {
+                                let mid = 0.5 * (lo + hi);
+                                if (offset_at(mid)? < 0.0) == lo_negative {
+                                    lo = mid;
+                                } else {
+                                    hi = mid;
+                                }
+                            }
+                            let crossing = 0.5 * (lo + hi);
+                            let point = curve.evaluate(crossing).or_refuse(KernelStage::Intersect, "evaluate")?;
+                            let mut standing = near_curve_end(point) || !seam.on_seam_half(point);
+                            for value in &split_parameters {
+                                if standing {
+                                    break;
+                                }
+                                let existing = curve.evaluate(*value).or_refuse(KernelStage::Intersect, "evaluate")?;
+                                standing = existing.sub(point).length() <= overlap_limit;
+                            }
+                            if !standing && crossing > whole_start && crossing < whole_end {
+                                split_parameters.push(crossing);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -882,7 +987,11 @@ impl<'a> ImprintBuilder<'a> {
                         // must not alias interior samples onto a distant preimage
                         // sheet, which folds the pcurve across the trim and strands
                         // the shared section one-use. Fail-soft to the global build.
-                        pcurve: build_pcurve_on_surface_marched(&face.face.surface, &snapped).or_refuse(KernelStage::Intersect, "build_pcurve_on_surface_marched")?,
+                        // On the face's CHART: a section crossing a lifted
+                        // carrier's seam is ONE curve in the band the face's own
+                        // loops are drawn in, where the carrier would break it at
+                        // the seam and place half of it a period away.
+                        pcurve: build_pcurve_on_surface_marched(face.chart(), &snapped).or_refuse(KernelStage::Intersect, "build_pcurve_on_surface_marched")?,
                     })
                 })
                 .collect::<Result<Vec<_>, KernelRefusal>>()?;

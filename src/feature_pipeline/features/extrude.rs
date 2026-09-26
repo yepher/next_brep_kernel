@@ -442,7 +442,7 @@ fn build_drafted(
     // draft `_E` suffix (kernel-side scene metadata, like every other port).
     common::stamp_sweep_roles_multi(&solid, "_SW", &caps.starts(), &caps.ends());
     // The two-sided union carries BOTH legs' walls; the boolean uniquifies the
-    // duplicate names to `{...}_SW_1`, which `stamp_sweep_roles`' suffix match
+    // duplicate names to `{...}_SW_1`, which `stamp_sweep_roles_multi`'s suffix match
     // misses — those are sidewalls all the same.
     for face in solid.shells.iter().flat_map(|shell| shell.faces.iter()) {
         if let Some(name) = face.name.as_deref() {
@@ -519,4 +519,3 @@ pub fn schema() -> serde_json::Value {
 })
 }
 
-// BREP private tests: 380237f16f62b7ad

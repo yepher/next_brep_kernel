@@ -531,4 +531,3 @@ pub(super) fn classify_tangent_contact(
     }))
 }
 
-// BREP private tests: 2f1c8ba7d4e05913

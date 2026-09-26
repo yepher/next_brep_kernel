@@ -740,7 +740,6 @@ fn sew_solid_with_search(
     ))
 }
 
-// BREP private tests: 5d5f790e24e4b378
 
 /// Split PINCHED vertices — points where two (or more) umbrella fans of
 /// faces meet at a single vertex record. Local manifold checks (edge use
@@ -888,4 +887,3 @@ pub fn split_pinched_vertices(solid: &mut BrepSolid) -> Result<usize, String> {
     Ok(split_count)
 }
 
-// BREP private tests: a9a5574c31d13d8c

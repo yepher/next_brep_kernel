@@ -407,8 +407,14 @@ pub(crate) fn scan_dihedral(
     }
     let angular = crate::KernelTolerances::for_solid(solid, 1e-7).angular;
     let span = edge.t1 - edge.t0;
+    // The edge's unit tangent, read as the one-sided limit where its
+    // parameterization is stationary (`NurbsCurve::unit_tangent`); the extended
+    // sibling keeps the extended read this scan always made.
     let tangent_at = |t: f64| -> Result<Vec3, String> {
-        edge.curve.derivatives_extended(t, 1)?[1].normalized()
+        edge.curve
+            .point_and_unit_tangent_extended(t, edge.t0, edge.t1)
+            .map(|(_, tangent)| tangent)
+            .map_err(|error| format!("dihedral scan: edge {edge_id}: {error}"))
     };
     // Fix each face's into-material sign ONCE, at the parameter midpoint, with
     // the trim probe.  `into_face_direction` wants a construct point and a
@@ -837,9 +843,12 @@ pub(super) fn check_support_extent(
             }
             // Equality is the LIMIT case and it is exact: at r = the support's
             // own width the contact lands on the far boundary, the support is
-            // consumed whole, and the volume still matches the closed form to
-            // 1e-6.  Refuse strictly beyond it.
-            if reach <= extent + 1e-6 * (1.0 + extent.abs()) {
+            // consumed whole, and the network builds it to the closed form
+            // (5F/9E/6V on a cube, 1e-11).  Refuse strictly beyond the band
+            // the surgery SNAPS a rail across (`consumed_band`): a wider
+            // slack admits a rail that runs off its face and is neither
+            // snapped nor refused.
+            if reach <= extent + crate::blend::consumed_band(solid) {
                 continue;
             }
             return Err(format!(
@@ -895,9 +904,7 @@ pub(super) fn check_support_extent(
 ///
 /// Refusing here routes the selection to the boolean cutter
 /// (`fillet_or_chamfer_exact`), which imprints and classifies and therefore
-/// *does* split the crossing faces and drop the fragments in the void.  See
-/// `docs/developer/kernel-plans/fillet-stripe-network.md` §4 row E₃: this trim
-/// is one of the constructions the network still owes before the cutter can go.
+/// *does* split the crossing faces and drop the fragments in the void.
 ///
 /// Neither pass classifies at `model`: rails and blend surfaces are FITS
 /// through marched stations, so a point of one sits a fit-accuracy away from
@@ -1101,4 +1108,57 @@ fn face_sample_uv_band(face: &FaceRecord, u: f64, v: f64, spatial: f64) -> f64 {
         _ => f64::INFINITY,
     };
     band.min(cap)
+}
+
+/// **Does any face of the result have a trim loop that crosses ITSELF?**
+///
+/// The acceptance's other three questions — the heal, `validate()` and
+/// [`check_blend_interference`] — all pass a bowtie. A face whose outer loop
+/// crosses itself is perfectly incident (every coedge chains, every edge is
+/// used twice with opposite senses), it is connected, its Euler parity is
+/// unchanged, and it crosses no OTHER face, so the face-versus-face scan has
+/// no pair to confirm. The 2026-09-13 rib-spine partition composed exactly
+/// that: both rib side faces came back with a loop crossing itself twice, and
+/// every detector in the kernel passed the solid.
+///
+/// What it means geometrically is that a blend wall's contact rail ran off the
+/// end of its own face and the surgery spliced the whole rail into the loop
+/// instead of clipping it to where the face stops. The overhang comes back as
+/// an inverted lobe: the enclosed VOLUME still comes out right (an inverted
+/// lobe's flux equals a correctly oriented one's), and the face's AREA is
+/// short by exactly the overhang — which is why nothing that measures volume
+/// notices.
+///
+/// So this is a refusal, not a repair: the shape asked for is a trim this lane
+/// does not construct, and returning the bowtie reports success for a
+/// different result. The message names the face and the two edges, because the
+/// question a caller then has is WHICH wall ran off WHICH face.
+pub(super) fn check_loop_self_crossings(result: &BrepSolid, entry: &str) -> Result<(), String> {
+    let report = crate::loop_self_crossings(result);
+    let Some(crossing) = report.crossings.first() else {
+        return Ok(());
+    };
+    Err(format!(
+        "{entry}: the result's face {}{} has a loop that CROSSES ITSELF at \
+         ({:.6}, {:.6}, {:.6}) — its edges {} and {} cross in the face's own parameter \
+         domain{}. A blend wall whose contact rail runs off the end of its own face is not \
+         trimmed to it, and the face that comes back is wrong in AREA where its volume is \
+         not; `validate()` cannot see it. Blend the edges that need the runout separately.",
+        crossing.face,
+        crossing
+            .face_name
+            .as_ref()
+            .map(|name| format!(" '{name}'"))
+            .unwrap_or_default(),
+        crossing.point.x,
+        crossing.point.y,
+        crossing.point.z,
+        crossing.edge_a,
+        crossing.edge_b,
+        if report.crossings.len() > 1 {
+            format!(" ({} crossings in all)", report.crossings.len())
+        } else {
+            String::new()
+        },
+    ))
 }

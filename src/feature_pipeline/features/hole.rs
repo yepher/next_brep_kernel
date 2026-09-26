@@ -614,6 +614,32 @@ pub fn context_applicable(probe: &crate::feature_pipeline::SelectionProbe) -> bo
     probe.sketches > 0
 }
 
+/// Dialog field-visibility hook (see [`crate::feature_pipeline::feature_hidden_params`]).
+/// Given the dialog's CURRENT param values, return the param keys that do not
+/// apply and should be hidden. The shared form engine calls this every frame, so
+/// it covers both the first display and every field change with one pure function.
+///
+/// The recess parameters only apply to their own hole type, and the straight
+/// depth is meaningless once the hole cuts through all — so the simple/threaded
+/// hole shows neither recess, and a through hole drops its depth field.
+pub fn hidden_params(values: &serde_json::Value) -> Vec<&'static str> {
+    let countersink = ["countersinkDiameter", "countersinkAngle"];
+    let counterbore = ["counterboreDiameter", "counterboreDepth"];
+    let hole_type = values.get("holeType").and_then(serde_json::Value::as_str).unwrap_or("SIMPLE");
+    let mut hidden: Vec<&'static str> = match hole_type {
+        "COUNTERSINK" => counterbore.to_vec(),
+        "COUNTERBORE" => countersink.to_vec(),
+        // SIMPLE, THREADED, or anything unrecognized: no recess at all.
+        _ => countersink.into_iter().chain(counterbore).collect(),
+    };
+    // The straight depth is ignored when the hole goes through all (its own hint
+    // says so) — hide it rather than let the user dial in a value that does nothing.
+    if values.get("throughAll").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+        hidden.push("depth");
+    }
+    hidden
+}
+
 pub fn schema() -> serde_json::Value {
     serde_json::json!({
     "type": "H",
@@ -628,7 +654,7 @@ pub fn schema() -> serde_json::Value {
         },
         "face": {
             "type": "reference_selection",
-            "label": "Placement (sketch)",
+            "label": "Placement sketch",
             "selectionFilter": [
                 "SKETCH"
             ],
@@ -718,4 +744,3 @@ pub fn schema() -> serde_json::Value {
 })
 }
 
-// BREP private tests: 3a0a8c31dc7bf9bf

@@ -1,12 +1,83 @@
 use super::*;
+use super::mass_profile;
+use web_time::Instant;
+
+/// The static facts a `mass.face` line carries beside the route: the
+/// recognized carrier kind, the patch degrees and closed directions, and the
+/// trim's size. Read only when `BREP_PROFILE_MASS_FACES` armed the lines.
+fn face_line_meta(face: &FaceRecord) -> (&'static str, usize, usize, bool, bool, usize, usize) {
+    // `kind_label` spells the general carrier with spaces; the profile line is
+    // whitespace-tokenized, so collapse it to one word.
+    let kind = match face.surface.analytic().map(|analytic| analytic.kind_label()) {
+        Some("Surface of revolution") => "Revolution",
+        Some(label) => label,
+        None => "Fitted",
+    };
+    let (closed_u, closed_v) = face.surface.closed_directions().unwrap_or((false, false));
+    let coedges = face
+        .loops
+        .iter()
+        .map(|loop_record| loop_record.coedges.len())
+        .sum();
+    (
+        kind,
+        face.surface.degree_u,
+        face.surface.degree_v,
+        closed_u,
+        closed_v,
+        face.loops.len(),
+        coedges,
+    )
+}
+
+/// Emit one `mass.face` line for the face just integrated. `before` is the
+/// counter snapshot taken ahead of its work and `started` the wall clock at
+/// the same point; both are `None` unless the lines are armed.
+fn emit_face_line(
+    call: &str,
+    shell: usize,
+    face_index: usize,
+    face: &FaceRecord,
+    before: Option<super::profile::MassProfile>,
+    started: Option<Instant>,
+) {
+    let (Some(before), Some(started)) = (before, started) else {
+        return;
+    };
+    let wall_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let (kind, degree_u, degree_v, closed_u, closed_v, loops, coedges) = face_line_meta(face);
+    super::profile::emit_face(
+        call, shell, face_index, kind, degree_u, degree_v, closed_u, closed_v, loops, coedges,
+        before, wall_ms,
+    );
+}
 
 pub fn solid_mass_properties(solid: &BrepSolid) -> Result<MassProperties, String> {
+    let token = super::profile::begin("solid_mass_properties");
+    let result = solid_mass_properties_inner(solid);
+    super::profile::end(token);
+    if let (Some(dump), Ok(properties)) = (super::profile::identity_dump(), result.as_ref()) {
+        super::profile::emit_identity(
+            dump,
+            "solid_mass_properties",
+            solid,
+            &[
+                ("volume_bits", properties.volume),
+                ("area_bits", properties.surface_area),
+            ],
+        );
+    }
+    result
+}
+
+fn solid_mass_properties_inner(solid: &BrepSolid) -> Result<MassProperties, String> {
     let mut properties = MassProperties {
         surface_area: 0.0,
         volume: 0.0,
     };
     let mut volume_compensation = 0.0;
-    for shell in &solid.shells {
+    let face_lines = super::profile::face_lines_enabled();
+    for (shell_index, shell) in solid.shells.iter().enumerate() {
         if shell.faces.is_empty() {
             continue;
         }
@@ -15,19 +86,54 @@ pub fn solid_mass_properties(solid: &BrepSolid) -> Result<MassProperties, String
         // even tiny quadrature or boundary errors then dominate their sum.
         let reference = shell_volume_reference(shell)?;
         let kinds = [Integrand::Area, Integrand::VolumeAbout(reference)];
-        for face in &shell.faces {
+        for (face_index, face) in shell.faces.iter().enumerate() {
+            mass_profile(|p| p.faces += 1);
+            let line_before = face_lines.then(super::profile::snapshot);
+            let line_started = face_lines.then(Instant::now);
+            let gate_started = super::profile::profile_started();
             let (area, volume) = if let Some(values) = biperiodic_band_integral(face, &kinds)? {
+                mass_profile(|p| {
+                    p.route_biperiodic += 1;
+                    p.gate_ms += super::profile::elapsed_ms(gate_started);
+                });
                 (values[0], values[1] / 3.0)
             } else if !is_affine(&face.surface)? && !is_untrimmed(face)? {
+                mass_profile(|p| {
+                    p.trimmed_faces += 1;
+                    p.gate_ms += super::profile::elapsed_ms(gate_started);
+                });
                 // Preserve the shared cell decomposition and integration pass.
                 let values = integrate_trimmed_multi(face, &kinds)?;
                 (values[0], values[1] / 3.0)
+            } else if is_affine(&face.surface)? {
+                mass_profile(|p| {
+                    p.route_affine += 1;
+                    p.gate_ms += super::profile::elapsed_ms(gate_started);
+                });
+                // One parameter-space area and one planar metric for both
+                // numbers, instead of `face_area` and
+                // `face_volume_contribution_about` each walking the trim.
+                affine_area_and_volume_about(face, reference)?
             } else {
-                (
-                    face_area(face)?,
-                    face_volume_contribution_about(face, reference)?,
-                )
+                mass_profile(|p| {
+                    p.route_untrimmed += 1;
+                    p.gate_ms += super::profile::elapsed_ms(gate_started);
+                });
+                // One station sweep carrying both integrands, instead of one
+                // sweep per integrand.
+                let started = super::profile::profile_started();
+                let values = integrate_untrimmed_multi(face, &kinds)?;
+                mass_profile(|p| p.untrimmed_ms += super::profile::elapsed_ms(started));
+                (values[0], values[1] / 3.0)
             };
+            emit_face_line(
+                "solid_mass_properties",
+                shell_index,
+                face_index,
+                face,
+                line_before,
+                line_started,
+            );
             properties.surface_area += area;
             let next = properties.volume + volume;
             if properties.volume.abs() >= volume.abs() {
@@ -47,9 +153,20 @@ pub fn solid_mass_properties(solid: &BrepSolid) -> Result<MassProperties, String
 /// assembly orientation gate consumes only the volume sign, and the area
 /// integral costs as much again as the volume one.
 pub fn solid_signed_volume(solid: &BrepSolid) -> Result<f64, String> {
+    let token = super::profile::begin("solid_signed_volume");
     let mut volume = 0.0;
     for shell in &solid.shells {
-        volume += shell_signed_volume(shell)?;
+        volume += match shell_signed_volume(shell) {
+            Ok(value) => value,
+            Err(error) => {
+                super::profile::end(token);
+                return Err(error);
+            }
+        };
+    }
+    super::profile::end(token);
+    if let Some(dump) = super::profile::identity_dump() {
+        super::profile::emit_identity(dump, "solid_signed_volume", solid, &[("signed_bits", volume)]);
     }
     Ok(volume)
 }
@@ -107,8 +224,20 @@ pub(crate) fn shell_signed_volume(shell: &ShellRecord) -> Result<f64, String> {
     // face sum so the sign is stable for small, far-translated shells.
     let mut volume = 0.0;
     let mut compensation = 0.0;
-    for face in &shell.faces {
+    let face_lines = super::profile::face_lines_enabled();
+    for (face_index, face) in shell.faces.iter().enumerate() {
+        mass_profile(|p| p.faces += 1);
+        let line_before = face_lines.then(super::profile::snapshot);
+        let line_started = face_lines.then(Instant::now);
         let contribution = face_volume_contribution_about(face, reference)?;
+        emit_face_line(
+            "shell_signed_volume",
+            0,
+            face_index,
+            face,
+            line_before,
+            line_started,
+        );
         let next = volume + contribution;
         if volume.abs() >= contribution.abs() {
             compensation += (volume - next) + contribution;
@@ -155,14 +284,32 @@ pub(super) fn affine_moment(face: &FaceRecord, kind: Integrand) -> Result<f64, S
     for loop_record in &face.loops {
         for coedge in &loop_record.coedges {
             for pair in curve_breaks(&coedge.pcurve)?.windows(2) {
-                let half = (pair[1] - pair[0]) * 0.5;
-                let middle = (pair[1] + pair[0]) * 0.5;
-                for index in 0..GAUSS_X.len() {
-                    let parameter = middle + half * GAUSS_X[index];
-                    let (point, tangent) = coedge.pcurve.deriv1(parameter)?;
-                    total += GAUSS_W[index] * half * inner(point.x, point.y) * tangent.y;
+                // The inner antiderivative is a polynomial in u on an affine
+                // carrier and is exact at any order; the boundary walk is the
+                // pcurve's own, so it takes the pcurve's panels (`rule`).
+                for panel in rule::curve_panels(&coedge.pcurve, pair[0], pair[1])? {
+                    for (parameter, weight) in panel.stations() {
+                        let (point, tangent) = coedge.pcurve.deriv1(parameter)?;
+                        total += weight * inner(point.x, point.y) * tangent.y;
+                    }
                 }
             }
+        }
+    }
+    // The loops closed as the area closes them (`closed_parameter_space_area`):
+    // an open boundary integral moves with the uv origin. Along a straight
+    // chord the integrand is a polynomial of degree at most four, which the
+    // eight-station rule integrates exactly.
+    for (end, start) in loop_closing_chords(face)? {
+        let step = start.y - end.y;
+        if step == 0.0 {
+            continue;
+        }
+        for index in 0..GAUSS_X.len() {
+            let fraction = 0.5 * (GAUSS_X[index] + 1.0);
+            let u = end.x + (start.x - end.x) * fraction;
+            let v = end.y + step * fraction;
+            total += 0.5 * GAUSS_W[index] * inner(u, v) * step;
         }
     }
     Ok(total)
@@ -307,6 +454,16 @@ pub(super) fn principal_frame(inertia: [[f64; 3]; 3]) -> ([f64; 3], [[f64; 3]; 3
 /// spans, trim-polygon scanline accuracy for trimmed faces).
 pub fn solid_mass_properties_full(solid: &BrepSolid) -> Result<FullMassProperties, String> {
     let base = solid_mass_properties(solid)?;
+    let token = super::profile::begin("solid_mass_properties_full.moments");
+    let result = solid_mass_properties_full_moments(solid, base);
+    super::profile::end(token);
+    result
+}
+
+fn solid_mass_properties_full_moments(
+    solid: &BrepSolid,
+    base: MassProperties,
+) -> Result<FullMassProperties, String> {
     const MOMENT_KINDS: [Integrand; 9] = [
         Integrand::MomentX,
         Integrand::MomentY,
@@ -323,7 +480,9 @@ pub fn solid_mass_properties_full(solid: &BrepSolid) -> Result<FullMassPropertie
     let mut products = [0.0f64; 3];
     for shell in &solid.shells {
         for face in &shell.faces {
+            mass_profile(|p| p.faces += 1);
             let results = if !is_affine(&face.surface)? && !is_untrimmed(face)? {
+                mass_profile(|p| p.trimmed_faces += 1);
                 // One cell decomposition, all nine moment integrands per
                 // station, instead of nine full passes per face.
                 integrate_trimmed_multi(face, &MOMENT_KINDS)?

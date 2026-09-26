@@ -17,19 +17,37 @@
 //! marches every stripe against the original solid and solves each shared
 //! corner from its ball before anything is cut.
 
+mod carve;
 mod chain;
+mod collapse;
 mod corner;
 mod edge;
+mod fold;
 mod miter;
 mod network;
+mod planar_chart;
+mod restrict;
+mod runout;
 mod stations;
 mod rows;
+mod track_fit;
 
-// BREP private tests: fb8e60d6a94ef81c
 
 pub use chain::{blend_smooth_chain, blend_smooth_chain_if_closed};
 pub(crate) use corner::round_concave_chain_corner;
 pub use corner::round_convex_corner;
 pub use edge::{blend_closed_edge, blend_edge_variable, blend_open_edge};
-pub(crate) use network::{blend_star_network, mixed_convexity_corner, MixedCorner};
+pub(crate) use collapse::FULL_WIDTH_COLLAPSE_UNSOUND;
+pub(crate) use planar_chart::{
+    fit_planar_charts_to_trims, PLANAR_CHART_EDGE_OFF_PLANE, PLANAR_CHART_WIDEN_UNSOUND,
+};
+pub(crate) use track_fit::PCURVE_OFF_FLOOR;
+pub(crate) use edge::{consumed_band, CONSUMED_SNAP_UNSOUND, RAIL_COLLAPSE_UNSUPPORTED};
+pub(crate) use network::{
+    blend_star_network, degenerate_corner_setbacks, mixed_convexity_corner, DegenerateSetback,
+    MixedCorner,
+};
+pub(crate) use miter::MARCHED_FIT_OFF_CARRIERS;
+pub(crate) use runout::{plan_runout, RunoutPlan};
+pub(crate) use fold::{is_wall_fold, WALL_FOLDS};
 pub(crate) use stations::BALL_OFF_CARRIER;

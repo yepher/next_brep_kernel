@@ -152,6 +152,14 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         }
     }
 
+    // Pushing a carrier past a neighbour's own extent leaves the moved face
+    // crossing one it should have stopped at, and pushing a concave one past
+    // its curvature radius folds it through itself. Both bodies validate and
+    // both measure a volume, so this is the one place the push is asked
+    // whether its result is sound; it covers every carrier the dispatch above
+    // routes to, including the planar `move_faces` lane.
+    let solid = crate::accept_sound(solid, "pushFace")?;
+
     // `move_faces` preserves every face name — collect, never re-stamp.
     let face_names = common::collect_face_names(&solid);
     let edge_names = common::collect_edge_names(&solid);
@@ -276,4 +284,3 @@ pub fn schema() -> serde_json::Value {
 })
 }
 
-// BREP private tests: 3d6fe399b7eb340d

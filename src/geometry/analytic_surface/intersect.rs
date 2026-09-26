@@ -78,7 +78,43 @@ pub fn intersect_analytic_pair(
     second: &NurbsSurface,
     tolerance: f64,
 ) -> Option<Vec<NurbsCurve>> {
-    if let Some(curves) = intersect_recognized_pair(first, second, tolerance) {
+    intersect_analytic_pair_with(first, second, tolerance, ruled_gate())
+}
+
+/// Which predicate admits a general revolution's generatrix as the straight
+/// line of a cone, frustum or cylinder in [`intersect_analytic_pair`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuledGate {
+    /// The count proxy: degree 1, exactly two control points, unit weights.
+    Count,
+    /// What the section constructions consume: the generatrix's two ends, and
+    /// that the curve between them is the straight segment joining them
+    /// ([`NurbsCurve::straight_segment`]).
+    Geometry,
+}
+
+/// The gate the boolean runs: straightness, which is all the section
+/// constructions read. The count proxy declined a knot-refined, degree-elevated
+/// or re-weighted generatrix of the same cone and sent the pair to the marcher.
+/// Escape hatch for measurement: `BREP_RULED_GATE_GEOMETRY=0` runs the count
+/// gate.
+pub(crate) fn ruled_gate() -> RuledGate {
+    if std::env::var("BREP_RULED_GATE_GEOMETRY").as_deref() == Ok("0") {
+        RuledGate::Count
+    } else {
+        RuledGate::Geometry
+    }
+}
+
+/// [`intersect_analytic_pair`] under a named generatrix gate — what the fit
+/// census asks of the gate the boolean does NOT run.
+pub(crate) fn intersect_analytic_pair_with(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    tolerance: f64,
+    gate: RuledGate,
+) -> Option<Vec<NurbsCurve>> {
+    if let Some(curves) = intersect_recognized_pair(first, second, tolerance, gate) {
         return Some(curves);
     }
     if let Some(curves) = intersect_coaxial_revolutions(first, second, tolerance) {
@@ -156,17 +192,18 @@ fn intersect_recognized_pair(
     first: &NurbsSurface,
     second: &NurbsSurface,
     tolerance: f64,
+    gate: RuledGate,
 ) -> Option<Vec<NurbsCurve>> {
     let a = first.analytic()?;
     let b = second.analytic()?;
     if !matches!(b, AnalyticSurface::Plane { .. }) {
         if let Some(plane) = plane_data(a) {
-            return intersect_plane_quadric(&plane, b, tolerance);
+            return intersect_plane_quadric(&plane, b, tolerance, gate);
         }
     }
     if !matches!(a, AnalyticSurface::Plane { .. }) {
         if let Some(plane) = plane_data(b) {
-            return intersect_plane_quadric(&plane, a, tolerance);
+            return intersect_plane_quadric(&plane, a, tolerance, gate);
         }
     }
     // Sphere×sphere, whichever way each sphere is parameterized (a reflected
@@ -187,11 +224,15 @@ fn intersect_recognized_pair(
 
 /// Frame/meridian data for any revolution with a straight-line generatrix:
 /// the `RuledRevolution` quadrics themselves, plus partial-sweep
-/// `Revolution`s whose generatrix is a degree-1 unit-weight segment
-/// (fillet cutter walls are quarter cylinders of this shape). The plane
+/// `Revolution`s whose generatrix the named gate admits as straight (fillet
+/// cutter walls are quarter cylinders of this shape). The plane
 /// intersectors only need the carrier geometry — the boolean trims the
 /// returned curves to the actual face domains afterwards.
-fn ruled_revolution_data(quadric: &AnalyticSurface) -> Option<(RevolutionFrame, f64, f64, f64)> {
+fn ruled_revolution_data(
+    quadric: &AnalyticSurface,
+    tolerance: f64,
+    gate: RuledGate,
+) -> Option<(RevolutionFrame, f64, f64, f64)> {
     match quadric {
         AnalyticSurface::RuledRevolution {
             frame,
@@ -202,16 +243,22 @@ fn ruled_revolution_data(quadric: &AnalyticSurface) -> Option<(RevolutionFrame, 
         AnalyticSurface::Revolution {
             frame, generatrix, ..
         } => {
-            let controls = &generatrix.control_points;
-            if generatrix.degree != 1
-                || controls.len() != 2
-                || (controls[0].w - 1.0).abs() > RECOGNITION_TOLERANCE
-                || (controls[1].w - 1.0).abs() > RECOGNITION_TOLERANCE
-            {
-                return None;
-            }
-            let (_, rho0, z0) = frame.cylindrical(controls[0].point().ok()?);
-            let (_, rho1, z1) = frame.cylindrical(controls[1].point().ok()?);
+            let (start, end) = match gate {
+                RuledGate::Count => {
+                    let controls = &generatrix.control_points;
+                    if generatrix.degree != 1
+                        || controls.len() != 2
+                        || (controls[0].w - 1.0).abs() > RECOGNITION_TOLERANCE
+                        || (controls[1].w - 1.0).abs() > RECOGNITION_TOLERANCE
+                    {
+                        return None;
+                    }
+                    (controls[0].point().ok()?, controls[1].point().ok()?)
+                }
+                RuledGate::Geometry => generatrix.straight_segment(tolerance)?,
+            };
+            let (_, rho0, z0) = frame.cylindrical(start);
+            let (_, rho1, z1) = frame.cylindrical(end);
             let height = z1 - z0;
             if height.abs() <= 1e-12 * (1.0 + rho0.abs().max(rho1.abs())) {
                 return None;
@@ -229,6 +276,47 @@ fn ruled_revolution_data(quadric: &AnalyticSurface) -> Option<(RevolutionFrame, 
         }
         _ => None,
     }
+}
+
+/// CENSUS ONLY (`BREP_FIT_CENSUS=1`): a description of `surface`'s generatrix
+/// when it is a general revolution the two generatrix gates answer
+/// differently, `None` otherwise.
+pub(crate) fn ruled_gate_census(surface: &NurbsSurface, tolerance: f64) -> Option<String> {
+    let quadric = surface.analytic()?;
+    let AnalyticSurface::Revolution { generatrix, .. } = quadric else {
+        return None;
+    };
+    let count = ruled_revolution_data(quadric, tolerance, RuledGate::Count).is_some();
+    let geometry = ruled_revolution_data(quadric, tolerance, RuledGate::Geometry).is_some();
+    if count == geometry {
+        return None;
+    }
+    let controls = &generatrix.control_points;
+    let points: Vec<Vec3> = controls
+        .iter()
+        .map(|control| control.point().unwrap_or_default())
+        .collect();
+    let (first, last) = (points[0], points[points.len() - 1]);
+    let direction = last.sub(first);
+    let length_squared = direction.length_squared();
+    let mut collinearity = 0.0_f64;
+    for point in &points {
+        collinearity = collinearity.max(if length_squared <= 0.0 {
+            point.sub(first).length()
+        } else {
+            let fraction = (point.sub(first).dot(direction) / length_squared).clamp(0.0, 1.0);
+            point.sub(first.add(direction.scale(fraction))).length()
+        });
+    }
+    let unit_weights = controls
+        .iter()
+        .all(|control| (control.w - 1.0).abs() <= RECOGNITION_TOLERANCE);
+    Some(format!(
+        "degree={} controls={} collinearity={collinearity:.3e} unit_weights={unit_weights} \
+         count_gate={count} geometry_gate={geometry}",
+        generatrix.degree,
+        controls.len()
+    ))
 }
 
 /// TRUE when a recognized frustum's radius drift is below the precision floor
@@ -259,16 +347,179 @@ fn degenerate_apex_frustum(rho0: f64, rho1: f64, height: f64) -> bool {
     delta * delta <= 64.0 * f64::EPSILON * height.abs() * rho0.abs().max(rho1.abs())
 }
 
+/// The EXACT arc of `plane ∩ ruled revolution` spanning a given AZIMUTH range
+/// about the carrier's own frame — the arc-restricted, seam-anchorable form of
+/// the full sections [`intersect_plane_quadric`] returns.
+///
+/// ADDITION, not a change: `intersect_plane_quadric` is untouched and still
+/// answers every pair it answered before, bit for bit. This function exists
+/// because a direct edit needs the section as an EDGE, not as a carrier
+/// section, and an edge has endpoints: a closed rim must START at the face's
+/// own seam vertex (which need not sit at the carrier's `u = 0` — see the
+/// push-face seam fix), and an open rim is a sub-arc between two re-solved
+/// corners. `intersect_plane_quadric` always returns the whole section anchored
+/// at the frame's `x_axis`, so neither is expressible through it.
+///
+/// Both constructions below are the ones that function already uses, and both
+/// preserve AZIMUTH — the cylinder's map adds only an axial component, the
+/// cone's is a central projection from a point ON the axis — so "the arc from
+/// azimuth `a` through `sweep`" is well defined on the section itself and the
+/// anchoring is exact rather than fitted:
+///
+/// - **Cylinder** (`rho1 ≈ rho0`): the section is the AFFINE image of the base
+///   circle under the axial shear `X ↦ X + axis·(c − n·X)/(n·axis)`, which is
+///   linear in the homogeneous control point, so a rational-quadratic arc maps
+///   to a rational-quadratic arc on the SAME knot vector.
+/// - **Cone/frustum**: the section is the PROJECTIVE image from the apex,
+///   `X ↦ apex + (k/((X−apex)·n))·(X−apex)`, again linear in the homogeneous
+///   control point. Weight signs flip for a parabolic/hyperbolic section (the
+///   arc crosses the apex plane), and those are refused by name rather than
+///   silently mis-built.
+///
+/// `sweep` must be positive and at most a full turn; a reversed rim is built
+/// forward and reversed by the caller, which is what keeps the knot vector the
+/// arc construction's own.
+pub fn plane_ruled_section_arc(
+    plane_origin: Vec3,
+    plane_normal: Vec3,
+    frame: &RevolutionFrame,
+    rho0: f64,
+    rho1: f64,
+    height: f64,
+    start_azimuth: f64,
+    sweep: f64,
+    tolerance: f64,
+) -> Result<NurbsCurve, String> {
+    let tau = std::f64::consts::TAU;
+    if !(start_azimuth.is_finite() && sweep.is_finite()) {
+        return Err("plane_ruled_section_arc: non-finite azimuth range".into());
+    }
+    if sweep <= 1e-12 || sweep > tau + 1e-9 {
+        return Err(format!(
+            "plane_ruled_section_arc: the section arc sweeps {sweep:.6e} rad, which is not a \
+             positive arc of at most one turn — refusing"
+        ));
+    }
+    let normal = plane_normal.normalized()?;
+    let radius_scale = rho0.abs().max(rho1.abs()).max(1.0);
+    let axis = frame.axis;
+    let is_cylinder = (rho1 - rho0).abs() <= 1e-9 * radius_scale
+        || degenerate_apex_frustum(rho0, rho1, height);
+    let curve = if is_cylinder {
+        let alignment = normal.dot(axis);
+        if alignment.abs() <= 1e-12 {
+            return Err(
+                "plane_ruled_section_arc: the plane is parallel to the cylinder axis, so the \
+                 section is a generatrix pair rather than a conic — refusing"
+                    .into(),
+            );
+        }
+        if rho0.abs() <= tolerance {
+            return Err("plane_ruled_section_arc: the cylinder carrier has no radius".into());
+        }
+        let base = make_arc(
+            frame.origin,
+            frame.x_axis,
+            frame.y_axis,
+            rho0.abs(),
+            start_azimuth,
+            start_azimuth + sweep,
+        )?;
+        let origin_dot = plane_origin.dot(normal);
+        map_rational_curve(&base, |p| {
+            let t = (origin_dot * p.w - Vec3::new(p.x, p.y, p.z).dot(normal)) / alignment;
+            crate::Vec4 {
+                x: p.x + axis.x * t,
+                y: p.y + axis.y * t,
+                z: p.z + axis.z * t,
+                w: p.w,
+            }
+        })
+        .ok_or_else(|| {
+            "plane_ruled_section_arc: the cylinder section's weights are not one-signed \
+             — refusing"
+                .to_string()
+        })?
+    } else {
+        let apex = frame.origin.add(axis.scale(height * rho0 / (rho0 - rho1)));
+        let k = plane_origin.sub(apex).dot(normal);
+        if k.abs() <= tolerance {
+            return Err(
+                "plane_ruled_section_arc: the plane passes through the cone apex, so the \
+                 section is a line pair rather than a conic — refusing"
+                    .into(),
+            );
+        }
+        let (reference_rho, reference_z) = if rho0.abs() > rho1.abs() {
+            (rho0.abs(), 0.0)
+        } else {
+            (rho1.abs(), height)
+        };
+        if reference_rho <= tolerance {
+            return Err("plane_ruled_section_arc: the cone carrier degenerates to its apex".into());
+        }
+        let base = make_arc(
+            frame.origin.add(axis.scale(reference_z)),
+            frame.x_axis,
+            frame.y_axis,
+            reference_rho,
+            start_azimuth,
+            start_azimuth + sweep,
+        )?;
+        map_rational_curve(&base, |p| {
+            let relative = Vec3::new(p.x - p.w * apex.x, p.y - p.w * apex.y, p.z - p.w * apex.z);
+            let w_new = relative.dot(normal);
+            let scaled = relative.scale(k);
+            crate::Vec4 {
+                x: apex.x * w_new + scaled.x,
+                y: apex.y * w_new + scaled.y,
+                z: apex.z * w_new + scaled.z,
+                w: w_new,
+            }
+        })
+        .ok_or_else(|| {
+            "plane_ruled_section_arc: the section crosses the cone's apex plane (a parabolic \
+             or hyperbolic branch, whose weights change sign) — refusing"
+                .to_string()
+        })?
+    };
+    // The construction is exact, so this measures rather than fits: every
+    // sample must sit on BOTH carriers, at the carrier's own radius for its own
+    // axial station and on the plane.
+    let [d0, d1] = curve.domain()?;
+    let slope = if height == 0.0 {
+        0.0
+    } else {
+        (rho1 - rho0) / height
+    };
+    for step in 0..=8 {
+        let point = curve.evaluate(d0 + (d1 - d0) * (step as f64 / 8.0))?;
+        let delta = point.sub(frame.origin);
+        let axial = delta.dot(axis);
+        let radial = delta.sub(axis.scale(axial)).length();
+        let off_ruled = (radial - (rho0 + slope * axial)).abs();
+        let off_plane = point.sub(plane_origin).dot(normal).abs();
+        if off_ruled > 10.0 * tolerance || off_plane > 10.0 * tolerance {
+            return Err(format!(
+                "plane_ruled_section_arc: the section does not lie on both carriers (off ruled \
+                 {off_ruled:.3e}, off plane {off_plane:.3e}) — refusing"
+            ));
+        }
+    }
+    Ok(curve)
+}
+
 fn intersect_plane_quadric(
     plane: &PlaneData,
     quadric: &AnalyticSurface,
     tolerance: f64,
+    gate: RuledGate,
 ) -> Option<Vec<NurbsCurve>> {
     match quadric {
         AnalyticSurface::RuledRevolution { .. } | AnalyticSurface::Revolution { .. }
-            if ruled_revolution_data(quadric).is_some() =>
+            if ruled_revolution_data(quadric, tolerance, gate).is_some() =>
         {
-            let (frame, rho0, rho1, height) = ruled_revolution_data(quadric)?;
+            let (frame, rho0, rho1, height) = ruled_revolution_data(quadric, tolerance, gate)?;
             let (frame, rho0, rho1, height) = (&frame, &rho0, &rho1, &height);
             let alignment = plane.normal.dot(frame.axis);
             if alignment.abs() >= 1.0 - 1e-12 {

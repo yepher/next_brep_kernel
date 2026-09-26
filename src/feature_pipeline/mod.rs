@@ -27,9 +27,10 @@ pub use component::ComponentRecord;
 // GC'd at the end of every history run. See parts_library.rs.
 pub(crate) mod parts_library;
 pub use parts_library::{
-    add_part_to_library, install_parts_library, missing_library_parts, parts_library_json,
-    parts_library_map, parts_library_revision, refresh_library_entry, PartsLibraryEntry,
-    PartsLibraryMap, stable_json_hash,
+    add_part_to_library, add_part_to_library_impl, install_parts_library, missing_library_parts,
+    parts_library_json, parts_library_map, parts_library_revision, refresh_library_entry,
+    refresh_library_entry_impl, same_build,
+    PartsLibraryEntry, PartsLibraryMap, stable_json_hash,
 };
 // Assembly constraint state + lifecycle (build-spec §4/§6/§7): the `assembly`
 // history block, the ten constraint schemas, the mate-mapping + solve tail,
@@ -39,7 +40,12 @@ pub mod assembly;
 /// graph, per-connection routes and the bundle solids — solved at the tail of
 /// every run like `assembly` (see `wire_harness.rs`).
 pub mod wire_harness;
+/// A part's symbol pins ARE its harness ports, bound by label (eCAD plan
+/// decision 8): the pin/port report, following an edit from one side to the
+/// other, and resolving a placed part's pin to its port id (see `part_pins.rs`).
+pub mod part_pins;
 pub mod pmi;
+pub mod ports;
 pub(crate) use features::import3d::imported_solid_names;
 pub use assembly::{AssemblyState, ConstraintEntry};
 mod expression;
@@ -47,6 +53,10 @@ mod expression;
 pub(crate) mod features;
 pub use features::common::{first_reference_name, reference_names};
 pub(crate) use features::transform::bbox_center as transform_bbox_center;
+// Transform Face's default pivot over a replayed prefix: the value the app
+// stores into `pivot` when a face selection is committed, computed by the same
+// resolution and centre the feature falls back to for a null pivot.
+pub use features::transform_face::face_transform_pivot;
 // The native IMPORT3D payload encoder: finished solids → an `io/snapshot`
 // payload carrying IMPORT3D's own names, ready to become an
 // `inputParams.nativeBrep` part document. Lives WITH the feature that reads it
@@ -65,6 +75,7 @@ mod schema;
 // (the engine-native egui UI in brep-app, via a brep-render re-export) — the same
 // definitions the wasm `feature_schemas_json` export serves the caller's feature registry.
 pub use schema::feature_schema_catalogue;
+pub use schema::feature_hidden_params;
 pub mod context_offer;
 // Selection-context applicability: the per-feature show/no-show predicates the
 // app's context bar runs against the current selection (schema.rs's sibling —
@@ -157,6 +168,36 @@ pub struct HistoryRequest {
     /// out — never this loaded block (see parts_library.rs).
     #[serde(default, rename = "partsLibrary")]
     pub parts_library: parts_library::PartsLibraryMap,
+    /// The declared-ports block: the part's connection points as DATA, a
+    /// sibling of `features` (see `ports.rs`). Absent on every document that
+    /// declares none (and omitted on re-serialize). Resolved at the tail of
+    /// every run, against the finished scene.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<ports::PortDeclaration>,
+    /// The EXPLICIT encapsulation mark: `true` hides this document's children
+    /// behind its declared ports, `false` keeps them reachable. Absent means
+    /// derive it — see [`ports::document_is_boundary`].
+    #[serde(default, rename = "portBoundary", skip_serializing_if = "Option::is_none")]
+    pub port_boundary: Option<bool>,
+    /// Whether the document carries a `pcb` block, which makes it a board and
+    /// therefore a port boundary by construction. Presence ONLY: the block
+    /// itself is eCAD's and the kernel neither reads nor rewrites it, so this
+    /// never serializes back out.
+    #[serde(
+        default,
+        rename = "pcb",
+        deserialize_with = "de_present",
+        skip_serializing
+    )]
+    pub pcb_present: bool,
+}
+
+/// Deserialize any value as "it was there" - see [`HistoryRequest::pcb_present`].
+fn de_present<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(|_: serde::de::IgnoredAny| true)
 }
 
 /// The "Normal" render LOD — the [`HistoryRequest::display_lod`] serde default.
@@ -244,6 +285,14 @@ pub struct FeatureResult {
     /// scene-map. NOT an error/halt — the caller runs a snapshot-repair pass and
     /// re-dispatches (migration-plan Stage 5 gate).
     pub unresolved: Vec<String>,
+    /// What the kernel REPAIRED while building this feature, in the words of the
+    /// repair that made it. A repair changes the answer the lane returns — the
+    /// self-crossing fixer drops material and re-trims its neighbours — so it is
+    /// never silent: the feature that ran it says so here, and the case gate
+    /// records it per case. Empty on every feature that repaired nothing, which
+    /// is nearly all of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     /// True when this result was REPLAYED from the incremental history cache (the
     /// feature and everything it references are unchanged since the last run).
     /// The handles are the same resident solids — the caller can skip re-tessellation.
@@ -277,6 +326,15 @@ pub struct FeatureResult {
     /// that segment, instead of after its position in the chain.
     #[serde(skip)]
     pub path_segment_names: Vec<(String, Vec<Option<String>>)>,
+    /// The SCREW AXIS of each curve in a published path chain, parallel to the
+    /// matching [`Self::paths`] entry: `Some` for a curve its builder KNOWS is a
+    /// helix about that axis (the HELIX feature), `None` for everything else.
+    /// Same INTERNAL `#[serde(skip)]` side-channel — ingested into
+    /// `scene.path_segment_axes` so the SWEEP's `pathAlign` can carry a profile by
+    /// the helix's own screw motion rather than by a rotation-minimizing frame,
+    /// which rolls away from it by the helix's integrated torsion.
+    #[serde(skip)]
+    pub path_segment_axes: Vec<(String, Vec<Option<Axis>>)>,
     /// Named world points this feature produced (a SKETCH publishes every point
     /// as `{sketchId}:P{pid}`, construction flag included — see [`ScenePoint`]).
     /// Same side-channel — ingested into `scene.points` for hole-center /
@@ -307,12 +365,14 @@ impl FeatureResult {
             removed: Vec::new(),
             error: None,
             unresolved: Vec::new(),
+            notes: Vec::new(),
             reused: false,
             profiles: Vec::new(),
             frames: Vec::new(),
             axes: Vec::new(),
             paths: Vec::new(),
             path_segment_names: Vec::new(),
+            path_segment_axes: Vec::new(),
             points: Vec::new(),
             ports: Vec::new(),
             components: Vec::new(),
@@ -367,6 +427,12 @@ pub struct HistoryResult {
     /// request carries no `pmi` block). INTERNAL side-channel like `timings`.
     #[serde(skip)]
     pub pmi: Option<pmi::PmiReport>,
+    /// The ports tail's resolution of the declared-ports block (`None` when the
+    /// document declares none). INTERNAL side-channel like `timings`: the tail
+    /// is not a feature, so this is where its unresolved references and refused
+    /// names surface.
+    #[serde(skip)]
+    pub ports: Option<ports::PortsReport>,
 }
 
 // ===========================================================================
@@ -553,6 +619,27 @@ impl Frame {
         })
     }
 
+    /// Derive an orthonormal frame whose **x_axis** is `direction` — the frame a
+    /// connection point's placement is an offset in (its seat, `ports::seat_of`).
+    ///
+    /// A connection point's direction is its rotation applied to **+X** (the
+    /// convention every feature transform reads), so the frame that seats one
+    /// must carry the direction on X, not on Z. Rather than invent a second
+    /// worldUp rule this is the CYCLIC RELABEL of [`Self::from_origin_normal`]'s
+    /// triad — x = z', y = x', z = y' — which is still right-handed and keeps
+    /// ONE convention for how a direction becomes a basis. A sketch on the
+    /// point's published frame and the point's own offset axes therefore agree
+    /// by construction: they are the same three vectors, named round.
+    pub fn from_origin_direction(origin: Vec3, direction: Vec3) -> Result<Self, String> {
+        let normal = Self::from_origin_normal(origin, direction)?;
+        Ok(Frame {
+            origin,
+            x_axis: normal.z_axis,
+            y_axis: normal.x_axis,
+            z_axis: normal.y_axis,
+        })
+    }
+
     /// Map a plane-local `(u, v)` into world space: `origin + u·x + v·y`.
     pub fn to_3d(&self, u: f64, v: f64) -> Vec3 {
         self.origin
@@ -570,8 +657,10 @@ pub struct Axis {
     pub direction: Vec3,
 }
 
-/// The kind of a harness PORT (the `kind` param): a cable END, or a WAYPOINT
-/// that joins spline paths into a network.
+/// What a connection point is to the harness router: a cable END, or a
+/// pass-through that joins spline paths into a network. Not a user param any
+/// more - it is decided by WHICH producer made the record (a declared port
+/// point is a termination, a WAYPOINT feature is a waypoint).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PortKind {
@@ -579,13 +668,22 @@ pub enum PortKind {
     Waypoint,
 }
 
-/// A harness port a PORT feature published under its feature id. `direction`
-/// is the unit vector a wire leaves the port along on side **A**; side **B** is
-/// its negation. `extension` is the straight run a wire keeps from `point`
+/// One resolved connection point, keyed in [`SceneMap::ports`] by its ADDRESS
+/// (`J1.VCC`, `ACOMP3:J1.VCC` once placed - see `ports.rs`). Published by the
+/// ports tail, by the WAYPOINT feature (under its own feature id) and by an
+/// ACOMP re-publishing a placed part's points.
+///
+/// `direction` is the unit vector a wire leaves along on side **A**; side **B**
+/// is its negation. `extension` is the straight run a wire keeps from `point`
 /// before it may bend (a spline anchor attached here takes it as its
-/// forward/backward distance), `display_length` the length of the drawn port
-/// line, and `label` the user's `portName` (the harness panel's endpoint text;
-/// references always use the feature id).
+/// forward/backward distance) and `display_length` the length of the drawn
+/// line.
+///
+/// `port_name` / `point_name` / `purpose` stay PART-LOCAL through every
+/// namespacing: a placed part's point is still point `VCC` of port `J1`
+/// whatever occurrence chain its address carries. That is what a pin binds to.
+/// A WAYPOINT carries an empty `port_name` and `purpose`, and its own name as
+/// `point_name`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PortRecord {
     pub point: Vec3,
@@ -593,10 +691,26 @@ pub struct PortRecord {
     pub kind: PortKind,
     pub extension: f64,
     pub display_length: f64,
-    pub label: String,
+    #[serde(default, rename = "portName")]
+    pub port_name: String,
+    #[serde(default, rename = "pointName")]
+    pub point_name: String,
+    #[serde(default)]
+    pub purpose: String,
 }
 
 impl PortRecord {
+    /// The PART-LOCAL address of this point (`J1.VCC`), or just the name for a
+    /// WAYPOINT, which belongs to no port. The occurrence chain is the map key's
+    /// business, not the record's.
+    pub fn local_address(&self) -> String {
+        if self.port_name.is_empty() {
+            self.point_name.clone()
+        } else {
+            ports::address(&self.port_name, &self.point_name)
+        }
+    }
+
     /// The direction a wire leaves this port along on `side` (`A` = the port
     /// direction, `B` = its negation).
     pub fn side_direction(&self, side: wire_harness::PortSide) -> Vec3 {
@@ -643,14 +757,21 @@ pub struct SceneMap {
     /// by the SWEEP via [`SceneMap::resolve_path_segment_names`] so the faces one
     /// path SEGMENT builds carry that segment's name rather than its position.
     pub path_segment_names: HashMap<String, Vec<Option<String>>>,
+    /// Path name -> the SCREW AXIS of each curve in its chain (`Some` for a
+    /// helix), parallel to the [`Self::paths`] entry of the same name. Populated
+    /// by HELIX features; read by the SWEEP via
+    /// [`SceneMap::resolve_path_segment_axes`].
+    pub path_segment_axes: HashMap<String, Vec<Option<Axis>>>,
     /// Point name -> its world position + construction flag. Populated by SKETCH
     /// features (`{sketchId}:P{pid}`), splines and helices; read by hole placement
     /// via [`SceneMap::model_points_with_prefix`] and by name via
     /// [`SceneMap::resolve_point`].
     pub points: HashMap<String, ScenePoint>,
-    /// Port id -> its record. Populated by PORT features via the `ports`
-    /// side-channel; read by SPLINE attachments ([`SceneMap::resolve_port`]) and
-    /// by the wire-harness tail, which builds its sided routing graph from it.
+    /// Connection-point ADDRESS -> its record. Populated by the ports tail
+    /// (the document's declared points), by WAYPOINT features and by ACOMP
+    /// (a placed part's points, namespaced and posed); read by SPLINE
+    /// attachments ([`SceneMap::resolve_port`]) and by the wire-harness tail,
+    /// which builds its sided routing graph from it.
     pub ports: HashMap<String, PortRecord>,
     /// Owning feature id -> component record (assemblies). Populated by ACOMP
     /// features via the `components` side-channel; the whole component API
@@ -793,6 +914,17 @@ impl SceneMap {
             .and_then(|base| self.path_segment_names.get(base))
     }
 
+    /// The per-segment SCREW AXES of a named path chain, resolved exactly as
+    /// [`SceneMap::resolve_path`] resolves the chain itself. `None` when the
+    /// publisher recorded none — every segment is then an ordinary curve.
+    pub fn resolve_path_segment_axes(&self, name: &str) -> Option<&Vec<Option<Axis>>> {
+        if let Some(axes) = self.path_segment_axes.get(name) {
+            return Some(axes);
+        }
+        name.strip_suffix(":PROFILE")
+            .and_then(|base| self.path_segment_axes.get(base))
+    }
+
     /// Resolve a named world point (exact match), for hole/placement centers.
     /// Contract surface consumed by the spline/hole placement tests; kept as the
     /// documented point-resolution API even where no shipping feature reads it
@@ -802,7 +934,7 @@ impl SceneMap {
         self.points.get(name).map(|point| point.position)
     }
 
-    /// Resolve a harness PORT by its feature id (exact match).
+    /// Resolve a connection point by its address (exact match).
     pub fn resolve_port(&self, name: &str) -> Option<&PortRecord> {
         self.ports.get(name)
     }
@@ -880,6 +1012,9 @@ impl SceneMap {
         // Ingest any named path chains (SKETCH geometry chains).
         for (name, names) in &result.path_segment_names {
             self.path_segment_names.insert(name.clone(), names.clone());
+        }
+        for (name, axes) in &result.path_segment_axes {
+            self.path_segment_axes.insert(name.clone(), axes.clone());
         }
         for (name, path) in &result.paths {
             self.paths.insert(name.clone(), path.clone());
@@ -1062,7 +1197,7 @@ impl<'a> FeatureContext<'a> {
 /// Extract the feature id from `inputParams` (`id`, falling back to the
 /// non-enumerable `featureID`). The solid + all face/edge names are prefixed
 /// with this id, so name fidelity depends on it.
-fn extract_id(params: &serde_json::Value) -> String {
+pub(crate) fn extract_id(params: &serde_json::Value) -> String {
     for key in ["id", "featureID"] {
         if let Some(serde_json::Value::String(text)) = params.get(key) {
             if !text.is_empty() {
@@ -1131,6 +1266,7 @@ pub fn execute_feature(
         "O.S" | "OFFSET SHELL" | "OFFSETSHELL" => features::offset_shell::execute(&ctx),
         "O.F" | "OFFSET FACE" | "OFFSETFACE" => features::offset_face::execute(&ctx),
         "PF" | "PUSHFACE" | "PUSH FACE" => features::push_face::execute(&ctx),
+        "TF" | "TRANSFORMFACE" | "TRANSFORM FACE" => features::transform_face::execute(&ctx),
         "DF" | "DELETE FACE" | "DELETEFACE" => features::delete_face::execute(&ctx),
         "THK" | "THICKEN" => features::thicken::execute(&ctx),
         "H" | "HOLE" => features::hole::execute(&ctx),
@@ -1156,7 +1292,7 @@ pub fn execute_feature(
         "S" | "SKETCH" => features::sketch::execute(&ctx),
         // --- Non-solid construction geometry: editor-drawn pass-throughs ---
         "SP" | "SPLINE" => features::spline::execute(&ctx),
-        "PORT" => features::port::execute(&ctx),
+        "WP" | "WAYPOINT" => features::waypoint::execute(&ctx),
         "HX" | "HELIX" => features::helix::execute(&ctx),
         // --- Genuinely unknown type string ---
         _ => FeatureResult::error(id, feature_type.clone(), format!("unknown feature type '{feature_type}'")),
@@ -1546,6 +1682,17 @@ pub fn execute_history_observed(
     let mut name_version: HashMap<String, u64> = HashMap::new();
     let mut seen_ids: HashMap<String, ()> = HashMap::new();
 
+    // The declared connection points whose placement nothing the walk builds
+    // can move, published BEFORE it so a SPLINE in the same document can
+    // attach to one and a sketch can sit on its frame (`ports.rs` states the
+    // rule and why this is the one deviation from tail-only resolution). Each
+    // name carries the CONTENT VERSION of its declaration, so a consumer is
+    // invalidated when the point moves.
+    for (name, version) in ports::seed_history_run(request, &mut scene, &env) {
+        available.insert(name.clone(), ());
+        name_version.insert(name, version);
+    }
+
     let total = request.features.len();
     for (index, descriptor) in request.features.iter().enumerate() {
         let id = extract_id(&descriptor.input_params);
@@ -1626,9 +1773,22 @@ pub fn execute_history_observed(
             break;
         }
 
+        // Anything left in the ledger by a DIRECT api call on this thread
+        // (`move_faces_json`, an MCP edit) belongs to that call, not to the
+        // feature about to run: drop it rather than attribute it wrongly.
+        let _ = crate::take_crossing_repairs();
         let feat_start = web_time::Instant::now();
         let mut result = execute_feature(descriptor, &env, &scene);
         timings.push((id.clone(), feat_start.elapsed().as_secs_f64() * 1000.0));
+        // A result the soundness acceptance REPAIRED rather than returned as
+        // built says so on the feature that built it. Drained here, so a repair
+        // made by any lane reaches the caller's report by one route instead of
+        // each lane growing a channel of its own.
+        result.notes.extend(
+            crate::take_crossing_repairs()
+                .into_iter()
+                .map(|repair| repair.to_string()),
+        );
         // `halt` reflects the feature's OWN error only — a naming collision flags
         // the feature but does NOT truncate the history (the model still renders).
         let halt = result.error.is_some();
@@ -1724,6 +1884,14 @@ pub fn execute_history_observed(
     // solids ride an extra result so the display pipeline shows them through
     // the standard solid path. Runs AFTER the assembly solve so the bundles
     // are built against the posed scene.
+    // Ports tail: resolve the declared-ports block against the FINISHED scene
+    // (a port point may reference any geometry in the part, which is why this
+    // runs here and not as a history feature) and publish every point. Before
+    // the harness, which routes over what this published.
+    let ports = ports::finish_history_run(request, &mut scene, &env);
+    if let Some(result) = ports.result {
+        results.push(result);
+    }
     let harness = wire_harness::finish_history_run(request, &mut scene, &env);
     if let Some(result) = harness.result {
         results.push(result);
@@ -1737,6 +1905,7 @@ pub fn execute_history_observed(
         timings,
         wire_harness: harness.report,
         pmi,
+        ports: ports.report,
     }
 }
 
@@ -1755,7 +1924,4 @@ pub fn execute_history_json(request_json: &str) -> Result<String, JsValue> {
     serde_json::to_string(&result).map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
-// BREP private tests: 7aa141d9b9a12e3a
-// BREP private tests: 1d1cdd0112bd1f6e
 
-// BREP private tests: fc0844ce3604ae1f

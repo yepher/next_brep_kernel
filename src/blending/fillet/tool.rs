@@ -195,7 +195,51 @@ pub(super) fn fillet_or_chamfer(
     // exactly (the boolean-backed exact path is already committed; this is a
     // no-op there and on any clean blend).
     heal_edge_vertex_gaps(&mut result, radius)?;
+    // A trim the §6.9 surgery ran outside a planar carrier's chart is clamped
+    // onto the chart's boundary by the pcurve builder, which leaves a wrong
+    // region on a body `validate()` passes; widen the carrier to hold it.
+    crate::blend::fit_planar_charts_to_trims(&healed, &mut result)?;
+    // A blend with no corner closure after it is finished here. A cutter-first
+    // composition's cutter keeps its standing scaffold tagged until the group
+    // has closed its corners, which read that topology (`settle_cutter_scaffold`).
+    if lane == Lane::GeneralFirst {
+        result = settle_cutter_scaffold(result);
+    }
     Ok(result)
+}
+
+/// Is this march refusal about the SHAPE rather than the lane?
+///
+/// A wall that folds through itself is not something another construction
+/// answers: the cutter's tool surface is the same envelope with the same fold,
+/// and the edge-preserving fallback builds a blend the rolling ball never made.
+/// Reported as-is, so the caller reads the geometry instead of whichever later
+/// rung complained last.
+///
+/// A marched seam or connector whose fit left its carriers is the same kind of
+/// refusal for the same reason.  It does not say "not this lane": it says the
+/// curve the corner was closed with is not the curve the march solved for,
+/// read against the march's own witnesses, and no later rung re-asks that
+/// question.  The lane beneath it answers a DIFFERENT question and answers it
+/// wrong without saying so -- on the notched cap's stuck connector the cutter
+/// composition reads 1724.506048919, +1.81e-2 against the closed form, and it
+/// validates.  A refusal that falls through to a validating wrong solid is not
+/// a refusal.
+///
+/// So is a blend that stops within a sliver of its face's width and cannot be
+/// snapped onto the far edge without opening the shell
+/// (`blend::CONSUMED_SNAP_UNSOUND`): the size is the question, and a tool solid
+/// cut a sliver short of an edge answers it with a sliver no lane keeps.
+///
+/// So is a trim that left its planar carrier's chart
+/// (`blend::PLANAR_CHART_EDGE_OFF_PLANE`, `blend::PLANAR_CHART_WIDEN_UNSOUND`):
+/// the clamped body another lane would answer with is the defect itself.
+pub(super) fn is_terminal_blend_refusal(error: &str) -> bool {
+    crate::blend::is_wall_fold(error)
+        || error.starts_with(crate::blend::MARCHED_FIT_OFF_CARRIERS)
+        || error.starts_with(crate::blend::CONSUMED_SNAP_UNSOUND)
+        || error.starts_with(crate::blend::PLANAR_CHART_EDGE_OFF_PLANE)
+        || error.starts_with(crate::blend::PLANAR_CHART_WIDEN_UNSOUND)
 }
 
 fn fillet_or_chamfer_inner(
@@ -239,11 +283,19 @@ fn fillet_or_chamfer_inner(
         // chain is NOT walked: the network treats the edge as one stripe and
         // caps it where it runs into an unselected tangent neighbour.
         crate::blend::blend_smooth_chain_if_closed(solid, edge_id, radius, chamfer, name)
-            .or_else(|_| {
+            .or_else(|error| {
+                if is_terminal_blend_refusal(&error) {
+                    return Err(error);
+                }
                 let names = [name.map(str::to_string)];
                 crate::blend::blend_star_network(solid, &[edge_id], radius, chamfer, &names, &|_| None)
             })
-            .or_else(|_| crate::blend::blend_open_edge(solid, edge_id, radius, chamfer, name))
+            .or_else(|error| {
+                if is_terminal_blend_refusal(&error) {
+                    return Err(error);
+                }
+                crate::blend::blend_open_edge(solid, edge_id, radius, chamfer, name)
+            })
     };
     // A general-lane result is accepted only when it is BOTH a valid solid and
     // a trimmed one: `check_blend_interference` catches the blend wall left
@@ -270,6 +322,17 @@ fn fillet_or_chamfer_inner(
     if general_error.starts_with(crate::blend::BALL_OFF_CARRIER) {
         return Err(general_error);
     }
+    // The wall the rolling ball sweeps FOLDS THROUGH ITSELF: terminal for the
+    // same reason, and a step further.  The march converged — every station is
+    // on the true centre curve — but the curve turns tighter there than the
+    // ball is wide, so the envelope's own section sweeps back through itself
+    // and no lane in the kernel trims that.  The cutter builds the identical
+    // self-intersecting surface, and its boolean then hides the defect inside a
+    // solid that validates; the fold is only visible to the tessellation-level
+    // scan (`brep/soundness.rs`).  Reporting the geometry beats shipping it.
+    if is_terminal_blend_refusal(&general_error) {
+        return Err(general_error);
+    }
     match fillet_or_chamfer_exact(solid, edge_id, radius, chamfer, name, ends, lane) {
         Ok(result) => Ok(result),
         Err(exact_error) => {
@@ -281,7 +344,12 @@ fn fillet_or_chamfer_inner(
                 crate::blend::blend_closed_edge(solid, edge_id, radius, chamfer, name)
             } else {
                 crate::blend::blend_smooth_chain(solid, edge_id, radius, chamfer, name).or_else(
-                    |_| crate::blend::blend_open_edge(solid, edge_id, radius, chamfer, name),
+                    |error| {
+                        if is_terminal_blend_refusal(&error) {
+                            return Err(error);
+                        }
+                        crate::blend::blend_open_edge(solid, edge_id, radius, chamfer, name)
+                    },
                 )
             };
             // Last rung of the ladder, and the same contract: an untrimmed
@@ -293,6 +361,13 @@ fn fillet_or_chamfer_inner(
                     check_blend_interference(solid, &result, &[edge_id], entry).map(|()| result)
                 })
                 .map_err(|error| {
+                    // Reachable with a fold only in the cutter-first
+                    // compositions, where the first attempt never marched: the
+                    // refusal is still the shape's, so it is reported alone
+                    // rather than wrapped in the cutter's complaint.
+                    if is_terminal_blend_refusal(&error) {
+                        return error;
+                    }
                     format!(
                         "exact cutter failed: {exact_error}; general blend also failed: {error} \
                          (first attempt: {general_error})"
@@ -394,7 +469,8 @@ fn build_exact_tool(
     // lying on the mates and the end caps — is scaffolding: it exists to close
     // the tool solid and must not appear on the blended solid.  It is tagged
     // so a survivor can be recognised in the boolean's output
-    // (`strip_cutter_scaffold`); the tag never reaches a caller.
+    // (`count_cutter_scaffold`) and settled (`settle_cutter_scaffold`); the
+    // tag never reaches a caller.
     let mut side_index = 0usize;
     for shell in &mut tool.shells {
         for face in &mut shell.faces {
@@ -405,7 +481,7 @@ fn build_exact_tool(
                     }
                 }
             } else {
-                face.name = Some(CUTTER_SCAFFOLD_NAME.to_string());
+                face.name = Some(scaffold_tag(name));
             }
             side_index += 1;
         }
@@ -413,36 +489,99 @@ fn build_exact_tool(
     Ok(tool)
 }
 
-/// Name stamped on every cutter face except the blend wall while the blend
-/// boolean runs.  A control character leads it so no authored or derived face
-/// name can collide with it.
-const CUTTER_SCAFFOLD_NAME: &str = "\u{1}blend-cutter-scaffold";
+/// Prefix of the name stamped on every cutter face except the blend wall while
+/// the blend boolean runs.  A control character leads it so no authored or
+/// derived face name can collide with it.
+pub(super) const CUTTER_SCAFFOLD_NAME: &str = "\u{1}blend-cutter-scaffold:";
 
-/// Clear the scaffold tag from every face of a blend boolean's result and
-/// return how many faces carried it — the cutter faces the boolean left
-/// standing on the blended solid.  A split fragment of a tagged face carries
-/// the boolean's `_n` suffix on top of the tag, so this matches by prefix.
+/// The scaffold tag of a cutter whose wall is named `wall`: the prefix, the
+/// wall's name and a closing control character, so the wall survives the
+/// boolean's `_n` fragment suffix, which lands after it.
+pub(super) fn scaffold_tag(wall: Option<&str>) -> String {
+    format!("{CUTTER_SCAFFOLD_NAME}{}\u{1}", wall.unwrap_or(""))
+}
+
+/// The wall name a scaffold tag carries, or `None` for a face that is not
+/// scaffold.
+fn scaffold_wall(name: Option<&str>) -> Option<&str> {
+    let rest = name?.strip_prefix(CUTTER_SCAFFOLD_NAME)?;
+    Some(rest.split('\u{1}').next().unwrap_or(""))
+}
+
+/// How many faces of a blend boolean's result carry the scaffold tag — the
+/// cutter faces the boolean left standing on the blended solid.  Read only on
+/// the general-first lane, whose operand never carries a tag (every earlier
+/// blend on that lane settled its own), so every one counted is this cutter's.
 ///
 /// Zero is the shape of a complete blend: the result's boundary is the
 /// original solid's faces plus the blend wall, nothing else.  A survivor is a
 /// bulkhead — the cutter's end cap (or a side wall) standing INSIDE the
-/// material because the cutter stopped where the material did not — and a
-/// blend never ends in one.
-fn strip_cutter_scaffold(solid: &mut BrepSolid) -> usize {
-    let mut survivors = 0usize;
-    for shell in &mut solid.shells {
+/// material because the cutter stopped where the material did not — or an end
+/// cap lying in the plane of the face the blend ends on.
+fn count_cutter_scaffold(solid: &BrepSolid) -> usize {
+    solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .filter(|face| scaffold_wall(face.name.as_deref()).is_some())
+        .count()
+}
+
+/// Settle the cutter faces a blend left standing, by whose material each one is.
+///
+/// A survivor that rides the same carrier as a face it shares an edge with
+/// is that face's material: the cutter's end cap lying in the plane of the face
+/// a concave blend ends on (the fill's end, bounded by the arc and the two
+/// straight legs to the sharp corner the blend replaced) or a side wall on its
+/// mate. It merges into that face — the boolean's own same-carrier merge at the
+/// blend boolean's model tolerance, which moves no boundary and so no volume —
+/// and the two edges its corner vertices split along that face's boundary are
+/// joined again, so the blend and a solid that never had the corner agree on
+/// F/E/V. A survivor on no neighbour's carrier is a face the blend made, a cap
+/// of its own, and is named `{wall}:CAP` after the wall of the edge it came
+/// from, as the stripe network names its caps; with no wall name (the legacy
+/// unnamed call) it stays unnamed.
+///
+/// A merge the checks refuse leaves every survivor in place, named as a cap.
+pub(super) fn settle_cutter_scaffold(solid: BrepSolid) -> BrepSolid {
+    let tagged: rustc_hash::FxHashSet<u64> = solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .filter(|face| scaffold_wall(face.name.as_deref()).is_some())
+        .map(|face| face.id)
+        .collect();
+    if tagged.is_empty() {
+        return solid;
+    }
+    let tolerance = crate::KernelTolerances::for_solid(&solid, BooleanOptions::default().tolerance).model;
+    let corners: rustc_hash::FxHashSet<u64> = solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .filter(|face| tagged.contains(&face.id))
+        .flat_map(|face| &face.loops)
+        .flat_map(|loop_record| &loop_record.coedges)
+        .filter_map(|coedge| solid.edges.iter().find(|edge| edge.id == coedge.edge_id))
+        .flat_map(|edge| [edge.start_vertex_id, edge.end_vertex_id])
+        .collect();
+    let mut settled = match crate::face_merge::absorb_faces_into_carriers(&solid, tolerance, &tagged) {
+        Ok(absorbed) => {
+            match crate::coalesce::merge_curve_continuation_edges_at(&absorbed, tolerance, &corners) {
+                Ok(joined) if joined.validate().is_empty() => joined,
+                _ => absorbed,
+            }
+        }
+        Err(_) => solid,
+    };
+    for shell in &mut settled.shells {
         for face in &mut shell.faces {
-            if face
-                .name
-                .as_deref()
-                .is_some_and(|name| name.starts_with(CUTTER_SCAFFOLD_NAME))
-            {
-                face.name = None;
-                survivors += 1;
+            if let Some(wall) = scaffold_wall(face.name.as_deref()) {
+                face.name = (!wall.is_empty()).then(|| format!("{wall}:CAP"));
             }
         }
     }
-    survivors
+    settled
 }
 
 /// Rigid rotation of a curve's control points about `axis` through `center`
@@ -656,8 +795,8 @@ fn fillet_or_chamfer_exact(
                 apply_tool(solid, &tool, cross.convex)
             };
             match assembled {
-                Ok(mut result) => {
-                    let survivors = strip_cutter_scaffold(&mut result);
+                Ok(result) => {
+                    let survivors = count_cutter_scaffold(&result);
                     if !prefer_through {
                         return Ok(result);
                     }

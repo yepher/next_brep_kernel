@@ -193,4 +193,3 @@ pub fn offset_torus_face(
     )
 }
 
-// BREP private tests: 727508359354a2e9

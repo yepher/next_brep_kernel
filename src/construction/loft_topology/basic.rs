@@ -412,6 +412,15 @@ fn loft_profile_brep_core(
     let mut vertical_edge_ids = Vec::new();
     for index in 0..curve_count {
         let [start, end] = bottom[index].domain()?;
+        // The TOP curve's own range, which is NOT the bottom's once the winding
+        // normalization has reversed one section's curve ORDER: `reverse_section`
+        // reverses the order and `reversed()` preserves each curve's domain, so
+        // `top[i]` becomes a curve that lived on a different parameter span.
+        // Stamping the bottom's span on it made `coedge_sample` evaluate the top
+        // curve outside its own domain — pinned at an end while the skin swept
+        // the real arc — which on a circular section split into two half-arcs is
+        // a deviation of exactly the diameter.
+        let [top_start, top_end] = top[index].domain()?;
         let bottom_id = 10 + index as u64;
         let top_id = 10 + curve_count as u64 + index as u64;
         let vertical_id = 10 + 2 * curve_count as u64 + index as u64;
@@ -431,8 +440,8 @@ fn loft_profile_brep_core(
         edges.push(EdgeRecord {
             id: top_id,
             curve: top[index].clone(),
-            t0: start,
-            t1: end,
+            t0: top_start,
+            t1: top_end,
             start_vertex_id: (curve_count + index) as u64 + 1,
             end_vertex_id: (curve_count + (index + 1) % curve_count) as u64 + 1,
             degenerate: false,
@@ -529,11 +538,15 @@ fn loft_profile_brep_core(
         genus: 0,
     };
     let issues = solid.validate();
-    if issues.is_empty() {
-        Ok(solid)
-    } else {
-        Err(format!(
+    if !issues.is_empty() {
+        return Err(format!(
             "Rust loft builder produced invalid topology: {issues:?}"
-        ))
+        ));
     }
+    // `validate()` is an INCIDENCE test: a loft whose walls pass through each
+    // other — sections that cross, a run tighter than the profile's own
+    // half-width — satisfies every one of its checks. This is the soundness
+    // question asked at the lane's single exit, repaired where it can be and
+    // refused by name where it cannot. Every path sweep ends here too.
+    crate::accept_sound(solid, "loftSolid")
 }

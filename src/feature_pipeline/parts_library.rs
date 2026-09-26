@@ -73,9 +73,10 @@ use wasm_bindgen::prelude::*;
 // ===========================================================================
 
 /// One unique part payload (spec §2.1). `dirty` is RESIDENT-ONLY state: set by
-/// [`refresh_library_entry`] (edit-in-context / update-components), it forces
-/// the ACOMP self-heal lane on the next run even with a readable snapshot, and
-/// clears when the heal rewrites the snapshot.
+/// [`refresh_library_entry`] (edit-in-context / update-components) when the
+/// new document builds differently, it forces the ACOMP self-heal lane on the
+/// next run even with a readable snapshot, and clears when the heal rewrites
+/// the snapshot.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PartsLibraryEntry {
     #[serde(rename = "sourceKey", default)]
@@ -89,6 +90,20 @@ pub struct PartsLibraryEntry {
     /// The evaluated part as an `io/snapshot` payload (the fast lane).
     #[serde(default)]
     pub snapshot: String,
+    /// The kernel build that produced `snapshot` ([`kernel_source_stamp`]).
+    ///
+    /// A snapshot is a CACHE of evaluated geometry, and it is only as current as
+    /// the code that evaluated it. Before this stamp an entry was served for as
+    /// long as it decoded, so a document kept the geometry of whichever kernel
+    /// first inserted the part, whatever the kernel had learned since: the
+    /// `AssemblyTest` fixture decoded 1859.122725 where a rebuild of its own
+    /// document gives 1859.151146, and the stale body failed the shell
+    /// vector-area bar at 4.7x. An entry whose stamp differs from the running
+    /// build — including one with no stamp — is rebuilt by the ACOMP lane.
+    /// Carried beside the snapshot rather than inside the `BREPSNAP` container,
+    /// whose layout is a durable format (see `io/snapshot.rs`).
+    #[serde(rename = "snapshotProducer", default, skip_serializing_if = "String::is_empty")]
+    pub snapshot_producer: String,
     /// The part's harness ports (part-local id -> record, part-local pose),
     /// captured from the same run as the snapshot. Derived like the snapshot:
     /// an entry whose document declares a PORT but carries none is healed.
@@ -104,6 +119,14 @@ pub struct PartsLibraryEntry {
 
 /// The library map shape as it travels in the history request / save file.
 pub type PartsLibraryMap = BTreeMap<String, PartsLibraryEntry>;
+
+/// This build's identity for [`PartsLibraryEntry::snapshot_producer`]: the hash
+/// of the kernel source that `build.rs` computes. `None` when the build could
+/// not compute it, which disables stale-snapshot invalidation rather than
+/// making every snapshot look stale on every run.
+pub(crate) fn kernel_source_stamp() -> Option<&'static str> {
+    option_env!("BREP_KERNEL_SOURCE_HASH")
+}
 
 thread_local! {
     /// The open document's library (the ROOT store).
@@ -197,6 +220,7 @@ pub(crate) fn heal_entry(part_name: &str, snapshot: String, ports: BTreeMap<Stri
     let heal = |map: &mut PartsLibraryMap| {
         if let Some(entry) = map.get_mut(part_name) {
             entry.snapshot = snapshot.clone();
+            entry.snapshot_producer = kernel_source_stamp().unwrap_or_default().to_string();
             entry.ports = ports.clone();
             entry.dirty = false;
         }
@@ -275,19 +299,25 @@ pub(crate) fn ingest(request_map: &PartsLibraryMap) {
     }
 }
 
-/// Whether an entry must heal to pick up its ports: its document declares a
-/// PORT feature (at any depth — a nested assembly's parts count) but the entry
-/// carries no port records, i.e. it was saved before parts carried them.
+/// Whether an entry must heal to pick up its connection points: its document
+/// declares some (at any depth — a nested assembly's parts count) but the entry
+/// carries no records, i.e. it was captured before they existed.
 fn needs_port_heal(entry: &PartsLibraryEntry) -> bool {
     entry.ports.is_empty() && document_declares_ports(&entry.document)
 }
 
-/// Whether any feature in `document` — or in a library entry it embeds — is
-/// a PORT.
+/// Whether `document` — or a library entry it embeds — declares a connection
+/// point or a WAYPOINT, the two things that put a record in `scene.ports`.
 fn document_declares_ports(document: &serde_json::Value) -> bool {
     match document {
         serde_json::Value::Object(map) => {
-            map.get("type").and_then(serde_json::Value::as_str) == Some("PORT")
+            map.get(crate::feature_pipeline::ports::PORTS_BLOCK)
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|block| !block.is_empty())
+                || matches!(
+                    map.get("type").and_then(serde_json::Value::as_str),
+                    Some("WP" | "WAYPOINT")
+                )
                 || map.values().any(document_declares_ports)
         }
         serde_json::Value::Array(items) => items.iter().any(document_declares_ports),
@@ -316,10 +346,14 @@ fn identity(entry: &PartsLibraryEntry) -> (&str, &str, u64) {
 /// * a name whose resident entry has the SAME identity is KEPT VERBATIM — that
 ///   is what protects a runner-side heal, whose only trace is a rewritten
 ///   `snapshot`, from being clobbered by a re-send;
-/// * a name whose resident entry has a DIFFERENT identity is REPLACED and
-///   marked `dirty`, so the ACOMP self-heal lane re-derives every instance
-///   (`dirty` is `#[serde(skip)]` and cannot ride the wire — it is derived
-///   HERE, from the identity mismatch);
+/// * a name whose resident entry has a DIFFERENT identity but the SAME build
+///   ([`same_build`]: only the symbol, pads or BOM attributes moved) is
+///   REPLACED with the resident snapshot and ports carried over — they still
+///   describe the part, so nothing is rebuilt;
+/// * a name whose resident entry builds DIFFERENTLY is REPLACED and marked
+///   `dirty`, so the ACOMP self-heal lane re-derives every instance (`dirty` is
+///   `#[serde(skip)]` and cannot ride the wire — it is derived HERE, from the
+///   mismatch);
 /// * a resident name ABSENT from `incoming` is dropped.
 ///
 /// Returns whether anything changed (and bumps the revision if so).
@@ -341,6 +375,16 @@ pub fn install_parts_library(incoming: &PartsLibraryMap) -> bool {
                 // Same part: keep the RESIDENT copy — it may carry a heal this
                 // side derived and the sender never saw.
                 Some(resident) if identity(resident) == identity(&entry) => continue,
+                // A new version that builds the same (a symbol, pads or BOM
+                // attribute edit): take its document and signature, but the
+                // resident snapshot and ports still describe it — keep them, and
+                // any heal they carry, rather than rebuilding the part.
+                Some(resident) if same_stamped_build(&resident.document, &entry.document) => {
+                    entry.snapshot = resident.snapshot.clone();
+                    entry.snapshot_producer = resident.snapshot_producer.clone();
+                    entry.ports = resident.ports.clone();
+                    entry.dirty = resident.dirty || needs_port_heal(&entry);
+                }
                 // Genuinely different content: replace, and force the self-heal
                 // lane so every instance follows the new document.
                 Some(_) => entry.dirty = true,
@@ -469,7 +513,10 @@ pub(crate) fn gc_after_rebuild(request: &HistoryRequest) {
 /// Never touches the history cache or the parent scene; every handle it
 /// registers is freed before returning. See the module doc for why this must
 /// not recurse into `execute_history`.
-fn run_isolated_document(document: &serde_json::Value) -> Result<IsolatedRun, String> {
+fn run_isolated_document(
+    document: &serde_json::Value,
+    pmi: Option<&mut Option<crate::feature_pipeline::pmi::PmiReport>>,
+) -> Result<IsolatedRun, String> {
     let mut request: HistoryRequest = serde_json::from_value(document.clone())
         .map_err(|error| format!("embedded part document does not parse: {error}"))?;
     // A stale editor stop point saved into a library part must not silently
@@ -490,7 +537,16 @@ fn run_isolated_document(document: &serde_json::Value) -> Result<IsolatedRun, St
         }
         stack.borrow_mut().push(library);
     });
-    let outcome = run_isolated_features(&request);
+    let electronics_part = ["symbol", "pads"]
+        .iter()
+        .any(|key| document.get(*key).is_some_and(serde_json::Value::is_object))
+        || !request.ports.is_empty();
+    let outcome = run_isolated_features(
+        &request,
+        pmi,
+        electronics_part,
+        crate::feature_pipeline::ports::document_is_boundary(document),
+    );
     STACK.with(|stack| {
         stack.borrow_mut().pop();
     });
@@ -503,9 +559,18 @@ fn run_isolated_document(document: &serde_json::Value) -> Result<IsolatedRun, St
 /// history order) and the part's ports (part-local ids, part-local pose).
 type IsolatedRun = (Vec<(String, BrepSolid)>, BTreeMap<String, PortRecord>);
 
-fn run_isolated_features(request: &HistoryRequest) -> Result<IsolatedRun, String> {
+fn run_isolated_features(
+    request: &HistoryRequest,
+    pmi: Option<&mut Option<crate::feature_pipeline::pmi::PmiReport>>,
+    electronics_part: bool,
+    boundary: bool,
+) -> Result<IsolatedRun, String> {
     let env = Env::build(&request.expressions, &request.configurator).unwrap_or_else(Env::poisoned);
     let mut scene = SceneMap::default();
+    // The same pre-walk seed `execute_history` does (see `ports.rs`): a part's
+    // own spline must attach to its own connection point on this lane too.
+    // Nothing here caches, so the versions are dropped.
+    crate::feature_pipeline::ports::seed_history_run(request, &mut scene, &env);
     let mut results = Vec::with_capacity(request.features.len());
     let mut all_handles: Vec<u32> = Vec::new();
     let mut error: Option<String> = None;
@@ -551,20 +616,48 @@ fn run_isolated_features(request: &HistoryRequest) -> Result<IsolatedRun, String
             }
         }
     }
+    // The document's own PMI, resolved while its solids are still RESIDENT —
+    // every reference resolves through the registry, so the tail has to run
+    // before the free loop below. Only an exporter asks for it
+    // ([`document_pmi`]); a snapshot rebuild passes `None` and pays nothing.
+    if let Some(out) = pmi {
+        *out = crate::feature_pipeline::pmi::finish_history_run(request, &scene, &env);
+    }
+    // The document's own declared ports, resolved here for the same reason the
+    // PMI is: a point may reference the part's geometry, and the geometry is
+    // only resident until the free loop below. This is the one place a part's
+    // connection points are captured, so the tail HAS to run on this lane too —
+    // without it every placed part would arrive with an empty port map.
+    let declared: Vec<String> = crate::feature_pipeline::ports::finish_history_run(
+        request,
+        &mut scene,
+        &env,
+    )
+    .report
+    .map(|report| report.points.into_iter().map(|row| row.address).collect())
+    .unwrap_or_default();
     for handle in all_handles {
         sheet_metal::remove_tree(handle);
         crate::free_registered_solid(handle);
     }
-    // The part's ports: every record the run left in the scene (a nested
-    // assembly's component ports are already namespaced by its ACOMPs).
-    let ports: BTreeMap<String, PortRecord> = scene
+    // The part's connection points: every record the run left in the scene (a
+    // nested assembly's component points are already namespaced by its ACOMPs),
+    // through the ENCAPSULATION filter. A boundary part — a PCB, or anything
+    // flagged one — exports only what it declares itself, so a parent can reach
+    // its connectors and nothing inside it. See `ports::export_ports`.
+    let scene_ports: BTreeMap<String, PortRecord> = scene
         .ports
         .iter()
         .map(|(id, port)| (id.clone(), port.clone()))
         .collect();
+    let ports = crate::feature_pipeline::ports::export_ports(&scene_ports, &declared, boundary);
     match error {
         Some(message) => Err(message),
-        None if members.is_empty() => Err("embedded part document produced no solids".into()),
+        // An electronics part may have a symbol and ports before a 3D model is
+        // available. Keep the occurrence and its endpoints without inventing a
+        // solid. A generic empty modeling document remains an error.
+        None if members.is_empty() && !electronics_part =>
+            Err("embedded part document produced no solids".into()),
         None => Ok((members, ports)),
     }
 }
@@ -578,7 +671,7 @@ pub(crate) fn rebuild_snapshot(
     document: &serde_json::Value,
 ) -> Result<(String, BTreeMap<String, PortRecord>), String> {
     let saved = scene_metadata::take_store();
-    let outcome = run_isolated_document(document).and_then(|(members, ports)| {
+    let outcome = run_isolated_document(document, None).and_then(|(members, ports)| {
         let refs: Vec<(&str, &BrepSolid)> = members
             .iter()
             .map(|(name, solid)| (name.as_str(), solid))
@@ -587,6 +680,30 @@ pub(crate) fn rebuild_snapshot(
     });
     scene_metadata::restore_store(saved);
     outcome
+}
+
+/// An embedded part document's OWN PMI, resolved against the geometry the
+/// document builds — the pair the STEP writer needs to put a part's
+/// annotations into the part's own `PRODUCT` rather than into the assembly
+/// that places it (`io/step/assembly.rs`).
+///
+/// `None` when the document carries no PMI block, when it does not run, or
+/// when nothing resolved. The scene-metadata store is bracketed exactly as
+/// [`rebuild_snapshot`] brackets it, so the caller's store is byte-identical
+/// afterwards on every path.
+pub(crate) fn document_pmi(
+    document: &serde_json::Value,
+) -> Option<(crate::feature_pipeline::pmi::PmiState, crate::feature_pipeline::pmi::PmiReport)> {
+    let state: crate::feature_pipeline::pmi::PmiState = serde_json::from_value(document.get("pmi")?.clone()).ok()?;
+    if state.views.is_empty() {
+        return None;
+    }
+    let saved = scene_metadata::take_store();
+    let mut report = None;
+    let outcome = run_isolated_document(document, Some(&mut report));
+    scene_metadata::restore_store(saved);
+    outcome.ok()?;
+    report.map(|report| (state, report))
 }
 
 // ===========================================================================
@@ -616,7 +733,7 @@ fn unique_name(root: &PartsLibraryMap, requested: &str) -> String {
 /// (`EngineState::set_history_json`), but a part inserted or refreshed through
 /// the assembly lanes never passes through that: `add_part_to_library` and
 /// `refresh_library_entry` take a document STRING straight from a caller (the
-/// file panel inserts a saved `.BREP.json`; update-components commits an edited
+/// file panel inserts a saved `.nbrep`; update-components commits an edited
 /// one). Stamping here rather than at those call sites means a future lane that
 /// installs a document cannot silently skip it.
 ///
@@ -654,6 +771,11 @@ fn stamp_document_loop_ids(document: &mut serde_json::Value) {
 ///   disambiguated name (existing instances keep their version; the explicit
 ///   refresh lane is [`refresh_library_entry`]);
 /// - a requested name taken by different content is disambiguated (`name-2`).
+///
+/// The wasm export. A NATIVE caller must call [`add_part_to_library_impl`]:
+/// building a `JsValue` off wasm32 panics inside a frame that cannot unwind,
+/// so an error returned through this door aborts the whole app (the audit's
+/// Insert component crash).
 #[wasm_bindgen]
 pub fn add_part_to_library(
     name: &str,
@@ -661,9 +783,21 @@ pub fn add_part_to_library(
     source_signature: &str,
     document_json: &str,
 ) -> Result<String, JsValue> {
+    add_part_to_library_impl(name, source_key, source_signature, document_json)
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+/// [`add_part_to_library`] for native callers: the same insert, its error as
+/// text.
+pub fn add_part_to_library_impl(
+    name: &str,
+    source_key: &str,
+    source_signature: &str,
+    document_json: &str,
+) -> Result<String, String> {
     let requested = name.trim();
     if requested.is_empty() {
-        return Err(JsValue::from_str("add_part_to_library: empty part name"));
+        return Err("add_part_to_library: empty part name".to_string());
     }
     let reused = ROOT.with(|root| {
         root.borrow().iter().find_map(|(entry_name, entry)| {
@@ -675,18 +809,19 @@ pub fn add_part_to_library(
         return Ok(entry_name);
     }
     let mut document: serde_json::Value = serde_json::from_str(document_json)
-        .map_err(|error| JsValue::from_str(&format!("add_part_to_library: {error}")))?;
+        .map_err(|error| format!("add_part_to_library: {error}"))?;
     // Stamp BEFORE the hash and the snapshot so both describe the stored form —
     // a later re-stamp then finds nothing to change and cannot dirty the entry.
     stamp_document_loop_ids(&mut document);
     let (snapshot, ports) = rebuild_snapshot(&document)
-        .map_err(|error| JsValue::from_str(&format!("add_part_to_library: {error}")))?;
+        .map_err(|error| format!("add_part_to_library: {error}"))?;
     let entry = PartsLibraryEntry {
         source_key: source_key.to_string(),
         source_signature: source_signature.to_string(),
         doc_hash: stable_json_hash(&document),
         document,
         snapshot,
+        snapshot_producer: kernel_source_stamp().unwrap_or_default().to_string(),
         ports,
         dirty: false,
     };
@@ -701,35 +836,91 @@ pub fn add_part_to_library(
 }
 
 /// UPDATE (update-components / edit-in-place commit): replace an existing
-/// entry's document + signature and mark it DIRTY. The next history run's
-/// ACOMP self-heal lane re-executes the document, re-snapshots, and every
-/// instance of the part follows.
+/// entry's document + signature. When the new document BUILDS differently
+/// ([`same_build`]) the entry is marked DIRTY: the next history run's ACOMP
+/// self-heal lane re-executes the document, re-snapshots, and every instance
+/// of the part follows. When it builds the same — only its symbol, pads or BOM
+/// attributes moved — the snapshot and ports still describe it and are kept,
+/// so the part is not rebuilt for an edit that changed no geometry.
+///
+/// The wasm export; a NATIVE caller must call [`refresh_library_entry_impl`],
+/// for the reason [`add_part_to_library`] gives.
 #[wasm_bindgen]
 pub fn refresh_library_entry(
     name: &str,
     source_signature: &str,
     document_json: &str,
 ) -> Result<(), JsValue> {
+    refresh_library_entry_impl(name, source_signature, document_json)
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+/// [`refresh_library_entry`] for native callers: its error as text.
+pub fn refresh_library_entry_impl(
+    name: &str,
+    source_signature: &str,
+    document_json: &str,
+) -> Result<(), String> {
     let mut document: serde_json::Value = serde_json::from_str(document_json)
-        .map_err(|error| JsValue::from_str(&format!("refresh_library_entry: {error}")))?;
+        .map_err(|error| format!("refresh_library_entry: {error}"))?;
     // Stamped before the hash, as in `add_part_to_library`.
     stamp_document_loop_ids(&mut document);
     ROOT.with(|root| {
         let mut root = root.borrow_mut();
         let Some(entry) = root.get_mut(name) else {
-            return Err(JsValue::from_str(&format!(
+            return Err(format!(
                 "refresh_library_entry: no parts-library entry named '{name}'"
-            )));
+            ));
         };
+        let rebuild = !same_stamped_build(&entry.document, &document);
         entry.source_signature = source_signature.to_string();
         entry.doc_hash = stable_json_hash(&document);
         entry.document = document;
-        entry.ports.clear(); // the heal re-derives them from the new document
-        entry.dirty = true;
+        if rebuild {
+            entry.ports.clear(); // the heal re-derives them from the new document
+            entry.dirty = true;
+        }
         Ok(())
     })?;
     bump_revision();
     Ok(())
+}
+
+/// Whether two part documents build the same solids and ports, so that one's
+/// snapshot serves the other.
+///
+/// A snapshot is what [`run_isolated_document`] makes of a document: the
+/// document read as a [`HistoryRequest`] with its editor stop points cleared.
+/// Everything that request does not read — the eCAD `symbol` and `pads`
+/// blocks, the BOM `partAttributes`, drawing `sheets` — cannot change what the
+/// part builds, so two documents that read as the same request build the same
+/// part. The comparison is of that request, not of a list of keys that do or
+/// do not matter, so a block the request learns to read later counts at once.
+///
+/// Sketch loop ids are stamped on both sides first, as every library door
+/// stamps them. A document that does not read as a request is never the same
+/// build as anything: it has to heal.
+pub fn same_build(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    let stamped = |document: &serde_json::Value| {
+        let mut document = document.clone();
+        stamp_document_loop_ids(&mut document);
+        document
+    };
+    same_stamped_build(&stamped(a), &stamped(b))
+}
+
+/// [`same_build`] for two documents a library door has already stamped.
+fn same_stamped_build(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    matches!((build_identity(a), build_identity(b)), (Some(a), Some(b)) if a == b)
+}
+
+/// The hash of `document` as [`run_isolated_document`] reads it; `None` when it
+/// does not read as a request.
+fn build_identity(document: &serde_json::Value) -> Option<u64> {
+    let mut request: HistoryRequest = serde_json::from_value(document.clone()).ok()?;
+    request.stop_at_id = None;
+    request.stop_before_id = None;
+    Some(stable_json_hash(&serde_json::to_value(&request).ok()?))
 }
 
 /// The current library in the `partsLibrary` block shape (spec §2.1) — what
@@ -741,3 +932,4 @@ pub fn parts_library_json() -> String {
         serde_json::to_string(&*root.borrow()).unwrap_or_else(|_| "{}".to_string())
     })
 }
+

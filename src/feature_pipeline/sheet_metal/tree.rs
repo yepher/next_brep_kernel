@@ -196,13 +196,6 @@ pub fn identity_placement() -> [[f64; 3]; 4] {
     ]
 }
 
-impl SheetTree {
-    /// Half the material thickness — the extrusion offset used everywhere.
-    pub fn half_thickness(&self) -> f64 {
-        self.thickness * 0.5
-    }
-}
-
 impl Bend {
     /// Mid-surface radius: the inside radius plus half the thickness.
     pub fn mid_radius(&self, thickness: f64) -> f64 {
@@ -298,4 +291,3 @@ impl Flat {
     }
 }
 
-// BREP private tests: b045fa22af232b58

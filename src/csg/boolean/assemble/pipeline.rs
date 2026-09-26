@@ -419,7 +419,7 @@ fn assemble_fragments_impl(
              (V={} E={} F={} H={} S={} shell_faces={:?} \
              one_use={} {:?} one_use_geometry={one_use_geometry:?} \
              geometric_matches={geometric_matches:?} \
-             one_use_by_face={:?} overused={} {:?})",
+             one_use_by_face={:?} overused={} {:?}); on faces [{}]",
             assembler.vertices.len(),
             edge_count,
             face_count,
@@ -431,6 +431,24 @@ fn assemble_fragments_impl(
             one_use_by_face,
             overused.len(),
             overused.iter().take(24).collect::<Vec<_>>(),
+            {
+                // The same faces by name (face records keep id == index + 1).
+                let mut named = one_use_by_face.iter().collect::<Vec<_>>();
+                named.sort();
+                named
+                    .into_iter()
+                    .map(|(id, count)| {
+                        let name = shells
+                            .iter()
+                            .flat_map(|shell| &shell.faces)
+                            .find(|face| face.id == *id as u64)
+                            .and_then(|face| face.name.clone())
+                            .unwrap_or_default();
+                        format!("{id} '{name}' x{count}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
         )));
     }
     let solid = BrepSolid {
@@ -625,6 +643,25 @@ fn assemble_fragments_impl(
                 }
             }
         }
+        // The faces holding the open edges, by name: a name is its source
+        // face's, so the refusal says which operand faces lost a partner — the
+        // pair to measure — not only which minted edge ids did.
+        let mut open_faces: Vec<(u64, String, usize)> = Vec::new();
+        for face in solid.shells.iter().flat_map(|shell| &shell.faces) {
+            let count = face
+                .loops
+                .iter()
+                .flat_map(|loop_record| &loop_record.coedges)
+                .filter(|coedge| use_counts.get(&coedge.edge_id).copied().unwrap_or(0) == 1)
+                .count();
+            if count > 0 {
+                open_faces.push((face.id, face.name.clone().unwrap_or_default(), count));
+            }
+        }
+        let open_faces = open_faces
+            .iter()
+            .map(|(id, name, count)| format!("{id} '{name}' x{count}"))
+            .collect::<Vec<_>>();
         return Err(KernelRefusal::new(
             RefusalClass::DegenerateArrangement {
                 open_edges: open_edges.len() as u32,
@@ -632,16 +669,18 @@ fn assemble_fragments_impl(
             },
             KernelStage::Validate,
             format!(
-            "boolean assembly produced invalid topology (S={} genus={}): {issues:?}; open edges [{}]",
+            "boolean assembly produced invalid topology (S={} genus={}): {issues:?}; open edges [{}]; on faces [{}]",
             solid.shells.len(),
             solid.genus,
-            open_edges.join(", ")
+            open_edges.join(", "),
+            open_faces.join(", ")
         )));
     }
     // Exercise exact integration here so a geometrically inverted shell is
     // rejected at the kernel boundary instead of reaching the application.
     // Volume-only: the gate reads nothing but the sign.
     let stage_started = Instant::now();
+    let _caller = crate::mass_caller("assemble.mass_check");
     let volume = solid_signed_volume(&solid).or_refuse(KernelStage::Sew, "solid_signed_volume")?;
     if profile {
         eprintln!(

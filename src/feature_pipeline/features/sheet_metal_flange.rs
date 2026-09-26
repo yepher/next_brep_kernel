@@ -130,7 +130,6 @@ enum Target {
 mod build;
 mod hole;
 mod outline;
-// BREP private tests: e357ce94538bf6a3
 
 pub use build::{execute, run};
 use build::corner_child_flat;

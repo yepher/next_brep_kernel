@@ -53,6 +53,7 @@ impl HotConstraint {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             line_sign: js_number(map.get("_linePointDistanceSign")),
+            foot_t: get_finite("_splineFootT"),
             ctype,
             type_str,
             point_ids,
@@ -107,6 +108,17 @@ impl HotConstraint {
     pub(super) fn set_line_sign(&mut self, value: f64) {
         self.line_sign = value;
         self.line_sign_written = true;
+    }
+
+    /// Persist the foot-parameter tangency's touch point as `span + t`. Written
+    /// on every pass that resolves a foot — including the passes that find it
+    /// already satisfied — so the seed tracks the configuration the solve is
+    /// actually on, and so an interactive drag (relaxation only, `polish:false`)
+    /// hands the next frame the touch point this frame ended with instead of the
+    /// one the drag started from.
+    pub(super) fn set_foot_t(&mut self, value: f64) {
+        self.foot_t = if value.is_finite() { Some(value) } else { None };
+        self.foot_t_written = true;
     }
 
     pub(super) fn matches_filter(&self, filter: &Filter) -> bool {
@@ -194,6 +206,12 @@ impl HotConstraint {
         if self.line_sign_written {
             self.raw
                 .insert("_linePointDistanceSign".into(), json_num(self.line_sign));
+        }
+        if self.foot_t_written {
+            self.raw.insert(
+                "_splineFootT".into(),
+                self.foot_t.map(json_num).unwrap_or(Value::Null),
+            );
         }
         Value::Object(self.raw)
     }

@@ -20,6 +20,7 @@ pub fn tessellate_brep_watertight(solid: &BrepSolid, chord_tolerance: f64) -> Re
     }
     // The whole solid is stride 1 (every face). Validation (closed-shell,
     // no odd-use edges) only makes sense on the complete mesh.
+    let profile = crate::watertight_tessellation::profile::begin();
     let mut mesh = tessellate_brep_watertight_face_stride(solid, chord_tolerance, 1, 0)?;
     // Final orientation pass over the COMPLETE mesh: make every shared edge
     // coherent and match each component to its source shell's material-side
@@ -30,6 +31,7 @@ pub fn tessellate_brep_watertight(solid: &BrepSolid, chord_tolerance: f64) -> Re
     // touched, so watertightness is preserved (validated below).
     orient_mesh_coherently(&mut mesh, chord_tolerance, &face_shell_signs)?;
     mesh.validate()?;
+    crate::watertight_tessellation::profile::end(profile, chord_tolerance, mesh.indices.len() / 3);
     Ok(mesh)
 }
 
@@ -454,4 +456,3 @@ pub(crate) fn orient_mesh_coherently(
     Ok(())
 }
 
-// BREP private tests: aa6f62d2648159b4

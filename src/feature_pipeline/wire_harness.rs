@@ -5,12 +5,15 @@
 //!
 //! # The `wireHarness` block
 //!
-//! `{ connections: [{ id, name, from, to, diameter }], idCounter, buildBundles }`
-//! on the history request, round-tripped through the saved document. `from` /
-//! `to` are PORT FEATURE IDS (references are ids, never labels — the panel
-//! shows the ports' `portName`s and stores their ids). `idCounter` mints
-//! `wire-N` ids monotonically, like the feature counter. `buildBundles`
-//! (default true) switches the bundle solids off while keeping the routing.
+//! `{ connections: [{ id, name, from, to, diameter }], idCounter, buildBundles,
+//! cutMargin }` on the history request, round-tripped through the saved
+//! document. `from` / `to` are PORT FEATURE IDS (references are ids, never
+//! labels — the panel shows the ports' `portName`s and stores their ids).
+//! `idCounter` mints `wire-N` ids monotonically, like the feature counter.
+//! `buildBundles` (default true) switches the bundle solids off while keeping
+//! the routing. `cutMargin` (default 0, omitted at 0) is the amount the BOM adds
+//! to every wire's routed length to give its cut length; the router never
+//! reads it.
 //!
 //! # The network
 //!
@@ -91,7 +94,9 @@ const SAFETY_FACTOR: f64 = 1.1;
 /// The smallest wire / bundle diameter accepted (a zero-diameter wire is a
 /// data error, not a thin wire).
 const MIN_DIAMETER: f64 = 0.01;
-/// Samples per chain curve for the arc-length estimate.
+/// Chords per chain piece when the exact arc-length measure refuses a piece —
+/// never for the lines and cubic Béziers a spline publishes. Chords read SHORT
+/// (32 of them miss 1.0e-4 of a 90° Hermite span), so this is a fallback only.
 const LENGTH_SAMPLES: usize = 32;
 /// Sweep stations per chain piece for a bundle (a spline span is three pieces).
 const STATIONS_PER_PIECE: usize = 12;
@@ -180,6 +185,18 @@ pub struct WireHarnessState {
     /// report but registers no solids.
     #[serde(default = "default_true", rename = "buildBundles")]
     pub build_bundles: bool,
+    /// The cut margin, in model units: a set amount added to EVERY wire's
+    /// routed length to give the cut length its BOM line carries (MF QTY) —
+    /// once per wire, never a percentage and never once per BOM line. It lives
+    /// here, in the typed block, because the block is rewritten from this struct
+    /// on every harness edit and a key it did not know would be dropped.
+    ///
+    /// The router never reads it and [`harness_fingerprint`] deliberately does
+    /// not hash it: a margin change must not invalidate a route, so the tail
+    /// replays its cache and only the BOM's arithmetic moves. Omitted from the
+    /// saved block at 0, so a document that never set one saves as before.
+    #[serde(default, rename = "cutMargin", skip_serializing_if = "is_zero")]
+    pub cut_margin: f64,
 }
 
 impl Default for WireHarnessState {
@@ -188,6 +205,7 @@ impl Default for WireHarnessState {
             connections: Vec::new(),
             id_counter: 0,
             build_bundles: true,
+            cut_margin: 0.0,
         }
     }
 }
@@ -218,6 +236,10 @@ fn default_true() -> bool {
     true
 }
 
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
+}
+
 fn default_diameter() -> f64 {
     1.0
 }
@@ -242,11 +264,23 @@ pub struct WireHarnessReport {
     pub segment_problems: Vec<String>,
 }
 
-/// A port as an endpoint choice.
+/// A connection point as an endpoint choice.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireHarnessEndpoint {
+    /// The point's ADDRESS, which is what `from`/`to` store
+    /// (`J1.VCC`, `ACOMP3:J1.VCC`, or a WAYPOINT's feature id).
     pub id: String,
-    pub label: String,
+    /// The port group, PART-LOCAL (empty for a waypoint).
+    #[serde(default)]
+    pub port: String,
+    /// The point name, PART-LOCAL — what a symbol pin binds to (a waypoint's
+    /// own display name).
+    #[serde(default)]
+    pub point: String,
+    /// The port group's purpose (`pcb` | `wiring` | `piping` | …; empty for a
+    /// waypoint).
+    #[serde(default)]
+    pub purpose: String,
     pub kind: PortKind,
     /// The placed component (ACOMP feature id) carrying this port, when the
     /// port came in with a part rather than from a PORT feature of this
@@ -323,6 +357,42 @@ pub struct RouteResult {
     pub port_ids: Vec<String>,
 }
 
+/// Why a segment's bundle solid is or is not there.
+///
+/// A ROUTE has had a status since the router existed, because "no route" is an
+/// answer about the model rather than a failure of it. A bundle's refusals are
+/// the same kind of answer — a spline that turns tighter than the bundle can be
+/// pushed round is a thing the user drew, not a thing that went wrong — so it
+/// gets a status too, and the panel keys its colour and its word on that rather
+/// than on the shape of an error string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BundleStatus {
+    /// The solid is built and registered under `solid_name`.
+    Built,
+    /// `buildBundles` is off: the routing is there and the geometry deliberately
+    /// is not.
+    BundlesOff,
+    /// The spline bends TIGHTER than the bundle's own radius, so the swept
+    /// surface would pass through itself. `error` names the bend — where it is,
+    /// the radius of curvature there, and how far the bundle reaches into it.
+    TightBend,
+    /// The sweep failed for some other reason; `error` carries it.
+    BuildFailed,
+}
+
+impl BundleStatus {
+    /// The kebab-case word the panel keys its colours on.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BundleStatus::Built => "built",
+            BundleStatus::BundlesOff => "bundles-off",
+            BundleStatus::TightBend => "tight-bend",
+            BundleStatus::BuildFailed => "build-failed",
+        }
+    }
+}
+
 /// One segment's bundle.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireHarnessBundle {
@@ -334,7 +404,10 @@ pub struct WireHarnessBundle {
     pub diameter: f64,
     pub length: f64,
     pub connection_ids: Vec<String>,
-    /// The build failure, if the solid could not be swept.
+    /// Whether the solid is there, and why not when it is not.
+    pub status: BundleStatus,
+    /// The build failure in full, if the solid could not be swept. Empty
+    /// otherwise; the STATUS is what a reader classifies on.
     pub error: String,
 }
 
@@ -457,7 +530,10 @@ pub fn clear_cache() {
 /// endpoints and diameter, in order, plus the bundles switch — a renamed wire
 /// or a bumped id counter replays) and everything it reads from the scene:
 /// every port record and every segment's identity, sides and exact chain.
-/// Bit-exact on the floats — a moved port must rebuild.
+/// Bit-exact on the floats — a moved port must rebuild. A port's LABEL is in
+/// it too: the report's endpoints (and a waypoint-end message) carry it, and a
+/// part's pin rename changes nothing else, so without it the replayed report
+/// went on naming the port by its old label.
 fn harness_fingerprint(state: &WireHarnessState, network: &Network) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -476,6 +552,7 @@ fn harness_fingerprint(state: &WireHarnessState, network: &Network) -> u64 {
     };
     for (id, port) in &network.ports {
         id.hash(&mut hasher);
+        port.local_address().hash(&mut hasher);
         bits(port.point, &mut hasher);
         bits(port.direction, &mut hasher);
         (port.kind == PortKind::Waypoint).hash(&mut hasher);
@@ -537,7 +614,9 @@ impl Network {
             .iter()
             .map(|(id, port)| WireHarnessEndpoint {
                 id: id.clone(),
-                label: port.label.clone(),
+                port: port.port_name.clone(),
+                point: port.point_name.clone(),
+                purpose: port.purpose.clone(),
                 kind: port.kind,
                 component: self.owners.get(id).cloned(),
             })
@@ -712,18 +791,31 @@ fn end_tangent(chain: &[NurbsCurve], at_start: bool) -> Vec3 {
     }
 }
 
-/// Sampled arc length of a chain.
+/// Arc length of a chain: the kernel's exact measure
+/// ([`crate::curve_arc_length`], Gauss–Legendre paneled at the knots) over each
+/// piece. This is the number a wire's cut length is read from, so it must not
+/// be a chord sum: chords are a lower bound, and a wire cut short is scrap.
 fn chain_length(chain: &[NurbsCurve]) -> f64 {
     let mut total = 0.0;
     for curve in chain {
         let Ok([t0, t1]) = curve.domain() else { continue };
-        let Ok(mut previous) = curve.evaluate(t0) else { continue };
-        for sample in 1..=LENGTH_SAMPLES {
-            let t = t0 + (t1 - t0) * sample as f64 / LENGTH_SAMPLES as f64;
-            if let Ok(point) = curve.evaluate(t) {
-                total += point.sub(previous).length();
-                previous = point;
-            }
+        total += match crate::curve_arc_length(curve, t0, t1) {
+            Ok(length) => length,
+            Err(_) => chord_length(curve, t0, t1),
+        };
+    }
+    total
+}
+
+/// The chord-sum fallback for a piece the exact measure refused.
+fn chord_length(curve: &NurbsCurve, t0: f64, t1: f64) -> f64 {
+    let Ok(mut previous) = curve.evaluate(t0) else { return 0.0 };
+    let mut total = 0.0;
+    for sample in 1..=LENGTH_SAMPLES {
+        let t = t0 + (t1 - t0) * sample as f64 / LENGTH_SAMPLES as f64;
+        if let Ok(point) = curve.evaluate(t) {
+            total += point.sub(previous).length();
+            previous = point;
         }
     }
     total
@@ -1018,7 +1110,7 @@ fn route_connection(
         if port.kind == PortKind::Waypoint {
             return unrouted(
                 RouteStatus::WaypointEndpoint,
-                format!("{label} port '{}' is a waypoint, not a termination", port.label),
+                format!("{label} port '{}' is a waypoint, not a termination", port.local_address()),
             );
         }
     }
@@ -1153,6 +1245,7 @@ fn build_bundles(
             diameter,
             length: segment.length,
             connection_ids,
+            status: BundleStatus::BundlesOff,
             error: String::new(),
         };
         if state.build_bundles {
@@ -1161,8 +1254,19 @@ fn build_bundles(
                 Ok(solid) => {
                     result.added.push(common::register_added(solid, &name));
                     bundle.solid_name = name;
+                    bundle.status = BundleStatus::Built;
                 }
-                Err(error) => bundle.error = error,
+                Err(error) => {
+                    // Classified on the refusal's own published PREFIX, not on
+                    // free text: the sweep owns the sentence, this owns the
+                    // status, and neither has to guess at the other's wording.
+                    bundle.status = if error.starts_with(crate::SWEEP_TIGHT_BEND_REFUSAL) {
+                        BundleStatus::TightBend
+                    } else {
+                        BundleStatus::BuildFailed
+                    };
+                    bundle.error = error;
+                }
             }
         }
         bundles.push(bundle);
@@ -1190,10 +1294,14 @@ fn sweep_bundle(segment: &Segment, radius: f64, name: &str) -> Result<crate::Bre
         .map(|index| format!("{}:piece{index}", segment.id))
         .collect();
     let stations = (segment.chain.len() * STATIONS_PER_PIECE).clamp(32, 1024);
+    // The chain is classified here, where it is assembled: a harness span is a
+    // spline cut into pieces, so it is open and tangent-continuous by
+    // construction, and the classification is what lets the builder SAY so when a
+    // zero-length anchor extension leaves a corner in it anyway.
+    let path = crate::SweepPath::new(segment.chain.clone(), names)?;
     let mut solid = crate::sweep_profile_along_chain_with_stations(
         &profile,
-        &segment.chain,
-        &names,
+        &path,
         stations,
         "a harness segment must be tangent-continuous (a spline always is; a zero extension at an anchor can leave a corner)",
     )?;
@@ -1217,4 +1325,3 @@ fn sweep_bundle(segment: &Segment, radius: f64, name: &str) -> Result<crate::Bre
     Ok(solid)
 }
 
-// BREP private tests: dc0e974727237ec0

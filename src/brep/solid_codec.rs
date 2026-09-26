@@ -335,4 +335,3 @@ pub fn decode_solid(data: &[f64], names: &SolidNames) -> Result<BrepSolid, Strin
     })
 }
 
-// BREP private tests: d2397960a07083f3

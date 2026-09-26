@@ -17,7 +17,10 @@ pub use assembly::{
 };
 #[path = "step/export_tree.rs"]
 mod export_tree;
-pub use export_tree::assembly_export_tree;
+pub use export_tree::{assembly_export_tree, PART_ATTRIBUTES, PART_NUMBER};
+#[path = "step/styles.rs"]
+pub(crate) mod styles;
+pub use styles::StepColors;
 
 pub use crate::step_matrix::Mat4;
 pub(crate) use crate::step_matrix::{mat4_mul, MAT4_IDENTITY};
@@ -820,6 +823,11 @@ pub struct StepExportReport {
     /// `NEXT_ASSEMBLY_USAGE_OCCURRENCE` edges written — the placed component
     /// instances. Zero for the flat lane.
     pub occurrences: usize,
+    /// `STYLED_ITEM`s written for GEOMETRY colour — one per coloured body and
+    /// per coloured face (`step/styles.rs`). Zero when the caller passed no
+    /// colours, or when none of the names it passed named written geometry;
+    /// the PMI block's own styled item is not counted here.
+    pub styled_items: usize,
 }
 
 /// Serialize exact NURBS BREP topology as an AP242 STEP Part 21 document.
@@ -844,7 +852,7 @@ pub fn export_step_report(
         .iter()
         .map(|solid| (name.to_string(), solid))
         .collect();
-    export_step_report_named(&named, name, unit, timestamp, None)
+    export_step_report_named(&named, name, unit, timestamp, None, None)
 }
 
 /// The full writer: each body carries its SCENE NAME (`MANIFOLD_SOLID_BREP`
@@ -866,8 +874,11 @@ pub(crate) struct StepItemOwner {
 /// under several occurrence paths, and each path registers its own alias.
 #[derive(Default)]
 pub(crate) struct ProductGeometry {
-    /// `MANIFOLD_SOLID_BREP` ids, in body order.
-    pub solids: Vec<usize>,
+    /// Body name -> its `MANIFOLD_SOLID_BREP`, in emission order — one entry per
+    /// SHELL the body wrote, so a body with voids appears once per shell. The
+    /// name rides along because a coloured body is styled on this entity
+    /// (`step/styles.rs`), and the representation's item list is the ids alone.
+    pub solids: Vec<(String, usize)>,
     /// Face name -> its `ADVANCED_FACE`.
     pub faces: Vec<(String, usize)>,
     /// Edge name -> its `EDGE_CURVE`.
@@ -1298,10 +1309,11 @@ pub(crate) fn write_product_geometry(
                 face_ids.push(face_step_id);
             }
             let closed_shell = writer.add(format!("CLOSED_SHELL('',{})", id_list(&face_ids)));
-            written.solids.push(writer.add(format!(
+            let body_id = writer.add(format!(
                 "MANIFOLD_SOLID_BREP('{}',#{closed_shell})",
                 step_string(solid_name)
-            )));
+            ));
+            written.solids.push((solid_name.to_string(), body_id));
         }
         // The vertices this solid wrote, for `{solid}@x,y,z` PMI references.
         let mut points: Vec<(Vec3, usize)> = Vec::with_capacity(vertex_ids.len());
@@ -1371,6 +1383,7 @@ pub fn export_step_report_named(
     unit: &str,
     timestamp: &str,
     pmi: Option<&StepPmi<'_>>,
+    colors: Option<&StepColors>,
 ) -> Result<StepExportReport, String> {
     if solids.is_empty() {
         return Err("export_step: at least one solid is required".into());
@@ -1383,7 +1396,7 @@ pub fn export_step_report_named(
     let contexts = write_file_contexts(&mut writer, unit)?;
     let geometry = write_product_geometry(&mut writer, &contexts, solids, &mut report)?;
     let mut items = vec![contexts.axis];
-    items.extend(&geometry.solids);
+    items.extend(geometry.solids.iter().map(|(_, id)| *id));
     let geometry_context = contexts.geometry_context;
     let representation = writer.add(format!(
         "ADVANCED_BREP_SHAPE_REPRESENTATION('',{},#{geometry_context})",
@@ -1394,6 +1407,14 @@ pub fn export_step_report_named(
     writer.add(format!(
         "SHAPE_DEFINITION_REPRESENTATION(#{product_shape},#{representation})"
     ));
+    // Geometry colour, before the PMI block so a file's presentation styles read
+    // in geometry order. The flat lane's bodies carry their document names with
+    // no component namespace, so the ONE prefix to resolve through is the empty
+    // one.
+    if let Some(colors) = colors.filter(|colors| !colors.is_empty()) {
+        let items = styles::styled_items(&geometry, colors, &[String::new()]);
+        report.styled_items = styles::write_geometry_styles(&mut writer, geometry_context, &items)?;
+    }
     if let Some(pmi) = pmi {
         let mut names = StepNameMaps::default();
         names.register(
@@ -1593,4 +1614,3 @@ pub fn audit_step_manifold(step: &str) -> Vec<String> {
     issues
 }
 
-// BREP private tests: 60b37a9d721ab87b

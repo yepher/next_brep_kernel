@@ -66,6 +66,10 @@ pub(super) enum ChainSource {
     Cut {
         piece_id: u64,
         pcurve: NurbsCurve,
+        /// The whole-period shift the arrangement placed this chain at, off
+        /// the pcurve's own period (zero unless the cut-chain period lift in
+        /// `fragment_face` moved it into the face's unwrapped band).
+        lift: Vec2,
         curve: NurbsCurve,
         /// (operand, edge_id, aligned) when the piece rides an existing
         /// closed boundary ring (shared_edge on a closed piece) — the

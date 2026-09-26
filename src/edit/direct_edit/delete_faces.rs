@@ -41,6 +41,15 @@
 //! between two different carriers, which is what re-intersection is for, so the
 //! splice walk is the gate rather than a separate test (`splice_fragments`).
 //!
+//! The gate DECLINES one shape before it looks at a loop: a selection that
+//! encloses every survivor it borders, so that no survivor would keep a loop
+//! (`encloses_every_survivor`). A cap needs a face around the opening to drop
+//! the opening out of, and there is none — the selection is not a pocket but,
+//! say, every blend on a cube with all twelve edges rounded, whose six sides
+//! are each bounded by strips alone. The lanes after this one read it; one that
+//! none of them reads is refused by name rather than taken apart one face at a
+//! time.
+//!
 //! ## The bridged rejoin
 //!
 //! The splice above hands one cut run over to the next AT A SHARED VERTEX,
@@ -188,6 +197,146 @@ fn census(solid: &BrepSolid, face_ids: &HashSet<u64>) -> HashMap<u64, EdgeCensus
     counts
 }
 
+/// Whether every survivor the selection borders is bounded by the selection
+/// ALONE: each face outside it that shares an edge with it has every coedge of
+/// every loop on such an edge.
+///
+/// That is the one shape a cap cannot be. A cap drops the free boundary out of
+/// the face AROUND the patch, and here no survivor keeps a loop to be that
+/// face. A cube with all twelve edges rounded, every blend selected, is the
+/// shape that asks: each of its six sides is bounded by four strips and
+/// nothing else, and un-rounding it is the blend network's question.
+///
+/// False when the selection borders nothing at all — a whole closed shell —
+/// which the patch gate declines on its own terms.
+fn encloses_every_survivor(
+    solid: &BrepSolid,
+    selected: &HashSet<u64>,
+    counts: &HashMap<u64, EdgeCensus>,
+) -> bool {
+    let on_selection = |coedge: &CoedgeRecord| {
+        counts
+            .get(&coedge.edge_id)
+            .is_some_and(|count| count.selected > 0)
+    };
+    let mut bordered = false;
+    for face in solid.shells.iter().flat_map(|shell| &shell.faces) {
+        if selected.contains(&face.id) {
+            continue;
+        }
+        let mut coedges = face.loops.iter().flat_map(|loop_record| &loop_record.coedges);
+        if !coedges.clone().any(on_selection) {
+            continue;
+        }
+        if !coedges.all(on_selection) {
+            return false;
+        }
+        bordered = true;
+    }
+    bordered
+}
+
+/// [`encloses_every_survivor`] for a selection, and the faces it encloses.
+/// `None` when the selection does not enclose every survivor it borders.
+pub(super) fn enclosed_survivors(solid: &BrepSolid, face_ids: &[u64]) -> Option<Vec<u64>> {
+    let selected: HashSet<u64> = face_ids.iter().copied().collect();
+    let counts = census(solid, &selected);
+    if !encloses_every_survivor(solid, &selected, &counts) {
+        return None;
+    }
+    Some(
+        solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .filter(|face| {
+                !selected.contains(&face.id)
+                    && face
+                        .loops
+                        .iter()
+                        .flat_map(|loop_record| &loop_record.coedges)
+                        .any(|coedge| counts.get(&coedge.edge_id).is_some_and(|count| count.selected > 0))
+            })
+            .map(|face| face.id)
+            .collect(),
+    )
+}
+
+/// The refusal for a selection that encloses every survivor it borders and
+/// that no lane after the cap has read: nothing is left to cap against, and
+/// one face at a time is not an answer to a set whose every neighbour is going
+/// with it.
+///
+/// Two shapes of it have a reason of their own, and the refusal names it:
+///
+/// * the selection is every face of a closed shell but ONE — five sides of a
+///   box. It is a patch on the sixth whose free boundary is that face's whole
+///   outer loop: removing it leaves one face with no boundary at all, and one
+///   face bounds no solid.
+/// * a CURVED face is among the enclosed — the eight vertex blends of a box
+///   whose twelve strips are selected. Once the strips go, the walls meet in
+///   sharp edges, and a sphere rolled against three planes stands off each of
+///   them (at `r·√2` on a cube): nothing is left to bound it, so it cannot stay.
+fn enclosed_selection_refusal(solid: &BrepSolid, face_ids: &[u64], op: &str) -> Option<String> {
+    let enclosed = enclosed_survivors(solid, face_ids)?;
+    let labels = |ids: &[u64]| -> String {
+        let mut labels: Vec<String> = ids
+            .iter()
+            .take(4)
+            .filter_map(|face_id| find_face(solid, *face_id))
+            .map(|(shell, position)| face_label(&solid.shells[shell].faces[position]))
+            .collect();
+        if ids.len() > labels.len() {
+            labels.push(format!("{} more", ids.len() - labels.len()));
+        }
+        labels.join(", ")
+    };
+    let selected: HashSet<u64> = face_ids.iter().copied().collect();
+    let all_but_one = enclosed.len() == 1
+        && solid.shells.iter().any(|shell| {
+            shell.faces.iter().any(|face| face.id == enclosed[0])
+                && shell
+                    .faces
+                    .iter()
+                    .all(|face| selected.contains(&face.id) || face.id == enclosed[0])
+        });
+    if all_but_one {
+        return Some(format!(
+            "{op}: the selection is every face of the closed shell but {} — a patch whose free \
+             boundary is that face's whole outer loop, so deleting it would leave one face with \
+             no boundary at all, and one face bounds no solid to heal to",
+            labels(&enclosed)
+        ));
+    }
+    let tolerance = (solid_model_scale(solid) * 1e-6).max(1e-7);
+    let curved: Vec<u64> = enclosed
+        .iter()
+        .copied()
+        .filter(|face_id| {
+            find_face(solid, *face_id).is_some_and(|(shell, position)| {
+                plane_of_surface(&solid.shells[shell].faces[position].surface, tolerance, op).is_err()
+            })
+        })
+        .collect();
+    if !curved.is_empty() {
+        return Some(format!(
+            "{op}: {} {} bounded by the selection alone — a vertex blend whose strips are all \
+             selected cannot stay once they go, because the walls re-intersect in sharp edges \
+             that stand off it; select {} as well",
+            labels(&curved),
+            if curved.len() == 1 { "is a curved face" } else { "are curved faces" },
+            if curved.len() == 1 { "it" } else { "them" }
+        ));
+    }
+    Some(format!(
+        "{op}: every face the selection borders ({}) is bounded by the selection alone, so no \
+         face is left around it to cap the opening against, and the selection does not read \
+         as a corner blend, a closed band or a planar blend network — refusing rather than \
+         deleting it one face at a time (deferred)",
+        labels(&enclosed)
+    ))
+}
+
 /// Decide whether `face_ids` is a PATCH — a set whose free boundary consumes,
 /// or rejoins, whole loops of the faces around it — and if so gather what its
 /// removal takes with it. `None` routes the caller to the one-face-at-a-time
@@ -224,6 +373,14 @@ fn classify_patch(solid: &BrepSolid, face_ids: &[u64]) -> Option<FacePatch> {
         !edges.get(edge_id).is_some_and(|edge| edge.degenerate)
             && count.selected + count.kept != 2
     }) {
+        return None;
+    }
+    // Nothing to cap AGAINST: every survivor the selection borders would lose
+    // every loop it has. `cap_preconditions` would only refuse it ("the whole
+    // boundary of ..."), and it is not a pocket at all — it is what a blend
+    // network looks like when every face it touches is bounded by blends. So
+    // the lane declines here, and the lanes after it read the set.
+    if encloses_every_survivor(solid, &selected, &counts) {
         return None;
     }
 
@@ -1003,7 +1160,7 @@ fn widest_loop_on(
 /// `V - E + F - H` on the reduced complex `validate()`'s Euler check uses:
 /// degenerate (pole) edges and the vertices only they reference are not
 /// independent cells, and each loop past a face's first is a hole.
-fn euler_characteristic(solid: &BrepSolid) -> i64 {
+pub(super) fn euler_characteristic(solid: &BrepSolid) -> i64 {
     let referenced: HashSet<u64> = solid
         .edges
         .iter()
@@ -1021,12 +1178,7 @@ fn euler_characteristic(solid: &BrepSolid) -> i64 {
         .iter()
         .map(|shell| shell.faces.len())
         .sum::<usize>() as i64;
-    let holes: i64 = solid
-        .shells
-        .iter()
-        .flat_map(|shell| &shell.faces)
-        .map(|face| face.loops.len().saturating_sub(1) as i64)
-        .sum();
+    let holes = solid.bounding_hole_count();
     vertices - edges + faces - holes
 }
 
@@ -1174,6 +1326,23 @@ fn cap_preconditions(solid: &BrepSolid, patch: &FacePatch, op: &str) -> Result<(
 /// the hole loops it consumed whole, and rejoin the faces whose loops it only
 /// cut.
 fn cap_face_patch(solid: &BrepSolid, patch: &FacePatch, op: &str) -> Result<BrepSolid, String> {
+    if !patch.bridges.is_empty() {
+        if let Some(directory) = census_directory() {
+            let mut face_ids: Vec<u64> = patch.face_ids.iter().copied().collect();
+            face_ids.sort_unstable();
+            let rejoined: Vec<u64> = patch
+                .merges
+                .iter()
+                .flat_map(|merge| &merge.faces)
+                .map(|position| solid.shells[patch.shell_index].faces[*position].id)
+                .collect();
+            let operation = |body: &BrepSolid| -> Result<BrepSolid, String> {
+                let patch = classify_patch(body, &face_ids).ok_or("the copy is no longer a patch")?;
+                cap_face_patch(body, &patch, op)
+            };
+            record_rejoin_census(&directory, solid, &face_ids, &rejoined, &operation);
+        }
+    }
     cap_preconditions(solid, patch, op)?;
     let per_face = dropped_per_face(patch);
 
@@ -1276,7 +1445,18 @@ fn delete_one_face(solid: &BrepSolid, face_id: u64, op: &str) -> Result<BrepSoli
             return cap_face_patch(solid, &patch, op);
         }
     }
-    delete_face_and_heal(solid, face_id)
+    // A closed strip whose rims are RUNS of edges rather than one closed edge
+    // each: `delete_face_and_heal_impl` reads only `[seam+, rim_a, seam-,
+    // rim_b]` and refuses anything else on its coedge count, but the band lane
+    // is stated for a run and heals it identically (`closed_band.rs`). The gate
+    // declines every shape the closed strip CAN read, so that lane keeps every
+    // case it already answered — and this is asked after the patch gate, so a
+    // through feature's wall still caps rather than being sharpened against
+    // two survivors that were never meant to meet.
+    if let Some(band) = classify_closed_band(solid, &[face_id]) {
+        return heal_closed_band(solid, &band, op);
+    }
+    delete_face_and_heal_impl(solid, face_id)
 }
 
 /// The selection's edge-connected COMPONENTS, in the order their faces appear
@@ -1288,7 +1468,7 @@ fn delete_one_face(solid: &BrepSolid, face_id: u64, op: &str) -> Result<BrepSoli
 /// boundary is a property of one contiguous piece of surface, and two pieces
 /// that touch nothing of each other cannot make one another's boundary any
 /// less whole.
-fn connected_components(solid: &BrepSolid, face_ids: &[u64]) -> Vec<Vec<u64>> {
+pub(super) fn connected_components(solid: &BrepSolid, face_ids: &[u64]) -> Vec<Vec<u64>> {
     let selected: HashSet<u64> = face_ids.iter().copied().collect();
     let mut adjacency: HashMap<u64, Vec<u64>> = HashMap::default();
     let mut by_edge: HashMap<u64, Vec<u64>> = HashMap::default();
@@ -1356,6 +1536,12 @@ fn connected_components(solid: &BrepSolid, face_ids: &[u64]) -> Vec<Vec<u64>> {
 /// mouth is tangent to something, where the rim arrives as runs of two
 /// pinch-split faces' loops instead of as a hole loop.
 ///
+/// A contiguous selection that is neither a patch nor a corner but a CLOSED
+/// BAND — an annulus whose free boundary is one closed run on each of two
+/// survivors, like a nut pocket sunk over a bore that keeps going — is healed by
+/// re-intersecting those two survivors (`closed_band.rs`), the same answer the
+/// one-face closed strip gets.
+///
 /// A selection can be BOTH — holes and fillets picked together — and then it is
 /// neither lane as a whole. Such a selection is split into edge-connected
 /// components and each component takes the lane its own shape asks for; the
@@ -1363,6 +1549,17 @@ fn connected_components(solid: &BrepSolid, face_ids: &[u64]) -> Vec<Vec<u64>> {
 /// patch never reaches that split, so every set the gate already accepted is
 /// answered by exactly the code it was answered by before.
 pub fn delete_faces_and_heal(solid: &BrepSolid, face_ids: &[u64]) -> Result<BrepSolid, String> {
+    // The soundness floor, once, on the finished body. `validate()` is an
+    // incidence test and says nothing about a shell passing through itself;
+    // a re-intersected rim is exactly what can produce one, and a fold is
+    // wrong in AREA where it is right in volume, so nothing that measures
+    // volume would notice. See `healing::accept_sound`.
+    crate::accept_sound(delete_faces_and_heal_impl(solid, face_ids)?, "deleteFace")
+}
+
+/// The whole selection's heal, without the soundness floor: see
+/// [`delete_faces_and_heal`].
+fn delete_faces_and_heal_impl(solid: &BrepSolid, face_ids: &[u64]) -> Result<BrepSolid, String> {
     let op = "delete_faces_and_heal";
     let mut seen: HashSet<u64> = HashSet::default();
     let face_ids: Vec<u64> = face_ids
@@ -1378,8 +1575,24 @@ pub fn delete_faces_and_heal(solid: &BrepSolid, face_ids: &[u64]) -> Result<Brep
             return Err(format!("{op}: no face with id {face_id}"));
         }
     }
+    // A strip a fillet capped takes its planar end caps with it, picked or not
+    // (`blend_network_heal.rs`), so every lane below is asked about the strip
+    // and its caps together.
+    let face_ids = with_owned_caps(solid, &face_ids, op)?;
     if face_ids.len() == 1 {
-        return Ok(coalesce_healed_edges(&delete_one_face(solid, face_ids[0], op)?));
+        // One face is still a network when caps left standing by a second
+        // round sit at its ends — a first round's cylinder whose end arcs the
+        // second round's strips ran up to (`blend_network_heal.rs`). Every
+        // other face is the one-face chain's, exactly as before.
+        return match read_blend_network(solid, &face_ids, op) {
+            NetworkRead::Network(network) => {
+                Ok(coalesce_healed_edges(&heal_blend_network(solid, &network, op)?))
+            }
+            NetworkRead::Refused(reason) => Err(reason),
+            NetworkRead::NotANetwork => {
+                Ok(coalesce_healed_edges(&delete_one_face(solid, face_ids[0], op)?))
+            }
+        };
     }
     if let Some(patch) = classify_patch(solid, &face_ids) {
         return Ok(coalesce_healed_edges(&cap_face_patch(solid, &patch, op)?));
@@ -1389,6 +1602,18 @@ pub fn delete_faces_and_heal(solid: &BrepSolid, face_ids: &[u64]) -> Result<Brep
             solid, &group, op,
         )?));
     }
+    if let Some(band) = classify_closed_band(solid, &face_ids) {
+        return Ok(coalesce_healed_edges(&heal_closed_band(solid, &band, op)?));
+    }
+    match read_blend_network(solid, &face_ids, op) {
+        NetworkRead::Network(network) => {
+            return Ok(coalesce_healed_edges(&heal_blend_network(solid, &network, op)?));
+        }
+        // A network with a face beside it that cannot stay is refused by name:
+        // one face at a time has no better answer for a network.
+        NetworkRead::Refused(reason) => return Err(reason),
+        NetworkRead::NotANetwork => {}
+    }
 
     // Not one patch. Ask each edge-connected component of the selection the
     // same question on its own, so a mixed selection is answered rather than
@@ -1396,6 +1621,13 @@ pub fn delete_faces_and_heal(solid: &BrepSolid, face_ids: &[u64]) -> Result<Brep
     let components = connected_components(solid, &face_ids);
     let mut healed = solid.clone();
     if components.len() < 2 {
+        // A set that encloses every face it borders, and that no lane above
+        // read, is refused by name: the patch gate declined it for having
+        // nothing to cap against, and the chain would take it apart one face
+        // at a time with every neighbour still going.
+        if let Some(reason) = enclosed_selection_refusal(solid, &face_ids, op) {
+            return Err(reason);
+        }
         // One contiguous piece that is neither a patch nor a corner: the
         // chain, exactly as before, in the caller's own order.
         for face_id in &face_ids {
@@ -1424,14 +1656,36 @@ pub fn delete_faces_and_heal(solid: &BrepSolid, face_ids: &[u64]) -> Result<Brep
     // A corner blend is a component the chain cannot take a face at a time
     // (`corner_heal.rs`), and like the chain it refits carriers, so it runs in
     // the same phase — after every cap, before the faces the chain still owns.
-    for component in chained {
+    for (index, component) in chained.iter().enumerate() {
         if component.len() > 1 {
-            if let Some(group) = classify_corner_blend_group(&healed, &component) {
+            if let Some(group) = classify_corner_blend_group(&healed, component) {
                 healed = heal_corner_blend_group(&healed, &group, op)?;
                 continue;
             }
+            if let Some(band) = classify_closed_band(&healed, component) {
+                healed = heal_closed_band(&healed, &band, op)?;
+                continue;
+            }
         }
-        for face_id in &component {
+        // A lone face with caps standing at its ends is a network, as it is when
+        // it is the whole selection.
+        match read_blend_network(&healed, component, op) {
+            NetworkRead::Network(network) => {
+                healed = heal_blend_network(&healed, &network, op)?;
+                continue;
+            }
+            NetworkRead::Refused(reason) => return Err(reason),
+            NetworkRead::NotANetwork => {}
+        }
+        // The same refusal, asked of everything still selected rather than of
+        // this piece: twelve strips without their vertex blends are twelve
+        // separate pieces, and each one alone borders survivors that the rest
+        // of the set goes on to enclose.
+        let remaining: Vec<u64> = chained[index..].iter().flatten().copied().collect();
+        if let Some(reason) = enclosed_selection_refusal(&healed, &remaining, op) {
+            return Err(reason);
+        }
+        for face_id in component {
             healed = delete_one_face(&healed, *face_id, op)?;
         }
     }
@@ -1467,4 +1721,3 @@ fn coalesce_healed_edges(solid: &BrepSolid) -> BrepSolid {
     }
 }
 
-// BREP private tests: 538eae5ab598fdf6

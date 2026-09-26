@@ -7,10 +7,9 @@
 //!    it must not also carry `stepText`/`igesText` (an error, not a precedence
 //!    puzzle). The solids register VERBATIM under their stored names: re-deriving
 //!    them would break every scene-metadata record and every constraint keyed to a
-//!    face name. This is the lane a STEP-assembly part document rides on (see
-//!    `docs/developer/kernel-plans/step-assembly-import.md` §3.2), and the reason
-//!    the snapshot container is a DURABLE format, not a cache (§6 there, and the
-//!    `io/snapshot.rs` module doc).
+//!    face name. This is the lane a STEP-assembly part document rides on, and the
+//!    reason the snapshot container is a DURABLE format, not a cache (§6 there,
+//!    and the `io/snapshot.rs` module doc).
 //! 1. **`inputParams.stepText`** — the raw ISO-10303-21 document, baked in by the
 //!    toolbar Import lane ([`crate`]'s host: `EngineState::import_step_feature`).
 //!    Runs the exact Rust STEP importer
@@ -429,4 +428,3 @@ pub fn schema() -> serde_json::Value {
 })
 }
 
-// BREP private tests: fdb8c7a1acf7c80a

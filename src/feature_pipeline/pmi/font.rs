@@ -162,4 +162,3 @@ static GLYPHS: &[Glyph] = &[
 ];
 
 
-// BREP private tests: e30fe48f73b0cd80

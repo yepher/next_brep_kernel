@@ -51,6 +51,116 @@ pub fn fragment_face(
     fragment_face_indexed(solid, operand, face, &index)
 }
 
+/// The winding the SOURCE face's own outer loop uses in its (u,v) chart:
+/// `Some(true)` when it is negative (clockwise), `Some(false)` when positive,
+/// `None` when the sign cannot be trusted.
+///
+/// `build_loop` orients a rebuilt fragment loop against the arrangement, whose
+/// outer cycles are ALWAYS positive-area (`arrangement.rs`: a cycle goes to
+/// `positive` only when `area > tol²`, and negative cycles become holes), and
+/// reversed it only for `!same_sense` — *material runs counter-clockwise in
+/// (u,v) exactly when `same_sense`*.
+///
+/// That rule is CORRECT and is this kernel's stated invariant: it is what
+/// `validate_uv_wire` checks (`brep/topology/validate.rs`, "wire winding
+/// disagrees with face sense"), what `watertight_tessellation::periodic::trim`
+/// cites as the authority for the same question, and what nine sites in `src/`
+/// compare a winding against. It is also forced by the definitions — with
+/// `n_s = S_u × S_v` and `n_f = same_sense ? n_s : −n_s`, material-on-the-left
+/// projected into the chart with `n_s` up leaves no freedom.
+///
+/// So a face carrying a CW outer loop with `same_sense = true` is MALFORMED,
+/// not merely unusual. This function exists because one arrives anyway: nothing
+/// refuses it on the way in, and `validate_uv_wire`'s verdict is filed under
+/// `ValidationReport::wire_warnings`, which `validate()` does not return — so
+/// every `validate().is_empty()` in the kernel reads clean on it.
+///
+/// Reading the source winding here is DEFENCE IN DEPTH, not a blessing of the
+/// chart: it stops the boolean refusing on such a face and builds the correct
+/// body instead. It does not make the face correct, and the real defect is
+/// upstream in whatever produced it.
+///
+/// Measured on the 2026-09-21 through-tunnel body: five of the stretched
+/// wedge's six faces wind positive, `Box_PZ` winds −1.2334e3 with `same_sense =
+/// true` (the plain box's `Box_PZ` winds +1.2143e3; `TF3` is what flips it).
+/// Rebuilding `Box_PZ` against the arrangement's CCW convention flips every
+/// coedge on it, which is the six same-sense edges the boolean then refuses on.
+///
+/// Restricted to OPEN charts on purpose. On a closed/periodic chart a raw
+/// shoelace is meaningless without the seam unwrap the arrangement scan does,
+/// and that path already has its own material-orientation authority in
+/// `full_span_loop_area`; leaving periodic faces on the old rule keeps this
+/// change to the case it was measured on. `None` also covers a loop with too
+/// few samples or an area too small to carry a reliable sign — the caller then
+/// keeps today's `!same_sense`.
+fn source_loop_winding_negative(face: &FaceRecord) -> Result<Option<bool>, KernelRefusal> {
+    let closed = face
+        .surface
+        .closed_directions()
+        .or_refuse(KernelStage::Fragment, "closed_directions")?;
+    if closed.0 || closed.1 {
+        return Ok(None);
+    }
+    // The OUTER loop is the one bounding the most parameter area; holes wind
+    // against it. Reading `loops[0]` would trust a convention this function
+    // exists to stop trusting.
+    let mut best: Option<f64> = None;
+    for loop_record in &face.loops {
+        let mut points: Vec<Vec2> = Vec::new();
+        for coedge in &loop_record.coedges {
+            let [d0, d1] = coedge
+                .pcurve
+                .domain()
+                .or_refuse(KernelStage::Fragment, "domain")?;
+            const SAMPLES: usize = 24;
+            for step in 0..SAMPLES {
+                let fraction = step as f64 / SAMPLES as f64;
+                // `d0 -> d1` ALWAYS. A pcurve is stored in its coedge's own
+                // traversal direction -- `reverse_fragment` flips `forward` and
+                // calls `pcurve.reversed()` together, and the loop-polygon
+                // builder below walks every pcurve `d0 -> d1` regardless of
+                // `forward`. Consulting `forward` here would reverse those
+                // segments in place and trace a zig-zag: on the plain box's
+                // `Box_NZ` (60.715 x 20 in parameter space) that yields 607.15,
+                // exactly half the 1214.3 the loop actually bounds, and the
+                // sign of a self-intersecting polygon is not the loop's
+                // winding.
+                let t = d0 + (d1 - d0) * fraction;
+                let point = coedge
+                    .pcurve
+                    .evaluate(t)
+                    .or_refuse(KernelStage::Fragment, "evaluate")?;
+                points.push(Vec2 { x: point.x, y: point.y });
+            }
+        }
+        if points.len() < 3 {
+            continue;
+        }
+        let mut area = 0.0;
+        for (index, point) in points.iter().enumerate() {
+            let next = points[(index + 1) % points.len()];
+            area += 0.5 * (point.x * next.y - next.x * point.y);
+        }
+        if best.map(|current: f64| area.abs() > current.abs()).unwrap_or(true) {
+            best = Some(area);
+        }
+    }
+    // Scale the "is this sign real" floor to the chart, so a millimetre-wide
+    // face is not judged by a millimetre-squared absolute.
+    let u_domain = KnotVector::new(face.surface.knots_u.clone(), face.surface.degree_u)
+        .or_refuse(KernelStage::Fragment, "new")?
+        .domain();
+    let v_domain = KnotVector::new(face.surface.knots_v.clone(), face.surface.degree_v)
+        .or_refuse(KernelStage::Fragment, "new")?
+        .domain();
+    let chart = (u_domain[1] - u_domain[0]) * (v_domain[1] - v_domain[0]);
+    let floor = (chart.abs() * 1e-9).max(f64::MIN_POSITIVE);
+    Ok(match best {
+        Some(area) if area.abs() > floor => Some(area < 0.0),
+        _ => None,
+    })
+}
+
 fn fragment_face_indexed(
     solid: &BrepSolid,
     operand: u8,
@@ -503,6 +613,11 @@ fn fragment_face_indexed(
     // Post-rebase boundary polyline segments (incl. seam-image copies), kept
     // for the sag-refinement boundary-crossing parity guard on cut chains.
     let mut boundary_segments: Vec<(Vec2, Vec2)> = Vec::new();
+    // The u and v extent of the boundary chains as the arrangement places
+    // them — after the seam-hop unwrap and the band re-base, before any
+    // seam-image copy — which is the period window the face's material lives
+    // in. See the cut-chain period lift below.
+    let mut band_hull = [[f64::INFINITY, f64::NEG_INFINITY]; 2];
     for (loop_index, loop_record) in face.loops.iter().enumerate() {
         // SEAM-HOP UNWRAP: a loop whose pcurves are drawn IN-DOMAIN but hop
         // the seam between consecutive coedges (t91's face 675: the boundary
@@ -649,6 +764,10 @@ fn fragment_face_indexed(
         };
         for (coedge_index, points, curve, start_vertex, end_vertex) in sampled {
             let coedge = &loop_record.coedges[coedge_index];
+            for point in &points {
+                band_hull[0] = [band_hull[0][0].min(point.x), band_hull[0][1].max(point.x)];
+                band_hull[1] = [band_hull[1][0].min(point.y), band_hull[1][1].max(point.y)];
+            }
             boundary_segments.extend(points.windows(2).map(|pair| (pair[0], pair[1])));
             add_chain(
                 points.clone(),
@@ -701,6 +820,11 @@ fn fragment_face_indexed(
         let mut clamp_u = u_domain;
         let mut clamp_v = v_domain;
         let (closed_u, closed_v) = face.surface.closed_directions().or_refuse(KernelStage::Fragment, "closed_directions")?;
+        // NOTE (2026-09-16): this hatch's ONLY tamper guard,
+        // `csg/fragment/tests.rs::seam_band_cut_chain_splits_periodic_face`, went
+        // INERT when the march-window lift landed — that test now passes with this
+        // hatch off, so nothing tamper-verifies this mechanism any more. Not that it
+        // is untested: no other test NAMES this hatch.
         if (closed_u || closed_v) && std::env::var("BREP_FRAG_ENV_CLAMP").as_deref() != Ok("0") {
             for loop_record in &face.loops {
                 for coedge in &loop_record.coedges {
@@ -805,6 +929,102 @@ fn fragment_face_indexed(
         for point in &mut points {
             *point = rebase_point(*point);
         }
+        // CUT-CHAIN PERIOD LIFT. A section's pcurve on a closed carrier is
+        // drawn on the carrier's own period, but the boundary chains above can
+        // sit a period away from it: an imported face whose seam edge is not
+        // at the carrier's parameter origin carries rims split AT that origin,
+        // so its loop hops the branch cut between coedges and the seam-hop
+        // unwrap lays it out over [seam, seam + period] (the 2026-09-14 gear:
+        // cone and fillet torus with seam edges at u = 1/2, boundary chains on
+        // u ∈ [0.5, 1.5], section arcs on [0, 0.5] and [0.5, 1]). The arc a
+        // period off never meets the band, the section never closes across the
+        // face, the face stays one fragment and is kept or dropped whole — one
+        // rim and the section ring then strand one-use. Every piece the imprint
+        // attaches to a face has its midpoint inside that face's trim, so the
+        // chain's image whose middle lies inside the band is the one the
+        // arrangement must see; a whole-period shift is exact on a periodic
+        // carrier. The chain is lifted only when its middle is OUTSIDE the band
+        // and exactly one period image puts it inside, so a chain already
+        // coherent with its band — every native face, every re-based band —
+        // is untouched. The pcurve keeps the carrier's own period (the lift is
+        // an arrangement coordinate, recorded on the chain for the partial-run
+        // rescue). A lifted chain that still crosses a wall of the band crosses
+        // the face's seam edge unsplit, and the face refuses by name. Escape
+        // hatch `BREP_CUT_PERIOD_LIFT=0`.
+        let mut lift = Vec2 { x: 0.0, y: 0.0 };
+        if std::env::var("BREP_CUT_PERIOD_LIFT").as_deref() != Ok("0") {
+            let closed = face.surface.closed_directions().or_refuse(KernelStage::Fragment, "closed_directions")?;
+            for axis in 0..2 {
+                let (is_closed, domain) = if axis == 0 { (closed.0, u_domain) } else { (closed.1, v_domain) };
+                let [low, high] = band_hull[axis];
+                let span = domain[1] - domain[0];
+                if !is_closed || !(span > 0.0) || !(low < domain[0] || high > domain[1]) {
+                    continue;
+                }
+                let coordinate = |point: &Vec2| if axis == 0 { point.x } else { point.y };
+                let middle = coordinate(&points[points.len() / 2]);
+                let inside = |value: f64| value > low && value < high;
+                if inside(middle) {
+                    continue;
+                }
+                let images: Vec<f64> = [-2.0, -1.0, 1.0, 2.0]
+                    .into_iter()
+                    .map(|periods| periods * span)
+                    .filter(|shift| inside(middle + shift))
+                    .collect();
+                let [shift] = images[..] else {
+                    continue;
+                };
+                let slack = arrangement_tolerance * 50.0;
+                let (reach_low, reach_high) = points.iter().map(coordinate).fold(
+                    (f64::INFINITY, f64::NEG_INFINITY),
+                    |(lo, hi), value| (lo.min(value), hi.max(value)),
+                );
+                if reach_low + shift < low - slack || reach_high + shift > high + slack {
+                    let [first, second] = piece.support_faces;
+                    return Err(KernelRefusal::internal(
+                        KernelStage::Fragment,
+                        "fragment.face_split",
+                        format!(
+                            "fragment_face: section piece {piece_id} of faces {}:{} x {}:{} crosses \
+                             the seam wall of face {}:{}'s unwrapped band ({} in [{low:.9}, {high:.9}], \
+                             the section's period image [{:.9}, {:.9}]) without a vertex there",
+                            first.operand,
+                            first.face_id,
+                            second.operand,
+                            second.face_id,
+                            operand,
+                            face.id,
+                            if axis == 0 { "u" } else { "v" },
+                            reach_low + shift,
+                            reach_high + shift,
+                        ),
+                    ));
+                }
+                for point in &mut points {
+                    if axis == 0 {
+                        point.x += shift;
+                    } else {
+                        point.y += shift;
+                    }
+                }
+                if axis == 0 {
+                    lift.x = shift;
+                } else {
+                    lift.y = shift;
+                }
+                if std::env::var("BREP_DEBUG_FRAG")
+                    .map(|value| value == face.id.to_string())
+                    .unwrap_or(false)
+                {
+                    eprintln!(
+                        "  period lift: face {} cut p{piece_id} {} {shift:+} into the band [{low:.6},{high:.6}]",
+                        face.id,
+                        if axis == 0 { "u" } else { "v" }
+                    );
+                }
+            }
+        }
         // Guard runs on the FINAL (clamped/snapped/rebased) coordinates — the
         // same frame the boundary chains were sampled into — so crossing
         // parity is measured exactly where the arrangement would see it.
@@ -833,6 +1053,7 @@ fn fragment_face_indexed(
             ChainSource::Cut {
                 piece_id,
                 pcurve,
+                lift,
                 curve: trimmed_curve(&piece.curve, piece.t0, piece.t1)?,
                 shared_ring: piece.shared_edge.filter(|_| {
                     piece
@@ -1120,6 +1341,75 @@ fn fragment_face_indexed(
             .map(|(a, b)| b.sub(*a).length())
             .sum()
     };
+    // POLE-COLLAPSED ENDS. A pole is a whole row of the chart at one 3D
+    // point, so two chain ends on its degenerate boundary chain are one point
+    // however far apart their u reads, and near the pole a chart distance says
+    // nothing about the 3D one. The revolve_pole union's G2 end cap (a 93 deg
+    // sector with its apex on the axis) is cut by the wedge's two side planes
+    // along its own radius edges: the sections are those edges' sub-arcs to
+    // 1e-15, ending 3.2e-6 short of the apex. Their pcurves follow u = 1 and
+    // u = 0 and then swing to one u = 0.443 at the pole; evaluated on the cap
+    // a chain stands 7.4e-4 off its radius at v = 0.99976. The endpoint test
+    // read a gap of 0.557 and kept both cuts, and the arrangement carved two
+    // slivers, each bounded by a radius edge and its own weld copy. One was
+    // kept in the union and the coplanar merge refused its genus; the
+    // intersection refused with one-use edges. So when a chain end and a
+    // boundary end both lie on one degenerate boundary chain they coincide,
+    // and the cut is held to the boundary in 3D, section curve against edge
+    // curve, within the coincidence tolerance carried along the boundary by
+    // its own stretch (3D length over chart length). Escape hatch
+    // `BREP_DUP_DROP_POLE=0`.
+    let pole_ends = std::env::var("BREP_DUP_DROP_POLE").as_deref() != Ok("0");
+    let degenerate_chains: Vec<usize> = chains
+        .iter()
+        .enumerate()
+        .filter(|(_, chain)| match &chain.source {
+            ChainSource::Boundary { coedge, .. } => solid
+                .edges
+                .iter()
+                .any(|edge| edge.id == coedge.edge_id && edge.degenerate),
+            ChainSource::Cut { .. } => false,
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let on_one_pole = |a: Vec2, b: Vec2| -> bool {
+        degenerate_chains.iter().any(|&pole| {
+            near_chain(a, &chains[pole], coincidence_tolerance)
+                && near_chain(b, &chains[pole], coincidence_tolerance)
+        })
+    };
+    let coincident_in_space = |cut: &Chain, boundary: &Chain| -> bool {
+        let ChainSource::Boundary { curve, .. } = &boundary.source else {
+            return false;
+        };
+        let ChainSource::Cut { curve: section, .. } = &cut.source else {
+            return false;
+        };
+        let Ok([start, end]) = section.domain() else {
+            return false;
+        };
+        let mut chart_length = 0.0;
+        let mut space_length = 0.0;
+        for (a, b) in &boundary.segments {
+            let (Ok(pa), Ok(pb)) = (face.surface.evaluate(a.x, a.y), face.surface.evaluate(b.x, b.y)) else {
+                return false;
+            };
+            chart_length += b.sub(*a).length();
+            space_length += pb.sub(pa).length();
+        }
+        if chart_length <= 0.0 || space_length <= 0.0 {
+            return false;
+        }
+        let bound = coincidence_tolerance * space_length / chart_length;
+        let stations = cut.segments.len().max(16);
+        (0..=stations).all(|index| {
+            section
+                .evaluate(start + (end - start) * index as f64 / stations as f64)
+                .ok()
+                .and_then(|at| crate::project_point_to_curve(curve, at).ok())
+                .is_some_and(|projection| projection.distance <= bound)
+        })
+    };
     let mut dropped_chains = HashSet::default();
     for (index, chain) in chains.iter().enumerate() {
         if !matches!(chain.source, ChainSource::Cut { .. }) {
@@ -1141,14 +1431,26 @@ fn fragment_face_indexed(
                 && boundary.end.sub(chain.end).length() <= coincidence_tolerance;
             let reversed = boundary.start.sub(chain.end).length() <= coincidence_tolerance
                 && boundary.end.sub(chain.start).length() <= coincidence_tolerance;
+            let same_end = |a: Vec2, b: Vec2| a.sub(b).length() <= coincidence_tolerance || on_one_pole(a, b);
+            let (forward, reversed, at_pole) = if forward || reversed || !pole_ends || degenerate_chains.is_empty() {
+                (forward, reversed, false)
+            } else {
+                let forward = same_end(boundary.start, chain.start) && same_end(boundary.end, chain.end);
+                let reversed = same_end(boundary.start, chain.end) && same_end(boundary.end, chain.start);
+                (forward, reversed, true)
+            };
             if !(forward || reversed) {
                 continue;
             }
-            let interior_coincident = chain.segments.iter().all(|(a, b)| {
-                near_chain(*a, boundary, coincidence_tolerance)
-                    && near_chain(*b, boundary, coincidence_tolerance)
-                    && near_chain(a.add(*b).scale(0.5), boundary, midpoint_tolerance)
-            });
+            let interior_coincident = if at_pole {
+                coincident_in_space(chain, boundary)
+            } else {
+                chain.segments.iter().all(|(a, b)| {
+                    near_chain(*a, boundary, coincidence_tolerance)
+                        && near_chain(*b, boundary, coincidence_tolerance)
+                        && near_chain(a.add(*b).scale(0.5), boundary, midpoint_tolerance)
+                })
+            };
             if !interior_coincident {
                 continue;
             }
@@ -1635,19 +1937,64 @@ fn fragment_face_indexed(
         }
     }
     let regions = arrange_segments(&segments, arrangement_tolerance).or_refuse(KernelStage::Fragment, "arrange_segments")?;
+    // Orient every rebuilt loop the way the SOURCE face's own loops are
+    // oriented, rather than assuming `same_sense` predicts it. The two agree on
+    // every face whose chart is right-handed against its normal, so this is a
+    // no-op there; it differs only on a face the old assumption got wrong, and
+    // getting it wrong reverses that face's whole fragment. Falls back to the
+    // old rule whenever the source winding cannot be read (see the helper).
+    // Escape hatch for A/B against the old behaviour.
+    let source_winding = if std::env::var("BREP_FRAGMENT_SOURCE_WINDING").as_deref() == Ok("0") {
+        None
+    } else {
+        source_loop_winding_negative(face)?
+    };
+    let reverse_loops = source_winding.unwrap_or(!face.same_sense);
+    if debug && reverse_loops != !face.same_sense {
+        eprintln!(
+            "  face {}: source loop winds {} against same_sense={} — orienting fragments to the source",
+            face.id,
+            if reverse_loops { "CW" } else { "CCW" },
+            face.same_sense
+        );
+    }
     let mut fragments = Vec::new();
     for region in regions {
-        let candidates: Vec<Vec2> = interior_points(&region.outer, &region.holes, region.area, 3)
-            .into_iter()
-            .map(wrap_back)
-            .collect();
+        let arranged: Vec<Vec2> = interior_points(&region.outer, &region.holes, region.area, 3);
+        let candidates: Vec<Vec2> = arranged.iter().copied().map(wrap_back).collect();
         let Some(&test_uv) = candidates.first() else {
             if debug {
                 eprintln!("  region area={:.6e}: no interior point", region.area);
             }
             continue;
         };
-        if parameter_point_in_face(face, test_uv, 1e-9).or_refuse(KernelStage::Fragment, "parameter_point_in_face")? != PolygonClass::Inside {
+        let mut containment = parameter_point_in_face(face, test_uv, 1e-9).or_refuse(KernelStage::Fragment, "parameter_point_in_face")?;
+        // TRIM-FRAME CONTAINMENT. A face whose own pcurves run past its
+        // carrier's domain (helmet Face_15: its trim spans u in
+        // [-0.178, 0.298] on a carrier closed in u, drawn without a hop) is
+        // arranged in that frame, and the region's point is on the face there.
+        // Its wrapped image (u = 0.970 for -0.030) lies on no trim polygon,
+        // and containment has no period image to try for a trim that never
+        // hops the seam, so it reads Outside and the region was dropped: the
+        // face's y >= 0 piece in `20_helmet_merge_stage` b - a, whose section
+        // edges then stood one-use. With no band re-base the arrangement's
+        // frame is the trim's own, so the region's point is asked there as
+        // well. Escape hatch `BREP_REGION_TRIM_FRAME=0`.
+        if containment != PolygonClass::Inside
+            && band_rebase == [None, None]
+            && (arranged[0].x != test_uv.x || arranged[0].y != test_uv.y)
+            && std::env::var("BREP_REGION_TRIM_FRAME").as_deref() != Ok("0")
+        {
+            containment = parameter_point_in_face(face, arranged[0], 1e-9).or_refuse(KernelStage::Fragment, "parameter_point_in_face")?;
+            if debug {
+                eprintln!(
+                    "  region area={:.6e} test=({:.9},{:.9}) asked in the trim's frame at ({:.9},{:.9}): {:?}",
+                    region.area, test_uv.x, test_uv.y, arranged[0].x, arranged[0].y,
+                    containment == PolygonClass::Inside
+                );
+            }
+        }
+        if containment != PolygonClass::Inside {
             if debug {
                 eprintln!(
                     "  region area={:.6e} test=({:.9},{:.9}): outside trimmed face",
@@ -1664,7 +2011,7 @@ fn fragment_face_indexed(
         }
         let Some(outer_loop) = build_loop(
             &region.outer,
-            !face.same_sense,
+            reverse_loops,
             &chains,
             arrangement_tolerance,
             &face.surface,
@@ -1679,9 +2026,12 @@ fn fragment_face_indexed(
         };
         let mut loops = vec![outer_loop];
         for hole in &region.holes {
+            // Holes take the SAME flag as the outer loop: the arrangement
+            // hands them back already wound against it, so reversing both
+            // together keeps them opposite.
             if let Some(hole_loop) = build_loop(
                 hole,
-                !face.same_sense,
+                reverse_loops,
                 &chains,
                 arrangement_tolerance,
                 &face.surface,

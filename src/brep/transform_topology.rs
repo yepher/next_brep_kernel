@@ -178,4 +178,3 @@ pub fn mirror_brep(
     transform_brep(solid, transform, true)
 }
 
-// BREP private tests: 3908a150c7552e06

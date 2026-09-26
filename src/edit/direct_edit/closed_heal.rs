@@ -5,6 +5,101 @@ use super::*;
 /// `v = const` line does so over the whole turn, not between two samples.
 const RIM_STATION_SAMPLES: usize = 16;
 
+/// How many stations of equal arc length each rim of a closed strip is read at.
+const RIM_ARC_STATIONS: usize = 8;
+
+/// Which closed re-intersection a closed heal keeps, decided by GEOMETRY.
+///
+/// Each candidate is rated by the WORST distance from any of `stations` — the
+/// strip's two rims at equal arc length — to the candidate curve, measured by
+/// projection; the least rating wins. The recovered rim is the one the strip
+/// was blended from, so it runs beside both rims all the way round, and a
+/// branch that passes near them only somewhere has a rim station far from it.
+///
+/// Refuses (`Err((chosen, rival))`) when a DISTINCT candidate — one that does
+/// not lie on the winner within `tolerance` — rates within `tolerance` of the
+/// least rating: nothing about the strip tells two such rims apart, and
+/// keeping whichever the intersector listed first would make the heal a
+/// property of that order. The decision reads every candidate before it
+/// decides, so it does not depend on the order they arrive in either.
+///
+/// This is the closed strip's form of the open heal's `nearest_branch`. It
+/// replaces two picks that were not geometric: the analytic lane's nearest
+/// curve MIDPOINT (a point placed by the intersector's own parameterisation)
+/// to the strip surface's `(0.5, 0.5)` point, and the marched lane's
+/// `nearest_section`, which measures to 24 parameter samples of each section.
+pub(super) fn nearest_closed_rim(
+    candidates: &[NurbsCurve],
+    stations: &[Vec3],
+    tolerance: f64,
+) -> Result<Option<usize>, (usize, usize)> {
+    let rating = |curve: &NurbsCurve| {
+        stations
+            .iter()
+            .map(|station| {
+                project_point_to_curve(curve, *station)
+                    .map(|projection| projection.distance)
+                    .unwrap_or(f64::INFINITY)
+            })
+            .fold(0.0f64, f64::max)
+    };
+    let ratings: Vec<f64> = candidates.iter().map(rating).collect();
+    let Some(chosen) = (0..candidates.len()).min_by(|a, b| ratings[*a].total_cmp(&ratings[*b])) else {
+        return Ok(None);
+    };
+    // One curve lies on another when samples of each project onto the other.
+    let lies_on = |curve: &NurbsCurve, other: &NurbsCurve| {
+        let Ok([t0, t1]) = curve.domain() else {
+            return false;
+        };
+        (0..16).all(|index| {
+            curve
+                .evaluate(t0 + (t1 - t0) * index as f64 / 16.0)
+                .and_then(|point| project_point_to_curve(other, point))
+                .map(|projection| projection.distance <= tolerance)
+                .unwrap_or(false)
+        })
+    };
+    for rival in 0..candidates.len() {
+        if rival == chosen || ratings[rival] - ratings[chosen] > tolerance {
+            continue;
+        }
+        let same_rim =
+            lies_on(&candidates[rival], &candidates[chosen]) && lies_on(&candidates[chosen], &candidates[rival]);
+        if !same_rim {
+            return Err((chosen, rival));
+        }
+    }
+    Ok(Some(chosen))
+}
+
+/// The closed heal's refusal for two rims [`nearest_closed_rim`] cannot tell
+/// apart.
+fn closed_rim_tie(
+    op: &str,
+    neighbour_ids: &[u64; 2],
+    candidates: &[NurbsCurve],
+    chosen: usize,
+    rival: usize,
+    stations: &[Vec3],
+) -> String {
+    let worst = |curve: &NurbsCurve| {
+        stations
+            .iter()
+            .map(|station| project_point_to_curve(curve, *station).map(|p| p.distance).unwrap_or(f64::INFINITY))
+            .fold(0.0f64, f64::max)
+    };
+    format!(
+        "{op}: two closed re-intersections of faces {} and {} are equally near the strip's rims \
+         (worst rim station {:.6} and {:.6} away) — refusing rather than choosing one by the order \
+         the intersector returned them",
+        neighbour_ids[0],
+        neighbour_ids[1],
+        worst(&candidates[chosen]),
+        worst(&candidates[rival])
+    )
+}
+
 /// The constant `v` of a closed rim that lies on a `v = const` ISO-CURVE of
 /// `surface`, or `None` when it does not lie on one.
 ///
@@ -23,7 +118,7 @@ const RIM_STATION_SAMPLES: usize = 16;
 /// Returning `None` rather than a best-fit station is the point: the caller
 /// refuses, and no solid is emitted whose trim curve does not follow the
 /// boundary it claims to.
-fn rim_iso_station(surface: &NurbsSurface, rim: &NurbsCurve, tolerance: f64) -> Option<f64> {
+pub(super) fn rim_iso_station(surface: &NurbsSurface, rim: &NurbsCurve, tolerance: f64) -> Option<f64> {
     let [t0, t1] = rim.domain().ok()?;
     let [v0, v1] = surface.domain_v().ok()?;
     let v_span = (v1 - v0).abs().max(1e-12);
@@ -49,7 +144,7 @@ fn rim_iso_station(surface: &NurbsSurface, rim: &NurbsCurve, tolerance: f64) -> 
 
 /// Centre, unit normal and radius of the circle through three points, or
 /// `None` when they are collinear. Exact (the circumcentre in closed form).
-fn circle_through(a: Vec3, b: Vec3, c: Vec3) -> Option<(Vec3, Vec3, f64)> {
+pub(super) fn circle_through(a: Vec3, b: Vec3, c: Vec3) -> Option<(Vec3, Vec3, f64)> {
     let u = b.sub(a);
     let v = c.sub(a);
     let n = u.cross(v);
@@ -86,7 +181,7 @@ fn circle_through(a: Vec3, b: Vec3, c: Vec3) -> Option<(Vec3, Vec3, f64)> {
 /// and every sample of the original must lie on the rebuilt curve — and any
 /// miss refuses. A section that is not a circle (an oblique plane's ellipse)
 /// has no such closed form and is refused rather than approximated.
-fn align_closed_rim_origin(
+pub(super) fn align_closed_rim_origin(
     curve: &NurbsCurve,
     seam: Vec3,
     tolerance: f64,
@@ -386,10 +481,20 @@ pub(super) fn heal_closed_transition(
     face_index: usize,
     boundary: &[(u64, bool)],
 ) -> Result<BrepSolid, String> {
+    if let Some(directory) = census_directory() {
+        record_closed_heal_census(&directory, solid, shell_index, face_index, boundary);
+    }
     let op = "delete_face_and_heal";
     let mut solid = solid.clone();
     let scale = solid_model_scale(&solid);
     let tolerance = (scale * 1e-6).max(1e-9);
+    // The MARCHED lane's two numbers are the OPEN chain's, not this lane's:
+    // `march_tolerance` is the corrector's convergence radius and the polyline
+    // fit's chord tolerance, `plane_tolerance` the residual gate a fitted
+    // section must stay inside. Every closed form below keeps `tolerance`, so
+    // no rim that is answered exactly moves by a bit.
+    let march_tolerance = (scale * 1e-7).max(1e-9);
+    let plane_tolerance = (scale * 1e-6).max(1e-7);
     let face_id = solid.shells[shell_index].faces[face_index].id;
 
     // Classify the strip boundary: one OPEN seam edge used twice with
@@ -445,6 +550,7 @@ pub(super) fn heal_closed_transition(
     // somewhere far away would be "sharpened" onto geometry the strip never
     // touched.
     if let Some(holes) = through_wall_hole_loops(&solid, &rims, &neighbour_ids, op)? {
+        census_note("lane", || serde_json::json!("cap"));
         return cap_through_wall(&solid, shell_index, face_index, boundary, holes, op);
     }
     // A BLIND bore wears HALF that signature: the mouth rim is a hole loop,
@@ -467,28 +573,81 @@ pub(super) fn heal_closed_transition(
         None => format!("{op}: {reason} (deferred)"),
     };
 
-    // The strip's spatial extent: sampled points of BOTH rims. The healed
-    // rim (the neighbours' re-intersection) lies within this region.
+    // The strip's spatial extent: stations of BOTH rims at equal ARC LENGTH,
+    // in the strip loop's own traversal order (`arc_length_stations`). The
+    // healed rim lies within this region. These points size the neighbours'
+    // extensions and the region gate, seed the march, and decide which
+    // re-intersection is the rim, so they are read off where the rims ARE: a
+    // step in the rim's PARAMETER would put them wherever its speed law does,
+    // and one rim carries any number of speed laws. A closed rim's last station
+    // is its first, so it is dropped.
     let mut strip_points: Vec<Vec3> = Vec::new();
+    // Each rim's stations, and the sense they turn in along the EDGE's own
+    // direction: what the rebind below reads the new rim's direction against.
+    let mut rim_senses: Vec<Vec3> = Vec::with_capacity(2);
     for rim in &rims {
         let edge = solid
             .edges
             .iter()
             .find(|edge| edge.id == *rim)
             .ok_or_else(|| format!("{op}: missing rim {rim}"))?;
-        for sample in 0..8 {
-            let t = edge.t0 + (edge.t1 - edge.t0) * sample as f64 / 8.0;
-            strip_points.push(edge.curve.evaluate(t)?);
-        }
+        let forward = boundary
+            .iter()
+            .find(|(edge_id, _)| edge_id == rim)
+            .map(|(_, forward)| *forward)
+            .unwrap_or(true);
+        let mut stations = arc_length_stations(edge, RIM_ARC_STATIONS + 1, forward)?;
+        stations.pop();
+        let sense = turning_sense(&stations);
+        rim_senses.push(if forward { sense } else { sense.scale(-1.0) });
+        strip_points.extend(stations);
     }
+    // What each neighbour's carrier IS, read exactly as the open chain reads
+    // its four (`open_heal.rs`): a plane, a recognized analytic, or a FITTED
+    // patch that is neither. This one reading then picks the extension, the
+    // intersector and the rebind, so the three cannot disagree about a face.
+    let mut carriers: Vec<OpenNeighbourCarrier> = Vec::with_capacity(2);
+    for &neighbour_id in &neighbour_ids {
+        let (ns, nf) = find_face(&solid, neighbour_id)
+            .ok_or_else(|| format!("{op}: missing neighbour {neighbour_id}"))?;
+        let surface = &solid.shells[ns].faces[nf].surface;
+        carriers.push(match surface.analytic() {
+            Some(AnalyticSurface::Plane { .. }) => {
+                OpenNeighbourCarrier::Planar(plane_of_surface(surface, plane_tolerance, op)?)
+            }
+            Some(_) => OpenNeighbourCarrier::Curved,
+            None => OpenNeighbourCarrier::FreeForm,
+        });
+    }
+    // Whether either neighbour is fitted decides the whole lane below: an
+    // all-analytic pair keeps the closed forms it has always had, bit for bit.
+    let fitted_pair = carriers
+        .iter()
+        .any(|carrier| matches!(carrier, OpenNeighbourCarrier::FreeForm));
+
     // EXTEND-FIRST: a trimmed carrier stops at the strip's near rim, so
     // intersecting the trimmed surfaces finds nothing (the fillet removed
     // exactly the region where they meet). Grow every ruled-revolution
     // neighbour along its axis to cover the strip BEFORE intersecting;
     // planes are analytically unbounded and need no growth for the
     // intersection itself (retrim handles their extents afterwards).
-    for &neighbour_id in &neighbour_ids {
+    //
+    // A FITTED neighbour is continued by its own terminal Bezier span through
+    // `extend_freeform_neighbour_over` — the same call the open chain makes,
+    // with the same verified coverage. That is what item 2 of the heal-tail
+    // plan asks for and the only continuation that leaves a real surface with
+    // a real domain behind the trim: `evaluate_extended` is a tangent plane a
+    // Newton can converge onto anywhere.
+    for (index, &neighbour_id) in neighbour_ids.iter().enumerate() {
         extend_ruled_neighbour_over(&mut solid, neighbour_id, &strip_points, tolerance)?;
+        if matches!(carriers[index], OpenNeighbourCarrier::FreeForm) {
+            extend_freeform_neighbour_over(
+                &mut solid,
+                neighbour_id,
+                &strip_points,
+                march_tolerance,
+            )?;
+        }
     }
     let neighbour_surface = |id: u64, solid: &BrepSolid| -> Result<NurbsSurface, String> {
         let (shell, face) =
@@ -505,38 +664,139 @@ pub(super) fn heal_closed_transition(
             surface_b.analytic().map(std::mem::discriminant)
         );
     }
-    let curves = intersect_analytic_pair(&surface_a, &surface_b, tolerance)
-        .ok_or_else(|| deferral("neighbours are not a recognized analytic pair"))?;
-    let closed: Vec<_> = curves
-        .into_iter()
-        .filter(|curve| {
-            let [t0, t1] = curve.domain().unwrap_or([0.0, 1.0]);
-            curve
-                .evaluate(t0)
-                .and_then(|a| curve.evaluate(t1).map(|b| a.sub(b).length()))
-                .map(|gap| gap <= tolerance)
-                .unwrap_or(false)
-        })
-        .collect();
-    // Pick the re-intersection nearest the strip (a cone x plane pair can
-    // yield two circles; the healed rim is the one the strip surrounded).
+    // The strip's own region gate, used by both lanes below.
     let strip_centre = {
         let face = &solid.shells[shell_index].faces[face_index];
         face.surface.evaluate(0.5, 0.5)?
     };
-    let new_curve = closed
-        .into_iter()
-        .min_by(|a, b| {
-            let mid = |curve: &crate::NurbsCurve| {
+    let strip_reach = strip_points
+        .iter()
+        .map(|point| point.sub(strip_centre).length())
+        .fold(0.0f64, f64::max)
+        * 3.0
+        + tolerance;
+    let new_curve = if !fitted_pair {
+        let curves = intersect_analytic_pair(&surface_a, &surface_b, tolerance)
+            .ok_or_else(|| deferral("neighbours are not a recognized analytic pair"))?;
+        let closed: Vec<_> = curves
+            .into_iter()
+            .filter(|curve| {
                 let [t0, t1] = curve.domain().unwrap_or([0.0, 1.0]);
-                curve.evaluate(0.5 * (t0 + t1)).unwrap_or_default()
-            };
-            mid(a)
-                .sub(strip_centre)
-                .length()
-                .total_cmp(&mid(b).sub(strip_centre).length())
-        })
-        .ok_or_else(|| deferral("neighbours do not re-intersect in a closed rim"))?;
+                curve
+                    .evaluate(t0)
+                    .and_then(|a| curve.evaluate(t1).map(|b| a.sub(b).length()))
+                    .map(|gap| gap <= tolerance)
+                    .unwrap_or(false)
+            })
+            .collect();
+        census_note("lane", || serde_json::json!("analytic"));
+        census_note("candidates", || {
+            let rows: Vec<serde_json::Value> = closed
+                .iter()
+                .map(|curve| {
+                    let [t0, t1] = curve.domain().unwrap_or([0.0, 1.0]);
+                    let mid = curve.evaluate(0.5 * (t0 + t1)).unwrap_or_default();
+                    let worst = strip_points
+                        .iter()
+                        .map(|point| {
+                            project_point_to_curve(curve, *point)
+                                .map(|projection| projection.distance)
+                                .unwrap_or(f64::INFINITY)
+                        })
+                        .fold(0.0f64, f64::max);
+                    serde_json::json!({ "midpoint_to_centre": mid.sub(strip_centre).length(), "worst_station": worst })
+                })
+                .collect();
+            serde_json::Value::Array(rows)
+        });
+        // Pick the re-intersection the strip was blended from (a cone x plane
+        // pair can yield two circles; the healed rim is the one beside both
+        // rims), by geometry, refusing a tie.
+        match nearest_closed_rim(&closed, &strip_points, tolerance) {
+            Ok(Some(index)) => closed[index].clone(),
+            Ok(None) => return Err(deferral("neighbours do not re-intersect in a closed rim")),
+            Err((chosen, rival)) => return Err(closed_rim_tie(op, &neighbour_ids, &closed, chosen, rival, &strip_points)),
+        }
+    } else {
+        // A fitted pair has no closed form. `reintersect_carriers` is the
+        // shared, surface-type-blind seam the open chain already goes through:
+        // it tries the analytic lane first (which declines here) and marches
+        // otherwise, with a residual gate the caller sets. Seed it on the
+        // strip's own rims — the rim being recovered runs right beside them.
+        //
+        // A PLANAR partner goes in as a patch covering the region gate rather
+        // than as its own trimmed carrier: the marcher clamps to both domains,
+        // and a plane patch that stops at the rim leaves the branch lying on
+        // its own boundary (`planar_region_patch`). A plane has no extent of
+        // its own — only its trim does — so widening it is exact.
+        let widen = |carrier: &OpenNeighbourCarrier,
+                     surface: &NurbsSurface|
+         -> Result<NurbsSurface, String> {
+            match carrier {
+                OpenNeighbourCarrier::Planar(plane) => {
+                    planar_region_patch(plane, strip_centre, strip_reach)
+                }
+                _ => Ok(surface.clone()),
+            }
+        };
+        let first = widen(&carriers[0], &surface_a)?;
+        let second = widen(&carriers[1], &surface_b)?;
+        let policy = MarchPolicy {
+            tolerance: march_tolerance,
+            residual_tolerance: plane_tolerance,
+            seeds: strip_points.clone(),
+        };
+        let rim = reintersect_carriers(&first, &second, &policy).map_err(|refusal| {
+            deferral(&format!(
+                "the extended carriers do not re-intersect ({})",
+                refusal.describe()
+            ))
+        })?;
+        census_note("lane", || serde_json::json!("marched"));
+        census_note("candidates", || {
+            let rows: Vec<serde_json::Value> = rim
+                .sections
+                .iter()
+                .map(|section| {
+                    let [t0, t1] = section.curve.domain().unwrap_or([0.0, 1.0]);
+                    let samples: Vec<Vec3> = (0..24)
+                        .map(|index| section.curve.evaluate(t0 + (t1 - t0) * index as f64 / 23.0).unwrap_or_default())
+                        .collect();
+                    let sampled = strip_points
+                        .iter()
+                        .map(|point| samples.iter().map(|sample| sample.sub(*point).length()).fold(f64::INFINITY, f64::min))
+                        .fold(0.0f64, f64::max);
+                    let projected = strip_points
+                        .iter()
+                        .map(|point| {
+                            project_point_to_curve(&section.curve, *point)
+                                .map(|projection| projection.distance)
+                                .unwrap_or(f64::INFINITY)
+                        })
+                        .fold(0.0f64, f64::max);
+                    serde_json::json!({ "closed": section.closed, "worst_sampled": sampled, "worst_station": projected, "points": section.polyline.len() })
+                })
+                .collect();
+            serde_json::Value::Array(rows)
+        });
+        // Which branch is THIS rim is decided from the boundary it replaces,
+        // never inside the intersector, and by the same geometric rating the
+        // closed forms get: the worst distance from a rim station to the
+        // branch, which separates two branches that pass near each other where
+        // a midpoint pick does not.
+        let curves = rim.curves();
+        let section = match nearest_closed_rim(&curves, &strip_points, tolerance) {
+            Ok(Some(index)) => &rim.sections[index],
+            Ok(None) => return Err(deferral("the extended carriers do not re-intersect")),
+            Err((chosen, rival)) => return Err(closed_rim_tie(op, &neighbour_ids, &curves, chosen, rival, &strip_points)),
+        };
+        if !section.closed {
+            return Err(deferral(
+                "the extended carriers' nearest re-intersection branch is not a closed rim",
+            ));
+        }
+        section.curve.clone()
+    };
 
     // The rim's shared vertex must land on the SEAM of every periodic
     // neighbour, because that is where those neighbours' seam meridians end.
@@ -548,10 +808,26 @@ pub(super) fn heal_closed_transition(
             let neighbour_id = neighbour_ids[index];
             let (ns, nf) = find_face(&solid, neighbour_id)
                 .ok_or_else(|| format!("{op}: missing neighbour {neighbour_id}"))?;
-            if matches!(
-                solid.shells[ns].faces[nf].surface.analytic(),
-                Some(AnalyticSurface::Plane { .. })
-            ) {
+            let surface = &solid.shells[ns].faces[nf].surface;
+            if matches!(surface.analytic(), Some(AnalyticSurface::Plane { .. })) {
+                continue;
+            }
+            if surface.analytic().is_none() {
+                // A FITTED patch open in both directions has no seam either:
+                // its rim is a closed loop inside its own parameter square and
+                // no meridian ends anywhere on it, so it constrains nothing.
+                // One that IS closed in a direction does have a branch cut, and
+                // nothing here knows where — refused by name rather than
+                // guessed at, because binding a rim to the wrong azimuth is
+                // wrong by up to a diameter while looking plausible.
+                let (closed_u, closed_v) = surface.closed_directions()?;
+                if closed_u || closed_v {
+                    return Err(format!(
+                        "{op}: fitted neighbour {neighbour_id} is closed in its own parameter \
+                         square, so its rim must start on a seam this heal cannot locate \
+                         (deferred)"
+                    ));
+                }
                 continue;
             }
             let edge = solid
@@ -604,6 +880,19 @@ pub(super) fn heal_closed_transition(
         name: None,
     });
 
+    // The sense the new rim turns in along its own direction, read at equal
+    // arc length like the old rims' senses.
+    let new_sense = {
+        let record = solid
+            .edges
+            .iter()
+            .find(|edge| edge.id == new_edge_id)
+            .ok_or_else(|| format!("{op}: missing healed rim {new_edge_id}"))?;
+        let mut stations = arc_length_stations(record, RIM_ARC_STATIONS + 1, true)?;
+        stations.pop();
+        turning_sense(&stations)
+    };
+
     // Rebind each neighbour's rim coedge onto the new edge, extending the
     // carrier when the new rim lies outside its domain.
     for (index, rim) in rims.iter().enumerate() {
@@ -621,22 +910,31 @@ pub(super) fn heal_closed_transition(
             .find(|coedge| coedge.edge_id == *rim)
             .ok_or_else(|| format!("{op}: neighbour lost its rim coedge"))?;
         let old_forward = old_coedge.forward;
-        let old_edge = solid
-            .edges
-            .iter()
-            .find(|edge| edge.id == *rim)
-            .ok_or_else(|| format!("{op}: missing rim {rim}"))?
-            .clone();
-        // Azimuth agreement at a quarter turn decides the new forward flag.
-        let quarter = |curve: &crate::NurbsCurve, forward: bool| -> Result<Vec3, String> {
-            let [t0, t1] = curve.domain()?;
-            let f = if forward { 0.25 } else { 0.75 };
-            curve.evaluate(t0 + (t1 - t0) * f)
+        // The new coedge runs round the new rim in the sense the old one ran
+        // round the old rim. Both senses are read off the curves at equal arc
+        // length (`turning_sense`, the closed band's reading), so they are
+        // properties of where the rims are and not of how either is
+        // parameterised: a quarter of the old rim's PARAMETER range is a
+        // quarter turn only for a uniform speed law, and a re-weighted rim put
+        // that point past the half turn, bound the new coedge backwards, and
+        // failed validation as two coedges in the same sense.
+        let old_sense = if old_forward {
+            rim_senses[index]
+        } else {
+            rim_senses[index].scale(-1.0)
         };
-        let old_quarter = quarter(&old_edge.curve, old_forward)?;
-        let forward_gap = quarter(&new_curve, true)?.sub(old_quarter).length();
-        let backward_gap = quarter(&new_curve, false)?.sub(old_quarter).length();
-        let new_forward = forward_gap <= backward_gap;
+        let agreement = old_sense.dot(new_sense);
+        if agreement.abs() <= 1e-6 * old_sense.length() * new_sense.length() {
+            return Err(format!(
+                "{op}: the healed rim does not turn about the same axis as rim {rim} of neighbour \
+                 {neighbour_id}, so which way its coedge runs cannot be read from the old one \
+                 (deferred)"
+            ));
+        }
+        let new_forward = agreement > 0.0;
+        census_push("rebind", || {
+            serde_json::json!({ "rim": rim, "agreement": agreement, "forward": new_forward })
+        });
 
         let is_plane = matches!(face.surface.analytic(), Some(AnalyticSurface::Plane { .. }));
         if is_plane {
@@ -670,33 +968,92 @@ pub(super) fn heal_closed_transition(
         // to stand here was narrower than the intersector at line 100: for a
         // Sphere×Plane or Torus×Plane pair `intersect_analytic_pair` returns
         // the exact closed rim and the heal then refused to bind it.
+        // A rim produced by a CLOSED FORM between two revolution-family
+        // carriers is a `v = const` iso-curve of each by construction, and
+        // then the whole rebind is that one number. A rim the MARCHER produced
+        // is not one in general: it is the section of a fitted carrier and it
+        // crosses parameter lines, so laying a straight iso pcurve under it
+        // would be a trim that is wrong while looking plausible. There the
+        // trim is FITTED — from the same edge curve, over the same subrange,
+        // on both incident faces.
         let mut ruled_arm = false;
-        let v_new = match face.surface.analytic() {
+        let station = match face.surface.analytic() {
             Some(AnalyticSurface::RuledRevolution { frame, height, .. }) => {
-                ruled_arm = true;
-                // The pre-extension covered the strip, so the new rim's
-                // station is inside the (already extended) carrier.
-                let axial = new_point.sub(frame.origin).dot(frame.axis);
-                if !(-tolerance..=height + tolerance).contains(&axial) {
+                if fitted_pair && rim_iso_station(&face.surface, &new_curve, tolerance).is_none() {
+                    None
+                } else {
+                    ruled_arm = true;
+                    // The pre-extension covered the strip, so the new rim's
+                    // station is inside the (already extended) carrier.
+                    let axial = new_point.sub(frame.origin).dot(frame.axis);
+                    if !(-tolerance..=height + tolerance).contains(&axial) {
+                        return Err(format!(
+                            "{op}: healed rim escapes the extended carrier \
+                             (station {axial:.6} of {height:.6})"
+                        ));
+                    }
+                    Some((axial / *height).clamp(0.0, 1.0))
+                }
+            }
+            Some(_) => rim_iso_station(&face.surface, &new_curve, tolerance),
+            // A fitted carrier's parameter lines are its fitter's, not the
+            // geometry's; the rim is bound by a fit, never by a station.
+            None => None,
+        };
+        let Some(v_new) = station else {
+            if !fitted_pair {
+                // An all-analytic pair keeps its own refusals, word for word.
+                return Err(match face.surface.analytic() {
+                    Some(_) => format!(
+                        "{op}: the healed rim is not a `v = const` iso-curve of neighbour \
+                         {neighbour_id}'s carrier — refusing rather than binding it to a \
+                         parameter line it does not follow (deferred)"
+                    ),
+                    None => format!(
+                        "{op}: curved neighbour {neighbour_id} is a free-form surface (deferred)"
+                    ),
+                });
+            }
+            // On a PERIODIC carrier the rim still has to start on the seam —
+            // a pcurve that begins mid-domain traces the rim from the wrong
+            // azimuth — so measure that here as the iso path measures it.
+            let [u_low, u_high] = face.surface.domain_u()?;
+            let (closed_u, _) = face.surface.closed_directions()?;
+            if closed_u {
+                let rim_start = crate::project_point_to_surface(&face.surface, new_point)?;
+                let u_span = (u_high - u_low).abs().max(1e-12);
+                if (rim_start.u - u_low).abs() > 1e-6 * u_span
+                    && (rim_start.u - u_high).abs() > 1e-6 * u_span
+                {
                     return Err(format!(
-                        "{op}: healed rim escapes the extended carrier \
-                         (station {axial:.6} of {height:.6})"
+                        "{op}: the healed rim starts at u={:.6} of periodic neighbour \
+                         {neighbour_id}'s [{u_low:.6}, {u_high:.6}] domain, not at its seam — \
+                         a fitted pcurve would cross the seam branch (deferred)",
+                        rim_start.u
                     ));
                 }
-                (axial / *height).clamp(0.0, 1.0)
             }
-            Some(_) => rim_iso_station(&face.surface, &new_curve, tolerance).ok_or_else(|| {
-                format!(
-                    "{op}: the healed rim is not a `v = const` iso-curve of neighbour \
-                     {neighbour_id}'s carrier — refusing rather than binding it to a \
-                     parameter line it does not follow (deferred)"
-                )
-            })?,
-            None => {
-                return Err(format!(
-                    "{op}: curved neighbour {neighbour_id} is a free-form surface (deferred)"
-                ))
+            let surface = face.surface.clone();
+            let face = &mut solid.shells[shell].faces[face_pos];
+            for coedge in face
+                .loops
+                .iter_mut()
+                .flat_map(|loop_record| &mut loop_record.coedges)
+            {
+                if coedge.edge_id == *rim {
+                    coedge.edge_id = new_edge_id;
+                    coedge.forward = new_forward;
+                    coedge.pcurve = build_pcurve_on_surface_range(
+                        &surface,
+                        &new_curve,
+                        nt0,
+                        nt1,
+                        new_forward,
+                        march_tolerance,
+                    )?;
+                }
             }
+            continue;
         };
         let [u_low, u_high] = face.surface.domain_u()?;
         // A `v = const` pcurve running the WHOLE u range is only the rim's
@@ -767,12 +1124,15 @@ pub(super) fn heal_closed_transition(
     }
     let strip_edges: HashSet<u64> = boundary.iter().map(|(edge_id, _)| *edge_id).collect();
     let mut extended_edges: HashMap<u64, (bool, bool)> = HashMap::default();
-    // Extended edges whose curve is CURVED and was widened along itself. Their
-    // pcurves cannot be fixed by sliding one control point's v: a rational arc
-    // is not linear in the surface's v, so the straight two-point pcurve that
-    // serves a line meridian would cut the chord in parameter space. They are
-    // refit against the carrier over their new range instead.
-    let mut widened_edges: HashSet<u64> = HashSet::default();
+    // Extended edges whose pcurves must be REFIT against their faces' carriers
+    // rather than repaired by sliding one control point's v. Two kinds reach
+    // it. A CURVED meridian widened along itself: a rational arc is not linear
+    // in the surface's v, so the straight two-point pcurve that serves a line
+    // meridian would cut the chord in parameter space. And a straight meridian
+    // that had to be REBUILT because it was stored with more than two control
+    // points: its pcurve carries the same redundant control, so the two-point
+    // repair below does not apply to it either.
+    let mut refit_edges: HashSet<u64> = HashSet::default();
     for edge in &mut solid.edges {
         if strip_edges.contains(&edge.id) || edge.id == new_edge_id {
             continue;
@@ -788,10 +1148,12 @@ pub(super) fn heal_closed_transition(
         if end_hit {
             edge.end_vertex_id = new_vertex_id;
         }
-        if edge.curve.degree == 1 && edge.curve.control_points.len() == 2 {
+        if edge.curve.straight_segment(tolerance).is_some() {
             // A STRAIGHT meridian (a cylinder's or cone's wall seam) is
             // rebuilt from its endpoints: the prolonged line is the same line,
-            // so this is exact.
+            // so this is exact. Straightness is measured, not read off the
+            // control count — see `NurbsCurve::straight_segment`.
+            let redundant_controls = edge.curve.control_points.len() > 2;
             let anchor = if start_hit {
                 edge.curve.evaluate(edge.t1)?
             } else {
@@ -804,6 +1166,9 @@ pub(super) fn heal_closed_transition(
             };
             edge.curve = make_line(from, to)?;
             [edge.t0, edge.t1] = edge.curve.domain()?;
+            if redundant_controls {
+                refit_edges.insert(edge.id);
+            }
         } else {
             // A CURVED seam meridian — a dome's is an arc — must be WIDENED
             // along its own curve. Rebuilding it as a line, which is what this
@@ -833,14 +1198,14 @@ pub(super) fn heal_closed_transition(
                     edge.id
                 ));
             }
-            widened_edges.insert(edge.id);
+            refit_edges.insert(edge.id);
         }
         extended_edges.insert(edge.id, (start_hit, end_hit));
     }
-    // Refit every pcurve of a widened curved edge over its new range, on
-    // whatever carrier each referencing face has. Same mechanism the open
-    // chain's `refit_touched_pcurves` uses, and for the same reason.
-    if !widened_edges.is_empty() {
+    // Refit every pcurve of those edges over its new range, on whatever
+    // carrier each referencing face has. Same mechanism the open chain's
+    // `refit_touched_pcurves` uses, and for the same reason.
+    if !refit_edges.is_empty() {
         let edges_by_id: HashMap<u64, EdgeRecord> = solid
             .edges
             .iter()
@@ -848,7 +1213,7 @@ pub(super) fn heal_closed_transition(
             .collect();
         for shell in &mut solid.shells {
             for face in &mut shell.faces {
-                refit_touched_pcurves(face, &edges_by_id, &widened_edges, false, tolerance, op)?;
+                refit_touched_pcurves(face, &edges_by_id, &refit_edges, false, tolerance, op)?;
             }
         }
     }
@@ -870,7 +1235,7 @@ pub(super) fn heal_closed_transition(
                 .iter_mut()
                 .flat_map(|loop_record| &mut loop_record.coedges)
             {
-                if widened_edges.contains(&coedge.edge_id) {
+                if refit_edges.contains(&coedge.edge_id) {
                     continue; // already refit against the carrier above
                 }
                 let Some(&(start_moved, end_moved)) = extended_edges.get(&coedge.edge_id) else {

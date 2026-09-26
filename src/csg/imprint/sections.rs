@@ -1,4 +1,4 @@
-use crate::{KernelRefusal, KernelStage, OrRefuse};
+use crate::{KernelRefusal, KernelStage, OrRefuse, RefusalClass};
 use super::*;
 
 /// A marched intersection branch that runs along existing boundary edges of
@@ -187,7 +187,13 @@ pub(super) fn clip_branch_to_trims(
     });
     let inside_both = |point: Vec3| -> Result<bool, KernelRefusal> {
         for face in [first, second] {
-            let projection = project_point_to_surface(&face.face.surface, point).or_refuse(KernelStage::Intersect, "project_point_to_surface")?;
+            // The face's CHART, not its carrier: where the trim is drawn past a
+            // closed direction's domain, the carrier's own projection folds the
+            // point back into the domain and the trim's even-odd test then
+            // answers Outside for every point of the overhang the trim covers
+            // (helmet `Face_15`: a section point at u = −0.030 read at 0.970).
+            // On the chart the parameter is the one the loops are drawn in.
+            let projection = project_point_to_surface(face.chart(), point).or_refuse(KernelStage::Intersect, "project_point_to_surface")?;
             let status = parameter_point_in_face(
                 face.face,
                 Vec2 {
@@ -361,6 +367,10 @@ pub(super) fn reuse_boundary_section_edges(
         edge_id: u64,
         arc: NurbsCurve,
         aligned: bool,
+        /// Every support face whose OWN boundary already carries this section
+        /// (the owning face included). See the two-sided note at the apply
+        /// loop: a face in this list must not be cut.
+        redundant: Vec<FaceKey>,
     }
     // Decide first (immutable borrow of result.pieces), apply after.
     let mut decisions: Vec<Reuse> = Vec::new();
@@ -438,6 +448,7 @@ pub(super) fn reuse_boundary_section_edges(
                             edge_id: edge.id,
                             arc: ring.clone(),
                             aligned: piece_tangent.dot(ring_tangent) >= 0.0,
+                            redundant: vec![*face_key],
                         });
                     }
                 }
@@ -455,6 +466,19 @@ pub(super) fn reuse_boundary_section_edges(
         }
         let mut chosen: Option<Reuse> = None;
         let mut best_score = f64::INFINITY;
+        // TWO-SIDED COMMON BLOCK. The section is the intersection of its two
+        // support faces, so when it retraces an existing boundary edge it can
+        // retrace one on EACH of them — two copies of the same 1-cell, one per
+        // operand. That is the 2026-09-14 herringbone document's z = 0 seam: a
+        // right tooth band's flank meets the left band's flank exactly along
+        // the profile edge both faces already end on. Dropping the redundant
+        // cut from the owning face alone left the OTHER face cut by a curve
+        // sitting 4.2e-4 off its own boundary edge, and the arrangement's lens
+        // between the two produced a region no chain could complete
+        // ("chain N fragmented into an incomplete run"). Collect every support
+        // face whose boundary carries the section so the apply loop can decline
+        // to cut all of them.
+        let mut redundant: Vec<FaceKey> = Vec::new();
         for face_key in &piece.support_faces {
             let Some(edges) = face_edge_lists.get(face_key) else {
                 continue;
@@ -538,25 +562,39 @@ pub(super) fn reuse_boundary_section_edges(
                 // welds those as-is, and dropping their cut would strand the
                 // coincident face's split (revolve_pole_union one-use edges).
                 let span_dev = sec_to_arc.max(arc_to_sec);
-                if span_dev > endpoint_gate && span_dev <= span_band && span_dev < best_score {
-                    best_score = span_dev;
-                    chosen = Some(Reuse {
-                        piece_index,
-                        owning: *face_key,
-                        edge_id: edge.id,
-                        arc,
-                        aligned,
-                    });
+                if span_dev > endpoint_gate && span_dev <= span_band {
+                    if !redundant.contains(face_key) {
+                        redundant.push(*face_key);
+                    }
+                    if span_dev < best_score {
+                        best_score = span_dev;
+                        chosen = Some(Reuse {
+                            piece_index,
+                            owning: *face_key,
+                            edge_id: edge.id,
+                            arc,
+                            aligned,
+                            redundant: Vec::new(),
+                        });
+                    }
                 }
             }
         }
-        if let Some(reuse) = chosen {
+        if let Some(mut reuse) = chosen {
+            // Escape hatch BREP_SHARED_SECTION_BOTH=0: drop the cut from the
+            // owning face only, as before the two-sided case was handled.
+            reuse.redundant = if std::env::var("BREP_SHARED_SECTION_BOTH").as_deref() == Ok("0") {
+                vec![reuse.owning]
+            } else {
+                redundant
+            };
             decisions.push(reuse);
         }
     }
 
     // Apply: swap the section's geometry for the reused sub-arc, recompute the
-    // pcurves on the KEPT faces, drop the redundant cut from the owning face.
+    // pcurves on the faces that are still cut, drop the redundant cut from
+    // every face whose own boundary already carries the section.
     // Any failure in this path aborts this one reuse and keeps today's behaviour.
     for reuse in decisions {
         let piece = &result.pieces[reuse.piece_index];
@@ -567,8 +605,8 @@ pub(super) fn reuse_boundary_section_edges(
                 operand: facepc.operand,
                 face_id: facepc.face_id,
             };
-            if key == reuse.owning {
-                continue; // dropped — owning face already carries the edge
+            if reuse.redundant.contains(&key) {
+                continue; // dropped — this face already carries the edge
             }
             let Some(surface) = face_surface(&key) else {
                 ok = false;
@@ -589,7 +627,18 @@ pub(super) fn reuse_boundary_section_edges(
         let Ok([nt0, nt1]) = reuse.arc.domain() else {
             continue;
         };
-        if !ok || new_pcurves.is_empty() {
+        // An empty kept set is legitimate ONLY in the two-sided case, where
+        // every support face already carries the section as its own boundary
+        // and none of them is cut. Anywhere else it means a pcurve rebuild
+        // produced nothing, which is a failure.
+        let two_sided = !piece.pcurves.is_empty()
+            && piece.pcurves.iter().all(|facepc| {
+                reuse.redundant.contains(&FaceKey {
+                    operand: facepc.operand,
+                    face_id: facepc.face_id,
+                })
+            });
+        if !ok || (new_pcurves.is_empty() && !two_sided) {
             if debug {
                 eprintln!(
                     "shared-section SKIP piece {} (pcurve rebuild on kept face failed)",
@@ -605,23 +654,29 @@ pub(super) fn reuse_boundary_section_edges(
         piece.t1 = nt1;
         piece.pcurves = new_pcurves;
         piece.shared_edge = Some((reuse.owning.operand, reuse.edge_id, reuse.aligned));
-        if let Some(entry) = result
-            .by_face
-            .iter_mut()
-            .find(|f| f.operand == reuse.owning.operand && f.face_id == reuse.owning.face_id)
-        {
-            entry.piece_ids.retain(|id| *id != piece_id);
+        for key in &reuse.redundant {
+            if let Some(entry) = result
+                .by_face
+                .iter_mut()
+                .find(|f| f.operand == key.operand && f.face_id == key.face_id)
+            {
+                entry.piece_ids.retain(|id| *id != piece_id);
+            }
         }
         if debug {
             eprintln!(
                 "shared-section REUSE piece {} -> boundary edge {}:{} sub-arc \
-                 aligned={} (dropped redundant cut from face {}:{})",
+                 aligned={} (dropped redundant cut from {})",
                 piece_id,
                 reuse.owning.operand,
                 reuse.edge_id,
                 reuse.aligned,
-                reuse.owning.operand,
-                reuse.owning.face_id,
+                reuse
+                    .redundant
+                    .iter()
+                    .map(|key| format!("face {}:{}", key.operand, key.face_id))
+                    .collect::<Vec<_>>()
+                    .join(", "),
             );
         }
     }
@@ -634,6 +689,79 @@ fn support_pair_key(a: FaceKey, b: FaceKey) -> (FaceKey, FaceKey) {
         (a, b)
     } else {
         (b, a)
+    }
+}
+
+/// The worst distance from the chord `o`→`d` to `surface`, over stations along
+/// the whole span. The bridge's own gate reads ONE station (the midpoint); a
+/// chord that replaces a section has to run on the carrier everywhere, and on a
+/// carrier whose curvature is not symmetric about the midpoint the worst
+/// station is not the middle one.
+pub(super) fn chord_off_carrier(
+    surface: &NurbsSurface,
+    o: Vec3,
+    d: Vec3,
+) -> Result<f64, KernelRefusal> {
+    const STATIONS: usize = 32;
+    let mut worst = 0.0f64;
+    for station in 0..=STATIONS {
+        let fraction = station as f64 / STATIONS as f64;
+        let point = o.add(d.sub(o).scale(fraction));
+        worst = worst.max(
+            project_point_to_surface(surface, point)
+                .or_refuse(KernelStage::Intersect, "project_point_to_surface")?
+                .distance,
+        );
+    }
+    Ok(worst)
+}
+
+/// A face's trim window as the march reads it: the pcurve control hull against
+/// the carrier's domain, and the overhang the window's clamp discards on a
+/// closed direction (census only).
+fn describe_trim_window(face: &FaceRecord) -> String {
+    let (Ok([u0, u1]), Ok([v0, v1])) = (face.surface.domain_u(), face.surface.domain_v()) else {
+        return "?".into();
+    };
+    let Ok((closed_u, closed_v)) = face.surface.closed_directions() else {
+        return "?".into();
+    };
+    let mut low = [f64::INFINITY; 2];
+    let mut high = [f64::NEG_INFINITY; 2];
+    for coedge in face.loops.iter().flat_map(|record| &record.coedges) {
+        for control in &coedge.pcurve.control_points {
+            let Ok(point) = control.point() else {
+                return "?".into();
+            };
+            low[0] = low[0].min(point.x);
+            high[0] = high[0].max(point.x);
+            low[1] = low[1].min(point.y);
+            high[1] = high[1].max(point.y);
+        }
+    }
+    let mut parts = Vec::new();
+    for (axis, closed, domain) in [(0usize, closed_u, [u0, u1]), (1, closed_v, [v0, v1])] {
+        let below = (domain[0] - low[axis]).max(0.0);
+        let above = (high[axis] - domain[1]).max(0.0);
+        if !closed || (below <= 0.0 && above <= 0.0) {
+            continue;
+        }
+        parts.push(format!(
+            "{}overhang[{:.3e},{:.3e}]{}",
+            if axis == 0 { "u" } else { "v" },
+            below,
+            above,
+            if high[axis] - low[axis] < domain[1] - domain[0] {
+                "discarded"
+            } else {
+                "full"
+            }
+        ));
+    }
+    if parts.is_empty() {
+        "in-domain".into()
+    } else {
+        parts.join(",")
     }
 }
 
@@ -663,6 +791,7 @@ pub(super) fn extend_truncated_sections(
     face_edge_lists: &HashMap<FaceKey, Vec<&EdgeRecord>>,
     solid_a: &BrepSolid,
     solid_b: &BrepSolid,
+    charts: &FaceCharts<'_>,
     tolerance: f64,
 ) -> Result<usize, KernelRefusal> {
     if std::env::var("BREP_EXTEND_TRUNCATED_SECTIONS").as_deref() == Ok("0") {
@@ -692,7 +821,7 @@ pub(super) fn extend_truncated_sections(
             .iter()
             .flat_map(|shell| &shell.faces)
             .find(|face| face.id == key.face_id)
-            .map(|face| &face.surface)
+            .map(|face| chart_of(charts, key, face))
     };
     // "On F's trim boundary" uses the same clearance polish_endpoint snaps
     // section termini to, so a genuine crossing (~tolerance*100 off) reads On
@@ -710,6 +839,15 @@ pub(super) fn extend_truncated_sections(
             }
         }
         Ok(false)
+    };
+
+    let face_of = |key: FaceKey| -> Option<&FaceRecord> {
+        let solid = if key.operand == 0 { solid_a } else { solid_b };
+        solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .find(|face| face.id == key.face_id)
     };
 
     struct BridgeSpec {
@@ -787,19 +925,59 @@ pub(super) fn extend_truncated_sections(
                 if claimed.contains(&(o, d)) || claimed.contains(&(d, o)) {
                     continue;
                 }
-                // Chord validity: the straight O→D extension must lie on F (it
-                // approximates the missing near-tangent arc; reject if F bows away).
-                let Some(fsurf) = surface_of(f) else { continue };
-                let mid = vpoint[&o].add(d_pt).scale(0.5);
-                let dev = project_point_to_surface(fsurf, mid).or_refuse(KernelStage::Intersect, "project_point_to_surface")?.distance;
-                if dev > (tolerance * 100.0).max(0.25 * gap) * (1.0 + mid.length()) {
-                    if debug {
-                        eprintln!(
-                            "extend: reject F={}:{} G={}:{} d={d} o={o} gap={gap:.3e} midpoint-dev={dev:.3e}",
-                            f.operand, f.face_id, g.operand, g.face_id
-                        );
-                    }
+                // THE BRIDGE IS A SECTION, AND A SECTION LIES ON BOTH CARRIERS.
+                // The gate this replaces read ONE station — the chord's
+                // midpoint, against F only, inside a band of max(100 tol, 0.25
+                // gap)·(1 + |mid|), about 1.5e-3 on the helmet: it admitted a
+                // 6.05e-3 chord standing 7.874e-4 off Face_15, 430 times the
+                // section trim floor, and the fit reported the chord's residual
+                // against its own polyline rather than the carrier's, so no
+                // floor downstream caught it. A bridge is now measured along
+                // its WHOLE span against BOTH carriers and accepted only inside
+                // the fit tolerance a marched section is held to. Past that the
+                // chord is not the section, and the imprint refuses by name
+                // rather than minting a wrong one: the stranded stub's own
+                // refusal (an open assembly) would name the topology and not
+                // the geometry that caused it.
+                let (Some(fsurf), Some(gsurf)) = (surface_of(f), surface_of(g)) else {
                     continue;
+                };
+                let o_pt = vpoint[&o];
+                let off_f = chord_off_carrier(fsurf, o_pt, d_pt)?;
+                let off_g = chord_off_carrier(gsurf, o_pt, d_pt)?;
+                // The fit tolerance, as `build_imprints` passes it to the
+                // section fit: `options.tolerance.max(1e-7)`.
+                let fit_tolerance = tolerance.max(1e-7);
+                if off_f.max(off_g) > fit_tolerance {
+                    return Err(KernelRefusal::new(
+                        RefusalClass::NonConvergence {
+                            what: "truncated section bridge".into(),
+                        },
+                        KernelStage::Intersect,
+                        format!(
+                            "boolean: the section of faces {}:{} and {}:{} is truncated at \
+                             ({:.6}, {:.6}, {:.6}), {gap:.3e} short of the crossing at \
+                             ({:.6}, {:.6}, {:.6}), and the chord that would bridge it stands \
+                             {:.3e} off face {}'s carrier and {:.3e} off face {}'s, against the \
+                             fit tolerance {fit_tolerance:.1e} every marched section is held to. \
+                             A chord that is not on both carriers is a wrong section, not a \
+                             loose one.",
+                            f.operand,
+                            f.face_id,
+                            g.operand,
+                            g.face_id,
+                            d_pt.x,
+                            d_pt.y,
+                            d_pt.z,
+                            o_pt.x,
+                            o_pt.y,
+                            o_pt.z,
+                            off_f,
+                            f.face_id,
+                            off_g,
+                            g.face_id,
+                        ),
+                    ));
                 }
                 // D's parameter on F, read from the stub's own F pcurve.
                 let f_pcurve = pcurve_for_piece(piece, f)?;
@@ -807,9 +985,17 @@ pub(super) fn extend_truncated_sections(
                 let d_param = f_pcurve.evaluate(if d_is_start { pd0 } else { pd1 }).or_refuse(KernelStage::Intersect, "evaluate")?;
                 claimed.insert((o, d));
                 if debug {
+                    // CENSUS: the chord that was accepted, against the bars it
+                    // cleared and the two faces' march windows — the population
+                    // the overhang slice measured before it had a gate.
                     eprintln!(
-                        "extend: bridge F={}:{} G={}:{} d={d} o={o} gap={gap:.3e}",
-                        f.operand, f.face_id, g.operand, g.face_id
+                        "extend: bridge F={}:{} G={}:{} d={d} o={o} gap={gap:.3e} off_f={off_f:.3e} off_g={off_g:.3e} fit={fit_tolerance:.1e} f_window={} g_window={}",
+                        f.operand,
+                        f.face_id,
+                        g.operand,
+                        g.face_id,
+                        face_of(f).map(describe_trim_window).unwrap_or_default(),
+                        face_of(g).map(describe_trim_window).unwrap_or_default(),
                     );
                 }
                 bridges.push(BridgeSpec { f, g, o, d, d_param });
@@ -944,4 +1130,578 @@ fn pcurve_for_piece(piece: &ImprintPieceRecord, key: FaceKey) -> Result<&NurbsCu
         .find(|pcurve| pcurve.operand == key.operand && pcurve.face_id == key.face_id)
         .map(|pcurve| &pcurve.pcurve)
         .ok_or_else(|| KernelRefusal::internal(KernelStage::Intersect, "imprint.sections", "extend_truncated_sections: piece lacks face pcurve"))
+}
+
+/// Dissolve a marched section's own PARAMETERIZATION ORIGIN.
+///
+/// `intersect_surfaces` returns a closed rim as one branch whose first and last
+/// samples are the same point, and that point is wherever the trace happened to
+/// start — the first unclaimed grid start that refined, or a pierce seed when
+/// none did. `process_curve` then cuts the curve at each crossing it finds and
+/// pushes the remainder, so a CYCLE with k crossings arrives as k+1 arcs: the
+/// origin stands as a break that no operand edge passes through. A hole drilled
+/// through a torus, a general revolution or a fitted wall therefore reached
+/// `delete_face_and_heal` as a five-coedge strip and was gated out before any
+/// heal ran, and the flat pattern saw several rims where there is one.
+///
+/// The decision cannot be made inside `process_curve`, and that is the whole
+/// reason this is a post-pass. The same physical section is minted by SEVERAL
+/// pairs — a cosurface boundary copy and the analytic ring of the same circle,
+/// a rim carried by two halves of a split skin — and each call sees only its
+/// own `split_faces`, so one call can close a cycle while another still cuts
+/// it. A closed record and an open-arc record can never endpoint-weld, and the
+/// result is the one-use / non-integral-genus signature the OVERLAP-JUNCTION
+/// EXCHANGE already exists to prevent (measured: the rotated equator-tangency
+/// subtract goes from clean to `V=3 E=4 F=2 S=1 one_use=2`). Deciding it HERE,
+/// once, over the finished piece set makes every pair carrying a vertex agree
+/// about it.
+///
+/// The rule is a statement about the VERTEX, not about any one curve: a section
+/// vertex that lies on NO operand edge of either solid is not a junction of
+/// anything — nothing meets there — so where exactly two section pieces of the
+/// same support pair end on it, they are two arcs of one curve and it is the
+/// cut the marcher's parameterization left behind. Joining them is exact
+/// homogeneous concatenation (`concatenate_exact_curve_pieces`, which verifies
+/// the join against both originals by sampling and declines rather than
+/// approximate), and their trims are rebuilt from the joined curve on the same
+/// faces. A vertex that IS on an operand edge stays, whatever it is: a seam
+/// crossing, a pole, a face boundary, a ridden ring's pave. Escape hatch
+/// `BREP_SECTION_ORIGIN_DISSOLVE=0`.
+pub(super) fn dissolve_section_origin_vertices(
+    result: &mut ImprintResultRecord,
+    marched_pieces: &HashSet<u64>,
+    solid_a: &BrepSolid,
+    solid_b: &BrepSolid,
+    charts: &FaceCharts<'_>,
+    tolerance: f64,
+) -> Result<usize, KernelRefusal> {
+    if std::env::var("BREP_SECTION_ORIGIN_DISSOLVE").as_deref() == Ok("0") {
+        return Ok(0);
+    }
+    // An imprint that admitted a TANGENT NODE is left exactly as the march cut
+    // it. Not because its origin vertices are anything else — on the equal-radius
+    // torus pair they sit 0.75 and 3.15 from the nearest node, plain
+    // parameterization cuts — but because dissolving them changes that lane's
+    // verdict and the verdict is not this pass's to make. Measured with the pass
+    // applied there: both torus∪torus and torus−torus stop refusing and build,
+    // at 299.473659929 and 121.820780771 against an independent lens integral of
+    // 299.4736604 and 121.8207812; the union's mesh is closed with one component,
+    // and the difference's mesh carries a four-use edge at three of the four
+    // nodes, which is the zero-thickness pinch the boolean refuses everywhere
+    // else as unrepresentable. The assembly is the authority on whether a node
+    // was imprintable (`ImprintResultRecord::tangent_nodes`), so the change of
+    // verdict belongs to the node lane with these numbers in hand.
+    if !result.tangent_nodes.is_empty() {
+        return Ok(0);
+    }
+    let debug = std::env::var("BREP_DEBUG_ORIGIN_DISSOLVE").is_ok();
+    // The same band `process_curve` calls the meaningful noise floor for
+    // "this point is on that edge": anything finer cannot survive as distinct
+    // topology anyway.
+    let band = tolerance.max(COINCIDENCE_DISTANCE_FLOOR).max(assembler_weld(tolerance));
+    let vertex_point: HashMap<u64, Vec3> =
+        result.vertices.iter().map(|v| (v.id, v.point)).collect();
+
+    // Which section vertices sit on an operand edge? Asked only of a vertex that
+    // is otherwise a candidate, memoized, and prefiltered by each live edge's
+    // control-hull box (a positive-weight rational curve lies in its hull), so
+    // the pass costs nothing on an imprint with no marched cycle in it.
+    let mut edge_boxes: Vec<(&EdgeRecord, Vec3, Vec3)> = Vec::new();
+    for solid in [solid_a, solid_b] {
+        for edge in &solid.edges {
+            if edge.degenerate {
+                continue;
+            }
+            let mut low = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+            let mut high = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+            let mut hull_ok = true;
+            for control in &edge.curve.control_points {
+                if control.w <= 0.0 {
+                    hull_ok = false;
+                    break;
+                }
+                let point = Vec3::new(control.x / control.w, control.y / control.w, control.z / control.w);
+                low = Vec3::new(low.x.min(point.x), low.y.min(point.y), low.z.min(point.z));
+                high = Vec3::new(high.x.max(point.x), high.y.max(point.y), high.z.max(point.z));
+            }
+            if !hull_ok {
+                // No hull guarantee: never prefilter this edge out.
+                low = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+                high = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+            }
+            edge_boxes.push((edge, low, high));
+        }
+    }
+    let lies_on_operand_edge = |point: Vec3| -> Result<bool, KernelRefusal> {
+        for (edge, low, high) in &edge_boxes {
+            if point.x < low.x - band
+                || point.y < low.y - band
+                || point.z < low.z - band
+                || point.x > high.x + band
+                || point.y > high.y + band
+                || point.z > high.z + band
+            {
+                continue;
+            }
+            let projection = project_point_to_curve(&edge.curve, point)
+                .or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
+            let nearest = edge
+                .curve
+                .evaluate(projection.u.clamp(edge.t0.min(edge.t1), edge.t0.max(edge.t1)))
+                .or_refuse(KernelStage::Intersect, "evaluate")?;
+            if nearest.sub(point).length() <= band {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    let mut on_operand_edge: HashMap<u64, bool> = HashMap::default();
+
+    let mut dissolved = 0usize;
+    loop {
+        // Per support pair, the pieces ending on each vertex. A vertex is only
+        // a parameterization cut when EVERY pair that carries it carries
+        // exactly two pieces there — otherwise it is a junction of something.
+        let mut incident: HashMap<(FaceKey, FaceKey, u64), Vec<(usize, bool)>> = HashMap::default();
+        for (index, piece) in result.pieces.iter().enumerate() {
+            if piece.start_vertex_id == piece.end_vertex_id {
+                continue; // already a closed ring
+            }
+            let key = support_pair_key(piece.support_faces[0], piece.support_faces[1]);
+            incident
+                .entry((key.0, key.1, piece.start_vertex_id))
+                .or_default()
+                .push((index, true));
+            incident
+                .entry((key.0, key.1, piece.end_vertex_id))
+                .or_default()
+                .push((index, false));
+        }
+        let mut pairs_at: HashMap<u64, usize> = HashMap::default();
+        for &(_, _, vertex) in incident.keys() {
+            *pairs_at.entry(vertex).or_default() += 1;
+        }
+        // Deterministic order: the lowest vertex id, then the lowest piece id.
+        let mut candidates: Vec<(u64, FaceKey, FaceKey, usize, usize)> = Vec::new();
+        for (&(first, second, vertex), slots) in &incident {
+            if pairs_at.get(&vertex).copied().unwrap_or(0) != 1 {
+                continue; // a meeting of two pairs' sections is a junction
+            }
+            if slots.len() != 2 {
+                continue;
+            }
+            // Oriented head-to-tail: one piece ENDS here and the other STARTS
+            // here. Anything else would need a reversal, which would have to
+            // reverse the trims too; a cycle the marcher cut never produces it.
+            let (a, b) = match (slots[0], slots[1]) {
+                ((left, false), (right, true)) => (left, right),
+                ((left, true), (right, false)) => (right, left),
+                _ => continue,
+            };
+            if a == b {
+                continue;
+            }
+            // MARCHED arcs only. An exact analytic ring (a plane through a
+            // sphere) is cut at its frame origin too, but closing it here moved
+            // AnotherOffsetShellProblem's z = 1.5 carve-plane corners AWAY from
+            // their closed form — area error 1.18e-4 -> 3.24e-4 — where the
+            // coalescer's exact band closes it downstream as it always has.
+            if !marched_pieces.contains(&result.pieces[a].id)
+                || !marched_pieces.contains(&result.pieces[b].id)
+            {
+                continue;
+            }
+            candidates.push((vertex, first, second, a, b));
+        }
+        // Last and dearest: is anything of either operand passing through it?
+        // A support face's carrier seam the two arcs cross counts as something:
+        // the split there (`process_curve`'s carrier-seam pass) is what keeps
+        // each arc's trim on its analytic carrier's period, and the joined trim
+        // would cross the branch cut. Crossing means the arcs' middles stand on
+        // opposite sides of the seam's plane, each clear of it by the band — a
+        // section riding in that plane crosses nothing.
+        let mut kept = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let vertex = candidate.0;
+            let point = vertex_point.get(&vertex).copied().ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Intersect,
+                    "imprint.sections",
+                    "dissolve_section_origin_vertices: piece names an unknown vertex",
+                )
+            })?;
+            let mut on_carrier_seam = false;
+            for key in [candidate.1, candidate.2] {
+                let solid = if key.operand == 0 { solid_a } else { solid_b };
+                let Some(face) = solid
+                    .shells
+                    .iter()
+                    .flat_map(|shell| &shell.faces)
+                    .find(|face| face.id == key.face_id)
+                else {
+                    continue;
+                };
+                for seam in CarrierSeam::of(&face.surface)? {
+                    if seam.offset(point).abs() > band || !seam.on_seam_half(point) {
+                        continue;
+                    }
+                    let middle_offset = |index: usize| -> Result<f64, KernelRefusal> {
+                        let curve = &result.pieces[index].curve;
+                        let [t0, t1] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+                        Ok(seam.offset(
+                            curve
+                                .evaluate(0.5 * (t0 + t1))
+                                .or_refuse(KernelStage::Intersect, "evaluate")?,
+                        ))
+                    };
+                    let (before, after) = (middle_offset(candidate.3)?, middle_offset(candidate.4)?);
+                    if before.abs() > band && after.abs() > band && (before < 0.0) != (after < 0.0) {
+                        on_carrier_seam = true;
+                    }
+                }
+            }
+            if on_carrier_seam {
+                continue;
+            }
+            let on_edge = match on_operand_edge.get(&vertex) {
+                Some(known) => *known,
+                None => {
+                    let point = vertex_point.get(&vertex).copied().ok_or_else(|| {
+                        KernelRefusal::internal(
+                            KernelStage::Intersect,
+                            "imprint.sections",
+                            "dissolve_section_origin_vertices: piece names an unknown vertex",
+                        )
+                    })?;
+                    let known = lies_on_operand_edge(point)?;
+                    on_operand_edge.insert(vertex, known);
+                    known
+                }
+            };
+            if !on_edge {
+                kept.push(candidate);
+            }
+        }
+        let mut candidates = kept;
+        candidates.sort_by_key(|(vertex, _, _, a, b)| {
+            (*vertex, result.pieces[*a].id, result.pieces[*b].id)
+        });
+        let Some(&(vertex, _, _, a, b)) = candidates.first() else {
+            break;
+        };
+        // One join per sweep: the indices above are invalidated by the removal.
+        let joined = join_section_pieces(result, a, b, solid_a, solid_b, charts, tolerance)?;
+        if !joined {
+            // Record the refusal so a declined concatenation is visible, and
+            // stop rather than spinning on the same pair.
+            if debug {
+                eprintln!(
+                    "origin-dissolve: vertex {vertex} declined by concatenate_exact_curve_pieces"
+                );
+            }
+            on_operand_edge.insert(vertex, true);
+            continue;
+        }
+        if debug {
+            let point = vertex_point.get(&vertex).copied().unwrap_or_default();
+            let node = result
+                .tangent_nodes
+                .iter()
+                .map(|node| node.sub(point).length())
+                .fold(f64::INFINITY, f64::min);
+            eprintln!(
+                "origin-dissolve: vertex {vertex} at ({:.6},{:.6},{:.6}) dissolved \
+                 (nearest tangent node {node:.3e})",
+                point.x, point.y, point.z
+            );
+        }
+        dissolved += 1;
+    }
+    if dissolved > 0 {
+        // A dissolved vertex is referenced by nothing; leaving it would mint a
+        // stray topological vertex downstream.
+        let mut referenced: HashSet<u64> = HashSet::default();
+        for piece in &result.pieces {
+            referenced.insert(piece.start_vertex_id);
+            referenced.insert(piece.end_vertex_id);
+        }
+        result.vertices.retain(|v| referenced.contains(&v.id));
+    }
+    Ok(dissolved)
+}
+
+/// Join section pieces `a` (which ends at the shared vertex) and `b` (which
+/// starts there) into one, keeping `a`'s id. Returns false — changing nothing —
+/// when the exact concatenation declines or the two pieces do not carry the
+/// same trims.
+fn join_section_pieces(
+    result: &mut ImprintResultRecord,
+    a: usize,
+    b: usize,
+    solid_a: &BrepSolid,
+    solid_b: &BrepSolid,
+    charts: &FaceCharts<'_>,
+    tolerance: f64,
+) -> Result<bool, KernelRefusal> {
+    if result.pieces[a].shared_edge.is_some() || result.pieces[b].shared_edge.is_some() {
+        return Ok(false); // riding an existing boundary edge: not ours to join
+    }
+    let mut a_faces: Vec<(u8, u64)> = result.pieces[a]
+        .pcurves
+        .iter()
+        .map(|p| (p.operand, p.face_id))
+        .collect();
+    let mut b_faces: Vec<(u8, u64)> = result.pieces[b]
+        .pcurves
+        .iter()
+        .map(|p| (p.operand, p.face_id))
+        .collect();
+    a_faces.sort_unstable();
+    b_faces.sort_unstable();
+    if a_faces != b_faces {
+        return Ok(false); // different trims: not two arcs of one rim
+    }
+    let [a0, a1] = result.pieces[a]
+        .curve
+        .domain()
+        .or_refuse(KernelStage::Intersect, "domain")?;
+    let [b0, b1] = result.pieces[b]
+        .curve
+        .domain()
+        .or_refuse(KernelStage::Intersect, "domain")?;
+    let (a_span, b_span) = (a1 - a0, b1 - b0);
+    if a_span <= 0.0 || b_span <= 0.0 {
+        return Ok(false);
+    }
+    let split = a_span / (a_span + b_span);
+    let weld = assembler_weld(tolerance) * merge_scale(solid_scale(solid_a).max(solid_scale(solid_b)));
+    let Some(curve) = crate::concatenate_exact_curve_pieces(
+        &result.pieces[a].curve,
+        &result.pieces[b].curve,
+        split,
+        weld,
+    )
+    .or_refuse(KernelStage::Intersect, "concatenate_exact_curve_pieces")?
+    else {
+        return Ok(false);
+    };
+    let [t0, t1] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    // The trims are JOINED the way the curve is, not rebuilt from it. A rebuild
+    // re-projects the whole loop, and a re-projected full period is where a trim
+    // fit is worst: the coalescer's closing band was set on exactly that loss
+    // (the crossing-pipe tee, 2.8e-7 from its closed form as two arcs, 1.7e-6
+    // once its closure refit the trims). Each arc's pcurve is a linear image of
+    // its own piece's domain, so the same split carries both into one, and the
+    // joined trim is the two original trims to the bit. A rebuild stays the
+    // fallback where the join declines.
+    let mut pcurves = Vec::with_capacity(a_faces.len());
+    for (operand, face_id) in &a_faces {
+        let solid = if *operand == 0 { solid_a } else { solid_b };
+        let Some(face) = solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .find(|face| face.id == *face_id)
+        else {
+            return Ok(false);
+        };
+        let find = |index: usize| {
+            result.pieces[index]
+                .pcurves
+                .iter()
+                .find(|p| p.operand == *operand && p.face_id == *face_id)
+                .map(|p| p.pcurve.clone())
+        };
+        let chart = chart_of(charts, FaceKey { operand: *operand, face_id: *face_id }, face);
+        let joined = match (find(a), find(b)) {
+            (Some(first), Some(second)) => {
+                join_trims(chart, &first, &second, split, &curve)?
+            }
+            _ => None,
+        };
+        let pcurve = match joined {
+            Some(pcurve) => pcurve,
+            None => match {
+                if std::env::var("BREP_DEBUG_ORIGIN_DISSOLVE").is_ok() {
+                    eprintln!(
+                        "origin-dissolve: trim join declined on op{operand} face {face_id}; rebuilding"
+                    );
+                }
+                build_pcurve_on_surface_marched(chart, &curve)
+            } {
+                Ok(pcurve) => pcurve,
+                Err(_) => return Ok(false),
+            },
+        };
+        // A merged rim may end up spanning a FULL PERIOD of a closed direction.
+        // On a RULED REVOLUTION that is the ordinary state of every bore wall in
+        // this kernel — its seam is a straight generator its own loop already
+        // carries — and it is merged. On a DOUBLY-CURVED periodic carrier it is
+        // not, measured on the torus collar (a torus welded through a box face,
+        // whose collar runs once around the tube): merged, its trim reads back
+        // at 3.7e-6 and the volume is unchanged, but the blender's closed-chain
+        // lane then places the blend's support start where no neighbour edge
+        // passes ("neighbour edge 15 does not pass through the blend's support
+        // start (off by 0.1087)", `blend::tests::fold`, the corner-torus-collar
+        // inbox suite), and the saved collar document's `…|P.T2_Side_1[1]`
+        // reference names the arc that no longer exists. Both are consumers
+        // reading the collar as the two arcs they were written against — the
+        // seam-marker half of "one rim, one edge", owned by `blending/` and the
+        // naming pass — so the arcs stay here until they read one closed edge.
+        if spans_a_period_of_a_doubly_curved_carrier(&face.surface, &pcurve)? {
+            return Ok(false);
+        }
+        pcurves.push(FacePcurve {
+            operand: *operand,
+            face_id: *face_id,
+            pcurve,
+        });
+    }
+    let absorbed = result.pieces[b].id;
+    let keeper = result.pieces[a].id;
+    let end_vertex = result.pieces[b].end_vertex_id;
+    let piece = &mut result.pieces[a];
+    piece.curve = curve;
+    piece.t0 = t0;
+    piece.t1 = t1;
+    piece.end_vertex_id = end_vertex;
+    piece.pcurves = pcurves;
+    result.pieces.remove(b);
+    for record in &mut result.by_face {
+        if let Some(position) = record.piece_ids.iter().position(|&id| id == absorbed) {
+            if record.piece_ids.contains(&keeper) {
+                record.piece_ids.remove(position);
+            } else {
+                record.piece_ids[position] = keeper;
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Whether `pcurve` runs a full period of a CLOSED direction of `surface`, on a
+/// carrier that is not a ruled revolution. See the call site: a full-period
+/// trim on a cylinder is ordinary, on a torus or a sphere it is a rim with no
+/// start on the seam.
+fn spans_a_period_of_a_doubly_curved_carrier(
+    surface: &NurbsSurface,
+    pcurve: &NurbsCurve,
+) -> Result<bool, KernelRefusal> {
+    if matches!(
+        surface.analytic(),
+        Some(crate::AnalyticSurface::RuledRevolution { .. })
+    ) {
+        return Ok(false);
+    }
+    let (closed_u, closed_v) = surface
+        .closed_directions()
+        .or_refuse(KernelStage::Intersect, "closed_directions")?;
+    if !closed_u && !closed_v {
+        return Ok(false);
+    }
+    let [u0, u1] = surface
+        .domain_u()
+        .or_refuse(KernelStage::Intersect, "domain_u")?;
+    let [v0, v1] = surface
+        .domain_v()
+        .or_refuse(KernelStage::Intersect, "domain_v")?;
+    let [t0, t1] = pcurve
+        .domain()
+        .or_refuse(KernelStage::Intersect, "domain")?;
+    let (mut u_low, mut u_high) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut v_low, mut v_high) = (f64::INFINITY, f64::NEG_INFINITY);
+    for step in 0..=64 {
+        let uv = pcurve
+            .evaluate(t0 + (t1 - t0) * step as f64 / 64.0)
+            .or_refuse(KernelStage::Intersect, "evaluate")?;
+        u_low = u_low.min(uv.x);
+        u_high = u_high.max(uv.x);
+        v_low = v_low.min(uv.y);
+        v_high = v_high.max(uv.y);
+    }
+    // "A full period" with the same slack `restricted_carrier` uses to decide a
+    // trim hull leaves a direction FULL.
+    let spans = |low: f64, high: f64, start: f64, end: f64| {
+        let period = end - start;
+        period > 0.0 && (high - low) >= period * (1.0 - 1e-3)
+    };
+    Ok((closed_u && spans(u_low, u_high, u0, u1)) || (closed_v && spans(v_low, v_high, v0, v1)))
+}
+
+/// Join two arcs' trims on one face into the trim of their joined curve, or
+/// `None` where that cannot be done exactly.
+///
+/// `second` is first moved by whole periods of the carrier's closed directions
+/// so it starts on the branch `first` ends on (two arcs fitted separately may
+/// sit a period apart), then the two are concatenated exactly at `split` — the
+/// same split that joined the 3D arcs. The result is accepted only if it still
+/// lies on the joined curve: at nine stations, `surface(trim(s))` must be as
+/// close to `curve(s)` as the two original trims were to their own arcs, which
+/// is what fails if a trim was ever not a linear image of its piece.
+fn join_trims(
+    surface: &NurbsSurface,
+    first: &NurbsCurve,
+    second: &NurbsCurve,
+    split: f64,
+    curve: &NurbsCurve,
+) -> Result<Option<NurbsCurve>, KernelRefusal> {
+    let (closed_u, closed_v) = surface
+        .closed_directions()
+        .or_refuse(KernelStage::Intersect, "closed_directions")?;
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Intersect, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Intersect, "domain_v")?;
+    let [f0, f1] = first.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    let [s0, _] = second.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    let end = first.evaluate(f1).or_refuse(KernelStage::Intersect, "evaluate")?;
+    let start = second.evaluate(s0).or_refuse(KernelStage::Intersect, "evaluate")?;
+    let shift = |gap: f64, closed: bool, period: f64| {
+        if closed && period > 0.0 {
+            (gap / period).round() * period
+        } else {
+            0.0
+        }
+    };
+    let du = shift(end.x - start.x, closed_u, u1 - u0);
+    let dv = shift(end.y - start.y, closed_v, v1 - v0);
+    let mut moved = second.clone();
+    for control in &mut moved.control_points {
+        control.x += du * control.w;
+        control.y += dv * control.w;
+    }
+    let span = (u1 - u0).abs().max((v1 - v0).abs()).max(1.0);
+    let Some(joined) = crate::concatenate_exact_curve_pieces(first, &moved, split, 1e-9 * span)
+        .or_refuse(KernelStage::Intersect, "concatenate_exact_curve_pieces")?
+    else {
+        return Ok(None);
+    };
+    // The 3D/2D correspondence, measured on the result against the originals.
+    let [c0, c1] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    let [j0, j1] = joined.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    let off = |trim: &NurbsCurve, s: f64, at: f64| -> Result<f64, KernelRefusal> {
+        let [d0, d1] = trim.domain().or_refuse(KernelStage::Intersect, "domain")?;
+        let uv = trim
+            .evaluate(d0 + (d1 - d0) * s)
+            .or_refuse(KernelStage::Intersect, "evaluate")?;
+        let on_surface = surface
+            .evaluate(uv.x, uv.y)
+            .or_refuse(KernelStage::Intersect, "evaluate")?;
+        let on_curve = curve.evaluate(at).or_refuse(KernelStage::Intersect, "evaluate")?;
+        Ok(on_surface.sub(on_curve).length())
+    };
+    let mut original = 0.0f64;
+    let mut after = 0.0f64;
+    for station in 1..10 {
+        let fraction = station as f64 / 10.0;
+        let at = c0 + (c1 - c0) * fraction;
+        after = after.max(off(&joined, (j0 + (j1 - j0) * fraction - j0) / (j1 - j0), at)?);
+        original = original.max(if fraction <= split {
+            off(first, fraction / split, at)?
+        } else {
+            off(&moved, (fraction - split) / (1.0 - split), at)?
+        });
+    }
+    if after > original * 1.5 + 1e-9 * span {
+        return Ok(None);
+    }
+    Ok(Some(joined))
 }

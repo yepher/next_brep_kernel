@@ -1248,5 +1248,4 @@ pub fn apply(state: &mut AssemblyState, candidates: &[Candidate]) -> Vec<String>
     created
 }
 
-// BREP private tests: ce95d8c30dd12a7d
 

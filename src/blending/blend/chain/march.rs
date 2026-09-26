@@ -1,6 +1,31 @@
 use super::*;
 
+/// In-segment stations per chain segment, for a wall that does not fold.
 pub(super) const CHAIN_PER_SEGMENT: usize = 24;
+
+/// The TOP of the ladder a folding chain is re-marched up (24, 48, 96, ...).
+///
+/// A carve traces the crease on the surface the fit produced, so it is sound at
+/// any budget, but the wall it carves is only as close to the rolling ball as
+/// the fit. So the carve does not pick a budget: it climbs, and stops at the
+/// first rung whose fitted rails pass the rolling ball's own contacts, re-solved
+/// halfway between stations, to within `intersection_fit`
+/// (`chain/closed.rs`). The 2026-09-02 collar stops at the rung the record
+/// states. This is only the ceiling, and it is a RESOURCE bound, not an
+/// accuracy one: a 768-station segment is a 1540-row control net, and a wall
+/// that still misses there is refused by name rather than shipped.
+pub(super) const CHAIN_CARVE_MAX_PER_SEGMENT: usize = 768;
+
+/// What a march does when the wall it would build folds through itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum FoldPolicy {
+    /// Refuse by name, terminally (`blend/fold.rs`).
+    Refuse,
+    /// Build it anyway, because the caller is about to CARVE the fold out
+    /// (`blend/carve.rs`) and has already re-marched at the budget that needs.
+    Carve,
+}
+
 const CHAIN_OVERSHOOT: usize = 3;
 
 /// One marched chain station, tagged with its segment and its position
@@ -13,12 +38,18 @@ pub(super) struct ChainSample {
     pub(super) station: Station,
     /// Global chord parameter (filled after the march).
     pub(super) parameter: f64,
+    /// The rolling ball's EXACT contacts halfway to the next position — solved,
+    /// not interpolated — so a fitted row can be measured where an interpolant
+    /// is worst. Only a march for a carve pays for them.
+    pub(super) midpoint: Option<[Vec3; 2]>,
 }
 
 pub(super) fn march_chain(
     segments: &[ChainSegment<'_>],
     radius: f64,
     open: bool,
+    per_segment: usize,
+    fold: FoldPolicy,
 ) -> Result<Vec<ChainSample>, String> {
     let mut samples = Vec::new();
     for (index, segment) in segments.iter().enumerate() {
@@ -45,23 +76,28 @@ pub(super) fn march_chain(
                 .max(1.0)
         });
         let chain_t = |position: isize| -> f64 {
-            let fraction = position as f64 / CHAIN_PER_SEGMENT as f64;
+            let fraction = position as f64 / per_segment as f64;
             if segment.forward {
                 edge.t0 + span * fraction
             } else {
                 edge.t1 - span * fraction
             }
         };
-        let mid_position = CHAIN_PER_SEGMENT as isize / 2;
+        let mid_position = per_segment as isize / 2;
         let seed_mid = {
             let t = chain_t(mid_position);
             let uv1 = edge_uv_on_face(segment.first.coedge, edge, t)?;
             let uv2 = edge_uv_on_face(segment.second.coedge, edge, t)?;
             [uv1[0], uv1[1], uv2[0], uv2[1]]
         };
+        // The section plane at `t`, advancing past a stationary open end by the
+        // march's own chord (`march_section`).
+        let station_step = span.abs() / per_segment as f64;
+        let section_at = |t: f64| -> Result<(Vec3, Vec3), String> {
+            march_section(edge, t, station_step, "blend chain march")
+        };
         let solve_at = |t: f64, seed: [f64; 4]| -> Result<[f64; 4], String> {
-            let derivatives = edge.curve.derivatives_extended(t, 1)?;
-            let tangent = derivatives[1].normalized()?;
+            let (section_point, tangent) = section_at(t)?;
             let tangent = if segment.forward {
                 tangent
             } else {
@@ -72,37 +108,112 @@ pub(super) fn march_chain(
                 surface2,
                 rho,
                 seed,
-                derivatives[0],
+                section_point,
                 tangent,
                 scale,
             )
         };
         let low = -(CHAIN_OVERSHOOT as isize);
-        let high = (CHAIN_PER_SEGMENT + CHAIN_OVERSHOOT) as isize;
+        let high = (per_segment + CHAIN_OVERSHOOT) as isize;
         let count = (high - low + 1) as usize;
         let mut solutions = vec![[0.0f64; 4]; count];
         let index_of = |position: isize| (position - low) as usize;
+        // The segment's OWN stations first, out from the middle, and the
+        // overshoot past each end only after the fold check below has read
+        // them: the overshoot evaluates both carriers past the segment, where
+        // a Newton may not converge at all, and a march that stops there
+        // would hide a fold its own stations already prove. Each station is
+        // seeded by its neighbour either way, so the solutions are the same.
+        let segment_end = per_segment as isize;
         solutions[index_of(mid_position)] = solve_at(chain_t(mid_position), seed_mid)?;
-        for position in (low..mid_position).rev() {
+        for position in (0..mid_position).rev() {
             solutions[index_of(position)] =
                 solve_at(chain_t(position), solutions[index_of(position + 1)])?;
         }
-        for position in mid_position + 1..=high {
+        for position in mid_position + 1..=segment_end {
             solutions[index_of(position)] =
                 solve_at(chain_t(position), solutions[index_of(position - 1)])?;
+        }
+        // Does the wall this segment would carry FOLD? Measured on the ball
+        // centre curve the stations already sit on, by re-solving the tangency
+        // system either side of each — the station spacing itself is far too
+        // coarse to read a bend the size of the radius (`blend/fold.rs`).
+        {
+            let probe = |t: f64,
+                         seed: [f64; 4]|
+             -> Result<([f64; 4], Vec3, Vec3, Vec3), String> {
+                let uv = solve_at(t, seed)?;
+                let (section_point, tangent) = section_at(t)?;
+                let tangent = if segment.forward {
+                    tangent
+                } else {
+                    tangent.scale(-1.0)
+                };
+                let (_, p1, p2, center) =
+                    tangency_residual(surface1, surface2, rho, uv, section_point, tangent)?;
+                Ok((uv, p1, p2, center))
+            };
+            let probed: Vec<(f64, [f64; 4])> = (0..=per_segment as isize)
+                .map(|position| (chain_t(position), solutions[index_of(position)]))
+                .collect();
+            let radius_at = |_: f64| radius.abs();
+            if fold == FoldPolicy::Refuse {
+                check_wall_fold(
+                    &radius_at,
+                    span,
+                    &probed,
+                    &probe,
+                    segment.edge,
+                    [segment.first.face, segment.second.face],
+                    scale,
+                )?;
+            }
+        }
+        for position in (low..0).rev() {
+            solutions[index_of(position)] =
+                solve_at(chain_t(position), solutions[index_of(position + 1)])?;
+        }
+        for position in segment_end + 1..=high {
+            solutions[index_of(position)] =
+                solve_at(chain_t(position), solutions[index_of(position - 1)])?;
+        }
+        // Halfway contacts, for the closed chain's accuracy ladder — every
+        // closed chain, not only one being carved: a collar that does not fold
+        // is built from the same interpolated rails and can miss its carriers
+        // just as far (9.4e-4 off its torus on the 2026-09-02 two-torus collar,
+        // built at the first rung with nothing measuring it).
+        let mut midpoints: Vec<Option<[Vec3; 2]>> = vec![None; count];
+        if !open {
+            for position in 0..per_segment as isize {
+                let fraction = (position as f64 + 0.5) / per_segment as f64;
+                let t = if segment.forward {
+                    edge.t0 + span * fraction
+                } else {
+                    edge.t1 - span * fraction
+                };
+                let uv = solve_at(t, solutions[index_of(position)])?;
+                let (section_point, tangent) = section_at(t)?;
+                let tangent = if segment.forward {
+                    tangent
+                } else {
+                    tangent.scale(-1.0)
+                };
+                let (_, p1, p2, _) =
+                    tangency_residual(surface1, surface2, rho, uv, section_point, tangent)?;
+                midpoints[index_of(position)] = Some([p1, p2]);
+            }
         }
         for position in low..=high {
             let t = chain_t(position);
             let uv = solutions[index_of(position)];
-            let derivatives = edge.curve.derivatives_extended(t, 1)?;
-            let tangent = derivatives[1].normalized()?;
+            let (section_point, tangent) = section_at(t)?;
             let tangent = if segment.forward {
                 tangent
             } else {
                 tangent.scale(-1.0)
             };
             let (_, p1, p2, center) =
-                tangency_residual(surface1, surface2, rho, uv, derivatives[0], tangent)?;
+                tangency_residual(surface1, surface2, rho, uv, section_point, tangent)?;
             let n1 = raw_normal(surface1, uv[0], uv[1])?;
             let n2 = raw_normal(surface2, uv[2], uv[3])?;
             let cos_alpha = rho1.signum() * rho2.signum() * n1.dot(n2);
@@ -124,6 +235,7 @@ pub(super) fn march_chain(
                     apex,
                 },
                 parameter: 0.0,
+                midpoint: midpoints[index_of(position)],
             });
         }
     }
@@ -134,7 +246,7 @@ pub(super) fn march_chain(
     let mut previous: Option<Vec3> = None;
     let mut junction_params = vec![0.0; segments.len() + 1];
     for segment in 0..segments.len() {
-        for position in 0..CHAIN_PER_SEGMENT as isize {
+        for position in 0..per_segment as isize {
             let sample_index = samples
                 .iter()
                 .position(|sample| sample.segment == segment && sample.position == position)
@@ -206,10 +318,10 @@ pub(super) fn march_chain(
             previous_point = point;
         }
         // Above the last in-segment position.
-        let anchor = sample_at(&samples, CHAIN_PER_SEGMENT as isize - 1);
+        let anchor = sample_at(&samples, per_segment as isize - 1);
         let mut accumulated = samples[anchor].parameter;
         let mut previous_point = midpoint(&samples, anchor);
-        for position in CHAIN_PER_SEGMENT as isize..=(CHAIN_PER_SEGMENT + CHAIN_OVERSHOOT) as isize
+        for position in per_segment as isize..=(per_segment + CHAIN_OVERSHOOT) as isize
         {
             let index = sample_at(&samples, position);
             let point = midpoint(&samples, index);
@@ -219,6 +331,7 @@ pub(super) fn march_chain(
         }
     }
     let _ = junction_params;
+    station_trace(&samples, per_segment);
     // Re-origin the global parameter at segment 0's MIDDLE station so the
     // blend seam falls far from every junction (a seam ON a junction
     // collides with that junction's spoke crossing).  Kept UNWRAPPED so
@@ -229,7 +342,7 @@ pub(super) fn march_chain(
     if !open {
         let p_mid = samples
             .iter()
-            .find(|sample| sample.segment == 0 && sample.position == CHAIN_PER_SEGMENT as isize / 2)
+            .find(|sample| sample.segment == 0 && sample.position == per_segment as isize / 2)
             .map(|sample| sample.parameter)
             .expect("chain mid sample");
         for sample in samples.iter_mut() {
@@ -237,4 +350,59 @@ pub(super) fn march_chain(
         }
     }
     Ok(samples)
+}
+
+/// `BREP_BLEND_STATION_TRACE=1` prints every marched chain station once the
+/// global chord parameters are assigned: the two contacts, the ball centre,
+/// both parameter feet on the mates and the parameter the row fit will use.
+///
+/// The fitted rows are what a built wall carries, and reading them back off
+/// the face cannot tell a station apart from the interpolant through it — a
+/// branch hop between two stations hides inside one cubic span. This prints
+/// the samples themselves, so the fit and the march can be told apart.
+fn station_trace(samples: &[ChainSample], per_segment: usize) {
+    if std::env::var("BREP_BLEND_STATION_TRACE").ok().as_deref() != Some("1") {
+        return;
+    }
+    eprintln!(
+        "blend chain stations: {} sample(s) (in-segment 0..{})",
+        samples.len(),
+        per_segment - 1
+    );
+    let mut ordered: Vec<&ChainSample> = samples.iter().collect();
+    ordered.sort_by(|a, b| {
+        a.segment
+            .cmp(&b.segment)
+            .then(a.position.cmp(&b.position))
+    });
+    let mut previous: Option<Vec3> = None;
+    for sample in ordered {
+        let station = &sample.station;
+        let step = previous
+            .map(|point| station.center.sub(point).length())
+            .unwrap_or(f64::NAN);
+        eprintln!(
+            "  seg {} pos {:>3} t {:.9} p1 ({:.9}, {:.9}, {:.9}) p2 ({:.9}, {:.9}, {:.9}) \
+             c ({:.9}, {:.9}, {:.9}) uv1 ({:.9}, {:.9}) uv2 ({:.9}, {:.9}) w {:.9} dc {:.9}",
+            sample.segment,
+            sample.position,
+            sample.parameter,
+            station.p1.x,
+            station.p1.y,
+            station.p1.z,
+            station.p2.x,
+            station.p2.y,
+            station.p2.z,
+            station.center.x,
+            station.center.y,
+            station.center.z,
+            station.uv1[0],
+            station.uv1[1],
+            station.uv2[0],
+            station.uv2[1],
+            station.weight,
+            step,
+        );
+        previous = Some(station.center);
+    }
 }

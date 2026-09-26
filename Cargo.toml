@@ -12,13 +12,19 @@
 [package]
 edition = "2021"
 name = "BREP_kernel"
-version = "0.5.0"
-build = false
+version = "0.6.0"
+build = "build.rs"
 include = [
     "src/**/*.rs",
+    "/build.rs",
     "/Cargo.toml",
     "/README.md",
     "/LICENSE.md",
+    "!src/**/tests/**",
+    "!**/tests.rs",
+    "!**/*_tests.rs",
+    "!**/test_support.rs",
+    "!**/testdata/**",
 ]
 autolib = false
 autobins = false
@@ -26,6 +32,7 @@ autoexamples = false
 autotests = false
 autobenches = false
 description = "A boundary representation (BREP) geometry kernel for building CAD applications."
+homepage = "https://v2.brep.io"
 readme = "README.md"
 keywords = [
     "cad",

@@ -381,4 +381,3 @@ pub fn split_solid_by_face_surface(
     split_solid_by_surface(solid, &tool)
 }
 
-// BREP private tests: 92c02800afd395cc

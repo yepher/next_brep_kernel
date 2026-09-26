@@ -598,4 +598,3 @@ fn arrange_segments_impl(
     Ok(regions.into_iter().map(|(region, _)| region).collect())
 }
 
-// BREP private tests: fab715d03529103e

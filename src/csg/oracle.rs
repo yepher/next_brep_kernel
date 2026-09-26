@@ -569,4 +569,3 @@ pub fn boolean_residual_fusables(result: &BrepSolid, tol: f64) -> Vec<ResidualFu
     findings
 }
 
-// BREP private tests: de125ee70e252265

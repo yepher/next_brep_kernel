@@ -38,4 +38,3 @@ pub(super) fn surface_from_rows(
     NurbsSurface::new(degree, degree_v, first.knots.clone(), knots_v, control)
 }
 
-// BREP private tests: fd2d5240c94412ee

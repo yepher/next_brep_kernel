@@ -20,6 +20,13 @@ use serde::Serialize;
 
 const SOURCE_OPERAND: u8 = 250;
 
+/// The smallest |distance| an offset shell answers: at or under it the shell
+/// refuses ("distance must be finite and non-zero"). One constant, because the
+/// revolved-wedge lane runs in FRONT of that refusal and must stand down exactly
+/// where it fires — it once took (−1e-7, 0) as an outward distance and built a
+/// sliver where the shell had always refused.
+const MINIMUM_DISTANCE: f64 = 1e-7;
+
 fn debug_enabled() -> bool {
     std::env::var("BREP_OS_DEBUG").is_ok_and(|value| !value.is_empty() && value != "0")
 }
@@ -71,14 +78,21 @@ mod connectors;
 mod orientation;
 #[path = "offset_shell/rim_welds.rs"]
 mod rim_welds;
+#[path = "offset_shell/revolved_wedge.rs"]
+mod revolved_wedge;
+#[path = "offset_shell/outline_offset.rs"]
+mod outline_offset;
+#[path = "offset_shell/vacated_rim.rs"]
+mod vacated_rim;
 #[path = "offset_shell/pipeline.rs"]
 mod pipeline;
-// BREP private tests: 77b8029939f98de3
 
 use carrier_rebuild::*;
 use carriers::*;
 use connectors::*;
 use orientation::*;
+use outline_offset::*;
+use vacated_rim::*;
 use rim_welds::*;
 use smooth_sync::*;
 

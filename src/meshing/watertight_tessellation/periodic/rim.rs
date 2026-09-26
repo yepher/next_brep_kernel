@@ -112,4 +112,3 @@ pub(super) fn split_seam_arcs(
     Some((right, left))
 }
 
-// BREP private tests: 21c4b19f79e8cc3e

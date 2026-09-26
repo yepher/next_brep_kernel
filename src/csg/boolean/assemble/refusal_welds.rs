@@ -625,12 +625,7 @@ pub(in crate::boolean) fn conform_unmatched_one_use_edges(
 /// `validate()` checks against (left untouched when the counts do not give an
 /// integral genus — validation then reports the real defect).
 pub(super) fn refresh_derived_genus(solid: &mut BrepSolid) {
-    let hole_count: i64 = solid
-        .shells
-        .iter()
-        .flat_map(|shell| &shell.faces)
-        .map(|face| face.loops.len().saturating_sub(1) as i64)
-        .sum();
+    let hole_count = solid.bounding_hole_count();
     let face_count: i64 = solid
         .shells
         .iter()

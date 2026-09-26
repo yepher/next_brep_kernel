@@ -398,12 +398,7 @@ pub(crate) fn finalize_assembled_solid(
         .iter()
         .map(|shell| shell.faces.len() as i64)
         .sum();
-    let hole_count: i64 = solid
-        .shells
-        .iter()
-        .flat_map(|shell| &shell.faces)
-        .map(|face| face.loops.len().saturating_sub(1) as i64)
-        .sum();
+    let hole_count = solid.bounding_hole_count();
     let edge_count = solid.edges.iter().filter(|edge| !edge.degenerate).count() as i64;
     let non_degenerate_vertex_ids = solid
         .edges
@@ -418,19 +413,19 @@ pub(crate) fn finalize_assembled_solid(
         .count() as i64;
     let euler = vertex_count - edge_count + face_count - hole_count;
     let numerator = solid.shells.len() as i64 * 2 - euler;
-    let edge_degenerate = solid
-        .edges
-        .iter()
-        .map(|edge| (edge.id, edge.degenerate))
-        .collect::<HashMap<_, _>>();
-    let has_degenerate_open_edge = use_counts
-        .iter()
-        .any(|(edge_id, count)| *count == 1 && edge_degenerate.get(edge_id) == Some(&true));
-    let only_degenerate_open_edges = has_degenerate_open_edge
-        && use_counts.iter().all(|(edge_id, count)| {
-            *count == 2 || (*count == 1 && edge_degenerate.get(edge_id) == Some(&true))
-        });
-    if (numerator < 0 || numerator % 2 != 0) && !only_degenerate_open_edges {
+    // A numerator that is negative or odd supports no genus at all, on ANY
+    // body. Until 2026-09-12 a body whose only single-use edges were
+    // degenerate (pole edges) was exempted here and, when its numerator came
+    // out negative or odd, had `genus = 0` FORCED below instead. Instrumented
+    // over the 18-shell `shell_euler_probe` sweep, the 49-case gate and the
+    // 129 `offset` lib tests, that exemption was reached 23 times and the
+    // forced arm fired 0 times — every pole-carrying body the project can
+    // build has an even, non-negative numerator — so both were removed rather
+    // than trusted. A body that did reach here with such a numerator now
+    // takes this refusal, which the case gate classifies, instead of
+    // recording a 0 that `validate()` would later report as a GENUS MISMATCH
+    // against the forced number — a refusal that misdescribed its own cause.
+    if numerator < 0 || numerator % 2 != 0 {
         let edge_by_id = solid
             .edges
             .iter()
@@ -505,11 +500,22 @@ pub(crate) fn finalize_assembled_solid(
             use_counts.values().filter(|count| **count == 1).count(),
         )));
     }
-    solid.genus = if only_degenerate_open_edges {
-        0
-    } else {
-        numerator / 2
-    };
+    // Record the genus the count produced, on every body. This used to be
+    // forced to 0 for a body whose only single-use edges are degenerate,
+    // which is not a safe default but a statement the counts contradict: that
+    // is true of any body carrying an ordinary pole edge, so a shelled solid
+    // with a spherical cavity wall was recorded genus 0 while its own
+    // `V - E + F - H` said 3. `validate()` then disagreed with itself, and the
+    // disagreement was invisible because its Euler check was skipped on
+    // exactly these bodies. Measured on
+    // `sphere_carved_opening_shell_is_watertight`: chi = -4, numerator 6, so
+    // genus 3 -- and an independent WATERTIGHT MESH count of the same shell
+    // reads chi = -4 at three chord tolerances, closed, no boundary or
+    // non-manifold edges. The handles are real; only the recorded number was
+    // wrong. A shell opened on an ANNULAR face joins its outer and inner
+    // skins along two rim curves rather than one, so a non-zero genus there
+    // is the expected answer, not a symptom.
+    solid.genus = numerator / 2;
     let repair_debug =
         std::env::var("BREP_OS_DEBUG").is_ok_and(|value| !value.is_empty() && value != "0");
     if repair_debug {
@@ -567,6 +573,7 @@ pub(crate) fn finalize_assembled_solid(
             "boolean assembly: completed shell has invalid topology: {issues:?}; open={open:?}"
         )));
     }
+    let _caller = crate::mass_caller("finalize.closed_tail");
     let volume = solid_signed_volume(&solid).or_refuse(KernelStage::Validate, "solid_signed_volume")?;
     if volume <= tolerance.powi(3) {
         return Err(KernelRefusal::new(
@@ -654,6 +661,7 @@ pub(in crate::boolean) fn repair_open_assembly_via_heal_chain(
     if !solid.validate().is_empty() {
         return None;
     }
+    let _caller = crate::mass_caller("finalize.heal_fallback");
     let volume = solid_signed_volume(&solid).ok()?;
     if volume <= tolerance.powi(3) {
         return None;

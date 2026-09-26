@@ -14,4 +14,3 @@ pub(crate) fn newell_normal(points: &[Vec3]) -> Vec3 {
     normal
 }
 
-// BREP private tests: 40c58ad9843493d4

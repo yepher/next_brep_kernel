@@ -93,7 +93,6 @@ mod decompose;
 // Tests
 // ---------------------------------------------------------------------------
 
-// BREP private tests: af7c5ac96474d9d1
 
 use atoms::*;
 use mates::*;

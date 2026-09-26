@@ -24,7 +24,6 @@ mod import;
 mod reader;
 mod writer;
 
-// BREP private tests: 4108774a5d77416a
 
 pub use export::export_iges;
 pub use import::import_iges;

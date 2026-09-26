@@ -28,7 +28,10 @@ pub fn tessellate_brep_watertight_face_stride(
     if !(chord_tolerance > 0.0) || !chord_tolerance.is_finite() {
         return Err("tessellate_brep_watertight: chord tolerance must be positive".into());
     }
+    let started = profile_started();
     let samples = sample_all_edges(solid, chord_tolerance)?;
+    let sampling_ms = elapsed_ms(started);
+    tess_profile(|p| p.edge_sampling_ms += sampling_ms);
     tessellate_faces_stride(solid, &samples, chord_tolerance, stride, offset)
 }
 
@@ -96,6 +99,7 @@ pub(super) fn tessellate_faces_stride(
             sequential_face_id += 1;
         }
     }
+    tess_profile(|p| p.faces += work.len() as u64);
     let mesh_one = |face_id: u32, face: &FaceRecord| -> Result<Mesh, String> {
         let mut fragment = Mesh::default();
         tessellate_face_watertight(face, samples, chord_tolerance, face_id, &mut fragment)?;

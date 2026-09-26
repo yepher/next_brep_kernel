@@ -15,12 +15,12 @@
 //!
 //! The older construction survives as the FALLBACK: build the §6.9
 //! cross-section as a tool solid, extrude or revolve it along the edge, and
-//! let the boolean perform the surgery (`fillet/tool.rs`).  It is reached
+//! let the boolean perform the surgery (`fillet/tool.rs`). It is reached
 //! where the march refuses by name, and by the group's sequential
 //! composition (`Lane::CutterFirst`), whose remaining corner closures — the
 //! mixed-convexity torus sectors and the N≥4 no-common-ball Coons fill —
-//! reconstruct the corner from the cutter's output.  Both are on their way
-//! out; see `docs/developer/kernel-plans/fillet-stripe-network.md`.
+//! reconstruct the corner from the cutter's output. Both are on their way
+//! out.
 //!
 //! Diagnostic environment switches (all off by default, none change a
 //! result that reaches the user through a different lane than the one
@@ -30,7 +30,11 @@
 //!   * `BREP_NO_NETWORK=1` skips the network attempt so a selection can be
 //!     compared against the composition;
 //!   * `BREP_CUTTER_FIRST=1` restores the cutter's first turn on single
-//!     edges for the same comparison.
+//!     edges for the same comparison;
+//!   * `BREP_NO_THIRD_FACE_TRIM=1` skips the network's own restriction against
+//!     a third face (`blend/restrict.rs`), so a selection can be compared
+//!     against the cutter fallback it used to take, and so the restriction's
+//!     own cost can be measured against a run without it.
 
 use crate::topology::{BrepSolid, EdgeRecord, FaceRecord};
 use crate::{
@@ -42,26 +46,27 @@ use crate::{
 mod analyze;
 #[path = "fillet/edges.rs"]
 mod edges;
-// BREP private tests: 958d69cd590b385d
 #[path = "fillet/tool.rs"]
 mod tool;
 
 pub use edges::{
     chamfer_edge, chamfer_edge_angle, chamfer_edge_asymmetric, chamfer_edges_angle,
-    chamfer_edges_asymmetric, fillet_edge, fillet_edges, fillet_edges_variable,
-    fillet_edges_variable_law, fillet_edges_variable_vertex_radii,
+    chamfer_edges_asymmetric, fillet_edge, fillet_edges, fillet_edges_reported,
+    fillet_edges_variable, fillet_edges_variable_law, fillet_edges_variable_vertex_radii,
+    BlendSelection,
 };
 pub(crate) use analyze::into_face_direction;
 
 use analyze::{
-    analyze_edge, check_blend_interference, check_mixed_concavity, check_support_extent, EdgeCross,
+    analyze_edge, check_blend_interference, check_loop_self_crossings, check_mixed_concavity,
+    check_support_extent, EdgeCross,
     EdgePath,
 };
-// BREP private tests: 5c1aa30cfd5799e7
 use edges::heal_edge_vertex_gaps;
 use tool::{
     apply_tool, chamfer_angle_second_distance, chamfer_cross_section_offsets, fillet_or_chamfer,
-    tool_ends_to_original_extent, Lane, ToolEnds,
+    scaffold_tag, settle_cutter_scaffold, tool_ends_to_original_extent, Lane, ToolEnds,
+    CUTTER_SCAFFOLD_NAME,
 };
 #[allow(unused_imports)] // consumed by the corner-closure lanes' cfg(test) siblings
 pub(crate) use edges::fillet_edge_cutter;

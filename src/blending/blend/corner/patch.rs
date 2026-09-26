@@ -214,53 +214,53 @@ pub(in crate::blend) fn build_general_corner_patch(
         return Err("build_general_corner_patch: tangent arc loop is not closed".into());
     }
 
-    // Fit each coedge pcurve by projecting samples of the arc (taken in the
-    // coedge traversal direction, forward=false) onto the sphere.  Sphere
-    // projection is exact, so surface(pcurve(t)) reproduces the arc.  ACUTE
-    // corners produce fresh tangent arcs that sweep well past 90° (the face
-    // normals are nearly anti-parallel), and a degree-3 uv-curve through only
-    // 9 samples then bows off the true arc image by > the validator's pcurve
-    // limit.  Sample DENSELY (33 stations) so the fitted pcurve tracks the
-    // long arc to well inside tolerance at any convex angle.
-    const PATCH_PCURVE_SAMPLES: usize = 33;
+    // Each coedge's pcurve is the arc's track on the sphere, fitted by the one
+    // verified fitter (`track_fit`): broken at the revolution's knot lines,
+    // which every arc of an octant-sized patch crosses, and held to the
+    // refinement floor at midpoints it did not interpolate. It used to be one
+    // cubic through 33 uniform samples: exact at those samples and 1.3e-5 to
+    // 1.9e-5 off in uv between them, peaking where the arc crosses a knot line,
+    // which left the patch's trims 5.3e-7·r² of vector area off their arcs on a
+    // 10-cube star fillet and its volume +1.09e-4 at r = 9 (measured
+    // 2026-09-17). Each arc is walked in the coedge's traversal direction
+    // (forward = false: fraction 0 is its end vertex).
+    const PATCH_TRACK_SAMPLES: usize = 512;
+    const PATCH_TRACK_SAMPLES_LIMIT: usize = 4096;
+    let floor = crate::pcurve::PCURVE_REFINEMENT_TOLERANCE;
     let mut coedges = Vec::with_capacity(n_faces);
     for &ai in &order {
         let edge = &arc_edges[ai];
-        let mut points = Vec::with_capacity(PATCH_PCURVE_SAMPLES);
-        let mut params = Vec::with_capacity(PATCH_PCURVE_SAMPLES);
-        let mut previous_u: Option<f64> = None;
-        for k in 0..PATCH_PCURVE_SAMPLES {
-            let fraction = k as f64 / (PATCH_PCURVE_SAMPLES - 1) as f64;
-            // forward = false: fraction 0 -> t1 (end vertex), 1 -> t0 (start).
-            let t = edge.t1 - (edge.t1 - edge.t0) * fraction;
-            let p = edge.curve.evaluate(t)?;
-            let projection = crate::project_point_to_surface(&surface, p)?;
-            let mut u = projection.u;
-            let v = projection.v;
-            // Keep u continuous across the sampled arc (no spurious 2π jump).
-            if let Some(pu) = previous_u {
-                while u - pu > 0.5 {
-                    u -= 1.0;
-                }
-                while u - pu < -0.5 {
-                    u += 1.0;
-                }
-            }
-            previous_u = Some(u);
-            points.push(Vec4 {
-                x: u,
-                y: v,
-                z: 0.0,
-                w: 1.0,
-            });
-            params.push(fraction);
+        let at = |fraction: f64| edge.curve.evaluate(edge.t1 - (edge.t1 - edge.t0) * fraction);
+        let breaks = super::super::track_fit::curve_breaks(&edge.curve, edge.t0, edge.t1, false);
+        let fit = super::super::track_fit::fit_curve_track(
+            &surface,
+            &at,
+            &breaks,
+            floor,
+            PATCH_TRACK_SAMPLES,
+            PATCH_TRACK_SAMPLES_LIMIT,
+        )?;
+        if std::env::var("BREP_DEBUG_TRACK_FIT").is_ok() {
+            eprintln!(
+                "TRACK_FIT corner patch arc {}: miss {:.3e} at {} samples",
+                edge.id, fit.miss, fit.samples
+            );
         }
-        let pcurve = crate::fit::interpolate_homogeneous(&points, 3, &params)?;
+        if !fit.on_floor {
+            return Err(format!(
+                "{} the corner patch's pcurve along arc {} misses its arc by {:.3e} at {} \
+                 samples, against a floor of {floor:.1e}",
+                crate::blend::PCURVE_OFF_FLOOR,
+                edge.id,
+                fit.miss,
+                fit.samples
+            ));
+        }
         coedges.push(CoedgeRecord {
             id: next_id(),
             edge_id: edge.id,
             forward: false,
-            pcurve,
+            pcurve: fit.curve,
         });
     }
 
@@ -310,10 +310,11 @@ pub(in crate::blend) fn build_chamfer_corner_facet(
     next_id: &mut dyn FnMut() -> u64,
 ) -> Result<FaceRecord, String> {
     let n_faces = normals.len();
-    if n_faces != 3 || chord_edges.len() != n_faces {
+    if n_faces < 3 || chord_edges.len() != n_faces {
         return Err(format!(
-            "blend network: a chamfered star closes with a planar facet, which is only \
-             determined for 3 faces — this vertex has {n_faces} faces and {} sections",
+            "blend network: a chamfered star closes with the facet its end chords bound, which \
+             needs N≥3 faces carrying one chord each — this vertex has {n_faces} faces and {} \
+             sections",
             chord_edges.len()
         ));
     }
@@ -343,21 +344,53 @@ pub(in crate::blend) fn build_chamfer_corner_facet(
         return Err("blend network: the chamfer facet's section loop is not closed".into());
     }
 
-    // The plane through the three tangency points. They are `center + r·nᵢ`
-    // for a common r, so the plane is well conditioned exactly when the three
-    // normals are (which the ball solve has already established).
+    // The plane the N-gon bounds. Each tangency point is `center + r·nᵢ` for
+    // the one seated radius, and every face at the corner passes through the
+    // corner VERTEX V, so `nᵢ·(V − center) = −r` for all of them: the points
+    // all lie on the plane with normal `V − center`, whatever N is. That is an
+    // identity for PLANAR supports only — a curved support puts its tangency
+    // point somewhere the identity does not reach — so the N-gon's flatness is
+    // measured rather than assumed, and a skew one is refused by name.
     let corner_point = |index: usize| -> Result<Vec3, String> {
         let edge = &chord_edges[index];
         edge.curve.evaluate(edge.t0)
     };
-    let [a, b, c] = [corner_point(0)?, corner_point(1)?, corner_point(2)?];
+    let points = order
+        .iter()
+        .map(|&index| corner_point(index))
+        .collect::<Result<Vec<_>, String>>()?;
+    let [a, b] = [points[0], points[1]];
     let u_dir = b.sub(a).normalized()?;
-    let normal = u_dir.cross(c.sub(a)).normalized()?;
+    // Newell's normal over the chained N-gon: exact for a planar polygon at
+    // any N, and for N = 3 exactly the triangle's own `(b−a)×(c−a)`.
+    let mut newell = Vec3::default();
+    for index in 0..n_faces {
+        let from = points[index];
+        let to = points[(index + 1) % n_faces];
+        newell = newell.add(from.sub(a).cross(to.sub(a)));
+    }
+    let normal = newell.normalized()?;
     let v_dir = normal.cross(u_dir).normalized()?;
+    // The seated radius, which every tangency point shares, sets the bar the
+    // N-gon's flatness is held to.
+    let radius = points
+        .iter()
+        .fold(0.0f64, |worst, point| worst.max(point.sub(center).length()));
+    let flatness = 1e-9 * (1.0 + radius);
+    let skew = points
+        .iter()
+        .fold(0.0f64, |worst, point| worst.max(point.sub(a).dot(normal).abs()));
+    if skew > flatness {
+        return Err(format!(
+            "blend network: the {n_faces} chords at a chamfered star bound a SKEW N-gon \
+             ({skew:.3e} out of plane against {flatness:.3e}); a non-planar corner fill is not \
+             implemented"
+        ));
+    }
     // A patch big enough to hold the facet with room to spare, laid out so the
     // facet lands inside the parameter square (the same set-back `sew_cap`
     // uses for its bulkhead).
-    let reach = [a, b, c]
+    let reach = points
         .iter()
         .fold(0.0f64, |worst, point| worst.max(point.sub(a).length()))
         .max(1e-6)
@@ -389,7 +422,6 @@ pub(in crate::blend) fn build_chamfer_corner_facet(
     // convex corner and toward it at a concave one — the patch's own rule.
     let plane_normal = plane.normal(0.5, 0.5)?;
     let same_sense = (plane_normal.dot(pc) > 0.0) == outward;
-    let _ = center;
 
     let loop_id = next_id();
     Ok(FaceRecord {

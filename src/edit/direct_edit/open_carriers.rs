@@ -44,6 +44,7 @@ pub(super) fn extend_ruled_carrier(
     if low >= -tolerance && high <= height + tolerance {
         return Ok(());
     }
+    census_push("ruled_extension", || serde_json::json!({ "low": low, "high": high, "height": height }));
     let rho_at = |z: f64| rho0 + (rho1 - rho0) * z / height;
     let base = frame.origin.add(frame.axis.scale(low));
     let start = base.add(frame.x_axis.scale(rho_at(low)));
@@ -211,7 +212,7 @@ pub(super) fn regrow_and_refit_carrier(
         face,
         edges,
         &surface,
-        PcurveFit::SubrangeAware { tolerance },
+        tolerance,
         op,
     )
 }
@@ -222,13 +223,254 @@ pub(super) fn regrow_and_refit_carrier(
 // a curved analytic wall) alike.
 // ---------------------------------------------------------------------------
 
-/// Which analytic carrier a neighbour of an open transition strip offers.
+/// Which carrier a neighbour of an open transition strip offers.
 /// `Curved` is any recognized non-planar analytic (cylinder/cone wall,
 /// partial revolution with a straight generatrix, …) — `intersect_analytic_pair`
 /// decides below whether the actual PAIR has a closed-form re-intersection.
+/// `FreeForm` is a fitted NURBS patch that is not any recognized analytic: it
+/// grows by [`extend_freeform_neighbour_over`] and re-intersects through the
+/// marched lane of `offset_reintersect::reintersect_carriers`.
 pub(super) enum OpenNeighbourCarrier {
     Planar(Plane),
     Curved,
+    FreeForm,
+}
+
+/// How much of the estimated parameter overshoot each extension round asks
+/// for. A first-order estimate off the boundary tangent understates a curving
+/// patch, so each round overshoots deliberately and the coverage check below
+/// decides whether another round is needed.
+const FREEFORM_EXTENSION_MARGIN: f64 = 1.5;
+
+/// How many rounds of grow-and-recheck the free-form extension runs before it
+/// gives up. Each round re-measures against the surface it just built, so the
+/// estimate converges quadratically in practice; the cap is a guard against a
+/// boundary whose tangent is degenerate and never converges at all.
+const FREEFORM_EXTENSION_ROUNDS: usize = 5;
+
+/// An overrun below this fraction of the boundary's own domain span is NOISE,
+/// not a boundary the strip crosses. Measured 2026-09-12: a strip point sitting
+/// on the carrier to within round-off still reports a residual, whose component
+/// along the boundary tangent is a 1e-18-scale "overrun". Extending by that
+/// appends a span narrower than the band within which two knots are the same
+/// knot, and the appended span evaluates to a zero-weight point everywhere —
+/// a singular carrier built out of round-off. `extend_natural` refuses such an
+/// increment outright; this stops it ever being asked for.
+const FREEFORM_OVERRUN_NOISE_FLOOR: f64 = 1e-6;
+
+/// The smallest extension worth asking for, as a fraction of the boundary's own
+/// domain span. The measured overrun is the MINIMUM that covers the strip; an
+/// extension that only just covers it leaves the recovered branch running along
+/// the grown domain's own boundary, in a sliver too thin for the marcher's seed
+/// grid to land in. Asking for a floor of 2% of the span costs nothing (the
+/// coverage check and `extend_natural`'s growth limit both still hold) and gives
+/// the march somewhere to start.
+///
+/// It is also the UNIT every request is made in: a request is a whole number of
+/// floors, the fewest that cover the margined overrun. The overrun is read off
+/// the strip's stations, and the same strip read through another
+/// parameterisation of its rails puts those stations — and so the overrun — a
+/// few ulp elsewhere. A request of exactly `overrun × margin` carried those ulp
+/// into the extended carrier, the carrier into the marched branch, and the
+/// branch into every healed float; measured on the open heal's r = 1.0 rows,
+/// whose overrun (0.0167 and 0.0173 of the span) is the first to ask past one
+/// floor, re-parameterised rails healed to the same geometry but not the same
+/// bits. A whole number of floors is the same number unless the overrun sits
+/// within round-off of a floor boundary.
+pub(super) const FREEFORM_MINIMUM_EXTENSION: f64 = 0.02;
+
+/// Grow a FITTED (non-analytic) neighbour so its parameter square covers
+/// `points`, by [`NurbsSurface::extend_natural`] on whichever of its four
+/// sides the points overrun.
+///
+/// This is the free-form analogue of [`extend_ruled_neighbour_over`], and the
+/// reason the open-chain heal can reach a fitted carrier at all. The heal used
+/// to refuse a free-form neighbour outright, because the only thing available
+/// past the trim was `evaluate_extended` — a tangent-plane continuation with no
+/// bound and no surface, which a Newton solve can converge onto anywhere.
+/// `extend_natural` gives a real surface with a real domain instead, so a solve
+/// that leaves the extension leaves the surface.
+///
+/// COVERAGE IS VERIFIED, never assumed: after each round every point is
+/// re-projected and must land strictly INSIDE the grown domain. A point whose
+/// projection is still pinned to a boundary is a point the carrier does not
+/// cover, and another round is asked for. A closed direction wraps and needs no
+/// extension. Analytic and already-covering carriers are left untouched.
+pub(super) fn extend_freeform_neighbour_over(
+    solid: &mut BrepSolid,
+    face_id: u64,
+    points: &[Vec3],
+    tolerance: f64,
+) -> Result<(), String> {
+    let op = "delete_face_and_heal";
+    let (shell, face_pos) =
+        find_face(solid, face_id).ok_or_else(|| format!("{op}: missing neighbour {face_id}"))?;
+    let face = &mut solid.shells[shell].faces[face_pos];
+    if face.surface.analytic().is_some() {
+        return Ok(()); // an analytic carrier grows through its own exact lane
+    }
+    let debug = std::env::var("BREP_DEBUG_HEAL").is_ok();
+    let mut surface = face.surface.clone();
+    if debug {
+        let weights: Vec<f64> = surface
+            .control_points
+            .iter()
+            .flat_map(|row| row.iter().map(|point| point.w))
+            .collect();
+        let low = weights.iter().copied().fold(f64::INFINITY, f64::min);
+        let high = weights.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        eprintln!(
+            "HEAL extend: face {face_id} degree {}x{} net {}x{} knots {}+{} weights [{low},{high}] \
+             domain u{:?} v{:?} closed {:?}",
+            surface.degree_u,
+            surface.degree_v,
+            surface.control_points.len(),
+            surface.control_points[0].len(),
+            surface.knots_u.len(),
+            surface.knots_v.len(),
+            surface.domain_u()?,
+            surface.domain_v()?,
+            surface.closed_directions()?
+        );
+    }
+    for round in 0..FREEFORM_EXTENSION_ROUNDS {
+        let overruns = boundary_overruns(&surface, points, tolerance)?;
+        if debug {
+            eprintln!("HEAL extend: face {face_id} round {round} overruns {overruns:?}");
+        }
+        if overruns.iter().all(|overrun| *overrun <= 0.0) {
+            face.surface = surface;
+            return Ok(());
+        }
+        for (index, side) in [
+            SurfaceSide::UMin,
+            SurfaceSide::UMax,
+            SurfaceSide::VMin,
+            SurfaceSide::VMax,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if overruns[index] <= 0.0 {
+                continue;
+            }
+            let [low, high] = if side.is_u() {
+                surface.domain_u()?
+            } else {
+                surface.domain_v()?
+            };
+            let floor = (high - low) * FREEFORM_MINIMUM_EXTENSION;
+            let asked = (overruns[index] * FREEFORM_EXTENSION_MARGIN / floor).ceil().max(1.0) * floor;
+            census_push("freeform_extension", || {
+                serde_json::json!({
+                    "face": face_id,
+                    "round": round,
+                    "side": format!("{side:?}"),
+                    "overrun": overruns[index],
+                    "floor": floor,
+                    "asked": asked,
+                })
+            });
+            surface = surface
+                .extend_natural(side, asked)
+                .map_err(|refusal| {
+                    format!(
+                        "{op}: cannot extend the fitted carrier of face {face_id} past its \
+                         {side:?} boundary — {}",
+                        refusal.describe()
+                    )
+                })?;
+        }
+    }
+    Err(format!(
+        "{op}: the fitted carrier of face {face_id} still does not cover the deleted strip \
+         after {FREEFORM_EXTENSION_ROUNDS} extension rounds — refusing rather than solving \
+         on an unbounded extrapolation"
+    ))
+}
+
+/// A planar patch centred on the deleted strip and big enough to cover its
+/// region gate.
+///
+/// The marched re-intersection CLAMPS to each operand's stored domain
+/// (`intersect/surface_surface_intersection.rs`), and an extruded or imported
+/// planar face's patch ends exactly at the sharp edge the heal is trying to
+/// recover — so the marcher is handed a branch lying along its own domain
+/// boundary and finds nothing. A plane has no extent of its own; only its trim
+/// does. Widening it is therefore exact, not an approximation, and it is what
+/// makes the closed-form `Planar` neighbour usable in the marched lane the
+/// free-form pairings need.
+pub(super) fn planar_region_patch(
+    plane: &Plane,
+    center: Vec3,
+    reach: f64,
+) -> Result<NurbsSurface, String> {
+    let on_plane = center.sub(
+        plane
+            .normal
+            .scale(center.sub(plane.origin).dot(plane.normal)),
+    );
+    let corner = on_plane
+        .sub(plane.u_dir.scale(reach))
+        .sub(plane.v_dir.scale(reach));
+    crate::make_plane(corner, plane.u_dir, plane.v_dir, reach * 2.0, reach * 2.0)
+}
+
+/// How far past each of the four domain boundaries `points` reach, in that
+/// boundary's own parameter. Zero means covered. A point that projects into the
+/// interior overruns nothing; a point pinned to a boundary overruns it by the
+/// component of its residual along the outgoing tangent, converted to parameter
+/// through that tangent's own speed.
+fn boundary_overruns(
+    surface: &NurbsSurface,
+    points: &[Vec3],
+    tolerance: f64,
+) -> Result<[f64; 4], String> {
+    let [u0, u1] = surface.domain_u()?;
+    let [v0, v1] = surface.domain_v()?;
+    let (closed_u, closed_v) = surface.closed_directions()?;
+    // A projection this close to a boundary is ON it: the Newton clamped, so
+    // the true nearest point may be outside.
+    let pinned_u = (u1 - u0) * 1e-9;
+    let pinned_v = (v1 - v0) * 1e-9;
+    let floor_u = (u1 - u0) * FREEFORM_OVERRUN_NOISE_FLOOR;
+    let floor_v = (v1 - v0) * FREEFORM_OVERRUN_NOISE_FLOOR;
+    let mut overruns = [0.0f64; 4];
+    for &point in points {
+        let projection = crate::project_point_to_surface(surface, point)?;
+        if projection.distance <= tolerance {
+            continue; // the point is ON the carrier; nothing overruns
+        }
+        let derivatives = surface.derivatives(projection.u, projection.v, 1)?;
+        let residual = point.sub(projection.point);
+        let mut record = |index: usize, tangent: Vec3, sign: f64, floor: f64| {
+            let speed = tangent.length();
+            if speed <= 0.0 {
+                return;
+            }
+            let along = residual.dot(tangent) / (speed * speed) * sign;
+            if along > floor && along > overruns[index] {
+                overruns[index] = along;
+            }
+        };
+        if !closed_u {
+            if projection.u <= u0 + pinned_u {
+                record(0, derivatives[1][0], -1.0, floor_u);
+            }
+            if projection.u >= u1 - pinned_u {
+                record(1, derivatives[1][0], 1.0, floor_u);
+            }
+        }
+        if !closed_v {
+            if projection.v <= v0 + pinned_v {
+                record(2, derivatives[0][1], -1.0, floor_v);
+            }
+            if projection.v >= v1 - pinned_v {
+                record(3, derivatives[0][1], 1.0, floor_v);
+            }
+        }
+    }
+    Ok(overruns)
 }
 
 /// The parameter/point where `curve` crosses `plane`, restricted to crossings
@@ -281,11 +523,128 @@ pub(super) fn curve_plane_crossing_near(
     best.map(|(t, point, _)| (t, point))
 }
 
+/// [`curve_plane_crossing_near`], plus the curve's own END when that end lies
+/// ON the plane within `tolerance`.
+///
+/// A sign change is the right test for a branch that passes through a cap and
+/// the wrong one for a branch that STOPS on it. A marched re-intersection is
+/// clamped to its carriers' domains, and an extruded wall's domain ends exactly
+/// in its cap planes, so the branch the open heal recovers routinely ends in
+/// the cap it has to be clipped by. Its end height there is round-off: on the
+/// D-prism of `open_heal_tests` it read +2.2e-16 on one body and -4.4e-16 on
+/// the same body with a strip vertex moved 5e-13, and a strict sign change
+/// refused the first and built the second. The end is accepted by the heal's
+/// own model tolerance, the band every other incidence in the heal is held to;
+/// the nearest candidate to `center` still wins.
+pub(super) fn curve_plane_crossing_or_end_near(
+    curve: &NurbsCurve,
+    plane: &Plane,
+    center: Vec3,
+    reach: f64,
+    tolerance: f64,
+) -> Option<(f64, Vec3)> {
+    let mut best = curve_plane_crossing_near(curve, plane, center, reach)
+        .map(|(t, point)| (t, point, point.sub(center).length()));
+    let [t0, t1] = curve.domain().ok()?;
+    for t in [t0, t1] {
+        let point = curve.evaluate(t).ok()?;
+        if point.sub(plane.origin).dot(plane.normal).abs() > tolerance {
+            continue;
+        }
+        let distance = point.sub(center).length();
+        if distance <= reach && best.map(|(_, _, known)| distance < known).unwrap_or(true) {
+            best = Some((t, point, distance));
+        }
+    }
+    best.map(|(t, point, _)| (t, point))
+}
+
+/// Points along an edge's represented range at equal ARC LENGTH, both ends
+/// included, ordered the way the coedge that reads them traverses the edge.
+///
+/// This is how the open heal samples a strip's boundary. A uniform step in the
+/// edge's PARAMETER puts the samples wherever the curve's speed law puts them,
+/// and the same rail can carry any number of speed laws — reversed, re-knotted,
+/// fitted in pieces, re-weighted — so a heal fed parameter samples reads a
+/// property of the representation. Equal arc length is a property of the curve,
+/// and so is the traversal order: reversing an edge flips its coedge's
+/// `forward` flag with it. Each station is solved by a bracketed Newton on the
+/// Gauss arc length within one knot span, iterated until the step no longer
+/// moves the parameter.
+pub(super) fn arc_length_stations(
+    edge: &EdgeRecord,
+    count: usize,
+    forward: bool,
+) -> Result<Vec<Vec3>, String> {
+    let count = count.max(2);
+    let curve = &edge.curve;
+    let (low, high) = (edge.t0.min(edge.t1), edge.t0.max(edge.t1));
+    let mut breaks: Vec<f64> = vec![low, high];
+    breaks.extend(curve.knots.iter().copied().filter(|knot| *knot > low && *knot < high));
+    breaks.sort_by(f64::total_cmp);
+    breaks.dedup();
+    let mut cumulative = vec![0.0f64];
+    for pair in breaks.windows(2) {
+        let last = *cumulative.last().unwrap();
+        cumulative.push(last + crate::curve_arc_length(curve, pair[0], pair[1])?);
+    }
+    let total = *cumulative.last().unwrap();
+    let mut stations = Vec::with_capacity(count);
+    for index in 0..count {
+        let t = if index == 0 {
+            low
+        } else if index == count - 1 {
+            high
+        } else if !(total > 0.0) {
+            low + (high - low) * index as f64 / (count - 1) as f64
+        } else {
+            let target = total * index as f64 / (count - 1) as f64;
+            let panel = (0..breaks.len() - 1)
+                .find(|panel| cumulative[panel + 1] >= target)
+                .unwrap_or(breaks.len() - 2);
+            let (mut bracket_low, mut bracket_high) = (breaks[panel], breaks[panel + 1]);
+            let along = target - cumulative[panel];
+            let panel_length = cumulative[panel + 1] - cumulative[panel];
+            let mut t = if panel_length > 0.0 {
+                bracket_low + (bracket_high - bracket_low) * (along / panel_length).clamp(0.0, 1.0)
+            } else {
+                bracket_low
+            };
+            for _ in 0..64 {
+                let excess = crate::curve_arc_length(curve, breaks[panel], t)? - along;
+                if excess > 0.0 {
+                    bracket_high = t;
+                } else {
+                    bracket_low = t;
+                }
+                let speed = curve.deriv1(t)?.1.length();
+                let mut next = if speed > 0.0 { t - excess / speed } else { f64::NAN };
+                if !(next > bracket_low && next < bracket_high) {
+                    next = 0.5 * (bracket_low + bracket_high);
+                }
+                if next == t {
+                    break;
+                }
+                t = next;
+            }
+            t
+        };
+        stations.push(curve.evaluate(t)?);
+    }
+    if !forward {
+        stations.reverse();
+    }
+    Ok(stations)
+}
+
 /// The parameter/point where `curve` crosses a lateral cap's ANALYTIC carrier,
 /// restricted to crossings within `reach` of `center` (the deleted strip's
 /// region gate); the nearest such crossing wins. A PLANAR cap uses the exact
-/// bisection solver above; a CURVED analytic cap uses the Newton
-/// curve×surface intersector against the cap face's carrier surface.
+/// bisection solver above, which also accepts a branch that ENDS on the plane;
+/// a CURVED analytic cap uses the Newton curve×surface intersector against the
+/// cap face's carrier surface, whose Newton clamps to the curve's domain and
+/// accepts a hit within `tolerance`, so an end lying on the cap is a hit it can
+/// return.
 pub(super) fn curve_cap_crossing_near(
     curve: &NurbsCurve,
     cap_carrier: &OpenNeighbourCarrier,
@@ -296,9 +655,9 @@ pub(super) fn curve_cap_crossing_near(
 ) -> Option<(f64, Vec3)> {
     match cap_carrier {
         OpenNeighbourCarrier::Planar(plane) => {
-            curve_plane_crossing_near(curve, plane, center, reach)
+            curve_plane_crossing_or_end_near(curve, plane, center, reach, tolerance)
         }
-        OpenNeighbourCarrier::Curved => {
+        OpenNeighbourCarrier::Curved | OpenNeighbourCarrier::FreeForm => {
             let hits = intersect_curve_surface(curve, cap_surface, tolerance).ok()?;
             let mut best: Option<(f64, Vec3, f64)> = None;
             for hit in hits {
@@ -376,7 +735,7 @@ pub(super) fn relocate_open_side_edge(
     }
     // The curve itself does not reach the corner: rebuild straight lines,
     // hand everything else back to the caller for closed-form re-derivation.
-    if edge.curve.degree == 1 && edge.curve.control_points.len() == 2 {
+    if edge.curve.straight_segment(tolerance).is_some() {
         let start_point = match &start_target {
             Some((_, point)) => *point,
             None => edge.curve.evaluate(edge.t0)?,

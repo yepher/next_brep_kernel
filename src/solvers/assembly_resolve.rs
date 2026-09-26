@@ -743,4 +743,3 @@ fn circular_edge_circle(record: &EdgeRecord) -> Result<Option<SelectionGeometry>
 // Tests
 // ---------------------------------------------------------------------------
 
-// BREP private tests: 813a3962021020ed

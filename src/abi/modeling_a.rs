@@ -362,7 +362,7 @@ pub fn rib_from_profile_json(request_json: &str) -> Result<String, JsValue> {
         request.extrude_dir,
         request.plane_normal,
         request.extrusion,
-        request.name.as_deref(),
+        &request.names(),
     )
     .map_err(javascript_error)?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
@@ -379,7 +379,7 @@ pub fn rib_from_profile_buffer(request_json: &str) -> Result<WasmSolidBuffer, Js
         request.extrude_dir,
         request.plane_normal,
         request.extrusion,
-        request.name.as_deref(),
+        &request.names(),
     )
     .map_err(javascript_error)?;
     solid_buffer(&solid, "{}".into())

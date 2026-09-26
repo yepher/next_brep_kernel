@@ -53,24 +53,95 @@ pub fn mesh_to_faceted_brep(
     if positions.is_empty() || positions.len() % 3 != 0 {
         return Err("mesh_to_faceted_brep: positions must be xyz triples".into());
     }
-    let weld_tolerance = if tolerance > 0.0 && tolerance.is_finite() {
-        tolerance
-    } else {
-        let mut low = [f64::INFINITY; 3];
-        let mut high = [f64::NEG_INFINITY; 3];
-        for point in positions.chunks_exact(3) {
-            for axis in 0..3 {
-                low[axis] = low[axis].min(point[axis]);
-                high[axis] = high[axis].max(point[axis]);
-            }
-        }
-        let diagonal = (0..3)
-            .map(|axis| (high[axis] - low[axis]).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        (diagonal * 1e-6).max(1e-12)
-    };
+    let weld_tolerance = derived_weld_tolerance(positions, tolerance);
     triangle_soup_to_faceted_brep(positions, indices, weld_tolerance)
+}
+
+/// A non-positive request derives the weld distance from the bounding-box
+/// diagonal, so the mesh repair and anything rebuilt from its output share
+/// one vertex identity.
+fn derived_weld_tolerance(positions: &[f64], tolerance: f64) -> f64 {
+    if tolerance > 0.0 && tolerance.is_finite() {
+        return tolerance;
+    }
+    let mut low = [f64::INFINITY; 3];
+    let mut high = [f64::NEG_INFINITY; 3];
+    for point in positions.chunks_exact(3) {
+        for axis in 0..3 {
+            low[axis] = low[axis].min(point[axis]);
+            high[axis] = high[axis].max(point[axis]);
+        }
+    }
+    let diagonal = (0..3)
+        .map(|axis| (high[axis] - low[axis]).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    (diagonal * 1e-6).max(1e-12)
+}
+
+/// What [`repair_triangle_soup`] had to change to close the input.
+///
+/// Every count is of WELDED triangles, so a mesh whose only defect is
+/// duplicated vertices reports zeroes: welding alone made it a closed
+/// two-manifold.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MeshRepairReport {
+    /// Vertices after the weld.
+    pub welded_vertices: usize,
+    /// Triangles after the repair.
+    pub triangles: usize,
+    /// Welded triangles dropped as degenerate (two corners welded together)
+    /// or as a duplicate of a triangle already kept.
+    pub dropped_triangles: usize,
+    /// Surplus coincident sheets pruned at edges used by three or more
+    /// triangles.
+    pub pruned_triangles: usize,
+    /// Boundary cycles closed with a fan.
+    pub capped_loops: usize,
+    /// Triangles the caps added.
+    pub cap_triangles: usize,
+}
+
+impl MeshRepairReport {
+    /// Whether the repair changed the welded triangle set at all.
+    pub fn changed(&self) -> bool {
+        self.dropped_triangles != 0 || self.pruned_triangles != 0 || self.capped_loops != 0
+    }
+}
+
+/// The mesh half of [`mesh_to_faceted_brep`]: weld, drop degenerate and
+/// duplicate triangles, prune surplus sheets at non-manifold edges, and cap
+/// the remaining boundary cycles with a fan — returning the repaired triangle
+/// soup instead of a BREP.
+///
+/// This is what lets a defective mesh still reach the ANALYTIC import lanes.
+/// They all require a closed two-manifold, and the defect that costs a part
+/// every recognized cylinder is usually a handful of triangles far away from
+/// any of them; running them on this output instead of on the raw file keeps
+/// the surfaces a repairable mesh can still support. Pass `weld_tolerance`
+/// `<= 0` to derive it from the bounding-box diagonal. The result is not
+/// guaranteed closed — an input too broken to close comes back as whatever
+/// the repair could reach, and the caller must re-test it.
+pub fn repair_triangle_soup(
+    positions: &[f64],
+    indices: Option<&[u32]>,
+    weld_tolerance: f64,
+) -> Result<(Vec<f64>, Vec<u32>, MeshRepairReport), String> {
+    if positions.is_empty() || !positions.len().is_multiple_of(3) {
+        return Err("repair_triangle_soup: positions must be xyz triples".into());
+    }
+    let weld_tolerance = derived_weld_tolerance(positions, weld_tolerance);
+    let (points, triangles, report) = repair_soup(positions, indices, weld_tolerance)?;
+    let flat = points
+        .iter()
+        .flat_map(|point| [point.x, point.y, point.z])
+        .collect::<Vec<_>>();
+    let flat_indices = triangles
+        .iter()
+        .flatten()
+        .map(|&index| index as u32)
+        .collect::<Vec<_>>();
+    Ok((flat, flat_indices, report))
 }
 
 /// Shared weld → prune → cap → build pipeline. `indices` of `None` treats
@@ -81,6 +152,18 @@ fn triangle_soup_to_faceted_brep(
     indices: Option<&[u32]>,
     weld_tolerance: f64,
 ) -> Result<BrepSolid, String> {
+    let (points, triangles, _) = repair_soup(positions, indices, weld_tolerance)?;
+    build_faceted_brep(&points, &triangles)
+}
+
+/// The weld → dedup → prune → cap phase, shared by the BREP builder above and
+/// by the public [`repair_triangle_soup`].
+fn repair_soup(
+    positions: &[f64],
+    indices: Option<&[u32]>,
+    weld_tolerance: f64,
+) -> Result<(Vec<Vec3>, Vec<[usize; 3]>, MeshRepairReport), String> {
+    let mut report = MeshRepairReport::default();
     let mut points = Vec::<Vec3>::new();
     let mut buckets = HashMap::<[i64; 3], Vec<usize>>::default();
     let mut mesh_to_welded = Vec::with_capacity(positions.len() / 3);
@@ -115,12 +198,15 @@ fn triangle_soup_to_faceted_brep(
             mesh_to_welded[triangle[2] as usize],
         ];
         if value[0] == value[1] || value[1] == value[2] || value[2] == value[0] {
+            report.dropped_triangles += 1;
             continue;
         }
         let mut key = value;
         key.sort_unstable();
         if seen.insert(key) {
             triangles.push(value);
+        } else {
+            report.dropped_triangles += 1;
         }
     }
     if triangles.is_empty() {
@@ -161,6 +247,7 @@ fn triangle_soup_to_faceted_brep(
         if remove.is_empty() {
             break;
         }
+        report.pruned_triangles += remove.len();
         triangles = triangles
             .into_iter()
             .enumerate()
@@ -219,8 +306,17 @@ fn triangle_soup_to_faceted_brep(
             // Reverse the existing boundary direction on the new cap.
             triangles.push([second, first, center_index]);
         }
+        report.capped_loops += 1;
+        report.cap_triangles += loop_vertices.len();
     }
 
+    report.welded_vertices = points.len();
+    report.triangles = triangles.len();
+    Ok((points, triangles, report))
+}
+
+/// One planar face per repaired triangle, validated.
+fn build_faceted_brep(points: &[Vec3], triangles: &[[usize; 3]]) -> Result<BrepSolid, String> {
     let vertices = points
         .iter()
         .enumerate()
@@ -233,7 +329,7 @@ fn triangle_soup_to_faceted_brep(
     let mut edge_ids = HashMap::<(usize, usize), u64>::default();
     let mut faces = Vec::<FaceRecord>::new();
     let mut next_id = vertices.len() as u64 + 1;
-    for triangle in triangles {
+    for triangle in triangles.iter().copied() {
         let a = points[triangle[0]];
         let b = points[triangle[1]];
         let c = points[triangle[2]];
@@ -341,4 +437,3 @@ fn triangle_soup_to_faceted_brep(
     Ok(result)
 }
 
-// BREP private tests: 09be33c0d41cac3c

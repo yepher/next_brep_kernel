@@ -654,6 +654,7 @@ pub fn mesh_regions_to_brep(
             "mesh_regions_to_brep: rebuilt solid failed validation: {issues:?}"
         ));
     }
+    let _caller = crate::mass_caller("mesh.brep_builder");
     let volume = solid_signed_volume(&solid)?;
     if !(volume > 0.0) {
         return Err(format!(

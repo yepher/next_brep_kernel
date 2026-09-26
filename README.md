@@ -4,7 +4,7 @@
 
 A native/WASM B-rep geometry kernel for building CAD applications, written in
 Rust. Published on crates.io as **`BREP_kernel`** with library name
-`brep_kernel`; the manifest version is **0.5.0**, released 2026-09-11.
+`brep_kernel`; this is version **0.6.0**.
 It is the authoritative geometry engine behind the BREP CAD application
 (`BREP_app` + `BREP_render` in this repository, re-exported as `brep::kernel` by
 the umbrella `BREP` crate), and is usable standalone as a
@@ -181,36 +181,21 @@ The feature pipeline currently converts boolean refusals to an error string. STE
 through `import_step(&str) -> Result<Vec<BrepSolid>, String>` and
 `export_step`.
 
-## Build and test
+## Building
 
-Build and test (from the crate directory):
+The crate builds natively and for `wasm32-unknown-unknown`. The BREP CAD
+application links it as an rlib inside its own wasm bundle; `wasm-pack build
+--target web` on this crate produces a standalone kernel package with the
+`wasm-bindgen` exports.
 
-```sh
-../build.sh test         # private regression suite
-python3 ../BREP-dev-data/testing/run.py -- cargo bench --manifest-path BREP_kernel/Cargo.toml
-```
-
-The BREP CAD application links this crate as an rlib inside its own wasm
-bundle — build it with `./build.sh app` at the repository root. A standalone
-kernel wasm pkg (used by the step-validation review tool) is produced by
-`./build.sh kernel-wasm` (plain `wasm-pack` → `pkg-web/`).
-
-Note for publishing: the packaged crate ships only `src/`, this README, the
-license and the manifest — `include` in `Cargo.toml` is exactly that list. The
-test suites, fixtures, benches and fuzz corpora are not in this repository at
-all; they live in a private development submodule and are assembled over a
-public checkout by its own runner. So neither the packaged crate nor a public
-git checkout has a suite to run, and `cargo test` here is expected to find no
-tests. Maintainers with access run the gates through `./build.sh`.
+The packaged crate ships the library sources, this README, the licence and the
+manifest; it carries no test suite.
 
 ## License and links
 
-- License: the repository's Autodrop3d [`LICENSE.md`](LICENSE.md)
+- License: the Autodrop3d licence in `LICENSE.md`, shipped in the crate
   (`license-file` in the manifest).
-- Repository: <https://github.com/mmiscool/NURBS_BREP_kernel> — the kernel
-  lives in `BREP_kernel/`, alongside `BREP_gizmos/` (overlay widgets),
-  `BREP_render/` (the wgpu render/pick engine), and `BREP_app/` (the
-  application shell).
-- Manifest version: `BREP_kernel` 0.5.0. The publishing guide
-  `BREP-dev-data/reference/PUBLISHING.md` — in the private development
-  submodule — has the crate-family order and validation story.
+- The family: [`BREP_gizmos`](https://crates.io/crates/BREP_gizmos) (overlay
+  widgets), [`BREP_render`](https://crates.io/crates/BREP_render) (the wgpu
+  render/pick engine), [`BREP_app`](https://crates.io/crates/BREP_app) (the
+  application), and the umbrella [`BREP`](https://crates.io/crates/BREP).

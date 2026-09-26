@@ -56,6 +56,33 @@ pub fn offset_freeform_face(
         }
     }
 
+    // A push past the face's concave curvature radius folds its offset through
+    // the evolute however well that offset is FITTED, so the fit's own residual
+    // gate below cannot be what refuses it: it used to, only while the fit was
+    // coarse. This lane cannot carve, so ANY fold inside the face's own trim
+    // refuses — the trim-scoped scan the shell's collapse probe and `thicken`'s
+    // sheet gate read, at thicken's fold factor. `offset_surface(face, -d)` moves
+    // along the face's outward normal, which is `same_sense · (Su × Sv)`.
+    let displacement = if face.same_sense { distance } else { -distance };
+    let region = crate::offset_regularity::TrimRegion::from_face(face)?;
+    let scan = crate::offset_regularity::scan_offset_regularity(
+        &face.surface,
+        &region,
+        &[displacement],
+        crate::thicken::FOLD_FACTOR,
+        crate::offset_regularity::ScanBudget::SHEET,
+    )?;
+    if let Some(worst) = scan.worst.filter(|worst| worst.factor <= crate::thicken::FOLD_FACTOR) {
+        return Err(format!(
+            "offset_freeform_face: a push by {distance} folds the offset through the face's evolute \
+             — inside its trim the curvature radius {:.6} at (u={:.6}, v={:.6}) is not larger \
+             than the push (fold factor {:.3e}), and a push cannot carve the fold away",
+            worst.radius(),
+            worst.u,
+            worst.v,
+            worst.factor
+        ));
+    }
     let offset = crate::offset_surface(face, -distance, 0.0)?;
     // The residual gate asks the same question the evaluator answers: is the
     // FITTED surface still at `distance` along the pointwise offset's normal?
@@ -177,4 +204,3 @@ pub fn offset_freeform_face(
     )
 }
 
-// BREP private tests: 6ddbd92b0043d4e2

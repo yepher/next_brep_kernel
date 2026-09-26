@@ -32,20 +32,28 @@
 //! is one construction, not a composition of per-corner special cases.
 //! Configurations the lane does not construct refuse BY NAME: a smooth (G1)
 //! two-edge vertex, which is a chain and not a corner; mixed-convexity
-//! corners (their closure is a torus sector, not a sphere); re-entrant
+//! corners, where the convex stripe has no closure at all because it never
+//! reaches the vertex — it switches CARRIERS onto the concave stripes'
+//! surfaces and dies in a pole, measured in `runout.rs`; re-entrant
 //! miters (the blends wrap the concave edge instead of meeting in a seam);
 //! no-common-ball stars.  A CHAMFER reaches the lane too: its stripes are the
-//! same march with a chord section (`cross_section_basis`), and its STAR closes
-//! with the planar facet those chords bound (`build_chamfer_corner_facet`).
-//! Its other corners refuse by name, one message per vertex, and take the
-//! cutter composition.
+//! same march with a chord section (`cross_section_basis`), its STAR closes
+//! with the facet those chords bound (`build_chamfer_corner_facet`), its FLUSH
+//! join shares one chord where a fillet shares one arc, and its MITER trims the
+//! two bevels against each other along a seam marched on the chamfer's OWN
+//! level — the signed distance to the sibling's ruled bevel, because the
+//! sibling's rolling-ball CANAL is a surface a bevel is not (`bevel_level`).
+//! Only the re-entrant corner refuses by name and takes the cutter
+//! composition.
 
 use crate::topology::{BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, VertexRecord};
 use crate::{NurbsCurve, Vec3};
 
+use super::collapse::{check_collapse_closure, collapse_full_width};
 use super::corner::*;
 use super::edge::*;
 use super::miter::*;
+use super::restrict::{restrict_third_faces, StripeFaces};
 use super::stations::*;
 
 /// One selected edge, marched and fitted against the original solid.
@@ -55,6 +63,8 @@ struct Stripe<'a> {
     second: BlendMate<'a>,
     rows: FittedRows,
     name: Option<String>,
+    /// Which ends, start then finish, run out into a pole (`pole_end`).
+    poles: [bool; 2],
 }
 
 impl Stripe<'_> {
@@ -113,12 +123,17 @@ enum VertexKind<'a> {
     },
     /// A flush join: two selected edges meeting SMOOTHLY (G1).  The rolling
     /// ball is the same ball on the same (or tangent-continuous) faces on
-    /// both sides, so the two sections at the vertex coincide: both stripes
-    /// stop at their own vertex station and share ONE arc, with no patch.
-    /// When the two stripes' side faces differ (a planar wall running into a
-    /// cylindrical one), the seam between those faces is trimmed at the
-    /// shared side rim.
-    Flush,
+    /// both sides, so both stripes stop at ONE section and share ONE arc,
+    /// with no patch.
+    ///
+    /// On the same two faces that section is the vertex's own.  When the two
+    /// stripes' side faces differ (a planar wall running into a cylindrical
+    /// one, a cone side into the round on its rim), the ball changes carrier
+    /// where its side CONTACT crosses the seam between those faces, and that
+    /// is not the vertex section unless the seam happens to lie in the
+    /// vertex's normal plane: `join` is the ball seated on the seam
+    /// ([`solve_flush_seam_ball`]), and the seam is trimmed at its contact.
+    Flush { join: Option<FlushJoin> },
     /// A re-entrant corner: two selected CONVEX edges on a cap, meeting where
     /// the cap's perimeter turns inward (their third edge concave).  The two
     /// blends never meet in a seam — the ball rolls round the concave edge
@@ -137,7 +152,7 @@ enum VertexKind<'a> {
 /// INSIDE the edge, a tangency setback short of the vertex); the ladder is
 /// still needed for free ends, whose support crossings sit at or past the
 /// endpoint.
-const OVERSHOOTS: [f64; 4] = [0.08, 0.16, 0.28, 0.45];
+pub(super) const OVERSHOOTS: [f64; 4] = [0.08, 0.16, 0.28, 0.45];
 
 /// Unit tangent of `edge` at `vertex`, pointing AWAY from it.
 fn tangent_away_from(edge: &EdgeRecord, vertex: u64) -> Result<Vec3, String> {
@@ -146,15 +161,31 @@ fn tangent_away_from(edge: &EdgeRecord, vertex: u64) -> Result<Vec3, String> {
     } else {
         (edge.t1, -1.0)
     };
-    let derivatives = edge.curve.derivatives(t, 1)?;
-    derivatives[1].normalized().map(|tangent| tangent.scale(sign))
+    // At a vertex, where an involute flank's Hermite fit is stationary: read
+    // the one-sided limit from inside the edge.
+    edge.curve
+        .unit_tangent(t, edge.t0, edge.t1)
+        .map(|tangent| tangent.scale(sign))
+        .map_err(|error| format!("blend network: edge {}: {error}", edge.id))
+}
+
+/// Whether `edge` is STATIONARY at `vertex` — its first derivative there is too
+/// short to normalize, so [`tangent_away_from`] answered with the one-sided
+/// limit rather than the derivative. Reads the same parameter it does.
+fn stationary_at_vertex(edge: &EdgeRecord, vertex: u64) -> Result<bool, String> {
+    let t = if edge.start_vertex_id == vertex {
+        edge.t0
+    } else {
+        edge.t1
+    };
+    Ok(edge.curve.derivatives(t, 1)?[1].normalized().is_err())
 }
 
 /// The two mating faces of every selected edge, with the signed radius the
 /// march offsets each of them by.  Read off the ORIGINAL solid: `rho` is the
 /// side the rolling ball sits on, so it is the edge's convexity in the form
 /// the corner solve needs.
-fn stripe_mates<'a>(
+pub(super) fn stripe_mates<'a>(
     solid: &'a BrepSolid,
     edge_ids: &[u64],
     radius: f64,
@@ -236,10 +267,11 @@ pub(crate) struct MixedCorner {
 /// MIRROR — two or more concave edges meeting a convex one — has no closure
 /// here at all: the convex blend RUNS OUT against the concave beads partway
 /// along its edge, which is the vertex blend nothing in this kernel
-/// constructs (see `docs/developer/kernel-plans/fillet-stripe-network.md`).
-/// That boundary is empirical, one concave edge against two, not a rule
-/// derived from the balls' sides — the notch splits those the same way and is
-/// built.
+/// constructs. `runout.rs` measures what that run-out is — two carrier
+/// switches onto the concave stripes' own surfaces and a degenerate pole —
+/// and the refusal reports its stations. That boundary is empirical, one
+/// concave edge against two, not a rule derived from the balls' sides — the
+/// notch splits those the same way and is built.
 ///
 /// So `fillet_edges` reports that class as a TERMINAL refusal rather than
 /// retrying it on the cutter, whose answer for it is a shredded solid: sliver
@@ -297,6 +329,141 @@ pub(crate) fn mixed_convexity_corner(
             convex,
             concave,
         });
+    }
+    None
+}
+
+/// A selected edge with NO blend strip left on it: the corner balls seated at
+/// its two ends touch a mate face they share at the same point, or past each
+/// other, so the two corner setbacks consume the whole edge (every edge of a
+/// 20-cube at r = 10, where each face shrinks to a point and the answer is
+/// the r = 10 sphere).  `edge` is an index into the selection; `stops` are
+/// the two tangency points on `face_id`, start corner then end corner.
+pub(crate) struct DegenerateSetback {
+    pub(crate) edge: usize,
+    pub(crate) face_id: u64,
+    pub(crate) stops: [Vec3; 2],
+    pub(crate) strip: f64,
+    pub(crate) bar: f64,
+    /// True when the two setbacks run PAST each other along the edge (the
+    /// radius is beyond the limit), false when they meet within the bar.
+    pub(crate) crossed: bool,
+}
+
+/// The network refusal that must be TERMINAL for the whole selection rather
+/// than a fall-through: a star–star edge whose strip pinches out.
+///
+/// Inside the network the same condition is caught on the marched rows
+/// (`build_open_surgery`'s pinch check), but a refusal there falls through
+/// to the cutter composition and the maximal-valid-subset search, and
+/// neither can do better on a degenerate selection: on the r = 10 cube the
+/// search returned NINE walls over a 5174 volume against the sphere's 4189.
+/// So the condition is decided here, before anything is cut, from the corner
+/// balls alone — at a star every stripe stops exactly at the ball's tangency
+/// point on each of its mate faces, so the strip between two stars is the
+/// distance between their tangency points on the face the stripe shares
+/// with both, and no march is needed to measure it.  A miter's far station
+/// is the seam's exit, not a tangency, so only star–star edges are decided
+/// here; the in-network check keeps the rest.
+///
+/// `None` when nothing is degenerate OR when the balls cannot be seated at
+/// all — the network reports its own refusal for that.
+pub(crate) fn degenerate_corner_setbacks(
+    solid: &BrepSolid,
+    edge_ids: &[u64],
+    radius: f64,
+) -> Option<DegenerateSetback> {
+    let mates = stripe_mates(solid, edge_ids, radius).ok()?;
+    let scale = solid
+        .vertices
+        .iter()
+        .fold(0.0f64, |worst, vertex| worst.max(vertex.point.length()))
+        .max(1.0);
+    let bar = corner_station_bar(scale, radius);
+    // vertex id -> (face id, the ball's tangency point on it)
+    let mut stars: Vec<(u64, Vec<(u64, Vec3)>)> = Vec::new();
+    for (vertex_id, stripe_indices) in stripes_by_vertex(&mates) {
+        if stripe_indices.len() < 3 {
+            continue;
+        }
+        let point = solid
+            .vertices
+            .iter()
+            .find(|vertex| vertex.id == vertex_id)?
+            .point;
+        let mut faces: Vec<(&FaceRecord, f64)> = Vec::new();
+        let mut consistent = true;
+        for &index in &stripe_indices {
+            for mate in [&mates[index].1, &mates[index].2] {
+                match faces.iter().find(|(face, _)| face.id == mate.face.id) {
+                    Some((_, rho)) => {
+                        consistent &= (*rho - mate.rho).abs() <= 1e-9 * (1.0 + radius);
+                    }
+                    None => faces.push((mate.face, mate.rho)),
+                }
+            }
+        }
+        // Not a star (an unselected edge at the vertex) or mixed: not this
+        // check's question.
+        if !consistent || faces.len() != stripe_indices.len() {
+            continue;
+        }
+        let face_refs: Vec<&FaceRecord> = faces.iter().map(|(face, _)| *face).collect();
+        let rho_of = |id: u64| faces.iter().find(|(face, _)| face.id == id).map(|(_, rho)| *rho);
+        let Ok(prepared) = corner_faces(&face_refs, &rho_of, point) else {
+            continue;
+        };
+        let Ok(ball) = solve_corner_ball(&prepared, scale) else {
+            continue;
+        };
+        if ball.residual > 1e-7 * (1.0 + scale) {
+            continue;
+        }
+        stars.push((
+            vertex_id,
+            ball.contacts
+                .iter()
+                .map(|contact| (contact.face_id, contact.point))
+                .collect(),
+        ));
+    }
+    let tangency = |vertex: u64, face_id: u64| -> Option<Vec3> {
+        stars
+            .iter()
+            .find(|(id, _)| *id == vertex)?
+            .1
+            .iter()
+            .find(|(id, _)| *id == face_id)
+            .map(|(_, point)| *point)
+    };
+    for (index, (edge, first, second)) in mates.iter().enumerate() {
+        if edge.start_vertex_id == edge.end_vertex_id {
+            continue;
+        }
+        let chord = vertex_point_of(solid, edge.end_vertex_id)
+            .ok()?
+            .sub(vertex_point_of(solid, edge.start_vertex_id).ok()?);
+        for mate in [first, second] {
+            let (Some(from), Some(to)) = (
+                tangency(edge.start_vertex_id, mate.face.id),
+                tangency(edge.end_vertex_id, mate.face.id),
+            ) else {
+                continue;
+            };
+            let span = to.sub(from);
+            let strip = span.length();
+            let crossed = strip > bar && span.dot(chord) < 0.0;
+            if strip <= bar || crossed {
+                return Some(DegenerateSetback {
+                    edge: index,
+                    face_id: mate.face.id,
+                    stops: [from, to],
+                    strip,
+                    bar,
+                    crossed,
+                });
+            }
+        }
     }
     None
 }
@@ -384,7 +551,8 @@ pub(crate) fn blend_star_network(
             let tangent_a = tangent_away_from(mates[a].0, *vertex_id)?;
             let tangent_b = tangent_away_from(mates[b].0, *vertex_id)?;
             if tangent_a.dot(tangent_b) <= -(1.0 - 1e-6) {
-                corners.push((*vertex_id, stripe_indices.clone(), VertexKind::Flush));
+                let join = flush_join(solid, &mates[a], &mates[b], *vertex_id, point, scale)?;
+                corners.push((*vertex_id, stripe_indices.clone(), VertexKind::Flush { join }));
                 continue;
             }
             if faces.len() != 3 {
@@ -522,7 +690,17 @@ pub(crate) fn blend_star_network(
                         },
                         1e-6,
                     )?;
-                    if class != crate::PolygonClass::Inside {
+                    // ON the boundary is not beyond it.  The ball of a miter
+                    // whose radius is the side face's own width touches that
+                    // face at its far corner: the two blends consume the shared
+                    // face and both side faces whole at the corner (10-cube,
+                    // two top edges, r = d = 10).  That is the ordinary miter
+                    // with its shared-face rails collapsed to a point, which
+                    // the surgery and `collapse_full_width` build; a contact
+                    // BEYOND the boundary is the re-entrant class below.
+                    if class != crate::PolygonClass::Inside
+                        && class != crate::PolygonClass::Boundary
+                    {
                         return Err(format!(
                             "blend network: vertex {vertex_id} is re-entrant — the ball \
                              touches face {} beyond its edge, so the two blends do not meet \
@@ -592,45 +770,99 @@ pub(crate) fn blend_star_network(
         corners.push((*vertex_id, stripe_indices.clone(), kind));
     }
 
-    // §6.11 closes a chamfered corner differently from a filleted one, and only
-    // the STAR is built here so far: its stripes stop at the ball and their end
-    // CHORDS bound a planar facet. The others are still the cutter
-    // composition's, and each says which one it is rather than the whole
-    // selection failing under one message.
-    if chamfer {
-        for (vertex_id, _, kind) in &corners {
-            let unbuilt = match kind {
-                VertexKind::Star { .. } => None,
-                VertexKind::Miter { .. } => Some(
-                    "a chamfer's two-edge corner is the mutual trim of the two bevels, and                      the seam march solves for the sibling's rolling-ball canal, which a                      bevel is not",
-                ),
-                VertexKind::Flush => Some(
-                    "a chamfer's smooth (G1) two-edge join has no fitted section to share yet",
-                ),
-                VertexKind::Reentrant { .. } => Some(
-                    "a chamfer's re-entrant corner has no horn-torus sector to sweep",
-                ),
-            };
-            if let Some(reason) = unbuilt {
-                return Err(format!(
-                    "blend network: vertex {vertex_id} — {reason} (§6.11)"
-                ));
-            }
-        }
-    }
+    // §6.11 closes a chamfered corner differently from a filleted one, and
+    // EVERY kind is built here now: a star's stripes stop at the ball and
+    // their end CHORDS bound the facet they bound; a miter's two bevels trim
+    // each other along the seam `solve_miter` marches on the chamfer's own
+    // level; a flush join shares one chord where a fillet shares one arc; and
+    // a re-entrant corner revolves that chord about the concave edge into a
+    // CONE where a fillet's ball envelope gives the horn torus.  No chamfer
+    // corner reaches the cutter composition any more.
 
     // ---- 4. March and fit every stripe, against the ORIGINAL solid. ----
     let radius_at = |_: f64| radius;
     let mut stripes: Vec<Stripe> = Vec::with_capacity(mates.len());
     for (index, (edge, first, second)) in mates.iter().enumerate() {
-        let mut chosen: Option<FittedRows> = None;
+        // Where the rows are broken: at each vertex, or — at a flush join
+        // across a seam — at the seam ball, the section where this stripe's
+        // side contact leaves its carrier (`march_open_stations_ending`).
+        let mut ends = [edge.t0, edge.t1];
+        for (slot, vertex) in [edge.start_vertex_id, edge.end_vertex_id].into_iter().enumerate() {
+            if let Some((_, _, VertexKind::Flush { join: Some(join) })) =
+                corners.iter().find(|(id, _, _)| *id == vertex)
+            {
+                ends[slot] = section_parameter_through(edge, join.center, ends[slot], scale)
+                    .map_err(|error| {
+                        format!(
+                            "blend network: edge {}'s section through the flush join's ball at \
+                             vertex {vertex}: {error}",
+                            edge.id
+                        )
+                    })?;
+            }
+        }
+        // The open march climbs when its FITTED RAILS do not stand on the
+        // carriers they are tangent to, read between the stations they were
+        // fitted through (`rails_off_carriers`).  Measured, not estimated: a
+        // sagitta rule over the same stripes drove the lobe to 229 stations and
+        // cost this document 49.6%, because a curvature estimate cannot see
+        // that a stripe is already exact.  Here the five straight stripes of
+        // the notched cap read 7e-15 on rung zero and never climb, and only the
+        // two genuinely curved, genuinely fitted ones pay.
+        //
+        // The bar is HALF `intersection_fit`, and the halving is the only new
+        // number here.  `intersection_fit` is the right family -- it is
+        // literally "maximum geometric error accepted while fitting", the same
+        // quantity step 2 holds a marched seam to -- but its VALUE was set for
+        // an SSI curve, whose consumer is a trim.  A blend rail's consumer is a
+        // FACE, whose area enters the solid's volume, and the measured transfer
+        // on a filleted part is about tenfold: on the notched cap 2026-09-16 a
+        // rail 1.419e-6 off its cylinder puts the solid 1.618e-5 off its closed
+        // form.  So a rail sitting exactly at `intersection_fit` (2e-6 here)
+        // leaves that row twice outside its own 1e-5 band, and the bar has to
+        // be tighter than the contract it comes from.
+        //
+        // Measured across the bar, notched cap (delta against the closed form,
+        // and the whole document's replay, best of three alternating):
+        //
+        //   bar             delta        cap      revolve_test  bore mouth
+        //   2e-6 = fit     -1.618e-5     +0%          +0%           +0%     RED
+        //   1e-6 = fit/2   +3.128e-6     +5%         +22%           +0%
+        //   2e-7 = 2*model -7.897e-7    +55%         +73%          +16%
+        //   1e-7 = model   -1.126e-6   +150%
+        //
+        // The two tighter bars buy no accuracy the band can see and cost what
+        // this project rejects, so the ladder stops at fit/2.
+        // A free end whose two mates run tangent into it is a POLE: the
+        // section shrinks to the vertex, the march stops there instead of
+        // overshooting, and the end is closed by that point (step 6).  The
+        // test is a positive identification: a vertex whose offsets cannot be
+        // read (no regular normal in reach) is not called a pole, and keeps
+        // the free end's own construction and refusals.
+        let mut poles = [false, false];
+        for (slot, vertex) in [edge.start_vertex_id, edge.end_vertex_id].into_iter().enumerate() {
+            if corners.iter().any(|(id, _, _)| *id == vertex) {
+                continue;
+            }
+            poles[slot] =
+                pole_end(edge, first, second, slot == 0, corner_station_bar(scale, radius))
+                    .unwrap_or(false);
+        }
+        let rail_bar = 0.5 * crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
+        let mut chosen: Option<(FittedRows, Vec<f64>)> = None;
         let mut last_error: Option<String> = None;
+        let mut station_count = super::stations::STATIONS;
+        let rows = loop {
+        chosen = None;
         for &overshoot in &OVERSHOOTS {
-            match march_open_stations(edge, first, second, &radius_at, overshoot) {
+            match march_open_stations_ending(
+                edge, first, second, &radius_at, overshoot, ends, station_count, poles,
+            ) {
                 Ok((stations, vertex_indices)) => {
                     let parameters = station_parameters(&stations);
                     let at_vertices = vertex_stations(&parameters, vertex_indices);
-                    match fit_open_rows(&stations, &parameters, chamfer) {
+                    let extrusion = extrusion_direction(edge, first, second);
+                    match fit_open_rows(&stations, &parameters, chamfer, Some(vertex_indices), extrusion) {
                         Ok(mut rows) => {
                             rows.vertex_stations = at_vertices;
                             let settled = [
@@ -638,7 +870,12 @@ pub(crate) fn blend_star_network(
                                 (edge.end_vertex_id, false),
                             ]
                             .into_iter()
-                            .all(|(vertex, at_start)| {
+                            .enumerate()
+                            .all(|(slot, (vertex, at_start))| {
+                                // A pole's station is the vertex itself.
+                                if poles[slot] {
+                                    return true;
+                                }
                                 if let Some((_, _, kind)) =
                                     corners.iter().find(|(id, _, _)| *id == vertex)
                                 {
@@ -658,7 +895,7 @@ pub(crate) fn blend_star_network(
                                 )
                             });
                             if chosen.is_none() || settled {
-                                chosen = Some(rows);
+                                chosen = Some((rows, parameters.clone()));
                             }
                             if settled {
                                 break;
@@ -670,11 +907,28 @@ pub(crate) fn blend_star_network(
                 Err(error) => last_error = Some(error),
             }
         }
-        let rows = chosen.ok_or_else(|| {
-            last_error.unwrap_or_else(|| {
+        let Some((rows, parameters)) = chosen.take() else {
+            return Err(last_error.unwrap_or_else(|| {
                 format!("blend network: the march failed on edge {}", edge.id)
-            })
-        })?;
+            }));
+        };
+        let off = rails_off_carriers(
+            &rows,
+            &parameters,
+            [&first.face.surface, &second.face.surface],
+        )?;
+        if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+            eprintln!(
+                "open march: edge {} at {station_count} stations, rails {off:.3e} off their \
+                 carriers (bar {rail_bar:.3e})",
+                edge.id
+            );
+        }
+        if !(off > rail_bar) || station_count >= super::stations::MAX_OPEN_STATIONS {
+            break rows;
+        }
+        station_count *= 2;
+        };
         stripes.push(Stripe {
             edge,
             first: BlendMate {
@@ -691,6 +945,7 @@ pub(crate) fn blend_star_network(
             },
             rows,
             name: edge_names.get(index).cloned().flatten(),
+            poles,
         });
     }
 
@@ -754,10 +1009,13 @@ pub(crate) fn blend_star_network(
         (0..stripes.len()).map(|_| [None, None]).collect();
     let mut patches: Vec<PendingPatch> = Vec::new();
     let mut pending_miters: Vec<PendingMiter> = Vec::new();
+    // Whether a full-width miter consumed a sharp edge whole (see
+    // `collapse_full_width`).
+    let mut consumed_sharp_edge = false;
     for (vertex_id, stripe_indices, kind) in &corners {
         match kind {
             // Planned below, once every star and miter is in.
-            VertexKind::Reentrant { .. } | VertexKind::Flush => continue,
+            VertexKind::Reentrant { .. } | VertexKind::Flush { .. } => continue,
             VertexKind::Star { corner } => {
                 let mut arcs: Vec<EdgeRecord> = Vec::with_capacity(stripe_indices.len());
                 let mut normals: Vec<Vec3> = Vec::with_capacity(stripe_indices.len());
@@ -865,25 +1123,46 @@ pub(crate) fn blend_star_network(
                     })
                 };
                 let described = [describe(ia)?, describe(ib)?];
-                let closure = solve_miter([&described[0], &described[1]], radius, sharp, scale)?;
+                let fit_tolerance = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
+                let closure = solve_miter(
+                    [&described[0], &described[1]],
+                    radius,
+                    chamfer,
+                    sharp,
+                    scale,
+                    fit_tolerance,
+                )?;
                 if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
                     let seam = match &closure {
                         MiterClosure::Symmetric { seam, .. } => seam,
                         MiterClosure::Asymmetric { seam, .. } => seam,
                     };
-                    let center_b = stripes[ib].rows.center.as_ref();
-                    let center_a = stripes[ia].rows.center.as_ref();
+                    // The seam must ride BOTH walls: for a fillet that is the
+                    // two canals, for a chamfer the two bevels — the same two
+                    // surfaces their levels are written against.
                     let mut worst = 0.0f64;
                     for point in &seam.points {
-                        for center in [center_a, center_b].into_iter().flatten() {
-                            let d = crate::project_point_to_curve(center, *point)
-                                .map(|p| (p.distance - radius).abs())
-                                .unwrap_or(f64::NAN);
+                        for index in [ia, ib] {
+                            let rows = &stripes[index].rows;
+                            let d = if chamfer {
+                                crate::project_point_to_surface(&rows.surface, *point)
+                                    .map(|p| p.distance)
+                                    .unwrap_or(f64::NAN)
+                            } else {
+                                rows.center
+                                    .as_ref()
+                                    .and_then(|center| {
+                                        crate::project_point_to_curve(center, *point).ok()
+                                    })
+                                    .map(|p| (p.distance - radius).abs())
+                                    .unwrap_or(f64::NAN)
+                            };
                             worst = worst.max(d);
                         }
                     }
+                    let what = if chamfer { "off both bevels" } else { "|dist-to-centre - r|" };
                     eprintln!(
-                        "network seam at vertex {vertex_id}: {} samples, worst |dist-to-centre - r| {worst:.3e}",
+                        "network seam at vertex {vertex_id}: {} samples, worst {what} {worst:.3e}",
                         seam.points.len()
                     );
                 }
@@ -961,15 +1240,35 @@ pub(crate) fn blend_star_network(
                     }))
                 };
                 let slot_of = |index: usize| usize::from(!stripes[index].at_start(*vertex_id));
+                // Where the closure lands on the sharp edge.  At full width it
+                // lands on the sharp edge's FAR vertex (the side faces are
+                // consumed down to it), and that vertex is the point, not a
+                // fresh one beside it: the sharp edge is then consumed whole
+                // rather than trimmed to nothing (`consume_sharp_edge`).
+                let far_vertex = if sharp.start_vertex_id == *vertex_id {
+                    sharp.end_vertex_id
+                } else {
+                    sharp.start_vertex_id
+                };
+                let far_point = vertex_point_of(solid, far_vertex)?;
+                let band = consumed_band(solid);
+                let commit_on_sharp =
+                    |result: &mut BrepSolid, take_id: &mut dyn FnMut() -> u64, point: Vec3| {
+                        if point.sub(far_point).length() <= band {
+                            far_vertex
+                        } else {
+                            commit_vertex(result, take_id, point)
+                        }
+                    };
                 match closure {
                     MiterClosure::Symmetric {
-                        seam,
+                        seam_fit: (curve, on_a, on_b),
                         exit,
                         sharp_parameter,
+                        ..
                     } => {
                         let q_point = sharp.curve.evaluate(sharp_parameter)?;
-                        let q_vertex = commit_vertex(&mut result, &mut take_id, q_point);
-                        let (curve, on_a, on_b) = fit_marched(&seam)?;
+                        let q_vertex = commit_on_sharp(&mut result, &mut take_id, q_point);
                         let seam_id =
                             commit_curve(&mut result, &mut take_id, curve, p_vertex, q_vertex)?;
                         end_plans[ia][slot_of(ia)] =
@@ -986,11 +1285,13 @@ pub(crate) fn blend_star_network(
                     }
                     MiterClosure::Asymmetric {
                         seam,
+                        seam_fit: (seam_curve, seam_on_a, seam_on_b),
                         leader,
                         exit_leader,
-                        connector,
+                        connector_fit: (connector_curve, on_follower, on_face),
                         exit_follower,
                         sharp_parameter,
+                        ..
                     } => {
                         let (leader_index, follower_index) = if leader == 0 {
                             (ia, ib)
@@ -1000,8 +1301,7 @@ pub(crate) fn blend_star_network(
                         let exit_point = *seam.points.last().ok_or("miter: empty seam")?;
                         let x_vertex = commit_vertex(&mut result, &mut take_id, exit_point);
                         let q_point = sharp.curve.evaluate(sharp_parameter)?;
-                        let q_vertex = commit_vertex(&mut result, &mut take_id, q_point);
-                        let (seam_curve, seam_on_a, seam_on_b) = fit_marched(&seam)?;
+                        let q_vertex = commit_on_sharp(&mut result, &mut take_id, q_point);
                         let seam_id = commit_curve(
                             &mut result,
                             &mut take_id,
@@ -1009,7 +1309,6 @@ pub(crate) fn blend_star_network(
                             p_vertex,
                             x_vertex,
                         )?;
-                        let (connector_curve, on_follower, on_face) = fit_marched(&connector)?;
                         let connector_id = commit_curve(
                             &mut result,
                             &mut take_id,
@@ -1136,13 +1435,18 @@ pub(crate) fn blend_star_network(
             // there) must contain the axis, and its centre must sit one
             // radius from the pole, perpendicular to the axis.
             let stripe = &stripes[*index];
-            let direction = stripe
+            let centre_path = stripe
                 .rows
                 .center
                 .as_ref()
-                .ok_or("blend network: stripe rows carry no centre path")?
-                .derivatives(*u_stop, 1)?[1]
-                .normalized()?;
+                .ok_or("blend network: stripe rows carry no centre path")?;
+            let [c0, c1] = centre_path.domain()?;
+            let direction = centre_path.unit_tangent(*u_stop, c0, c1).map_err(|error| {
+                format!(
+                    "blend network: edge {}'s centre path at u = {u_stop}: {error}",
+                    stripe.edge.id
+                )
+            })?;
             let radial = center.sub(pole);
             if direction.dot(axis).abs() > 1e-6
                 || (radial.length() - radius).abs() > 1e-6 * (1.0 + radius)
@@ -1193,7 +1497,15 @@ pub(crate) fn blend_star_network(
             } else {
                 (second_point, first_point, second_vertex, first_vertex)
             };
-            let arc = corner_section_arc(*center, radius, from, to)?;
+            // §6.11: a chamfer's section at the stop is the CHORD between
+            // the ball's two contacts, exactly as at a star — and here one of
+            // those contacts is the POLE, the single point where the ball
+            // touches the concave edge.
+            let arc = if chamfer {
+                crate::make_line(from, to)?
+            } else {
+                corner_section_arc(*center, radius, from, to)?
+            };
             let arc_domain = arc.domain()?;
             let arc_edge_id = take_id();
             let record = EdgeRecord {
@@ -1239,18 +1551,84 @@ pub(crate) fn blend_star_network(
     // the same ball on both sides, and share one arc.
     struct PendingFlush {
         vertex: u64,
-        /// The seam edge between the two stripes' differing side faces, if
-        /// any, to trim at the shared side rim: (edge id, parameter, rim).
-        seam_trim: Option<(u64, f64, u64)>,
+        /// The seam edges between the two stripes' differing side faces, to
+        /// trim at the rims on them: (edge id, parameter, rim).
+        seam_trims: Vec<(u64, f64, u64)>,
     }
     let mut pending_flush: Vec<PendingFlush> = Vec::new();
     for (vertex_id, stripe_indices, kind) in &corners {
-        let VertexKind::Flush = kind else {
+        let VertexKind::Flush { join } = kind else {
             continue;
         };
         let [ia, ib] = [stripe_indices[0], stripe_indices[1]];
         let section = |index: usize| -> Result<(f64, Vec3, Vec3, Vec3), String> {
             let stripe = &stripes[index];
+            if let Some(join) = join {
+                // Across a seam: the stripe stops where its rails pass the
+                // seam ball's contacts, and the section IS that ball's, so
+                // both stripes carry the same points to the bar below.  The
+                // station is read on a rail whose contact sits on a seam —
+                // where that rail changes carrier — and the other rail must
+                // pass its own contact there.
+                let contact = |face_id: u64| {
+                    join.contact_on(face_id).ok_or_else(|| {
+                        format!(
+                            "blend network: the flush join at vertex {vertex_id} has no contact \
+                             on edge {}'s face {face_id}",
+                            stripe.edge.id
+                        )
+                    })
+                };
+                let (first_contact, second_contact) =
+                    (contact(stripe.first.face.id)?, contact(stripe.second.face.id)?);
+                let seam_first = first_contact.seam.is_some();
+                let (lead_face, lead_row, lead, other_face, other_row, other) = if seam_first {
+                    (
+                        stripe.first.face.id,
+                        &stripe.rows.cr,
+                        first_contact,
+                        stripe.second.face.id,
+                        &stripe.rows.cs,
+                        second_contact,
+                    )
+                } else {
+                    (
+                        stripe.second.face.id,
+                        &stripe.rows.cs,
+                        second_contact,
+                        stripe.first.face.id,
+                        &stripe.rows.cr,
+                        first_contact,
+                    )
+                };
+                let station_bar = corner_station_bar(scale, radius);
+                let station = rail_station(lead_row, lead.point, station_bar).map_err(
+                    |reason| match reason {
+                        RailMiss::OffRail(distance) => format!(
+                            "blend network: edge {}'s contact rail on face {lead_face} misses \
+                             the flush join's seam contact at vertex {vertex_id} by \
+                             {distance:.3e}",
+                            stripe.edge.id
+                        ),
+                        RailMiss::OffSpan(station) => format!(
+                            "blend network: the flush join station for edge {} lands at \
+                             {station:.6}, outside the marched rows",
+                            stripe.edge.id
+                        ),
+                        RailMiss::Projection(error) => error,
+                    },
+                )?;
+                let other_miss = other_row.evaluate(station)?.sub(other.point).length();
+                if other_miss > station_bar {
+                    return Err(format!(
+                        "blend network: edge {}'s contact rail on face {other_face} misses the \
+                         flush join's contact at vertex {vertex_id} by {other_miss:.3e} at the \
+                         station its seam contact is on",
+                        stripe.edge.id
+                    ));
+                }
+                return Ok((station, first_contact.point, second_contact.point, join.center));
+            }
             let at_start = stripe.at_start(*vertex_id);
             let station = stripe
                 .rows
@@ -1330,7 +1708,16 @@ pub(crate) fn blend_star_network(
         } else {
             (cs_a, cr_a, rim_second, rim_first)
         };
-        let arc = corner_section_arc(center_a, radius, from, to)?;
+        // §6.11: the shared section is the one both stripes stop at, and a
+        // chamfer's is the CHORD between the two rims a fillet arcs between.
+        // Nothing else about a flush join depends on its shape — the two
+        // stripes' agreement was already measured on the ball's centre and on
+        // the rim points themselves, which are the chord's own ends.
+        let arc = if chamfer {
+            crate::make_line(from, to)?
+        } else {
+            corner_section_arc(center_a, radius, from, to)?
+        };
         let arc_domain = arc.domain()?;
         let arc_edge_id = take_id();
         result.edges.push(EdgeRecord {
@@ -1388,64 +1775,24 @@ pub(crate) fn blend_star_network(
                  shared section the same way — inconsistent orientation"
             ));
         }
-        // If the side faces differ, the seam between them passes through the
-        // vertex and must be trimmed at the shared side rim.
-        let mut seam_trim = None;
-        for (side_a, rim, rim_point) in [
-            (stripe_a.first.face.id, rim_first, cr_a),
-            (stripe_a.second.face.id, rim_second, cs_a),
-        ] {
-            let b_face = if b_first_matches_a_first {
-                if side_a == stripe_a.first.face.id { stripe_b.first.face.id } else { stripe_b.second.face.id }
-            } else if side_a == stripe_a.first.face.id {
-                stripe_b.second.face.id
-            } else {
-                stripe_b.first.face.id
-            };
-            if b_face == side_a {
-                continue;
-            }
-            // The seam: the edge at the vertex bordering both differing faces,
-            // other than the two selected edges.
-            let seam = solid.edges.iter().find(|edge| {
-                (edge.start_vertex_id == *vertex_id || edge.end_vertex_id == *vertex_id)
-                    && edge.id != stripe_a.edge.id
-                    && edge.id != stripe_b.edge.id
-                    && [side_a, b_face].iter().all(|face_id| {
-                        solid
-                            .shells
-                            .iter()
-                            .flat_map(|shell| &shell.faces)
-                            .filter(|face| face.id == *face_id)
-                            .flat_map(|face| &face.loops)
-                            .flat_map(|l| &l.coedges)
-                            .any(|c| c.edge_id == edge.id)
-                    })
-            });
-            let Some(seam) = seam else {
-                return Err(format!(
-                    "blend network: the side faces at the smooth vertex {vertex_id} differ \
-                     but share no seam edge there"
-                ));
-            };
-            let on_seam = crate::project_point_to_curve(&seam.curve, rim_point)?;
-            if on_seam.distance > bar {
-                return Err(format!(
-                    "blend network: the shared side rim at the smooth vertex {vertex_id} is \
-                     {:.3e} off the seam between the side faces",
-                    on_seam.distance
-                ));
-            }
-            if seam_trim.is_some() {
-                return Err(format!(
-                    "blend network: both side pairs differ at the smooth vertex {vertex_id}"
-                ));
-            }
-            seam_trim = Some((seam.id, on_seam.u, rim));
-        }
+        // Where the side faces differ, each seam between them runs from the
+        // vertex through the ball's contact on it, and is trimmed there.
+        let seam_trims = join
+            .iter()
+            .flat_map(|join| &join.contacts)
+            .filter_map(|contact| {
+                let (seam_id, parameter) = contact.seam?;
+                let rim = if contact.faces.contains(&stripe_a.first.face.id) {
+                    rim_first
+                } else {
+                    rim_second
+                };
+                Some((seam_id, parameter, rim))
+            })
+            .collect();
         pending_flush.push(PendingFlush {
             vertex: *vertex_id,
-            seam_trim,
+            seam_trims,
         });
     }
 
@@ -1464,6 +1811,17 @@ pub(crate) fn blend_star_network(
             if end_plans[index][slot].is_some() {
                 continue;
             }
+            if stripe.poles[slot] {
+                end_plans[index][slot] = Some(EndPlan::Corner(plan_pole_end(
+                    solid,
+                    &mut result,
+                    &mut take_id,
+                    stripe,
+                    vertex,
+                    at_start,
+                )?));
+                continue;
+            }
             match resolve_free_end(
                 solid,
                 stripe.edge.id,
@@ -1480,21 +1838,35 @@ pub(crate) fn blend_star_network(
                 Err(free_error) => {
                     // A boundary that continues the edge smoothly has no
                     // transverse crossing: cap the stripe at its own section.
-                    let continues = [stripe.first.face, stripe.second.face]
+                    let continuing = [stripe.first.face, stripe.second.face]
                         .iter()
-                        .any(|face| {
-                            boundary_edge_at_vertex(solid, face, vertex, stripe.edge.id)
-                                .ok()
-                                .and_then(|id| solid.edges.iter().find(|e| e.id == id))
-                                .and_then(|boundary| {
-                                    let own = tangent_away_from(stripe.edge, vertex).ok()?;
-                                    let other = tangent_away_from(boundary, vertex).ok()?;
-                                    Some(own.dot(other) <= -(1.0 - 1e-6))
-                                })
-                                .unwrap_or(false)
+                        .find_map(|face| {
+                            let id = boundary_edge_at_vertex(solid, face, vertex, stripe.edge.id)
+                                .ok()?;
+                            let boundary = solid.edges.iter().find(|e| e.id == id)?;
+                            let own = tangent_away_from(stripe.edge, vertex).ok()?;
+                            let other = tangent_away_from(boundary, vertex).ok()?;
+                            (own.dot(other) <= -(1.0 - 1e-6)).then_some(boundary)
                         });
-                    if !continues {
+                    let Some(boundary) = continuing else {
                         return Err(free_error);
+                    };
+                    // Before the tangent reads took the one-sided limit, a
+                    // stationary edge here read as "does not continue" and
+                    // refused with `free_error`. The limit now says it does
+                    // continue, but no fixture has shown a stripe capped
+                    // through a stationary join to be the right body, so the
+                    // direction is read and the cap is not built.
+                    if stationary_at_vertex(stripe.edge, vertex)?
+                        || stationary_at_vertex(boundary, vertex)?
+                    {
+                        return Err(format!(
+                            "blend network: edge {} continues smoothly into edge {} at vertex \
+                             {vertex} only by the one-sided limit of a stationary tangent (a \
+                             first derivative that vanishes at the vertex); a stripe capped \
+                             through a stationary join is not verified, so it is not built",
+                            stripe.edge.id, boundary.id
+                        ));
                     }
                     let plan = plan_cap_end(
                         solid,
@@ -1525,13 +1897,51 @@ pub(crate) fn blend_star_network(
         // fillet is wide and its blend strip pinches out — a configuration
         // this lane names rather than builds (pinch splitting is not
         // implemented).
-        for (start, finish, which) in [
-            (start_plan.cr_parameter(), finish_plan.cr_parameter(), "first"),
-            (start_plan.cs_parameter(), finish_plan.cs_parameter(), "second"),
+        //
+        // "Some rail" is a LENGTH, measured on the rail itself, and the bar
+        // is the one the corner stations were accepted under
+        // (`corner_station_bar`): two stops closer than that are the same
+        // point by this lane's own standard, and two stops farther apart
+        // bound a strip the surgery splits like any other.  It used to be
+        // read in ROW PARAMETER against `RIM_MARGIN`, which is the margin a
+        // single station needs from the row's END, not a strip width — and
+        // 2e-3 of a row is 0.04 on a 20-long edge, so every strip narrower
+        // than that (all twelve edges of a 20-cube at r ≥ 9.99, a strip of
+        // 0.02) was refused as a pinch and fell through to the cutter
+        // composition, which returned a validating solid with half the
+        // part's volume again.  The row's parameter is not a length.
+        //
+        // A strip within `consumed_band` of nothing is the FULL-WIDTH corner:
+        // the two stops are one point, the surgery builds no rail there, and
+        // `collapse_full_width` identifies the rims and drops what lost its
+        // area.  Any wider strip is kept as a face — it is at least a sliver
+        // wide, the same rule the consumed width follows — and only stops that
+        // CROSS by more than the band are a pinch.  The bar used to be the
+        // corner station's own (1.8e-5 on a 10-cube), which sent every strip
+        // under it to the cutter composition; at 1e-5 short of full width that
+        // built a collapsed 5F/8E/5V miter 8.0e-4 off its closed form.
+        let band = consumed_band(solid);
+        for (row, start, finish, which) in [
+            (
+                &stripe.rows.cr,
+                start_plan.cr_parameter(),
+                finish_plan.cr_parameter(),
+                "first",
+            ),
+            (
+                &stripe.rows.cs,
+                start_plan.cs_parameter(),
+                finish_plan.cs_parameter(),
+                "second",
+            ),
         ] {
-            if finish - start <= RIM_MARGIN {
+            let strip = row.evaluate(finish)?.sub(row.evaluate(start)?).length();
+            if finish <= start && strip > band {
                 return Err(format!(
-                    "blend network: edge {} is shorter than the two corner setbacks that meet                      on it (its {which} rail would run from {start:.4} to {finish:.4}); the                      blend strip pinches out and pinch splitting is not implemented",
+                    "blend network: edge {} is shorter than the two corner setbacks that meet \
+                     on it (its {which} rail would run from {start:.6} to {finish:.6}, stops \
+                     {strip:.3e} past each other against a band of {band:.3e}); the blend strip \
+                     pinches out and pinch splitting is not implemented",
                     stripe.edge.id
                 ));
             }
@@ -1589,7 +1999,27 @@ pub(crate) fn blend_star_network(
     }
     for miter in pending_miters {
         // The sharp edge loses its corner end: it now starts at the seam's
-        // exit on it, on both faces it borders.
+        // exit on it, on both faces it borders — or, where the exit IS its far
+        // vertex, it is gone.
+        let consumed_whole = result
+            .edges
+            .iter()
+            .find(|edge| edge.id == miter.sharp_edge)
+            .is_some_and(|edge| {
+                edge.start_vertex_id == miter.sharp_vertex || edge.end_vertex_id == miter.sharp_vertex
+            });
+        if consumed_whole {
+            if miter.connector.is_some() {
+                return Err(format!(
+                    "{RAIL_COLLAPSE_UNSUPPORTED} the asymmetric miter at vertex {} closes on its \
+                     sharp edge's far vertex, which leaves its connector nothing to meet",
+                    miter.vertex
+                ));
+            }
+            consume_sharp_edge(&mut result, miter.sharp_edge);
+            consumed_sharp_edge = true;
+            continue;
+        }
         trim_edge_at(
             &mut result,
             miter.sharp_edge,
@@ -1608,7 +2038,14 @@ pub(crate) fn blend_star_network(
             sewn[leader_index].cr_edge_id
         } else {
             sewn[leader_index].cs_edge_id
-        };
+        }
+        .ok_or_else(|| {
+            format!(
+                "{RAIL_COLLAPSE_UNSUPPORTED} the miter connector at vertex {} runs from a leader \
+                 rail that collapsed to a point",
+                miter.vertex
+            )
+        })?;
         let coedge_id = take_id();
         let face = result
             .shells
@@ -1699,16 +2136,21 @@ pub(crate) fn blend_star_network(
         });
         // Splice it into the cap's loop between the two cap rails.
         let cap_forward_on_cap: bool;
-        let rail_a = if stripes[index_a].first.face.id == horn.cap_face {
-            sewn[index_a].cr_edge_id
-        } else {
-            sewn[index_a].cs_edge_id
+        let horn_rail = |index: usize| {
+            if stripes[index].first.face.id == horn.cap_face {
+                sewn[index].cr_edge_id
+            } else {
+                sewn[index].cs_edge_id
+            }
+            .ok_or_else(|| {
+                format!(
+                    "{RAIL_COLLAPSE_UNSUPPORTED} a cap rail at the re-entrant vertex {} collapsed \
+                     to a point",
+                    horn.vertex
+                )
+            })
         };
-        let rail_b = if stripes[index_b].first.face.id == horn.cap_face {
-            sewn[index_b].cr_edge_id
-        } else {
-            sewn[index_b].cs_edge_id
-        };
+        let (rail_a, rail_b) = (horn_rail(index_a)?, horn_rail(index_b)?);
         {
             let cap_face = result
                 .shells
@@ -1782,7 +2224,19 @@ pub(crate) fn blend_star_network(
         } else {
             horn.axis.scale(-1.0)
         };
-        let generatrix = corner_section_arc(center_a, radius, horn.pole, cap_point_a)?;
+        // The generatrix IS the stripe's end section, so the closure follows
+        // the section's shape: a fillet revolves the ball's ARC and gets the
+        // horn torus; a chamfer revolves the CHORD and gets a CONE, apex at
+        // the pole. The pole is the same point at every pivot angle — it is
+        // where the ball touches the concave edge — so the chord has one end
+        // pinned to the axis, and sweeping that is a cone by construction.
+        // `make_revolution` already takes a generatrix meeting the axis: the
+        // horn torus is degenerate at the pole in exactly the same way.
+        let generatrix = if chamfer {
+            crate::make_line(horn.pole, cap_point_a)?
+        } else {
+            corner_section_arc(center_a, radius, horn.pole, cap_point_a)?
+        };
         let surface = crate::make_revolution(horn.pole, revolve_axis, &generatrix, sweep)?;
         // Sanity: the far meridian lands on the second stripe's cap point.
         let far = surface.evaluate(1.0, 1.0)?;
@@ -1906,20 +2360,56 @@ pub(crate) fn blend_star_network(
         result.shells[shell_index].faces.push(face);
     }
     for flush in pending_flush {
-        if let Some((seam_id, parameter, rim)) = flush.seam_trim {
+        for (seam_id, parameter, rim) in flush.seam_trims {
             trim_edge_at(&mut result, seam_id, parameter, flush.vertex, rim)?;
         }
     }
     for cap in pending_caps {
         sew_cap(&mut result, &mut take_id, cap)?;
     }
+    // Full-width corners: every collapsed rail's rims are one vertex, and the
+    // faces that identification leaves without area go.  The passes below see
+    // the collapsed body, so a mate or a rail that went is left out of them
+    // exactly as a consumed one is.
+    let identified: Vec<(u64, u64)> =
+        sewn.iter().flat_map(|stripe| stripe.identified.iter().copied()).collect();
+    let collapse = collapse_full_width(
+        solid,
+        &mut result,
+        &identified,
+        consumed_sharp_edge,
+        consumed_band(solid),
+    )?;
+    let face_exists = |result: &BrepSolid, id: u64| {
+        result.shells.iter().flat_map(|shell| &shell.faces).any(|face| face.id == id)
+    };
+    for stripe in &mut sewn {
+        stripe.cr_edge_id = stripe.cr_edge_id.map(|id| collapse.edge(id));
+        stripe.cs_edge_id = stripe.cs_edge_id.map(|id| collapse.edge(id));
+    }
+    for (index, stripe) in stripes.iter().enumerate() {
+        for (side, face) in [stripe.first.face.id, stripe.second.face.id].into_iter().enumerate() {
+            sewn[index].consumed[side] |= !face_exists(&result, face);
+        }
+    }
     // A rail that wrapped a PERIODIC mate crosses that carrier's seam
     // meridian; split it there and trim the seam edge the blend just ate the
     // end of, so the carrier keeps its seam-in-one-loop structure.
+    //
+    // A mate the stripe CONSUMED whole is gone, and its rail is the existing
+    // edge the blend was sewn onto: there is no carrier left to split and no
+    // rail this operation built, so both are left out.  The face across that
+    // edge keeps the loop it had, which already closed.
     let mut rail_faces: Vec<(u64, u64)> = Vec::with_capacity(sewn.len() * 2);
     for (index, stripe) in stripes.iter().enumerate() {
-        rail_faces.push((stripe.first.face.id, sewn[index].cr_edge_id));
-        rail_faces.push((stripe.second.face.id, sewn[index].cs_edge_id));
+        for (side, face, rail) in [
+            (0, stripe.first.face.id, sewn[index].cr_edge_id),
+            (1, stripe.second.face.id, sewn[index].cs_edge_id),
+        ] {
+            if let (false, Some(rail)) = (sewn[index].consumed[side], rail) {
+                rail_faces.push((face, rail));
+            }
+        }
     }
     let rail_edges: Vec<u64> = rail_faces.iter().map(|(_, rail)| *rail).collect();
     let mut seam_faces: Vec<u64> = rail_faces.iter().map(|(face, _)| *face).collect();
@@ -1935,8 +2425,118 @@ pub(crate) fn blend_star_network(
             apply_carrier_seam_split(&mut result, &mut take_id, plan)?;
         }
     }
+    // ---- 8. Restrict every stripe against the THIRD faces it crosses. ----
+    //         The surgery above re-trimmed each stripe's two MATES and nothing
+    //         else, which is complete only while the swept volume touches
+    //         nothing but them.  Where a third face crosses it, the stripe is
+    //         trimmed against that face directly here — rails located from the
+    //         blend face's own loop, because the seam split above may already
+    //         have replaced the ids `sewn` recorded.  A crossing this lane does
+    //         not construct refuses BY NAME, and the group falls to the cutter
+    //         exactly as it did before (`fillet-stripe-network.md`, item 1).
+    // A stripe whose blend face collapsed (a full-width star's bevel) swept
+    // no area, so nothing can cross it.
+    let stripe_faces: Vec<StripeFaces> = stripes
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| face_exists(&result, sewn[*index].blend_face_id))
+        .map(|(index, stripe)| {
+            Ok(StripeFaces {
+                blend_face: sewn[index].blend_face_id,
+                mates: [stripe.first.face.id, stripe.second.face.id],
+                consumed: sewn[index].consumed,
+                convex: edge_is_convex(stripe.edge, &stripe.first, &stripe.second)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if std::env::var("BREP_NO_THIRD_FACE_TRIM").is_err() {
+        let policy = crate::KernelTolerances::for_solid(solid, 1e-7);
+        restrict_third_faces(&mut result, &mut take_id, &stripe_faces, &policy)?;
+    }
+
     prune_orphan_vertices(&mut result);
+    if !collapse.merged_edges.is_empty() {
+        let blend_faces: Vec<u64> = sewn.iter().map(|stripe| stripe.blend_face_id).collect();
+        result = absorb_cosurface_halves(result, &collapse.merged_edges, &blend_faces)?;
+    }
+    let snap = sewn.iter().fold(0.0f64, |worst, stripe| worst.max(stripe.snap));
+    check_snap_closure(solid, &result, snap)?;
+    if collapse.changed() {
+        check_collapse_closure(solid, &result)?;
+    }
     crossings.gate(result)
+}
+
+/// Where a collapse merged the rails of two blends that ride ONE carrier —
+/// the front and back rounds of a full-width channel are the two halves of one
+/// cylinder, meeting along the top face's collapsed slit — make them one face,
+/// and join the section arcs split at that rail's ends.  The merge is the
+/// boolean's own same-carrier merge at its model tolerance
+/// (`absorb_faces_into_carriers`, as the cutter scaffold settles its caps),
+/// which moves no boundary; a merge its checks refuse leaves the two halves
+/// standing, which is a valid body.  The absorbed half's name goes with it.
+fn absorb_cosurface_halves(
+    result: BrepSolid,
+    merged_edges: &[(u64, u64)],
+    blend_faces: &[u64],
+) -> Result<BrepSolid, String> {
+    let tolerance =
+        crate::KernelTolerances::for_solid(&result, crate::BooleanOptions::default().tolerance)
+            .model;
+    let mut absorbed = rustc_hash::FxHashSet::default();
+    let mut rail_ends = rustc_hash::FxHashSet::default();
+    for &(_, kept) in merged_edges {
+        let faces: Vec<&FaceRecord> = result
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .filter(|face| {
+                face.loops
+                    .iter()
+                    .flat_map(|loop_record| &loop_record.coedges)
+                    .any(|coedge| coedge.edge_id == kept)
+            })
+            .collect();
+        let [first, second] = faces[..] else {
+            continue;
+        };
+        if !(blend_faces.contains(&first.id) && blend_faces.contains(&second.id)) {
+            continue;
+        }
+        if !crate::face_merge::faces_are_cosurface(first, second, tolerance)
+            .map_err(|refusal| refusal.to_string())?
+        {
+            continue;
+        }
+        absorbed.insert(first.id.max(second.id));
+        if let Some(edge) = result.edges.iter().find(|edge| edge.id == kept) {
+            rail_ends.insert(edge.start_vertex_id);
+            rail_ends.insert(edge.end_vertex_id);
+        }
+    }
+    if absorbed.is_empty() {
+        return Ok(result);
+    }
+    let Ok(merged) = crate::face_merge::absorb_faces_into_carriers(&result, tolerance, &absorbed)
+    else {
+        return Ok(result);
+    };
+    Ok(match crate::coalesce::merge_curve_continuation_edges_at(&merged, tolerance, &rail_ends) {
+        Ok(joined) if joined.validate().is_empty() => joined,
+        _ => merged,
+    })
+}
+
+/// Delete a sharp edge a full-width miter consumed whole: the seam closed on
+/// its far vertex, so both faces it bordered lose it (and, consumed to their
+/// far edges, collapse with it in `collapse_full_width`).
+fn consume_sharp_edge(result: &mut BrepSolid, edge_id: u64) {
+    for face in result.shells.iter_mut().flat_map(|shell| &mut shell.faces) {
+        for loop_record in &mut face.loops {
+            loop_record.coedges.retain(|coedge| coedge.edge_id != edge_id);
+        }
+    }
+    result.edges.retain(|edge| edge.id != edge_id);
 }
 
 /// A cap's bulkhead, waiting for the stripes to be in so its arc and legs
@@ -2322,8 +2922,17 @@ fn corner_rails_reach(
         // A miter only reads the tangency on the SHARED face; its other rim
         // vertices come from the seam.
         VertexKind::Miter { corner, shared, .. } => on(corner, shared.id),
+        // A flush join across a seam stops where the rails pass the seam
+        // ball's two contacts, which can sit past the vertex — beyond the
+        // edge's own span on the stripe whose carrier the ball leaves.
+        VertexKind::Flush { join: Some(join) } => [first.face.id, second.face.id]
+            .into_iter()
+            .all(|face_id| {
+                join.contact_on(face_id)
+                    .is_some_and(|contact| reaches(face_id, contact.point))
+            }),
         // Their own lanes decide where these stop.
-        VertexKind::Reentrant { .. } | VertexKind::Flush => true,
+        VertexKind::Reentrant { .. } | VertexKind::Flush { join: None } => true,
     }
 }
 
@@ -2340,7 +2949,10 @@ fn sharp_edge_is_convex(
     let _ = solid;
     let t = (sharp.t0 + sharp.t1) * 0.5;
     let point = sharp.curve.evaluate(t)?;
-    let tangent = sharp.curve.derivatives(t, 1)?[1].normalized()?;
+    let tangent = sharp
+        .curve
+        .unit_tangent(t, sharp.t0, sharp.t1)
+        .map_err(|error| format!("blend network: sharp edge {}: {error}", sharp.id))?;
     let probe = (radius * 0.25).max(1e-4);
     let into_a = crate::fillet::into_face_direction(wall_a, point, tangent, point, tangent, probe)?;
     let into_b = crate::fillet::into_face_direction(wall_b, point, tangent, point, tangent, probe)?;
@@ -2387,6 +2999,476 @@ fn corner_section_arc(
         return Err("blend network: the corner section arc is degenerate".into());
     }
     crate::make_arc(center, x_axis, y_axis, radius, 0.0, sweep)
+}
+
+/// Close a stripe end that runs out into a POLE (`pole_end`): the march
+/// stopped on the vertex itself, where both rails arrive at the one point the
+/// section has shrunk to, so the end is that vertex — kept, not rebuilt — and
+/// the blend face's loop closes across it on a DEGENERATE edge, the way a
+/// revolution closes on its pole.  Nothing on either mate is trimmed: each
+/// rail simply replaces the blended edge up to the vertex, where the mates'
+/// own boundaries still meet.
+fn plan_pole_end(
+    solid: &BrepSolid,
+    result: &mut BrepSolid,
+    take_id: &mut dyn FnMut() -> u64,
+    stripe: &Stripe,
+    vertex: u64,
+    at_start: bool,
+) -> Result<CornerEnd, String> {
+    let point = solid
+        .vertices
+        .iter()
+        .find(|candidate| candidate.id == vertex)
+        .ok_or_else(|| format!("blend network: pole vertex {vertex} missing"))?
+        .point;
+    let station = stripe
+        .rows
+        .vertex_stations
+        .ok_or("blend network: stripe rows carry no vertex stations")?
+        [usize::from(!at_start)];
+    let [low, high] = stripe.rows.cr.domain()?;
+    if station != if at_start { low } else { high } {
+        return Err(format!(
+            "blend network: edge {}'s pole station {station:.6} is not the end of its rows",
+            stripe.edge.id
+        ));
+    }
+    // Both rails must arrive AT the vertex: the rows were marched onto it,
+    // so anything past the station bar is a march that did not.
+    let bar = corner_station_bar(
+        solid
+            .vertices
+            .iter()
+            .fold(0.0f64, |worst, candidate| worst.max(candidate.point.length()))
+            .max(1.0),
+        stripe.first.rho.abs(),
+    );
+    for (row, which) in [(&stripe.rows.cr, "first"), (&stripe.rows.cs, "second")] {
+        let miss = row.evaluate(station)?.sub(point).length();
+        if miss > bar {
+            return Err(format!(
+                "blend network: edge {}'s {which} rail ends {miss:.3e} off its pole vertex                  {vertex}",
+                stripe.edge.id
+            ));
+        }
+    }
+    let pole_edge_id = take_id();
+    result.edges.push(EdgeRecord {
+        id: pole_edge_id,
+        curve: crate::make_line(point, point)?,
+        t0: 0.0,
+        t1: 1.0,
+        start_vertex_id: vertex,
+        end_vertex_id: vertex,
+        degenerate: true,
+        name: None,
+    });
+    let arc_blend_pcurve = if stripe.walk_first_to_second(at_start) {
+        crate::sweep_topology::parameter_line(station, 0.0, station, 1.0)?
+    } else {
+        crate::sweep_topology::parameter_line(station, 1.0, station, 0.0)?
+    };
+    Ok(CornerEnd {
+        cr_parameter: station,
+        cs_parameter: station,
+        first_vertex: vertex,
+        second_vertex: vertex,
+        arc_edge_id: pole_edge_id,
+        arc_blend_pcurve,
+    })
+}
+
+/// One of the two contacts of a flush join's ball, and what it lies on.
+struct FlushContact {
+    /// The faces the contact lies on: the one face both stripes run along, or
+    /// the two faces of the seam it sits on (one carrier of each stripe).
+    faces: Vec<u64>,
+    point: Vec3,
+    /// The seam the contact sits on and its parameter there, when the
+    /// stripes' carriers change across one: the point where the rolling ball
+    /// changes carrier, and where the seam is trimmed.
+    seam: Option<(u64, f64)>,
+}
+
+/// The ball a flush join seats where its two stripes' carriers change.
+struct FlushJoin {
+    center: Vec3,
+    contacts: [FlushContact; 2],
+}
+
+impl FlushJoin {
+    /// The ball's contact on `face_id`, a carrier of one of the stripes.
+    fn contact_on(&self, face_id: u64) -> Option<&FlushContact> {
+        self.contacts.iter().find(|contact| contact.faces.contains(&face_id))
+    }
+}
+
+/// What a flush join at `vertex_id` stops on: nothing but the vertex section
+/// when the two stripes run along the same two faces, else the ball seated on
+/// the seam between the side faces that differ — or, when NEITHER face carries
+/// over, on both seams at once.
+///
+/// # Why not the vertex section
+///
+/// The vertex section is where the two EDGES meet; the ball changes carrier
+/// where its CONTACT crosses the seam, and the two coincide only when the seam
+/// lies in the vertex's normal plane (a stadium cap's straight wall running
+/// into its round, the seam a ruling straight down the wall). A seam that
+/// crosses the edge obliquely — a wall standing across a cone whose rim is
+/// rounded, the seams being circles — puts the carrier switch past the vertex
+/// on one stripe or the other, and the two vertex sections are different balls
+/// on carriers that are only G1 there: measured on the 2026-09-15 report
+/// (r = 0.1 against an r = 2.5 round), 1.1e-5 apart where the cone meets the
+/// round and 3.5e-4 where the round meets the top, which is the ruled
+/// continuation's departure `½·d²·κ` over the 0.0425 the plane stripe's contact
+/// sits beyond the round's rim. Each stripe's own rail then runs off its face
+/// into the other's, and the loops come back crossing themselves.
+///
+/// # When both carriers change
+///
+/// A straight edge running on into the crease two rounds leave where they
+/// meet (a box edge beside a corner whose other two edges are filleted) hands
+/// its ball over on BOTH sides: each plane runs tangent into its own round
+/// across its own seam. The ball changes carrier where each contact crosses
+/// its seam, and those two crossings are one section only when one ball
+/// touches both seams — which the symmetric corner does, both seams being
+/// the rounds' tangent rails in the vertex's normal plane. It is solved as
+/// the single-seam ball on the first seam and then REQUIRED to touch the
+/// second: a ball whose other contact misses its seam crosses the two at
+/// different sections, and between them the ball rolls on one face of each
+/// pair, a stretch no edge carries and this join does not build.
+fn flush_join(
+    solid: &BrepSolid,
+    a: &(&EdgeRecord, BlendMate, BlendMate),
+    b: &(&EdgeRecord, BlendMate, BlendMate),
+    vertex_id: u64,
+    vertex_point: Vec3,
+    scale: f64,
+) -> Result<Option<FlushJoin>, String> {
+    let shared: Vec<&BlendMate> = [&a.1, &a.2]
+        .into_iter()
+        .filter(|mate| [&b.1, &b.2].iter().any(|other| other.face.id == mate.face.id))
+        .collect();
+    if shared.len() == 2 {
+        return Ok(None);
+    }
+    let bounds = |face_id: u64, edge_id: u64| {
+        solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .filter(|face| face.id == face_id)
+            .flat_map(|face| &face.loops)
+            .flat_map(|loop_record| &loop_record.coedges)
+            .any(|coedge| coedge.edge_id == edge_id)
+    };
+    // A seam: an edge at the vertex bordering one carrier of each stripe,
+    // other than the two selected edges.
+    let seam_between = |face_a: u64, face_b: u64| {
+        solid.edges.iter().find(|edge| {
+            (edge.start_vertex_id == vertex_id || edge.end_vertex_id == vertex_id)
+                && edge.id != a.0.id
+                && edge.id != b.0.id
+                && bounds(face_a, edge.id)
+                && bounds(face_b, edge.id)
+        })
+    };
+    // Seated on stripe a's carrier; stripe b's must seat the SAME ball at the
+    // seam contact, which is what "the side faces are tangent across the
+    // seam" means. A seam with a crease would put b's ball elsewhere, and
+    // there is no flush join.
+    let bar = corner_station_bar(scale, a.1.rho.abs());
+    let across = |mate: &BlendMate, seam_point: Vec3, center: Vec3| -> Result<(), String> {
+        let on = crate::project_point_to_surface(&mate.face.surface, seam_point)?;
+        let seated = blend_offset(&mate.face.surface).at(on.u, on.v, mate.rho)?.point;
+        let apart = seated.sub(center).length();
+        if on.distance > bar || apart > bar {
+            return Err(format!(
+                "blend network: the side faces at the smooth vertex {vertex_id} are not tangent \
+                 across their seam — the two blends seat balls {apart:.3e} apart on it \
+                 ({:.3e} off face {}) — not a flush join",
+                on.distance, mate.face.id
+            ));
+        }
+        Ok(())
+    };
+    if let [shared] = shared.as_slice() {
+        let side_of = |first: &BlendMate<'_>, second: &BlendMate<'_>| -> (u64, f64) {
+            if first.face.id == shared.face.id {
+                (second.face.id, second.rho)
+            } else {
+                (first.face.id, first.rho)
+            }
+        };
+        let ((side_a_id, rho_a), (side_b_id, _)) = (side_of(&a.1, &a.2), side_of(&b.1, &b.2));
+        let side_a = if a.1.face.id == side_a_id { a.1.face } else { a.2.face };
+        let side_b = if b.1.face.id == side_b_id { &b.1 } else { &b.2 };
+        let seam = seam_between(side_a.id, side_b.face.id).ok_or_else(|| {
+            format!(
+                "blend network: the side faces at the smooth vertex {vertex_id} differ but \
+                 share no seam edge there"
+            )
+        })?;
+        let ball = solve_flush_seam_ball(
+            shared.face,
+            shared.rho,
+            side_a,
+            rho_a,
+            seam,
+            vertex_id,
+            vertex_point,
+            scale,
+        )?;
+        across(side_b, ball.seam_point, ball.center)?;
+        return Ok(Some(FlushJoin {
+            center: ball.center,
+            contacts: [
+                FlushContact {
+                    faces: vec![shared.face.id],
+                    point: ball.shared_point,
+                    seam: None,
+                },
+                FlushContact {
+                    faces: vec![side_a.id, side_b.face.id],
+                    point: ball.seam_point,
+                    seam: Some((seam.id, ball.seam_parameter)),
+                },
+            ],
+        }));
+    }
+    // Neither carrier carries over: pair each of a's carriers with the one of
+    // b's across a seam at the vertex.
+    let pair = |mate: &BlendMate| {
+        [&b.1, &b.2]
+            .into_iter()
+            .find_map(|other| seam_between(mate.face.id, other.face.id).map(|seam| (other, seam)))
+    };
+    let (Some((b_first, seam_first)), Some((b_second, seam_second))) = (pair(&a.1), pair(&a.2))
+    else {
+        return Err(format!(
+            "blend network: both side pairs differ at the smooth vertex {vertex_id}, and not \
+             each carrier runs into the other blend's across a seam there"
+        ));
+    };
+    if b_first.face.id == b_second.face.id || seam_first.id == seam_second.id {
+        return Err(format!(
+            "blend network: both side pairs differ at the smooth vertex {vertex_id}, and both \
+             carriers run into one face of the other blend"
+        ));
+    }
+    // The first switch: the ball touching a's second carrier and its first ON
+    // the first seam — the single-seam ball.
+    let ball = solve_flush_seam_ball(
+        a.2.face,
+        a.2.rho,
+        a.1.face,
+        a.1.rho,
+        seam_first,
+        vertex_id,
+        vertex_point,
+        scale,
+    )?;
+    // The second switch must be the same ball: its contact on a's second
+    // carrier sits ON the second seam, strictly inside it.
+    let on_second = crate::project_point_to_curve(&seam_second.curve, ball.shared_point)?;
+    let span = seam_second.t1 - seam_second.t0;
+    let fraction = (on_second.u - seam_second.t0) / span;
+    if on_second.distance > bar {
+        return Err(format!(
+            "blend network: both carriers change at the smooth vertex {vertex_id}, and the ball \
+             crosses their seams at different sections — seated on seam edge {}, its contact on \
+             face {} stands {:.3e} off seam edge {} — so between the two switches it rolls on \
+             one face of each pair, which this join does not build",
+            seam_first.id, a.2.face.id, on_second.distance, seam_second.id
+        ));
+    }
+    if !(fraction > 1e-9 && fraction < 1.0 - 1e-9) {
+        return Err(format!(
+            "blend network: the flush join's ball at the smooth vertex {vertex_id} touches seam \
+             edge {} at fraction {fraction:.6}, off the edge itself",
+            seam_second.id
+        ));
+    }
+    across(b_first, ball.seam_point, ball.center)?;
+    across(b_second, on_second.point, ball.center)?;
+    Ok(Some(FlushJoin {
+        center: ball.center,
+        contacts: [
+            FlushContact {
+                faces: vec![a.1.face.id, b_first.face.id],
+                point: ball.seam_point,
+                seam: Some((seam_first.id, ball.seam_parameter)),
+            },
+            FlushContact {
+                faces: vec![a.2.face.id, b_second.face.id],
+                point: on_second.point,
+                seam: Some((seam_second.id, on_second.u)),
+            },
+        ],
+    }))
+}
+
+/// The parameter of `edge`'s (extended) curve whose normal plane holds
+/// `point` — the march's section plane through a known ball centre — by
+/// Newton from `seed`.
+fn section_parameter_through(
+    edge: &EdgeRecord,
+    point: Vec3,
+    seed: f64,
+    scale: f64,
+) -> Result<f64, String> {
+    let mut t = seed;
+    let tolerance = 1e-11 * (1.0 + scale);
+    for _ in 0..NEWTON_ITERATIONS {
+        let derivatives = edge.curve.derivatives_extended(t, 2)?;
+        let offset = point.sub(derivatives[0]);
+        let speed = derivatives[1].length();
+        if !(speed > 0.0) {
+            return Err("the edge has a stationary tangent there".into());
+        }
+        let plane = offset.dot(derivatives[1]) / speed;
+        if plane.abs() <= tolerance {
+            return Ok(t);
+        }
+        let slope = offset.dot(derivatives[2]) - derivatives[1].dot(derivatives[1]);
+        if !(slope.abs() > 0.0) {
+            return Err("the section Newton is singular".into());
+        }
+        t -= offset.dot(derivatives[1]) / slope;
+    }
+    Err("the section Newton did not converge".into())
+}
+
+/// A ball seated by [`solve_flush_seam_ball`]: its centre, its contact on the
+/// shared carrier, and its contact on the seam with the seam's parameter
+/// there.
+struct SeamBall {
+    center: Vec3,
+    shared_point: Vec3,
+    seam_parameter: f64,
+    seam_point: Vec3,
+}
+
+/// Seat the radius-`|rho_shared|` ball touching `shared` and touching `side`
+/// ON the seam edge, by Newton on (the seam's pcurve parameter on `side`, the
+/// shared face's (u, v)): the side carrier's offset from the seam point must
+/// land on the shared carrier's offset — the station solve's own equation
+/// (`tangency_state`) with the section plane replaced by the seam.
+///
+/// The seam is walked through its PCURVE on the side face, so every contact
+/// is a point of the side carrier and the residual is smooth; a projection
+/// inside the loop stalls at its own stopping bar, above this one.  The curve
+/// (the side offset along the seam) meets the surface (the shared offset)
+/// transversally whenever the seam leaves the shared face, so the root is
+/// isolated; seeded at the vertex, it is one radius away.
+#[allow(clippy::too_many_arguments)]
+fn solve_flush_seam_ball(
+    shared: &FaceRecord,
+    rho_shared: f64,
+    side: &FaceRecord,
+    rho_side: f64,
+    seam: &EdgeRecord,
+    vertex_id: u64,
+    vertex_point: Vec3,
+    scale: f64,
+) -> Result<SeamBall, String> {
+    const ITERATIONS: usize = 40;
+    let coedge = side
+        .loops
+        .iter()
+        .flat_map(|loop_record| &loop_record.coedges)
+        .find(|coedge| coedge.edge_id == seam.id)
+        .ok_or_else(|| {
+            format!("blend network: the seam edge {} is not on face {}", seam.id, side.id)
+        })?;
+    // The pcurve parameter at the vertex, running with the coedge's walk.
+    let [q0, q1] = coedge.pcurve.domain()?;
+    let at_start_of_edge = seam.start_vertex_id == vertex_id;
+    let from_vertex = if at_start_of_edge == coedge.forward { q0 } else { q1 };
+    let on_shared = crate::project_point_to_surface(&shared.surface, vertex_point)?;
+    let mut x = [from_vertex, on_shared.u, on_shared.v];
+    // (residual, centre, side contact, shared contact)
+    let state = |x: &[f64; 3]| -> Result<([f64; 3], Vec3, Vec3, Vec3), String> {
+        let uv = coedge.pcurve.evaluate(x[0])?;
+        let side_offset = blend_offset(&side.surface).at(uv.x, uv.y, rho_side)?;
+        let shared_offset = blend_offset(&shared.surface).at(x[1], x[2], rho_shared)?;
+        let mismatch = side_offset.point.sub(shared_offset.point);
+        Ok((
+            [mismatch.x, mismatch.y, mismatch.z],
+            shared_offset.point,
+            side_offset.source,
+            shared_offset.source,
+        ))
+    };
+    let tolerance = 1e-11 * (1.0 + scale);
+    for _ in 0..ITERATIONS {
+        let (residual, center, side_point, shared_point) = state(&x)?;
+        if residual.iter().fold(0.0f64, |worst, value| worst.max(value.abs())) <= tolerance {
+            let fraction = (x[0] - q0) / (q1 - q0);
+            if !(fraction > 1e-9 && fraction < 1.0 - 1e-9) {
+                return Err(format!(
+                    "blend network: the flush join's ball at the smooth vertex {vertex_id} \
+                     touches the seam's carrier at fraction {fraction:.6}, off the seam edge \
+                     {} itself",
+                    seam.id
+                ));
+            }
+            if vertex_point.sub(center).length() < rho_shared.abs() * (1.0 - 1e-6) {
+                return Err(format!(
+                    "blend network: the flush join's ball at the smooth vertex {vertex_id} \
+                     swallows the vertex — wrong branch"
+                ));
+            }
+            // The seam is trimmed at the contact, so the rim vertex is the
+            // edge's own point there, and the pcurve must agree with it.
+            let on_seam = crate::project_point_to_curve(&seam.curve, side_point)?;
+            let bar = corner_station_bar(scale, rho_shared.abs());
+            if on_seam.distance > bar {
+                return Err(format!(
+                    "blend network: the seam edge {}'s pcurve on face {} runs {:.3e} off the \
+                     edge at the flush join's contact (smooth vertex {vertex_id})",
+                    seam.id, side.id, on_seam.distance
+                ));
+            }
+            return Ok(SeamBall {
+                center,
+                shared_point,
+                seam_parameter: on_seam.u,
+                seam_point: on_seam.point,
+            });
+        }
+        let step = 1e-7;
+        let mut jacobian = [[0.0f64; 3]; 3];
+        for column in 0..3 {
+            let mut probe = x;
+            // The pcurve parameter starts at an END of its domain; probe inward.
+            let signed = if column == 0 && x[0] + step > q0.max(q1) {
+                -step
+            } else {
+                step
+            };
+            probe[column] += signed;
+            let (probed, ..) = state(&probe)?;
+            for row in 0..3 {
+                jacobian[row][column] = (probed[row] - residual[row]) / signed;
+            }
+        }
+        let delta = crate::fit::solve_small::<3>(jacobian, residual, 3).map_err(|error| {
+            format!(
+                "blend network: the flush join's seam ball at the smooth vertex {vertex_id} is \
+                 singular ({error})"
+            )
+        })?;
+        for (value, correction) in x.iter_mut().zip(delta) {
+            *value -= correction;
+        }
+        x[0] = x[0].clamp(q0.min(q1), q0.max(q1));
+    }
+    Err(format!(
+        "blend network: the flush join's seam ball at the smooth vertex {vertex_id} did not \
+         converge"
+    ))
 }
 
 /// One planned split of a blend rail on a PERIODIC mate's seam meridian.

@@ -22,7 +22,7 @@
 //! The record rides on the FINAL, stamped name, so it is captured by
 //! `io/snapshot.rs` into the native IMPORT3D payload and restored with the
 //! geometry — an imported colour survives save/reload and the parts library for
-//! free (`docs/developer/kernel-plans/step-assembly-import.md` §3.8).
+//! free.
 //!
 //! **Precedence.** A face colour is stamped on the FACE name; a body colour on
 //! the BODY name only. A body colour is never fanned out onto its faces: the
@@ -107,4 +107,3 @@ impl BodyAppearance {
     }
 }
 
-// BREP private tests: a1fa8d400a8e2883

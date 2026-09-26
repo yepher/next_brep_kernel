@@ -15,7 +15,13 @@
 //! - **SELF-HEAL:** an unreadable/corrupt snapshot (or a DIRTY entry — the
 //!   `refresh_library_entry` / edit-in-context signal) re-executes the entry's
 //!   embedded `document` in isolation, REWRITES the snapshot, then proceeds as
-//!   FAST. The history cache re-runs this feature when the entry's content
+//!   FAST.
+//! - **STALE:** a snapshot made by a different kernel build (its
+//!   `snapshotProducer` stamp differs from this build's, or it has none) is
+//!   rebuilt the same way. The rebuild is never silent and never destructive:
+//!   when it changes the part, the feature's `notes` say by how much, and when
+//!   it FAILS the stored snapshot is used with a note saying so, because a
+//!   document that loads today must not stop loading because the kernel moved. The history cache re-runs this feature when the entry's content
 //!   changes (see `parts_library::mix_descriptor_fingerprint`).
 //!
 //! **Auto-ground:** when `isFixed` is ABSENT and no component exists earlier in
@@ -33,7 +39,8 @@
 use std::collections::BTreeMap;
 
 use crate::feature_pipeline::component::{self, create_component};
-use crate::feature_pipeline::features::{common, port};
+use crate::feature_pipeline::features::common;
+use crate::feature_pipeline::ports;
 use crate::feature_pipeline::{
     parts_library, scene_metadata, FeatureContext, FeatureResult, PortRecord,
 };
@@ -100,9 +107,15 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     };
 
     // FAST lane, with the SELF-HEAL fallback (dirty entry or unreadable
-    // snapshot -> re-execute the embedded document, rewrite the snapshot).
+    // snapshot -> re-execute the embedded document, rewrite the snapshot) and
+    // the STALE lane (a snapshot from another kernel build is rebuilt).
+    let stale = !entry.dirty
+        && parts_library::kernel_source_stamp().is_some_and(|stamp| entry.snapshot_producer != stamp);
+    let mut note: Option<String> = None;
     let (restored, ports): (RestoredSnapshot, BTreeMap<String, PortRecord>) = if entry.dirty {
         heal(&part_name, &entry.document)?
+    } else if stale {
+        rebuild_stale(&part_name, &entry, &mut note)?
     } else {
         match restore_solids(&entry.snapshot) {
             Ok(snapshot) => (snapshot, entry.ports.clone()),
@@ -135,8 +148,9 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     let mut result = FeatureResult::empty(ctx.id.clone(), ctx.feature_type.clone());
     result.added = added;
     result.components = vec![record];
+    result.notes.extend(note);
     for (id, posed) in posed_ports {
-        port::publish_port(&mut result, &id, posed)?;
+        ports::publish_port(&mut result, &id, posed)?;
     }
     Ok(result)
 }
@@ -149,12 +163,103 @@ fn heal(
     document: &serde_json::Value,
 ) -> Result<(RestoredSnapshot, BTreeMap<String, PortRecord>), String> {
     let (payload, ports) = parts_library::rebuild_snapshot(document).map_err(|error| {
-        format!("part '{part_name}': snapshot unreadable and document re-execution failed: {error}")
+        format!("part '{part_name}': re-executing its document failed: {error}")
     })?;
     let restored = restore_solids(&payload)
         .map_err(|error| format!("part '{part_name}': rebuilt snapshot did not decode: {error}"))?;
     parts_library::heal_entry(part_name, payload, ports.clone());
     Ok((restored, ports))
+}
+
+/// The STALE lane: rebuild a part whose snapshot another kernel build made.
+///
+/// On success the rebuilt part is used and the entry is rewritten with this
+/// build's stamp; `note` is set only when the rebuild CHANGED the part, since an
+/// identical rebuild changes nothing the user can see. On failure the stored
+/// snapshot is used when it still decodes, with `note` saying so, and the error
+/// is returned only when there is nothing to fall back to.
+fn rebuild_stale(
+    part_name: &str,
+    entry: &parts_library::PartsLibraryEntry,
+    note: &mut Option<String>,
+) -> Result<(RestoredSnapshot, BTreeMap<String, PortRecord>), String> {
+    let stored = restore_solids(&entry.snapshot);
+    match heal(part_name, &entry.document) {
+        Ok((rebuilt, ports)) => {
+            let change = match &stored {
+                Ok(stored) => describe_change(stored, &rebuilt),
+                Err(_) => None,
+            };
+            if let Some(change) = change {
+                *note = Some(format!(
+                    "part '{part_name}' was rebuilt from its document because its stored \
+                     snapshot was made by a different kernel build; {change}"
+                ));
+            }
+            Ok((rebuilt, ports))
+        }
+        Err(error) => match stored {
+            Ok(stored) => {
+                *note = Some(format!(
+                    "part '{part_name}': its stored snapshot was made by a different kernel \
+                     build and rebuilding it failed, so the stored snapshot is used ({error})"
+                ));
+                Ok((stored, entry.ports.clone()))
+            }
+            Err(_) => Err(error),
+        },
+    }
+}
+
+/// How a rebuilt part differs from its stored snapshot, or `None` when it does
+/// not: the same solids, in order, with the same face counts and volumes equal
+/// to 1e-12 relative.
+///
+/// A volume that cannot be computed on either side is reported, never skipped —
+/// an unmeasured solid must not read as an unchanged one.
+fn describe_change(stored: &RestoredSnapshot, rebuilt: &RestoredSnapshot) -> Option<String> {
+    if stored.solids.len() != rebuilt.solids.len() {
+        return Some(format!(
+            "its solid count changed from {} to {}",
+            stored.solids.len(),
+            rebuilt.solids.len()
+        ));
+    }
+    let mut changes = Vec::new();
+    let mut worst: Option<(f64, f64, &str)> = None;
+    let mut unmeasured = 0usize;
+    for (before, after) in stored.solids.iter().zip(&rebuilt.solids) {
+        let faces = |solid: &crate::BrepSolid| solid.shells.iter().map(|shell| shell.faces.len()).sum::<usize>();
+        let (faces_before, faces_after) = (faces(&before.solid), faces(&after.solid));
+        if before.name != after.name || faces_before != faces_after {
+            changes.push(format!(
+                "'{}' ({faces_before} faces) became '{}' ({faces_after} faces)",
+                before.name, after.name
+            ));
+        }
+        match (
+            crate::solid_signed_volume(&before.solid),
+            crate::solid_signed_volume(&after.solid),
+        ) {
+            (Ok(volume_before), Ok(volume_after)) => {
+                let delta = volume_after - volume_before;
+                let relative = delta.abs() / volume_before.abs().max(f64::MIN_POSITIVE);
+                if relative > 1e-12 && worst.map_or(true, |(_, known, _)| relative > known) {
+                    worst = Some((delta, relative, after.name.as_str()));
+                }
+            }
+            _ => unmeasured += 1,
+        }
+    }
+    if let Some((delta, relative, name)) = worst {
+        changes.push(format!(
+            "the largest volume change is {delta:+.6e} ({relative:.1e} relative) on '{name}'"
+        ));
+    }
+    if unmeasured > 0 {
+        changes.push(format!("the volume of {unmeasured} solid(s) could not be compared"));
+    }
+    (!changes.is_empty()).then(|| changes.join("; "))
 }
 
 /// Context-bar applicability ([`crate::feature_pipeline::context_offer`]):
@@ -202,4 +307,3 @@ pub fn schema() -> serde_json::Value {
     })
 }
 
-// BREP private tests: 6f2cd26580b95dc4

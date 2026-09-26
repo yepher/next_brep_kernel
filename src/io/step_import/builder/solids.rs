@@ -27,7 +27,7 @@ pub(in crate::step_import) fn build_solid(resolver: &Resolver, manifold_ref: usi
     if debug {
         eprintln!("SOLID #{manifold_ref} BEGIN");
     }
-    let result = build_solid_inner(resolver, manifold_ref);
+    let result = build_solid_inner(resolver, manifold_ref, false).map(|(solid, _)| solid);
     if let Some(started) = started {
         eprintln!(
             "SOLID #{manifold_ref} END {:?} ok={}",
@@ -63,16 +63,23 @@ fn build_shell_faces_in_namespace(
     }
     builder.relocate_periodic_rim_seams(&pending)?;
     builder.split_seam_crossing_edges(&mut pending)?;
+    // Phase 1.75: a planar face whose straight boundary sits off its plane
+    // (mesh-derived region fits) becomes exactly planar triangles BEFORE the
+    // reconcile step below can bend its edges onto one plane or the other.
+    builder.split_off_plane_planar_faces(&mut pending)?;
     builder.reconcile_edges_onto_surfaces(&pending)?;
     let mut faces = Vec::with_capacity(pending.len());
-    for (pending_face, face_value) in pending.into_iter().zip(face_refs) {
-        let face_ref = face_value.as_ref_id()?;
+    // The planar split can have minted more pending faces than STEP faces, so
+    // each pending face carries its own source reference.
+    for pending_face in pending {
+        let face_ref = pending_face.face_ref;
         faces.push(
             builder
                 .finish_face(pending_face)
                 .map_err(|error| format!("step_import: face #{face_ref}: {error}"))?,
         );
     }
+    builder.report_supplied_pcurves();
     Ok(faces)
 }
 
@@ -376,6 +383,15 @@ pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSo
 }
 
 pub(in crate::step_import) fn build_brep_with_voids(resolver: &Resolver, body_ref: usize) -> Result<BrepSolid, String> {
+    build_brep_with_voids_captured(resolver, body_ref, false).map(|(solid, _)| solid)
+}
+
+/// [`build_brep_with_voids`], optionally carrying the per-edge capture.
+pub(in crate::step_import) fn build_brep_with_voids_captured(
+    resolver: &Resolver,
+    body_ref: usize,
+    capture: bool,
+) -> Result<(BrepSolid, Option<readings::TrimCapture>), String> {
     let args = resolver
         .get(body_ref)?
         .find("BREP_WITH_VOIDS")
@@ -450,6 +466,9 @@ pub(in crate::step_import) fn build_brep_with_voids(resolver: &Resolver, body_re
         edge_of_vertex_pair: HashMap::default(),
         vertex_index: HashMap::default(),
         edge_index: HashMap::default(),
+        curve_ref_of_edge: HashMap::default(),
+        supplied_report: SuppliedReport::default(),
+        readings: capture.then(readings::TrimCapture::default),
     };
     let mut shells = Vec::with_capacity(face_lists.len());
     for ((_, same_sense), faces) in shell_specs.iter().zip(&face_lists) {
@@ -464,6 +483,7 @@ pub(in crate::step_import) fn build_brep_with_voids(resolver: &Resolver, body_re
         shells.push(shell);
     }
     let solid_id = builder.fresh();
+    let captured = builder.readings.take();
     let mut solid = BrepSolid {
         id: solid_id,
         vertices: builder.vertices,
@@ -482,6 +502,7 @@ pub(in crate::step_import) fn build_brep_with_voids(resolver: &Resolver, body_re
         ));
     }
     let tolerance = brep_with_voids_volume_tolerance(&solid);
+    let _caller = crate::mass_caller("step_import.brep_with_voids");
     let mut shell_volumes = solid
         .shells
         .iter()
@@ -524,10 +545,14 @@ pub(in crate::step_import) fn build_brep_with_voids(resolver: &Resolver, body_re
         ));
     }
     solid.genus = euler_genus(&solid);
-    Ok(solid)
+    Ok((solid, captured))
 }
 
-fn build_solid_inner(resolver: &Resolver, manifold_ref: usize) -> Result<BrepSolid, String> {
+pub(in crate::step_import) fn build_solid_inner(
+    resolver: &Resolver,
+    manifold_ref: usize,
+    capture: bool,
+) -> Result<(BrepSolid, Option<readings::TrimCapture>), String> {
     let entity = resolver.get(manifold_ref)?;
     // MANIFOLD_SOLID_BREP(name, #shell) and FACETED_BREP(name, #shell) share the
     // same shape: a single CLOSED_SHELL as the second argument.
@@ -537,7 +562,7 @@ fn build_solid_inner(resolver: &Resolver, manifold_ref: usize) -> Result<BrepSol
         .and_then(|args| args.get(1))
         .ok_or("step_import: solid brep missing shell")?
         .as_ref_id()?;
-    build_solid_from_shell(resolver, shell_ref)
+    build_solid_from_shell_captured(resolver, shell_ref, capture)
 }
 
 /// Reconstruct one `BrepSolid` from a single CLOSED_SHELL (or OPEN_SHELL)
@@ -546,6 +571,16 @@ fn build_solid_inner(resolver: &Resolver, manifold_ref: usize) -> Result<BrepSol
 /// reaches the same validation gate and is rejected there, so this stays safe to
 /// call on any shell reference.
 pub(in crate::step_import) fn build_solid_from_shell(resolver: &Resolver, shell_ref: usize) -> Result<BrepSolid, String> {
+    build_solid_from_shell_captured(resolver, shell_ref, false).map(|(solid, _)| solid)
+}
+
+/// [`build_solid_from_shell`], optionally carrying what the importer did to
+/// every edge (`capture`), for [`crate::import_step_trim_readings`].
+pub(in crate::step_import) fn build_solid_from_shell_captured(
+    resolver: &Resolver,
+    shell_ref: usize,
+    capture: bool,
+) -> Result<(BrepSolid, Option<readings::TrimCapture>), String> {
     let shell_entity = resolver.get(shell_ref)?;
     let face_refs = shell_entity
         .find("CLOSED_SHELL")
@@ -565,6 +600,9 @@ pub(in crate::step_import) fn build_solid_from_shell(resolver: &Resolver, shell_
         edge_of_vertex_pair: HashMap::default(),
         vertex_index: HashMap::default(),
         edge_index: HashMap::default(),
+        curve_ref_of_edge: HashMap::default(),
+        supplied_report: SuppliedReport::default(),
+        readings: capture.then(readings::TrimCapture::default),
     };
 
     // Phase 1: resolve every face's surface + coedge bounds (this also builds
@@ -572,6 +610,18 @@ pub(in crate::step_import) fn build_solid_from_shell(resolver: &Resolver, shell_
     // full-cylinder rim circles onto the surface seam meridian — a mutation of
     // shared edges/vertices that must precede any pcurve derivation. Phase 2:
     // assemble each face's loops/pcurves from the (now consistent) topology.
+    // Phase wall-clock on stderr when `BREP_PROFILE` is set — the switch the
+    // boolean's `boolean.<stage>_ms` lines use.
+    let profile = std::env::var("BREP_PROFILE").is_ok();
+    let mut lap_started = web_time::Instant::now();
+    let mut laps: Vec<(&str, f64)> = Vec::new();
+    let mut lap = |name: &'static str, started: &mut web_time::Instant, laps: &mut Vec<(&str, f64)>| {
+        if profile {
+            let now = web_time::Instant::now();
+            laps.push((name, (now - *started).as_secs_f64() * 1_000.0));
+            *started = now;
+        }
+    };
     let mut pending = Vec::with_capacity(face_refs.len());
     for face_value in &face_refs {
         let face_ref = face_value.as_ref_id()?;
@@ -581,21 +631,34 @@ pub(in crate::step_import) fn build_solid_from_shell(resolver: &Resolver, shell_
                 .map_err(|error| format!("step_import: face #{face_ref}: {error}"))?,
         );
     }
+    lap("collect_faces", &mut lap_started, &mut laps);
     builder.relocate_periodic_rim_seams(&pending)?;
     builder.split_seam_crossing_edges(&mut pending)?;
+    lap("seams", &mut lap_started, &mut laps);
+    // Phase 1.75: a planar face whose straight boundary sits off its plane
+    // (mesh-derived region fits) becomes exactly planar triangles BEFORE the
+    // reconcile step below can bend its edges onto one plane or the other.
+    builder.split_off_plane_planar_faces(&mut pending)?;
+    lap("planar_split", &mut lap_started, &mut laps);
     builder.reconcile_edges_onto_surfaces(&pending)?;
+    lap("reconcile", &mut lap_started, &mut laps);
     let mut faces = Vec::with_capacity(pending.len());
-    for (pending_face, face_value) in pending.into_iter().zip(&face_refs) {
-        let face_ref = face_value.as_ref_id()?;
+    // The planar split can have minted more pending faces than STEP faces, so
+    // each pending face carries its own source reference.
+    for pending_face in pending {
+        let face_ref = pending_face.face_ref;
         faces.push(
             builder
                 .finish_face(pending_face)
                 .map_err(|error| format!("step_import: face #{face_ref}: {error}"))?,
         );
     }
+    lap("finish_faces", &mut lap_started, &mut laps);
 
+    builder.report_supplied_pcurves();
     let shell_id = builder.fresh();
     let solid_id = builder.fresh();
+    let captured = builder.readings.take();
     let mut solid = BrepSolid {
         id: solid_id,
         vertices: builder.vertices,
@@ -608,8 +671,10 @@ pub(in crate::step_import) fn build_solid_from_shell(resolver: &Resolver, shell_
     };
     solid = finalize_imported_solid(solid)?;
     solid.genus = euler_genus(&solid);
+    lap("finalize", &mut lap_started, &mut laps);
 
     let issues = solid.validate();
+    lap("validate", &mut lap_started, &mut laps);
     if !issues.is_empty() {
         // Debug escape hatch: dump the invalid solid for offline triage
         // before refusing (validation issues reference face/coedge ids that
@@ -627,12 +692,18 @@ pub(in crate::step_import) fn build_solid_from_shell(resolver: &Resolver, shell_
     // Vendor face senses can leave the whole shell pointing inward; a closed
     // shell's material side is defined by its signed volume, so restore the
     // outward convention.
+    let _caller = crate::mass_caller("step_import.face_sense_flip");
     if let Ok(volume) = crate::solid_signed_volume(&solid) {
         if volume < 0.0 {
             crate::offset_shell::flip_all_faces(&mut solid)?;
         }
     }
-    Ok(solid)
+    lap("signed_volume", &mut lap_started, &mut laps);
+    if profile {
+        let line: Vec<String> = laps.iter().map(|(name, ms)| format!("{name}={ms:.2}")).collect();
+        eprintln!("step_import.profile shell=#{shell_ref} faces={} {}", face_refs.len(), line.join(" "));
+    }
+    Ok((solid, captured))
 }
 
 /// Debug escape hatch shared by BOTH validation gates: dump the invalid solid

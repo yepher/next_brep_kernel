@@ -550,7 +550,13 @@ impl<'a> SolidBuilder<'a> {
             return Ok(None);
         }
         let m = specs.len();
-        if m < 3 {
+        // Two coedges is a lens — two trims between one pair of vertices — and
+        // the joint assignment is exactly as well posed there as on a longer
+        // ring: an anchor, one propagation step, and the same closure test. The
+        // guard used to read `m < 3` with no stated reason; on `abc_00000026`
+        // three 2-coedge lens faces self-cross twice each and were never
+        // offered to this pass at all.
+        if m < 2 {
             return Ok(None);
         }
         let [u0, u1] = surface.domain_u()?;
@@ -592,29 +598,46 @@ impl<'a> SolidBuilder<'a> {
             samples.push(pts);
         }
 
-        // Aliasing signature: a raw GLOBAL closest-point inversion of the samples
-        // branch-JUMPS across a self-overlapping fold — the exact defect. On a
-        // well-behaved open carrier (no self-overlap) it is continuous and this
-        // is FALSE, so the face keeps its existing (byte-identical) fit. Breaks
-        // on the first jump: aliased faces cost almost nothing, and a clean face
-        // pays only one full continuous scan (no adoption follows).
+        // Aliasing signature: the SINGLE-SEED inversion of the samples (Newton
+        // from the seed grid's nearest sample) branch-JUMPS where the carrier
+        // comes back within one seed-grid spacing of itself — the seed grid's
+        // nearest sample alternates between the two ends. On a well-behaved
+        // open carrier (no self-overlap) it is continuous and this is FALSE, so
+        // the face keeps its existing (byte-identical) fit.
+        //
+        // It is that inversion BY NAME, not the nearest-point projector. Until
+        // 2026-09-14 they were the same function; the projector now returns
+        // the least minimum over the domain, which does not jump on these
+        // loops, and reading it here sent `abc_00000026`'s flank loops to the
+        // per-coedge fit: congruent lens faces spread 3.7e-7 in area instead
+        // of 3e-12, and two runout loops closed through a degenerate edge.
+        //
+        // The same pass reads `global_residual`, the worst distance that
+        // inversion reports over the loop's stations, for the trace only. It is
+        // NOT a floor: its distance is an upper bound, and on exactly the
+        // carriers this pass exists for it is the far end's local minimum —
+        // 1.2e-1 on `abc_00000026`, whose edges lie within 7.6e-4 of those
+        // carriers.
         const JUMP: f64 = 0.2;
         let mut aliased = false;
-        'scan: for pts in &samples {
+        let mut global_residual = 0.0f64;
+        for pts in &samples {
             let mut prev: Option<(f64, f64)> = None;
             for p in pts {
-                let g = crate::project_point_to_surface(surface, *p)?;
+                let g = crate::projection::project_point_to_surface_from_nearest_seed(surface, *p)?;
+                global_residual = global_residual.max(g.distance);
                 if let Some(pv) = prev {
                     if norm_step((g.u, g.v), pv) > JUMP {
                         aliased = true;
-                        break 'scan;
                     }
                 }
                 prev = Some((g.u, g.v));
             }
         }
         if dbg {
-            eprintln!("joint scan: m={m} extent={extent:.3} aliased={aliased}");
+            eprintln!(
+                "joint scan: m={m} extent={extent:.3} aliased={aliased} global_residual={global_residual:.3e}"
+            );
         }
         if !aliased {
             return Ok(None);
@@ -643,10 +666,19 @@ impl<'a> SolidBuilder<'a> {
         };
 
         // Anchor = the coedge whose own self-seeded chain (from its global start
-        // image) is cleanest. Its start footpoint must be NEAR-EXACT on-surface:
-        // a wrong-wrap anchor sits at the wrap gap (orders above fit tolerance),
-        // so this bound is the structural wrong-fold rejection. If none qualifies
-        // the loop is not cleanly recoverable → fall back.
+        // image) is cleanest. The gate rejects a WRONG-WRAP anchor, which sits
+        // at the wrap gap — orders above the fit band.
+        //
+        // Measured from zero. From 2026-09-13 to 2026-09-14 it was measured
+        // from `global_residual` instead, on the reading that `abc_00000026`'s
+        // edges sit 3.052e-2 off their carriers and no branch could beat that.
+        // They do not: the edges this gate saw had been moved there by the
+        // importer's reconcile pass, which trusted the same projector answer,
+        // and the "floor" it was measured from read 1.2e-1 — above the 2.5e-2
+        // wrap gap the gate exists to reject, so on that file it rejected
+        // nothing. With the file's own edges the 48 loops it adopts read anchor
+        // residuals of 1.02e-4 or less against a bound of at least 1.06e-3, and
+        // dropping the floor moves no row of the 1069-solid fixture corpus.
         let anchor_bound = (2e-4 * extent).max(20.0 * pcurve_tol);
         let mut anchor: Option<(usize, (f64, f64))> = None;
         let mut best_res = f64::INFINITY;
@@ -660,7 +692,15 @@ impl<'a> SolidBuilder<'a> {
         }
         let (anchor_ci, anchor_seed) = match anchor {
             Some(a) if best_res <= anchor_bound => a,
-            _ => return Ok(None),
+            _ => {
+                if dbg {
+                    eprintln!(
+                        "joint-branch: REFUSED anchor m={m} best_res={best_res:.3e} bound={anchor_bound:.3e} global_residual={global_residual:.3e} found={}",
+                        anchor.is_some()
+                    );
+                }
+                return Ok(None);
+            }
         };
 
         // Propagate the seed around the whole loop from the anchor: each coedge
@@ -694,6 +734,12 @@ impl<'a> SolidBuilder<'a> {
         let closes = closure <= 1e-3;
         let on_surface = worst_res_all <= 1e-2 * extent;
         if !(continuous && closes && on_surface) {
+            if dbg {
+                eprintln!(
+                    "joint-branch: REFUSED adopt m={m} anchor=ce{anchor_ci} step={worst_step_all:.3e} closure={closure:.3e} res={worst_res_all:.3e} bound={:.3e} (continuous={continuous} closes={closes} on_surface={on_surface})",
+                    1e-2 * extent
+                );
+            }
             return Ok(None);
         }
 

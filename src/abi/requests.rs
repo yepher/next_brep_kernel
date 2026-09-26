@@ -39,8 +39,26 @@ pub(crate) struct RibRequest {
     /// default the feature uses. There is no depth: the rib grows Up To Next.
     #[serde(default)]
     pub(crate) extrusion: RibExtrusion,
+    /// The feature id every face name starts with (`RIB` when absent).
     #[serde(default)]
     pub(crate) name: Option<String>,
+    /// The source name of each profile curve, index-aligned with `profile`
+    /// (`SEG{i}` when absent). See [`crate::RibNames`].
+    #[serde(default)]
+    pub(crate) segment_names: Option<Vec<String>>,
+}
+
+impl RibRequest {
+    pub(crate) fn names(&self) -> crate::RibNames {
+        let feature = self.name.as_deref().unwrap_or("RIB");
+        match &self.segment_names {
+            Some(segments) => crate::RibNames {
+                feature: feature.to_string(),
+                segments: segments.clone(),
+            },
+            None => crate::RibNames::positional(feature, self.profile.len()),
+        }
+    }
 }
 
 #[derive(Deserialize)]

@@ -443,18 +443,18 @@ pub(crate) struct ThickenSheetRequest {
 pub fn thicken_face_sheet_json(request_json: &str) -> Result<String, JsValue> {
     let request: ThickenSheetRequest =
         serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
-    let solid = thicken_face_sheet(&request.surface, request.thickness, request.symmetric)
+    let bodies = thicken_face_sheet(&request.surface, request.thickness, request.symmetric)
         .map_err(javascript_error)?;
-    serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+    serde_json::to_string(&bodies).map_err(|error| javascript_error(error.to_string()))
 }
 
 #[wasm_bindgen]
 pub fn thicken_face_sheet_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValue> {
     let request: ThickenSheetRequest =
         serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
-    let solid = thicken_face_sheet(&request.surface, request.thickness, request.symmetric)
+    let bodies = thicken_face_sheet(&request.surface, request.thickness, request.symmetric)
         .map_err(javascript_error)?;
-    solid_buffer(&solid, "{}".into())
+    solid_buffer(single_body(&bodies, "thicken_face_sheet")?, "{}".into())
 }
 
 #[derive(Deserialize)]
@@ -472,28 +472,46 @@ pub(crate) struct ThickenTrimmedSheetRequest {
 pub fn thicken_trimmed_sheet_json(request_json: &str) -> Result<String, JsValue> {
     let request: ThickenTrimmedSheetRequest =
         serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
-    let solid = thicken_trimmed_sheet(
+    let bodies = thicken_trimmed_sheet(
         &request.surface,
         &request.loops,
         request.thickness,
         request.symmetric,
     )
     .map_err(javascript_error)?;
-    serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+    serde_json::to_string(&bodies).map_err(|error| javascript_error(error.to_string()))
 }
 
 #[wasm_bindgen]
 pub fn thicken_trimmed_sheet_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValue> {
     let request: ThickenTrimmedSheetRequest =
         serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
-    let solid = thicken_trimmed_sheet(
+    let bodies = thicken_trimmed_sheet(
         &request.surface,
         &request.loops,
         request.thickness,
         request.symmetric,
     )
     .map_err(javascript_error)?;
-    solid_buffer(&solid, "{}".into())
+    solid_buffer(single_body(&bodies, "thicken_trimmed_sheet")?, "{}".into())
+}
+
+/// The one body a single-solid BUFFER export can carry.
+///
+/// A thicken whose trim a fold BAND crosses produces one body per regular
+/// piece, and this buffer shape holds exactly one solid. Returning the first
+/// and dropping the rest would hand a caller half a result it could not know
+/// was half, so the count is named and the `_json` export — which carries the
+/// whole list — is pointed at instead.
+fn single_body<'a>(bodies: &'a [BrepSolid], operation: &str) -> Result<&'a BrepSolid, JsValue> {
+    match bodies {
+        [body] => Ok(body),
+        _ => Err(javascript_error(format!(
+            "{operation}: the selected trim thickens into {} bodies and this buffer carries one \
+             — call {operation}_json, which returns them all",
+            bodies.len()
+        ))),
+    }
 }
 
 #[wasm_bindgen]

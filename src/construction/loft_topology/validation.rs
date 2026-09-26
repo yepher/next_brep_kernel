@@ -65,4 +65,3 @@ pub(super) fn validate_sections(
     Ok(curve_count)
 }
 
-// BREP private tests: df6afefbf4dfbbbb

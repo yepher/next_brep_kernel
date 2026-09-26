@@ -1,10 +1,19 @@
 use crate::topology::{BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord};
+use crate::offset_point::StationaryChart;
 use crate::{fit, NurbsCurve, NurbsSurface, OffsetEvaluator, OffsetNormal, Vec3, Vec4};
 
 /// Fixed uniform station count still used by the OPEN-edge and
 /// edge-preserving marches (edge/support.rs, edge/keep.rs).  The CLOSED
 /// general march is adaptive — see [`SEED_INTERVALS`] / [`MAX_STATIONS`].
 pub(super) const STATIONS: usize = 64;
+
+/// Ceiling for the OPEN march's measured refinement ([`STATIONS`] doubled
+/// twice).  A stripe that still misses its bar here keeps its best rung rather
+/// than refusing: the cap is a COST decision, not an accuracy one -- the rail
+/// reading is still falling at 256 (1.419e-6 / 3.534e-7 / 3.019e-8 on the
+/// notched cap's lobe) and the spans it buys are paid for by every stage
+/// downstream.
+pub(super) const MAX_OPEN_STATIONS: usize = 256;
 pub(super) const NEWTON_ITERATIONS: usize = 24;
 pub(super) const FIT_DEGREE: usize = 3;
 
@@ -46,11 +55,60 @@ pub(super) fn raw_normal(surface: &NurbsSurface, u: f64, v: f64) -> Result<Vec3,
 /// evaluation, and requiring the two supports' centres to coincide IS
 /// intersecting the two offset surfaces — pointwise, without ever materializing
 /// one. Routing it through the shared evaluator says so in code. The march must
-/// NOT inherit [`OffsetNormal::FaceStable`]'s singular recovery: where
-/// `S_u × S_v` collapses the march refuses today, and a recovered normal there
-/// would silently change a residual whose bar is `1e-11·(1 + scale)`.
+/// NOT inherit [`OffsetNormal::FaceStable`]'s singular recovery — a nudged
+/// normal would silently change a residual whose bar is `1e-11·(1 + scale)`.
+/// Where `S_u × S_v` vanishes, the `Raw` lane reads the cross product's own
+/// one-sided limit instead (a support extruded from a profile with a stationary
+/// vertex is regular there), and refuses only where no regular point is in
+/// reach. Past such a boundary its POINT moves along the same limit, so an
+/// overshoot station seated beyond the vertex solves on the face's
+/// continuation rather than on a Jacobian column of zeros. Near it the vanishing
+/// partial is read from the control net's differences, so the normal's rounding
+/// stays below that bar up to the isoline, and the station Newton steps that
+/// parameter in a regular chart ([`station_charts`]).
 pub(super) fn blend_offset(surface: &NurbsSurface) -> OffsetEvaluator<'_> {
     OffsetEvaluator::new("blend_march", surface, OffsetNormal::Raw)
+}
+
+/// The section plane at `t` of a march along `edge` whose stations are
+/// `station_step` apart in `t`: the extended point and the edge's unit tangent,
+/// read as the one-sided limit where the parameterization is stationary.
+///
+/// Past a STATIONARY open end the extended point does not move
+/// (`P(end) + C'(end)·(t − end)` with `C'(end) = 0`), so every overshoot station
+/// would solve on the vertex's own section plane: the chain window's chord
+/// parameters repeat, and the open march's rows stand still past the vertex. The
+/// overshoot exists to seat the rolling ball's contacts BEYOND the vertex, and a
+/// stationary parameterization is a degenerate parameterization of a regular
+/// curve, not a degenerate curve: the curve still has a direction there (the
+/// one-sided limit) and only its speed is missing. So the section advances along
+/// that limit by the chord the march was using, the distance between the vertex
+/// station and the station one step inside it, per station step. That keeps the
+/// station spacing continuous across the vertex; the regular twin's own
+/// extension (a line at constant speed) is the same rule. A regular end is
+/// untouched, to the bit. `site` names the march in a refusal.
+pub(super) fn march_section(
+    edge: &EdgeRecord,
+    t: f64,
+    station_step: f64,
+    site: &str,
+) -> Result<(Vec3, Vec3), String> {
+    let named = |error: String| format!("{site}: edge {}: {error}", edge.id);
+    let (point, tangent) = edge
+        .curve
+        .point_and_unit_tangent_extended(t, edge.t0, edge.t1)
+        .map_err(named)?;
+    let Some(boundary) = edge.curve.stationary_open_end(t).map_err(named)? else {
+        return Ok((point, tangent));
+    };
+    let [start, end] = edge.curve.domain().map_err(named)?;
+    let outward = if t < boundary { -1.0 } else { 1.0 };
+    let previous = (boundary - outward * station_step).clamp(start, end);
+    let chord = point
+        .sub(edge.curve.evaluate(previous).map_err(named)?)
+        .length();
+    let steps = (t - boundary).abs() / station_step;
+    Ok((point.add(tangent.scale(outward * steps * chord)), tangent))
 }
 
 /// Evaluate a coedge's pcurve at the EDGE parameter, honouring traversal
@@ -176,13 +234,85 @@ fn solve_station_state(
                 jacobian[row][column] = (probed.residual[row] - state.residual[row]) / step;
             }
         }
+        let charts = station_charts([first, second], uv, &jacobian)?;
+        for (column, chart) in charts.iter().enumerate() {
+            let Some(chart) = chart else {
+                continue;
+            };
+            let mut probe = uv;
+            probe[column] = chart.parameter(chart.regular(uv[column]) + step);
+            let probed = tangency_state(first, second, rho, probe, section_point, section_tangent)?;
+            for row in 0..4 {
+                jacobian[row][column] = (probed.residual[row] - state.residual[row]) / step;
+            }
+        }
         let delta = fit::solve_small::<4>(jacobian, state.residual, 4)
             .map_err(|error| format!("blend: station Newton is singular ({error})"))?;
-        for (value, correction) in uv.iter_mut().zip(delta) {
-            *value -= correction;
+        for ((value, correction), chart) in uv.iter_mut().zip(delta).zip(charts) {
+            match chart {
+                Some(chart) => *value = chart.parameter(chart.regular(*value) - correction),
+                None => *value -= correction,
+            }
         }
     }
     Err("blend: tangency Newton did not converge".into())
+}
+
+/// A column whose reach over its carrier's domain is below this fraction of the
+/// same carrier's other column is small enough to ask whether a stationary
+/// isoline made it so. A gate on cost only: the answer is
+/// `OffsetEvaluator::stationary_chart`'s.
+const STATION_CHART_REACH: f64 = 0.1;
+
+/// Which of the station Newton's four unknowns `(u, v, a, b)` step in a
+/// [`StationaryChart`] this iteration rather than in the carrier's own parameter.
+///
+/// The station at a stationary VERTEX — an edge whose parameterization stops
+/// there, so the extruded support carries that parameter as an isoline with
+/// `S_u = 0` — has its contact ON that isoline, a root of multiplicity two (for
+/// coincident end poles) in the support's `u`. Solved in `u`, the Newton halves
+/// its distance per iteration on a column that shrinks with it. In the chart the
+/// point moves at unit speed through the isoline and on along the `Raw` lane's
+/// continuation past it, so the column does not vanish. On the open tombstone
+/// fixtures that is three steps from the neighbour's seed to 1e-14, where the
+/// parameter took 14 and 16 (with the `Raw` normal's rounding fixed) or never
+/// settled (without it: 7.5e-11..3.8e-9 against the 5e-11 bar).
+///
+/// Asked per iteration from the Jacobian already built: a column is a candidate
+/// when its reach (norm × domain span) is small against its carrier's other
+/// column, and the chart decides. Everywhere else every unknown steps in its own
+/// parameter, to the bit.
+fn station_charts(
+    surfaces: [&NurbsSurface; 2],
+    uv: [f64; 4],
+    jacobian: &[[f64; 4]; 4],
+) -> Result<[Option<StationaryChart>; 4], String> {
+    let mut charts = [None; 4];
+    let reach = |column: usize, span: f64| -> f64 {
+        jacobian
+            .iter()
+            .map(|row| row[column] * row[column])
+            .sum::<f64>()
+            .sqrt()
+            * span
+    };
+    for (index, surface) in surfaces.into_iter().enumerate() {
+        let [u_column, v_column] = [2 * index, 2 * index + 1];
+        let [u0, u1] = surface.domain_u()?;
+        let [v0, v1] = surface.domain_v()?;
+        let reach_u = reach(u_column, u1 - u0);
+        let reach_v = reach(v_column, v1 - v0);
+        for (column, along_u, small) in [
+            (u_column, true, reach_u <= STATION_CHART_REACH * reach_v),
+            (v_column, false, reach_v <= STATION_CHART_REACH * reach_u),
+        ] {
+            if small {
+                charts[column] =
+                    blend_offset(surface).stationary_chart(along_u, uv[u_column], uv[v_column])?;
+            }
+        }
+    }
+    Ok(charts)
 }
 
 /// Newton on (u, v, a, b) with the section plane fixed.
@@ -239,9 +369,10 @@ fn solve_anchored_start(
         uv
     };
     let state_at = |x: &[f64; 4]| -> Result<TangencyState, String> {
-        let derivatives = edge.curve.derivatives_extended(x[0], 1)?;
-        let section_point = derivatives[0];
-        let section_tangent = derivatives[1].normalized()?;
+        let (section_point, section_tangent) = edge
+            .curve
+            .point_and_unit_tangent_extended(x[0], edge.t0, edge.t1)
+            .map_err(|error| format!("blend anchored start: edge {}: {error}", edge.id))?;
         tangency_state(
             first,
             second,
@@ -486,9 +617,10 @@ impl MarchFrame<'_> {
 
     /// Solve one station at `t`.  `lock` freezes the FIRST carrier's u on a
     /// seam meridian and frees t instead (the anchored endpoint contract).
-    /// The uv track stays continuous because every seed is a neighbouring
-    /// converged solution — wrapping would need the seed itself to jump,
-    /// which it never does mid-march.
+    /// The seed is a neighbouring converged solution, but that alone does
+    /// not keep the uv track continuous: an undamped Newton can still hop to
+    /// another root — see [`MarchFrame::continue_node`], which the march
+    /// solves through.
     fn solve_node(&self, t: f64, seed: [f64; 4], lock: Option<f64>) -> Result<MarchNode, String> {
         if let Some(u_lock) = lock {
             let (t_solved, uv, state) = solve_anchored_start(
@@ -504,14 +636,17 @@ impl MarchFrame<'_> {
             )?;
             self.node(t_solved, uv, &state)
         } else {
-            let derivatives = self.edge.curve.derivatives_extended(t, 1)?;
-            let section_tangent = derivatives[1].normalized()?;
+            let (section_point, section_tangent) = self
+                .edge
+                .curve
+                .point_and_unit_tangent_extended(t, self.edge.t0, self.edge.t1)
+                .map_err(|error| format!("blend march: edge {}: {error}", self.edge.id))?;
             let (uv, state) = solve_station_state(
                 self.surface1,
                 self.surface2,
                 (self.rho_at)(t),
                 seed,
-                derivatives[0],
+                section_point,
                 section_tangent,
                 self.scale,
             )?;
@@ -553,6 +688,109 @@ impl MarchFrame<'_> {
         })
     }
 
+    /// Solve the station at `t` as the CONTINUATION of the converged station
+    /// `(left_t, left_uv)`, refusing a root on another branch.
+    ///
+    /// The tangency Newton is undamped, and a converged answer is only a root
+    /// of the system — not necessarily the one the march is following.  A
+    /// section plane can cut the ball-centre locus more than once (an
+    /// elongated intersection loop is cut again across its own width), and
+    /// from a seed a whole seed interval back the first Newton step can fly
+    /// many carrier periods before settling on the far crossing.  The
+    /// 2026-09-23 reported document — a thin cylinder unioned through a fat
+    /// one at 34° — did exactly that past the loop's sharp crotch: from
+    /// t = 0.625 the first step moved u₁ by 8.5 periods and the solve
+    /// converged on the other side of the loop, 7 units from its neighbour.
+    /// Every station after it walked the wrong branch, the anchored closing
+    /// station hopped back, and the rows fitted through both branches ran
+    /// through the material the interference gate then found.
+    ///
+    /// Two readings say a converged node is on another branch, and either
+    /// refuses it like a Newton that did not converge: the interval bisects
+    /// and the solve is retried from a nearer seed.  At the depth cap
+    /// (`enforce` false) the node is taken as before: halving can no longer
+    /// help, and where no nearby root exists at all — a ball over its
+    /// ceiling, whose Newton escapes onto a carrier's extension — the escape
+    /// guard downstream names the geometry
+    /// (`inbox_20260910_fillet_mouth_over_wall` pins that message), which a
+    /// branch-hop refusal here would pre-empt.
+    ///
+    /// * A contact moved half a period or more round a CLOSED carrier
+    ///   direction.  The far-branch root above read 11.7 periods.
+    /// * The ball CENTRE moved further than the edge chord plus the ball's
+    ///   diameter.  The same document's second loop at radius 1.5 hopped
+    ///   within one period — support 1 moved 0.34 of a lap, the centre 8.7
+    ///   units for an edge chord under one — and its congruent twin built.
+    ///   Legitimate steps on both loops moved the centre at most 0.69 for a
+    ///   1.69 chord.
+    ///
+    /// Neither bar is a theorem about every blend: a sharp crotch swings the
+    /// centre round the edge faster than the edge advances, and a coarse
+    /// seed step there could exceed either.  That is safe because a trip
+    /// only ever bisects: this check adds retries, never a refusal.
+    fn continue_node(
+        &self,
+        left_t: f64,
+        left_uv: [f64; 4],
+        left_center: Vec3,
+        t: f64,
+        lock: Option<f64>,
+        enforce: bool,
+    ) -> Result<MarchNode, String> {
+        let node = self.solve_node(t, left_uv, lock)?;
+        if !enforce {
+            return Ok(node);
+        }
+        for (index, surface) in [self.surface1, self.surface2].into_iter().enumerate() {
+            // A carrier that cannot answer is not checked here; the solve
+            // itself already evaluated it, so any real fault surfaced there.
+            let (Ok((closed_u, closed_v)), Ok(domain_u), Ok(domain_v)) =
+                (surface.closed_directions(), surface.domain_u(), surface.domain_v())
+            else {
+                continue;
+            };
+            for (direction, closed, domain) in [(0, closed_u, domain_u), (1, closed_v, domain_v)] {
+                let period = domain[1] - domain[0];
+                let column = 2 * index + direction;
+                let step = (node.uv[column] - left_uv[column]).abs();
+                if closed && step >= 0.5 * period {
+                    return Err(format!(
+                        "blend: the station Newton converged on another branch between t={left_t:.9} \
+                         and t={t:.9} — support {} moved {:.3} of a period round its closed \
+                         carrier in one step",
+                        index + 1,
+                        step / period,
+                    ));
+                }
+            }
+        }
+        {
+            // The anchored march runs past t1 once round, so read the edge
+            // the way the solve does: continued past its ends.
+            let point = |t: f64| {
+                self.edge
+                    .curve
+                    .point_and_unit_tangent_extended(t, self.edge.t0, self.edge.t1)
+                    .map(|(point, _)| point)
+            };
+            let chord = point(node.t).and_then(|right| Ok(right.sub(point(left_t)?).length()));
+            if let Ok(chord) = chord {
+                let [rho_left, _] = (self.rho_at)(left_t);
+                let [rho_right, _] = (self.rho_at)(node.t);
+                let diameter = 2.0 * rho_left.abs().max(rho_right.abs());
+                let moved = node.station.center.sub(left_center).length();
+                if moved > chord + diameter {
+                    return Err(format!(
+                        "blend: the station Newton converged on another branch between t={left_t:.9} \
+                         and t={t:.9} — the ball centre moved {moved:.6} for an edge chord of \
+                         {chord:.6} and a ball diameter of {diameter:.6}"
+                    ));
+                }
+            }
+        }
+        Ok(node)
+    }
+
     /// Solve and append every station in (nodes.last().t, right_t], in
     /// strictly increasing parameter order.  An interval is bisected when
     /// its midpoint sagitta says the fitted rows would miss the tolerance
@@ -570,15 +808,22 @@ impl MarchFrame<'_> {
         presolved: Option<MarchNode>,
         depth: usize,
     ) -> Result<(), String> {
-        let (left_t, left_uv) = {
+        let (left_t, left_uv, left_center) = {
             let left = nodes
                 .last()
                 .expect("march interval requires a solved left station");
-            (left.t, left.uv)
+            (left.t, left.uv, left.station.center)
         };
         let right = match presolved {
             Some(node) => node,
-            None => match self.solve_node(right_t, left_uv, lock) {
+            None => match self.continue_node(
+                left_t,
+                left_uv,
+                left_center,
+                right_t,
+                lock,
+                depth < MAX_REFINEMENT_DEPTH,
+            ) {
                 Ok(node) => node,
                 Err(error) => {
                     if depth >= MAX_REFINEMENT_DEPTH {
@@ -591,7 +836,7 @@ impl MarchFrame<'_> {
         };
         if depth < MAX_REFINEMENT_DEPTH {
             let mid_t = 0.5 * (left_t + right.t);
-            match self.solve_node(mid_t, left_uv, None) {
+            match self.continue_node(left_t, left_uv, left_center, mid_t, None, true) {
                 Ok(probe) => {
                     let split = self.needs_refinement(
                         &nodes.last().expect("left station").station,
@@ -764,6 +1009,30 @@ pub(super) fn march_stations(
         nodes.len() <= MAX_STATIONS + 1,
         "adaptive march exceeded its hard station cap"
     );
+    // Does the wall this march would carry FOLD? The centre curve is the same
+    // whichever lane marches it, so the closed-edge march asks the same
+    // question the chain march does (`blend/fold.rs`) — measured by re-solving
+    // the tangency system either side of each station, never off the station
+    // spacing, which on a bend the size of the radius reads clean.
+    {
+        let probe = |t: f64,
+                     seed: [f64; 4]|
+         -> Result<([f64; 4], Vec3, Vec3, Vec3), String> {
+            let node = frame.solve_node(t, seed, None)?;
+            Ok((node.uv, node.station.p1, node.station.p2, node.station.center))
+        };
+        let probed: Vec<(f64, [f64; 4])> = nodes.iter().map(|node| (node.t, node.uv)).collect();
+        let fold_radius = |t: f64| radius_at(t).abs();
+        super::fold::check_wall_fold(
+            &fold_radius,
+            span,
+            &probed,
+            &probe,
+            edge,
+            [first.face, second.face],
+            scale,
+        )?;
+    }
     let stations: Vec<Station> = nodes.into_iter().map(|node| node.station).collect();
     let first_station = &stations[0];
     let last_station = stations.last().expect("march produced stations");
@@ -810,7 +1079,8 @@ pub(super) struct FittedRows {
     /// two-edge miter seam, `miter.rs`).  Only the open march fits it.
     pub(super) center: Option<NurbsCurve>,
     /// True when the surface is the EXACT extrusion of one section along a
-    /// straight spine (a straight edge between two planes: the blend is a
+    /// straight spine (a straight edge between two planes, or between a plane
+    /// or cylinder and a cylinder whose axis runs along it: the blend is a
     /// cylinder patch), laid out with the section along v.  The surgery
     /// transposes such a face once it is built so the analytic recogniser —
     /// which wants the circle along u — sees the cylinder it is.
@@ -1098,7 +1368,10 @@ pub(super) fn signed_radii(
     for fraction in [0.5, 0.375, 0.625, 0.25, 0.75] {
         let t = edge.t0 + (edge.t1 - edge.t0) * fraction;
         let point = edge.curve.evaluate(t)?;
-        let tangent = edge.curve.derivatives(t, 1)?[1].normalized()?;
+        let tangent = edge
+            .curve
+            .unit_tangent(t, edge.t0, edge.t1)
+            .map_err(|error| format!("blend: edge {}: {error}", edge.id))?;
         let Ok(into1) = crate::fillet::into_face_direction(
             first_face, point, tangent, point, tangent, probe_step,
         ) else {

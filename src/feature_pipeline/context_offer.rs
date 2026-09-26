@@ -74,7 +74,7 @@ pub static FEATURE_APPLICABILITY: &[(&str, fn(&SelectionProbe) -> bool)] = &[
     ("IMPORT3D", super::features::import3d::context_applicable),
     ("S", super::features::sketch::context_applicable),
     ("SP", super::features::spline::context_applicable),
-    ("PORT", super::features::port::context_applicable),
+    ("WP", super::features::waypoint::context_applicable),
     ("HX", super::features::helix::context_applicable),
     ("E", super::features::extrude::context_applicable),
     ("B", super::features::boolean::context_applicable),
@@ -83,6 +83,7 @@ pub static FEATURE_APPLICABILITY: &[(&str, fn(&SelectionProbe) -> bool)] = &[
     ("O.S", super::features::offset_shell::context_applicable),
     ("O.F", super::features::offset_face::context_applicable),
     ("PF", super::features::push_face::context_applicable),
+    ("TF", super::features::transform_face::context_applicable),
     ("DF", super::features::delete_face::context_applicable),
     ("THK", super::features::thicken::context_applicable),
     ("SM.TAB", super::features::sheet_metal_tab::context_applicable),
@@ -115,4 +116,3 @@ pub fn feature_context_applicable(type_id: &str, probe: &SelectionProbe) -> bool
         .is_some_and(|(_, applicable)| applicable(probe))
 }
 
-// BREP private tests: 7a82a24044e53956

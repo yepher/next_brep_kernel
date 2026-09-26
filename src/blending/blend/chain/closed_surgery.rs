@@ -679,14 +679,102 @@ pub(super) fn chain_surgery(
             pcurve: crate::sweep_topology::parameter_line(u_start, 0.0, u_start, 1.0)?,
         });
     }
+    let mut loops = vec![LoopRecord {
+        id: loop_id,
+        coedges,
+    }];
+
+    // The CARVED lens: an INNER loop of two coedges on ONE new edge — the
+    // crease — both of them this face's own.  That is the slit pattern the
+    // torus mate's v-seam already carries, and it is what a crease IS: the two
+    // sheets of the wall are one surface, so the curve where they meet has one
+    // edge and two coedges rather than two faces' worth.  The lens between them
+    // is the part of the swept envelope inside the swept ball volume, and
+    // dropping it is what makes the wall the blend.
+    if let Some(crease) = rows.crease {
+        let start_vertex = take_id();
+        let end_vertex = take_id();
+        let crease_edge = take_id();
+        result.vertices.push(VertexRecord {
+            id: start_vertex,
+            point: crease.start,
+        });
+        result.vertices.push(VertexRecord {
+            id: end_vertex,
+            point: crease.end,
+        });
+        let [crease_t0, crease_t1] = crease.curve.domain()?;
+        result.edges.push(EdgeRecord {
+            id: crease_edge,
+            curve: crease.curve,
+            t0: crease_t0,
+            t1: crease_t1,
+            start_vertex_id: start_vertex,
+            end_vertex_id: end_vertex,
+            degenerate: false,
+            name: name.map(|value| format!("{value}:CREASE")),
+        });
+        // WINDING: an inner loop runs against the outer one.  Measured from the
+        // two loops themselves rather than assumed from a convention, so the
+        // hole is a hole whichever way the outer loop was wound (this surgery
+        // winds it two ways already — see `v0_forward` above).
+        let outer = signed_area(&loops[0].coedges)?;
+        let forward_first = signed_area(&[
+            CoedgeRecord {
+                id: 0,
+                edge_id: crease_edge,
+                forward: true,
+                pcurve: crease.first.clone(),
+            },
+            CoedgeRecord {
+                id: 0,
+                edge_id: crease_edge,
+                forward: false,
+                pcurve: crease.second.reversed()?,
+            },
+        ])?;
+        let coedges = if outer * forward_first < 0.0 {
+            vec![
+                CoedgeRecord {
+                    id: take_id(),
+                    edge_id: crease_edge,
+                    forward: true,
+                    pcurve: crease.first,
+                },
+                CoedgeRecord {
+                    id: take_id(),
+                    edge_id: crease_edge,
+                    forward: false,
+                    pcurve: crease.second.reversed()?,
+                },
+            ]
+        } else {
+            vec![
+                CoedgeRecord {
+                    id: take_id(),
+                    edge_id: crease_edge,
+                    forward: true,
+                    pcurve: crease.second,
+                },
+                CoedgeRecord {
+                    id: take_id(),
+                    edge_id: crease_edge,
+                    forward: false,
+                    pcurve: crease.first.reversed()?,
+                },
+            ]
+        };
+        loops.push(LoopRecord {
+            id: take_id(),
+            coedges,
+        });
+    }
+
     let blend_face = FaceRecord {
         id: take_id(),
         surface: rows.surface,
         same_sense,
-        loops: vec![LoopRecord {
-            id: loop_id,
-            coedges,
-        }],
+        loops,
         name: name.map(|value| value.to_string()),
     };
     let shell_index = result
@@ -716,4 +804,29 @@ pub(super) fn chain_surgery(
         }
     }
     crossings.gate(result)
+}
+
+
+/// Signed area of a loop in the face's own (u, v), from its pcurves.
+///
+/// The sign is all that is used: an inner loop must run AGAINST its outer one,
+/// and reading both off the same sampler makes that true by measurement rather
+/// than by a convention this surgery would otherwise have to restate (it winds
+/// the outer loop two different ways already).
+fn signed_area(coedges: &[CoedgeRecord]) -> Result<f64, String> {
+    const SAMPLES: usize = 24;
+    let mut twice_area = 0.0;
+    for coedge in coedges {
+        let [t0, t1] = coedge.pcurve.domain()?;
+        let mut previous: Option<crate::Vec3> = None;
+        for index in 0..=SAMPLES {
+            let t = t0 + (t1 - t0) * index as f64 / SAMPLES as f64;
+            let point = coedge.pcurve.evaluate(t)?;
+            if let Some(before) = previous {
+                twice_area += before.x * point.y - point.x * before.y;
+            }
+            previous = Some(point);
+        }
+    }
+    Ok(0.5 * twice_area)
 }

@@ -9,6 +9,42 @@ use super::*;
 /// edges and the corner rings (one closed curve through every section at each
 /// section corner) are shared between adjacent skins.
 pub fn loft_profile_brep_closed(input_sections: &[Vec<NurbsCurve>]) -> Result<BrepSolid, String> {
+    loft_profile_brep_closed_shifted(input_sections, 0)
+}
+
+/// The largest number of stations one interpolation column of a SHIFTED closed
+/// loft may carry, laps included — the loft's own station cap, because the
+/// column solve is dense and `O(stations³)`.
+const MAX_SHIFTED_COLUMN_STATIONS: usize = 1024;
+
+/// [`loft_profile_brep_closed`] for a ring whose sections come back SHIFTED:
+/// after the last section the cycle continues into section 0 with curve `j`
+/// flowing into curve `(j + shift) mod m`, not into curve `j`.
+///
+/// That is a twisted sweep's closure when the section is symmetric. A square
+/// rolled a quarter turn over one lap lands each side on the NEXT side's place,
+/// so the wall leaving side `j` must arrive on side `j + 1`. The faces stay ONE
+/// PER SECTION CURVE, each spanning one lap: face `j` runs from curve `j` of
+/// section 0 (its `v = 0` seam) to curve `j + shift` of section 0 (its `v = 1`
+/// seam). Its corner rings run from vertex `j` to vertex `j + shift`. The seam
+/// edges are still the section-0 curves, each used by one face at `v = 0` and one
+/// at `v = 1`, so `V − E + F = m − 2m + m = 0`.
+///
+/// C² ACROSS THE SEAM, not welded. The curve indices form cycles of
+/// `laps = m / gcd(m, shift)` under `j → j + shift`, and a control column's data
+/// runs through all of them before it repeats. So each column is interpolated
+/// PERIODICALLY over `laps × S` stations, at parameters `l + p_k` for lap `l`, and
+/// split at the whole laps into one piece per face. Each piece is the lap's own
+/// v-parameterization, `[0, 1]` on the same knots every face uses. At `shift = 0`
+/// every cycle is one lap and this is exactly [`loft_profile_brep_closed`].
+///
+/// Curves `j` and `j + shift` of section 0 must share a representation (degree,
+/// knots, weights). The seam edge at `v = 1` is the other curve, parameterized
+/// as this face's own `u`.
+pub(crate) fn loft_profile_brep_closed_shifted(
+    input_sections: &[Vec<NurbsCurve>],
+    shift: usize,
+) -> Result<BrepSolid, String> {
     let tolerance = 1e-6;
     let section_count = input_sections.len();
     if section_count < 4 {
@@ -16,6 +52,32 @@ pub fn loft_profile_brep_closed(input_sections: &[Vec<NurbsCurve>]) -> Result<Br
     }
     let sections = input_sections.to_vec();
     let curve_count = validate_sections(&sections, tolerance, "loftSolid", false)?;
+    if shift >= curve_count {
+        return Err(format!(
+            "loftSolid: a closed loft's seam shift {shift} must be below its {curve_count} curves"
+        ));
+    }
+    // The curve each one flows into across the seam.
+    let landing = |curve_index: usize| (curve_index + shift) % curve_count;
+    for curve_index in 0..curve_count {
+        let (from, to) = (&sections[0][curve_index], &sections[0][landing(curve_index)]);
+        if from.degree != to.degree
+            || from.control_points.len() != to.control_points.len()
+            || from.knots.len() != to.knots.len()
+            || from.knots.iter().zip(&to.knots).any(|(a, b)| (a - b).abs() > 1e-9)
+            || from
+                .control_points
+                .iter()
+                .zip(&to.control_points)
+                .any(|(a, b)| (a.w - b.w).abs() > 1e-12 * a.w.abs().max(1.0))
+        {
+            return Err(format!(
+                "loftSolid: curve {curve_index} flows across the seam into curve {}, and the two \
+                 are not representation-compatible",
+                landing(curve_index)
+            ));
+        }
+    }
 
     // Cyclic chord parameters over S stations plus the wrap span back to
     // station 0 — the closed analogue of the open loft's averaging.
@@ -28,7 +90,12 @@ pub fn loft_profile_brep_closed(input_sections: &[Vec<NurbsCurve>]) -> Result<Br
             for station in 1..=section_count {
                 let previous =
                     sections[station - 1][curve_index].control_points[control_index].point()?;
-                let current = sections[station % section_count][curve_index].control_points
+                let across = if station == section_count {
+                    landing(curve_index)
+                } else {
+                    curve_index
+                };
+                let current = sections[station % section_count][across].control_points
                     [control_index]
                     .point()?;
                 total += current.sub(previous).length();
@@ -57,33 +124,37 @@ pub fn loft_profile_brep_closed(input_sections: &[Vec<NurbsCurve>]) -> Result<Br
     }
 
     let mut skins = Vec::with_capacity(curve_count);
-    for curve_index in 0..curve_count {
-        let reference = &sections[0][curve_index];
-        let mut grid = Vec::with_capacity(reference.control_points.len());
-        let mut knots_v = Vec::new();
-        for control_index in 0..reference.control_points.len() {
-            let points = sections
-                .iter()
-                .map(|section| section[curve_index].control_points[control_index].point())
-                .collect::<Result<Vec<_>, _>>()?;
-            let interpolated = crate::interpolate_curve_closed(&points, &parameters)?;
-            knots_v = interpolated.knots.clone();
-            let weight = reference.control_points[control_index].w;
-            grid.push(
-                interpolated
-                    .control_points
+    if shift == 0 {
+        for curve_index in 0..curve_count {
+            let reference = &sections[0][curve_index];
+            let mut grid = Vec::with_capacity(reference.control_points.len());
+            let mut knots_v = Vec::new();
+            for control_index in 0..reference.control_points.len() {
+                let points = sections
                     .iter()
-                    .map(|point| Vec4::from_point(point.point().unwrap(), weight))
-                    .collect(),
-            );
+                    .map(|section| section[curve_index].control_points[control_index].point())
+                    .collect::<Result<Vec<_>, _>>()?;
+                let interpolated = crate::interpolate_curve_closed(&points, &parameters)?;
+                knots_v = interpolated.knots.clone();
+                let weight = reference.control_points[control_index].w;
+                grid.push(
+                    interpolated
+                        .control_points
+                        .iter()
+                        .map(|point| Vec4::from_point(point.point().unwrap(), weight))
+                        .collect(),
+                );
+            }
+            skins.push(NurbsSurface::new(
+                reference.degree,
+                3,
+                reference.knots.clone(),
+                knots_v,
+                grid,
+            )?);
         }
-        skins.push(NurbsSurface::new(
-            reference.degree,
-            3,
-            reference.knots.clone(),
-            knots_v,
-            grid,
-        )?);
+    } else {
+        skins = shifted_skins(&sections, &parameters, curve_count, shift)?;
     }
 
     // Topology: c corner vertices (section-0 corners), c corner-ring edges
@@ -113,7 +184,7 @@ pub fn loft_profile_brep_closed(input_sections: &[Vec<NurbsCurve>]) -> Result<Br
             t0: ring_start,
             t1: ring_end,
             start_vertex_id: index as u64 + 1,
-            end_vertex_id: index as u64 + 1,
+            end_vertex_id: landing(index) as u64 + 1,
             degenerate: false,
             name: None,
         });
@@ -138,7 +209,8 @@ pub fn loft_profile_brep_closed(input_sections: &[Vec<NurbsCurve>]) -> Result<Br
     for index in 0..curve_count {
         let [u_start, u_end] = sections[0][index].domain()?;
         // Cylinder-wall rectangle: seam at v=0 forward, next corner ring up,
-        // seam at v=1 backward, own corner ring down.
+        // seam at v=1 backward, own corner ring down. On a SHIFTED ring the seam
+        // at v=1 is the curve this one lands on.
         let coedges = vec![
             CoedgeRecord {
                 id: next_id,
@@ -154,7 +226,7 @@ pub fn loft_profile_brep_closed(input_sections: &[Vec<NurbsCurve>]) -> Result<Br
             },
             CoedgeRecord {
                 id: next_id + 2,
-                edge_id: seam_edge_ids[index],
+                edge_id: seam_edge_ids[landing(index)],
                 forward: false,
                 pcurve: parameter_line(u_end, 1.0, u_start, 1.0)?,
             },
@@ -203,5 +275,104 @@ pub fn loft_profile_brep_closed(input_sections: &[Vec<NurbsCurve>]) -> Result<Br
     if crate::solid_signed_volume(&solid)? < 0.0 {
         crate::offset_shell::flip_all_faces(&mut solid)?;
     }
-    Ok(solid)
+    // A ring carried round a path too tight for its own profile closes through
+    // itself, and neither the validation above nor the signed volume can see
+    // it: the enclosed space still measures. Same acceptance as the open loft.
+    crate::accept_sound(solid, "loftSolid")
+}
+
+/// The skins of a SHIFTED closed loft ([`loft_profile_brep_closed_shifted`]): each
+/// control column interpolated periodically over every lap of its curve cycle,
+/// then split at the whole laps, one piece per face.
+fn shifted_skins(
+    sections: &[Vec<NurbsCurve>],
+    parameters: &[f64],
+    curve_count: usize,
+    shift: usize,
+) -> Result<Vec<NurbsSurface>, String> {
+    let section_count = sections.len();
+    let gcd = |mut a: usize, mut b: usize| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    };
+    let laps = curve_count / gcd(curve_count, shift);
+    if laps * section_count > MAX_SHIFTED_COLUMN_STATIONS {
+        return Err(format!(
+            "loftSolid: a ring whose curves land {shift} along after one lap runs each skin \
+             through {laps} laps of {section_count} stations, {} in all, past the \
+             {MAX_SHIFTED_COLUMN_STATIONS}-station cap the loft's dense column solve can carry",
+            laps * section_count
+        ));
+    }
+    // The knots every face shares in v: one lap's periodic interpolation, clamped.
+    let mut lap_knots = vec![parameters[0]; 4];
+    lap_knots.extend_from_slice(&parameters[1..section_count]);
+    lap_knots.extend(std::iter::repeat_n(parameters[section_count], 4));
+    let mut lap_parameters = Vec::with_capacity(laps * section_count + 1);
+    for lap in 0..laps {
+        for station in 0..section_count {
+            lap_parameters.push(lap as f64 + parameters[station]);
+        }
+    }
+    lap_parameters.push(laps as f64);
+
+    let mut grids: Vec<Vec<Vec<Vec4>>> = sections[0]
+        .iter()
+        .map(|curve| vec![Vec::new(); curve.control_points.len()])
+        .collect();
+    let mut visited = vec![false; curve_count];
+    for start in 0..curve_count {
+        if visited[start] {
+            continue;
+        }
+        let cycle: Vec<usize> = (0..laps).map(|lap| (start + lap * shift) % curve_count).collect();
+        for &curve_index in &cycle {
+            visited[curve_index] = true;
+        }
+        for control_index in 0..sections[0][start].control_points.len() {
+            let mut points = Vec::with_capacity(laps * section_count);
+            for &curve_index in &cycle {
+                for section in sections {
+                    points.push(section[curve_index].control_points[control_index].point()?);
+                }
+            }
+            let mut rest = crate::interpolate_curve_closed(&points, &lap_parameters)?;
+            for (lap, &curve_index) in cycle.iter().enumerate() {
+                let piece = if lap + 1 < laps {
+                    let (piece, remainder) = rest.split((lap + 1) as f64)?;
+                    rest = remainder;
+                    piece
+                } else {
+                    rest.clone()
+                };
+                if piece.knots.len() != lap_knots.len()
+                    || piece
+                        .knots
+                        .iter()
+                        .zip(&lap_knots)
+                        .any(|(knot, own)| (knot - lap as f64 - own).abs() > 1e-9)
+                {
+                    return Err(format!(
+                        "loftSolid: lap {lap} of a shifted ring's column did not split onto the \
+                         lap's own knots"
+                    ));
+                }
+                let weight = sections[0][curve_index].control_points[control_index].w;
+                grids[curve_index][control_index] = piece
+                    .control_points
+                    .iter()
+                    .map(|point| Ok(Vec4::from_point(point.point()?, weight)))
+                    .collect::<Result<Vec<_>, String>>()?;
+            }
+        }
+    }
+    sections[0]
+        .iter()
+        .zip(grids)
+        .map(|(reference, grid)| {
+            NurbsSurface::new(reference.degree, 3, reference.knots.clone(), lap_knots.clone(), grid)
+        })
+        .collect()
 }

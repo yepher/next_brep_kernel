@@ -466,4 +466,3 @@ fn oracle_scan(solid: &BrepSolid, heal_tol: f64) {
     }
 }
 
-// BREP private tests: 8278aed4986f3d13

@@ -27,9 +27,11 @@ enum EdgeMoveAction {
     /// created these edges SPLIT them at the corner, so `domain == [t0, t1]` and
     /// there is no parameter headroom for an outward push (verified on the
     /// flatted-frustum fixture — the flat×cone hyperbolas and the cap's conic
-    /// rims alike). Used for a CONE's oblique multi-rim cap, where the rim's
-    /// homothety about the apex carries the whole conic exactly but slides the
-    /// ARC's endpoints off the fixed wall the corners must stay on.
+    /// rims alike). Used where an oblique multi-rim cap's affine rim map carries
+    /// the whole conic exactly but slides the ARC's endpoints off the fixed wall
+    /// the corners must stay on (a cone's homothety about its apex), and for the
+    /// curved fixed edge between a flat and a cylinder or cone whose corner the
+    /// push moves.
     Replace {
         curve: NurbsCurve,
     },
@@ -45,7 +47,7 @@ enum FaceMoveAction {
 
 /// `plane_of_surface` with per-face memoisation, because a face is consulted
 /// once per boundary edge, once per touched vertex, and once at re-trim time.
-fn cached_plane(
+pub(super) fn cached_plane(
     cache: &mut HashMap<u64, Plane>,
     solid: &BrepSolid,
     face_lookup: &HashMap<u64, (usize, usize)>,
@@ -69,7 +71,7 @@ fn cached_plane(
 
 /// The carrier kind of a face, in the words a user would use — for refusals
 /// that must say WHAT the offending face is.
-fn carrier_kind_name(surface: &NurbsSurface) -> &'static str {
+pub(super) fn carrier_kind_name(surface: &NurbsSurface) -> &'static str {
     match surface.analytic() {
         Some(AnalyticSurface::Plane { .. }) => "plane",
         Some(AnalyticSurface::RuledRevolution { rho0, rho1, .. }) => {
@@ -123,7 +125,7 @@ fn unsupported_carrier(
 /// pair for the line, then the plane most transverse to that line for the
 /// point. The caller checks the residual against EVERY plane afterwards, so
 /// this only has to find *a* candidate, not prove consistency.
-fn solve_corner(planes: &[Plane]) -> Option<Vec3> {
+pub(super) fn solve_corner(planes: &[Plane]) -> Option<Vec3> {
     let mut best_pair: Option<(usize, usize, f64)> = None;
     for first in 0..planes.len() {
         for second in first + 1..planes.len() {
@@ -176,7 +178,7 @@ fn plan_straight_rebuild(
             edge.id
         ));
     }
-    if edge.curve.degree != 1 || edge.curve.control_points.len() != 2 {
+    if edge.curve.straight_segment(tolerance).is_none() {
         return Err(format!(
             "move_faces: edge {} must be re-stretched but is not a straight line \
              (curved re-intersection edges are deferred in this slice)",
@@ -289,7 +291,7 @@ fn ruled_revolution_carrier(
 /// exact affine `rim_ruled_map` (a homothety about the cone apex, or an axis
 /// translation for a cylinder), so unlike the earlier `axis_parallel_ruled`
 /// predicate this no longer requires the push to be parallel to the axis.
-fn carrier_ruled(
+pub(super) fn carrier_ruled(
     solid: &BrepSolid,
     face_lookup: &HashMap<u64, (usize, usize)>,
     face_id: u64,
@@ -338,8 +340,12 @@ fn plane_parallel_to(
     }
 }
 
-/// True iff a FIXED carrier is INVARIANT under `translation`, so a corner on it
-/// rides rigidly by `+translation` and provably stays on it. Two carriers are:
+/// True iff a carrier is INVARIANT under `translation` — `S + T == S` as a point
+/// set. Read on a FIXED face it says a corner on it rides rigidly by
+/// `+translation` and provably stays on it; read on every MOVED face at once it
+/// says the whole edit is the identity (`translation_is_identity_on`), because
+/// the predicate is about the geometry and not about the role the face plays.
+/// Two carriers are invariant:
 ///   • a plane the push is PARALLEL to (the corner slides in-plane), and
 ///   • a CYLINDER whose axis the push is PARALLEL to (the point shifts along a
 ///     generatrix, radius unchanged).
@@ -371,6 +377,50 @@ fn carrier_invariant_under(
         }
     }
     false
+}
+
+/// True iff `translation` carries EVERY selected carrier onto ITSELF, which
+/// makes the whole edit the IDENTITY: the answer is the input body, exactly.
+///
+/// The argument in full, because this lane answers before any other guard is
+/// asked. `move_faces` edits CARRIERS: a selected face's carrier becomes
+/// `S + T`, an unselected one is not touched at all, and every edge of a
+/// manifold solid is a section of the two carriers that share it (a periodic
+/// face's seam is the exception, and it is pinned by its endpoints, which are
+/// such sections). When `S + T == S` for every selected face, every carrier in
+/// the output is the same POINT SET as the one in the input — so every section
+/// is the same curve, every corner the same point, every trim the same trim,
+/// and the body is the input. That is not a guard being relaxed; it is a
+/// question the roads below never get to ask, because each of them chooses its
+/// lane from a NEIGHBOUR's carrier pair before the motion's magnitude is
+/// consulted at all. Nothing is left for the collapse, inversion and tear
+/// guards to find: each convicts a moved face for reaching somewhere new, and
+/// no point of an invariant carrier is anywhere new. Returning `solid` itself
+/// rather than a rebuild of it also means the identity is exact — not exact to
+/// a tolerance.
+///
+/// The invariant carriers are exactly the plane the translation is PARALLEL to
+/// and the cylinder whose AXIS it is parallel to; `carrier_invariant_under`
+/// already decides that on the geometry alone. A cone is excluded there and
+/// must be: an axial translation slides a cone ALONG itself but not ONTO
+/// itself, because its radius varies with the axial coordinate. A sphere,
+/// torus, general revolution or free-form patch is invariant under no
+/// translation but the zero one, and is refused here for want of a proof, which
+/// costs nothing: those take the roads below exactly as before.
+///
+/// EVERY selected face, because one that is not invariant moves the body: a top
+/// that slides in its own plane TOGETHER with a band that does not is not an
+/// identity, and takes the roads below unchanged.
+fn translation_is_identity_on(
+    solid: &BrepSolid,
+    face_lookup: &HashMap<u64, (usize, usize)>,
+    moved: &HashSet<u64>,
+    translation: Vec3,
+    parallel_tol: f64,
+) -> bool {
+    moved.iter().all(|&face_id| {
+        carrier_invariant_under(solid, face_lookup, face_id, translation, parallel_tol)
+    })
 }
 
 /// The EXACT affine that re-intersects a planar cap's rim with a ruled
@@ -485,8 +535,102 @@ fn verify_rim_on_carriers(
     Ok(())
 }
 
+/// A ruled revolution's frame carried by the push. A translation is rigid and
+/// leaves the axis DIRECTION and the radial basis alone, so the shifted frame
+/// describes the PUSHED carrier exactly and its radii and height are untouched.
+/// That is what lets a bore wall's own section against a fixed flat be
+/// re-intersected with the same closed form the mirror case uses.
+fn shift_ruled_frame(
+    frame: &crate::RevolutionFrame,
+    translation: Vec3,
+) -> crate::RevolutionFrame {
+    crate::RevolutionFrame {
+        origin: frame.origin.add(translation),
+        axis: frame.axis,
+        x_axis: frame.x_axis,
+        y_axis: frame.y_axis,
+    }
+}
+
+/// THE MIRROR MAP — the exact affine carrying the rim a MOVED ruled carrier
+/// shares with a FIXED plane: `P ∩ C  ↦  P ∩ (C + T)`.
+///
+/// Which of the two carriers the push moves is not something the section can
+/// see. Read in the CARRIER's own frame, a fixed plane `P` against a carrier
+/// pushed by `T` IS the plane pushed by `−T` against the carrier on record — so
+/// the map is [`rim_ruled_map`]'s affine for `−T` (a cylinder's axis
+/// translation, a cone's homothety about its apex), which lands the rim on
+/// `(P − T) ∩ C`, followed by `+ T`, which lands the whole conic back on `P`
+/// and on the pushed carrier. Both steps are affine, so a rational-quadratic
+/// rim maps EXACTLY, control point by control point, and its parametrisation
+/// survives untouched — a CLOSED rim included, where there is no arc to
+/// re-anchor and nothing for a corner to disambiguate.
+///
+/// For a CYLINDER the composite is the pure translation
+/// `T − ((n·T)/(n·a))·a`: the push with the part the carrier absorbs (its axial
+/// component) removed. The limits are `rim_ruled_map`'s own, and one of them is
+/// this direction's too — a push that would lay the axis parallel to the flat
+/// (`n·a ≈ 0`) meets it in a pair of rulings rather than a conic, and there is
+/// no rim to build.
+fn moved_ruled_rim_map(
+    frame: &crate::RevolutionFrame,
+    rho0: f64,
+    rho1: f64,
+    height: f64,
+    fixed_plane: &Plane,
+    translation: Vec3,
+    tolerance: f64,
+) -> Result<AffineTransform, String> {
+    let back = rim_ruled_map(
+        frame,
+        rho0,
+        rho1,
+        height,
+        fixed_plane,
+        translation.scale(-1.0),
+        tolerance,
+    )?;
+    // `translate(T) ∘ back` — a translation only touches the last column.
+    let mut elements = back.elements;
+    elements[3] += translation.x;
+    elements[7] += translation.y;
+    elements[11] += translation.z;
+    AffineTransform::new(elements)
+}
+
+/// The PUSHED ruled carrier of the one moved face at a corner, when that is
+/// what the corner must be solved against: `Some((face id, the frame on record,
+/// rho0, rho1, height))` for exactly one moved face at the vertex whose carrier
+/// is a cylinder or cone the translation does NOT leave invariant.
+///
+/// `None` — and so the roads that existed before — for a planar moved face, for
+/// a carrier the push maps onto itself (the rigid regime has already claimed
+/// those), and for a group that brings TWO faces to the corner, where "the
+/// rim's own affine places it" is no longer a statement about one carrier. A
+/// moved sphere, torus, revolution or free-form patch is not ruled, so it falls
+/// through to the three-plane solve and refuses there by name, as before.
+fn moved_ruled_carrier_at(
+    solid: &BrepSolid,
+    face_lookup: &HashMap<u64, (usize, usize)>,
+    moved: &HashSet<u64>,
+    adjacent: &HashSet<u64>,
+    translation: Vec3,
+    parallel_tolerance: f64,
+) -> Option<(u64, crate::RevolutionFrame, f64, f64, f64)> {
+    let mut here = adjacent.iter().copied().filter(|id| moved.contains(id));
+    let face_id = here.next()?;
+    if here.next().is_some() {
+        return None;
+    }
+    if carrier_invariant_under(solid, face_lookup, face_id, translation, parallel_tolerance) {
+        return None;
+    }
+    let (frame, rho0, rho1, height) = carrier_ruled(solid, face_lookup, face_id)?;
+    Some((face_id, frame, rho0, rho1, height))
+}
+
 /// True iff the face's carrier is a plane (the today path — planar retrim).
-fn carrier_is_planar(
+pub(super) fn carrier_is_planar(
     solid: &BrepSolid,
     face_lookup: &HashMap<u64, (usize, usize)>,
     face_id: u64,
@@ -502,15 +646,24 @@ fn carrier_is_planar(
         .unwrap_or(false)
 }
 
-/// A rebuilt straight edge bordering a curved invariant carrier must still lie
-/// ON that carrier (endpoints + midpoint within `10·tol`), else the moved group
-/// tore off it — refuse rather than emit a bad solid.
+/// A rebuilt straight edge bordering a curved carrier must still lie ON that
+/// carrier (endpoints + midpoint within `10·tol`), else the moved group tore
+/// off it — refuse rather than emit a bad solid.
+///
+/// `carrier_shift` is `Some(T)` when the face is one the push MOVES — the bore
+/// wall carrying its own seam generatrix — in which case the chord is measured
+/// against the carrier the push LEAVES, not the one on record. Measured against
+/// the stored frame it would convict every such push of tearing the seam off
+/// its own cylinder. (An invariant carrier measures identically either way:
+/// `ruled_offset` reads only the origin and the axis, and an axis-parallel
+/// shift moves the origin along the axis.)
 fn verify_chord_on_carrier(
     solid: &BrepSolid,
     face_lookup: &HashMap<u64, (usize, usize)>,
     face_id: u64,
     start: Vec3,
     end: Vec3,
+    carrier_shift: Option<Vec3>,
     tolerance: f64,
 ) -> Result<(), String> {
     let (shell, face) = *face_lookup
@@ -529,7 +682,8 @@ fn verify_chord_on_carrier(
             "move_faces: chord-on-carrier check expects a ruled carrier (face {face_id})"
         ));
     };
-    let (origin, axis) = (frame.origin, frame.axis);
+    let origin = frame.origin.add(carrier_shift.unwrap_or_default());
+    let axis = frame.axis;
     let midpoint = start.add(end).scale(0.5);
     for point in [start, midpoint, end] {
         let delta = point.sub(origin);
@@ -559,18 +713,19 @@ fn verify_chord_on_carrier(
 /// neighbour are carried.
 ///
 /// The three-phase body is `crate::offset_retrim::retrim_face_in_solid`; this is
-/// the two-step growth strategy and the `move_faces` refusal prefix. It differs
+/// the two-step growth strategy and the caller's `op` refusal prefix. It differs
 /// from `face_offset::retrim_offset_ruled_face` in exactly that second growth
 /// call — the partial-sweep `Revolution` prolongation, which the offset push has
 /// never run.
-fn retrim_ruled_face(
+pub(super) fn retrim_ruled_face(
     solid: &mut BrepSolid,
     face_id: u64,
     final_edges: &HashMap<u64, EdgeRecord>,
     tolerance: f64,
+    op: &str,
 ) -> Result<(), String> {
     let (shell, face_pos) = find_face(solid, face_id)
-        .ok_or_else(|| format!("move_faces: missing ruled face {face_id}"))?;
+        .ok_or_else(|| format!("{op}: missing ruled face {face_id}"))?;
     retrim_face_in_solid(
         solid,
         shell,
@@ -580,8 +735,8 @@ fn retrim_ruled_face(
             extend_ruled_neighbour_over(solid, face_id, points, tolerance)?;
             extend_revolution_carrier_over(solid, face_id, points, tolerance)
         },
-        PcurveFit::SubrangeAware { tolerance },
-        "move_faces",
+        tolerance,
+        op,
     )
 }
 
@@ -597,7 +752,7 @@ fn retrim_ruled_face(
 /// corner (`domain == [t0, t1]`), so riding the edge can only ever move a corner
 /// INWARD — an outward push would refuse for a purely representational reason.
 /// The carriers have no such horizon.
-fn corner_on_plane_and_ruled(
+pub(super) fn corner_on_plane_and_ruled(
     fixed_plane: &Plane,
     cap_normal: Vec3,
     cap_c: f64,
@@ -682,7 +837,7 @@ fn corner_on_plane_and_ruled(
 /// True iff `curve[t0..t1]` sweeps in the POSITIVE azimuth sense about `frame`
 /// (the sense `make_arc` builds), decided by whether its midpoint's azimuth lies
 /// inside the positive sweep from the start's to the end's.
-fn arc_sweeps_forward(
+pub(super) fn arc_sweeps_forward(
     frame: &crate::RevolutionFrame,
     curve: &NurbsCurve,
     t0: f64,
@@ -723,7 +878,7 @@ fn arc_sweeps_forward(
 /// The kernel's own `intersect_plane_quadric` builds a cone section the same way
 /// but only ever for the FULL section, so it refuses exactly the hyperbolic case
 /// this arc-restricted form supports.
-fn conic_arc_on_ruled(
+pub(super) fn conic_arc_on_ruled(
     frame: &crate::RevolutionFrame,
     rho0: f64,
     rho1: f64,
@@ -736,33 +891,11 @@ fn conic_arc_on_ruled(
     tolerance: f64,
 ) -> Result<NurbsCurve, String> {
     let radius_scale = rho0.abs().max(rho1.abs()).max(1.0);
-    if (rho1 - rho0).abs() <= 1e-9 * radius_scale {
-        // A cylinder's plane section is an ellipse (or a generatrix pair); its
-        // straight sections are already handled by the chord rebuild and no
-        // fixture exercises a curved one, so it stays an honest refusal.
-        return Err(
-            "move_faces: rebuilding a curved section on a CYLINDER carrier is deferred \
-             — refusing"
-                .into(),
-        );
-    }
     let axis = frame.axis;
-    let apex = frame
-        .origin
-        .add(axis.scale(rho0 * height / (rho0 - rho1)));
-    let k = plane_c - plane_normal.dot(apex);
-    if k.abs() <= tolerance {
-        return Err("move_faces: the section plane passes through the cone apex — refusing".into());
-    }
-    // Base circle at whichever end has the LARGER radius, so it never degenerates.
-    let (reference_rho, reference_axial) = if rho0.abs() >= rho1.abs() {
-        (rho0.abs(), 0.0)
-    } else {
-        (rho1.abs(), height)
-    };
-    if reference_rho <= tolerance {
-        return Err("move_faces: the cone carrier degenerates to its apex — refusing".into());
-    }
+    // Azimuth is preserved by BOTH section constructions — a cone's central
+    // projection from a point on the axis, and a cylinder's axial shear add no
+    // azimuthal component — so the arc between two points on the section is the
+    // arc between their azimuths on the base circle, exactly.
     let azimuth = |point: Vec3| {
         let delta = point.sub(frame.origin);
         delta.dot(frame.y_axis).atan2(delta.dot(frame.x_axis))
@@ -787,6 +920,46 @@ fn conic_arc_on_ruled(
              — refusing"
                 .into(),
         );
+    }
+    if (rho1 - rho0).abs() <= 1e-9 * radius_scale {
+        // A CYLINDER's plane section is an ellipse, built by the shared
+        // `plane_ruled_section_arc` — the same axial-shear image of a base arc
+        // `intersect_plane_quadric` uses for the whole section. This arm used
+        // to be an honest refusal ("deferred"), which is what stopped a curved
+        // fixed edge on a cylinder carrier from rebuilding.
+        let mut curve = plane_ruled_section_arc(
+            plane_normal.scale(plane_c / plane_normal.dot(plane_normal)),
+            plane_normal,
+            frame,
+            rho0,
+            rho1,
+            height,
+            start_angle,
+            sweep,
+            tolerance,
+        )
+        .map_err(|error| error.replace("plane_ruled_section_arc:", "move_faces:"))?;
+        if reverse {
+            curve = curve.reversed()?;
+        }
+        verify_section_between(&curve, frame, rho0, rho1, height, plane_normal, plane_c, start, end, tolerance)?;
+        return Ok(curve);
+    }
+    let apex = frame
+        .origin
+        .add(axis.scale(rho0 * height / (rho0 - rho1)));
+    let k = plane_c - plane_normal.dot(apex);
+    if k.abs() <= tolerance {
+        return Err("move_faces: the section plane passes through the cone apex — refusing".into());
+    }
+    // Base circle at whichever end has the LARGER radius, so it never degenerates.
+    let (reference_rho, reference_axial) = if rho0.abs() >= rho1.abs() {
+        (rho0.abs(), 0.0)
+    } else {
+        (rho1.abs(), height)
+    };
+    if reference_rho <= tolerance {
+        return Err("move_faces: the cone carrier degenerates to its apex — refusing".into());
     }
     let circle = crate::make_arc(
         frame.origin.add(axis.scale(reference_axial)),
@@ -842,9 +1015,31 @@ fn conic_arc_on_ruled(
     if reverse {
         curve = curve.reversed()?;
     }
-    // Fail-safe: the rebuilt arc must run between the given corners and lie on
-    // BOTH carriers — the same "reapply the trimming" contract the affine rim map
-    // is held to in `verify_rim_on_carriers`.
+    verify_section_between(
+        &curve, frame, rho0, rho1, height, plane_normal, plane_c, start, end, tolerance,
+    )?;
+    Ok(curve)
+}
+
+/// The "reapply the trimming" contract a rebuilt section is held to, shared by
+/// both branches of [`conic_arc_on_ruled`] and by the rotation's rim rebuild:
+/// the arc must RUN BETWEEN the two given corners and every sample of it must
+/// lie on BOTH carriers. The constructions are exact, so this measures rather
+/// than fits — it is the same fail-safe [`verify_rim_on_carriers`] applies to
+/// the affine rim map.
+pub(super) fn verify_section_between(
+    curve: &NurbsCurve,
+    frame: &crate::RevolutionFrame,
+    rho0: f64,
+    rho1: f64,
+    height: f64,
+    plane_normal: Vec3,
+    plane_c: f64,
+    start: Vec3,
+    end: Vec3,
+    tolerance: f64,
+) -> Result<(), String> {
+    let axis = frame.axis;
     let [d0, d1] = curve.domain()?;
     for (parameter, target) in [(d0, start), (d1, end)] {
         let drift = curve.evaluate(parameter)?.sub(target).length();
@@ -869,12 +1064,12 @@ fn conic_arc_on_ruled(
             ));
         }
     }
-    Ok(curve)
+    Ok(())
 }
 
 /// The fixed PLANE and the fixed RULED carrier an edge is shared by, when it is
 /// shared by exactly one of each (the flat×cone hyperbola configuration).
-fn plane_and_ruled_carriers(
+pub(super) fn plane_and_ruled_carriers(
     solid: &BrepSolid,
     face_lookup: &HashMap<u64, (usize, usize)>,
     planes: &mut HashMap<u64, Plane>,
@@ -929,7 +1124,7 @@ fn plane_and_ruled_carriers(
 ///
 /// Refuses cleanly when the fixed edge runs in the cap plane (no crossing) or
 /// the push drives the corner off the edge's reachable span (a tearing push).
-fn resolve_corner_on_fixed_edge(
+pub(super) fn resolve_corner_on_fixed_edge(
     fixed_edge: &EdgeRecord,
     seed_param: f64,
     plane_normal: Vec3,
@@ -937,9 +1132,7 @@ fn resolve_corner_on_fixed_edge(
     tolerance: f64,
 ) -> Result<Vec3, String> {
     let curve = &fixed_edge.curve;
-    if curve.degree == 1 && curve.control_points.len() == 2 {
-        let p0 = curve.control_points[0].point()?;
-        let p1 = curve.control_points[1].point()?;
+    if let Some((p0, p1)) = curve.straight_segment(tolerance) {
         let dir = p1.sub(p0);
         let denom = plane_normal.dot(dir);
         if denom.abs() <= PARALLEL_EPS * (1.0 + dir.length()) {
@@ -1034,8 +1227,9 @@ fn resolve_corner_on_fixed_edge(
 /// meets are RE-BUILT as exact conic sections between the re-solved corners
 /// (`conic_arc_on_ruled`, `EdgeMoveAction::Replace`); the corner itself comes
 /// from the carrier-level solve `corner_on_plane_and_ruled`. A curved fixed edge
-/// on a CYLINDER carrier, spheres, tori, general revolutions and a cap pushed
-/// to/through the apex are refused (SM3 is the general offset path).
+/// rebuilds on a CYLINDER carrier as its ellipse and on a cone as its conic.
+/// Spheres (outside their dedicated route), tori, general revolutions and a cap
+/// pushed to/through the apex are refused (SM3 is the general offset path).
 /// A translation that collapses an adjacent edge to zero length or reverses
 /// its direction (moving a box face onto or past its opposite face) is
 /// refused, as is a group that tears away from its neighbours. The input is
@@ -1070,6 +1264,16 @@ pub fn move_faces(
         }
     }
 
+    // THE PARALLEL ROAD. `BREP_FACE_MOVE_ROAD=carrier` re-intersects the
+    // selection's UNBOUNDED carriers against the rest of the solid instead of
+    // classifying each boundary edge into one of four actions — the
+    // construction the operator asked for, built alongside this one so the two
+    // can be compared cell by cell on the capability matrix before anything is
+    // rewired. With the variable unset this line is the only trace of it.
+    if carrier_road_selected() {
+        return move_faces_by_carrier(solid, &moved, translation);
+    }
+
     let scale = solid_model_scale(solid);
     let tolerance = (scale * 1e-7).max(1e-9);
     let plane_tolerance = (scale * 1e-6).max(1e-7);
@@ -1094,6 +1298,39 @@ pub fn move_faces(
             }
         }
     }
+    // --- The manifold contract, asked once and early -----------------------
+    // Hoisted out of the classification loop below so that the identity lane
+    // that follows cannot hand a non-manifold document straight back unread.
+    // The message is that loop's own, unchanged, and so is the verdict: this is
+    // the same test at an earlier line.
+    for edge in &solid.edges {
+        let uses = faces_of_edge
+            .get(&edge.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let expected = if edge.degenerate { 1 } else { 2 };
+        if uses.len() != expected {
+            return Err(format!(
+                "move_faces: edge {} is used {} times (non-manifold input)",
+                edge.id,
+                uses.len()
+            ));
+        }
+    }
+
+    // --- THE IDENTITY: a translation no selected carrier can feel ----------
+    // A plane slid WITHIN itself and a cylinder pushed along its OWN axis are
+    // the same statement — `S + T == S` — and the answer to both is the input
+    // body. Answered here, ahead of every road below, because each of those
+    // chooses its lane from a neighbour's carrier pair BEFORE the motion is
+    // looked at: a slide over a fillet band took the curved-fixed-edge road and
+    // a bore wall along its axis took the three-plane corner solve, and both
+    // refused a motion that moves nothing. See `translation_is_identity_on` for
+    // why no guard below is being relaxed by answering first.
+    if translation_is_identity_on(solid, &face_lookup, &moved, translation, parallel_tolerance) {
+        return Ok(solid.clone());
+    }
+
     // --- Plane × Sphere fast path (backlog #5) -----------------------------
     // A planar push whose FIXED neighbour across a boundary edge is a SPHERE
     // cannot be healed by the planar/ruled machinery below: the sphere's seam
@@ -1128,14 +1365,7 @@ pub fn move_faces(
             .get(&edge.id)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let expected = if edge.degenerate { 1 } else { 2 };
-        if uses.len() != expected {
-            return Err(format!(
-                "move_faces: edge {} is used {} times (non-manifold input)",
-                edge.id,
-                uses.len()
-            ));
-        }
+        // Manifold use counts were checked above, before the identity lane.
         let moved_uses = uses
             .iter()
             .filter(|face_id| moved.contains(*face_id))
@@ -1261,6 +1491,83 @@ pub fn move_faces(
             new_vertex.insert(vertex.id, vertex.point.add(translation));
             continue;
         }
+        // THE MIRROR CORNER — a MOVED ruled carrier against a fixed FLAT. This
+        // is the bore wall the user drags: the moved face is the cylinder (or
+        // cone), the fixed neighbour is the flat it opens through, and the rim
+        // they meet in is a conic on that flat. Neither road below can place
+        // this corner — the three-plane solve because the moved carrier is not
+        // a plane, the multi-rim ride because there it is the FIXED side that
+        // is curved. What places it is the rim's OWN exact affine: the corner
+        // is the image of the old corner under the map that carries
+        // `P ∩ C → P ∩ (C + T)`, and that is the same map the rim edge is then
+        // built with, so the corner and its rim cannot disagree.
+        if let Some((moved_face, frame, rho0, rho1, height)) = moved_ruled_carrier_at(
+            solid,
+            &face_lookup,
+            &moved,
+            adjacent,
+            translation,
+            parallel_tolerance,
+        ) {
+            // Two fixed flats at the corner give two different maps (each
+            // absorbs its own flat's share of the push along the axis) and no
+            // single image for the vertex. It refuses by name rather than
+            // picking one.
+            if fixed_at.len() != 1 {
+                return Err(format!(
+                    "move_faces: the corner at vertex {} where the MOVED {} meets its \
+                     neighbours touches {} fixed faces (a pushed cylinder or cone is \
+                     re-intersected against exactly one flat there) — refusing",
+                    vertex.id,
+                    carrier_kind_name(
+                        &solid.shells[face_lookup[&moved_face].0].faces[face_lookup[&moved_face].1]
+                            .surface
+                    ),
+                    fixed_at.len()
+                ));
+            }
+            let fixed_face = fixed_at[0];
+            let flat = cached_plane(&mut planes, solid, &face_lookup, fixed_face, plane_tolerance)
+                .map_err(|_| {
+                    unsupported_carrier(
+                        solid,
+                        &face_lookup,
+                        fixed_face,
+                        &format!(
+                            "the fixed neighbour of the MOVED ruled carrier (face \
+                             {moved_face}) at vertex {}",
+                            vertex.id
+                        ),
+                    )
+                })?;
+            let map =
+                moved_ruled_rim_map(&frame, rho0, rho1, height, &flat, translation, tolerance)?;
+            let corner = map.point(vertex.point);
+            // Checked, never asserted, exactly as every other corner here is:
+            // on the flat it must stay on, and on the carrier the push leaves.
+            let off_flat = corner.sub(flat.origin).dot(flat.normal).abs();
+            if off_flat > 10.0 * tolerance {
+                return Err(format!(
+                    "move_faces: the re-solved corner at vertex {} left its fixed flat \
+                     (off {off_flat:.3e}) — refusing",
+                    vertex.id
+                ));
+            }
+            let pushed = shift_ruled_frame(&frame, translation);
+            let delta = corner.sub(pushed.origin);
+            let axial = delta.dot(pushed.axis);
+            let radial = delta.sub(pushed.axis.scale(axial)).length();
+            let off_carrier = (radial - rho_at(rho0, rho1, height, axial)).abs();
+            if off_carrier > 10.0 * tolerance {
+                return Err(format!(
+                    "move_faces: the re-solved corner at vertex {} left the MOVED carrier \
+                     (face {moved_face}, off {off_carrier:.3e}) — refusing",
+                    vertex.id
+                ));
+            }
+            new_vertex.insert(vertex.id, corner);
+            continue;
+        }
         // SM1c multi-rim: a corner shared with a FIXED ruled carrier (a split
         // cylinder/cone band) cannot be placed by the planar 3-plane solver — its
         // carrier is not a plane. Ride it along the single fixed edge it shares:
@@ -1324,11 +1631,13 @@ pub fn move_faces(
             // A STRAIGHT fixed edge (a cylinder generatrix on a flat, or a cone's
             // seam meridian — which passes through the apex, so the rim homothety
             // agrees with it) rides its own line: exact, and unchanged since SM1c.
+            // Straightness is geometric: a line rejoined with an interior knot is
+            // still a line, and rides too.
             // A CURVED fixed edge (the hyperbola where a flat cuts a cone) is
             // solved on the CARRIERS instead: the boolean split it exactly at the
             // corner, so riding it could only ever move the corner inward.
-            let straight_fixed_edge = fixed_edge.curve.degree == 1
-                && fixed_edge.curve.control_points.len() == 2;
+            let straight_fixed_edge =
+                fixed_edge.curve.straight_segment(tolerance).is_some();
             let carriers = if straight_fixed_edge {
                 None
             } else {
@@ -1519,17 +1828,20 @@ pub fn move_faces(
                             })?;
                     }
                 }
-                if !edge.degenerate
-                    && (edge.curve.degree != 1 || edge.curve.control_points.len() != 2)
-                {
+                if !edge.degenerate && edge.curve.straight_segment(tolerance).is_none() {
                     // CURVED fixed edge — the hyperbola where a flat cuts a cone,
                     // whose cap-side endpoint rides along it. BOTH its carriers
                     // stayed put, so the section is unchanged as a SET, but the
                     // boolean split the curve exactly at the corner (`domain ==
                     // [t0, t1]`), leaving no parameter headroom for an outward
                     // push — so the arc is RE-BUILT between its endpoints. (A
-                    // straight-chord rebuild, what a degree-1 generatrix gets,
+                    // straight-chord rebuild, what a straight generatrix gets,
                     // would leave the cone; that is why this used to refuse.)
+                    // "Curved" is asked of the GEOMETRY (`straight_segment`), not
+                    // of the pole count: a line an offset shell rejoined out of
+                    // two pieces carries an interior knot, and counting poles
+                    // sent it down this arm to be refused for having two planar
+                    // carriers instead of a plane and a ruled one.
                     // Same collapse/inversion guards as `plan_straight_rebuild`,
                     // so a tearing push still refuses.
                     let new_chord = end_new.sub(start_new);
@@ -1591,6 +1903,7 @@ pub fn move_faces(
                                 face_id,
                                 *start,
                                 *end,
+                                moved.contains(&face_id).then_some(translation),
                                 tolerance,
                             )?;
                         }
@@ -1604,8 +1917,13 @@ pub fn move_faces(
                 } else {
                     // A tangential translation left the carriers in place, so
                     // an interior edge must stretch between re-solved corners
-                    // instead of riding along (both faces are planar-checked).
+                    // instead of riding along (both faces are planar-checked —
+                    // except a MOVED ruled carrier's own seam generatrix, whose
+                    // straight chord the carrier check below proves instead).
                     for &face_id in &faces_of_edge[&edge.id] {
+                        if carrier_ruled(solid, &face_lookup, face_id).is_some() {
+                            continue;
+                        }
                         cached_plane(&mut planes, solid, &face_lookup, face_id, plane_tolerance)
                             .map_err(|_| {
                                 unsupported_carrier(
@@ -1620,12 +1938,25 @@ pub fn move_faces(
                                 )
                             })?;
                     }
-                    actions.insert(
-                        edge.id,
-                        plan_straight_rebuild(
-                            edge, start_old, end_old, start_new, end_new, tolerance,
-                        )?,
-                    );
+                    let action = plan_straight_rebuild(
+                        edge, start_old, end_old, start_new, end_new, tolerance,
+                    )?;
+                    if let EdgeMoveAction::Rebuild { start, end } = &action {
+                        for &face_id in &faces_of_edge[&edge.id] {
+                            if carrier_ruled(solid, &face_lookup, face_id).is_some() {
+                                verify_chord_on_carrier(
+                                    solid,
+                                    &face_lookup,
+                                    face_id,
+                                    *start,
+                                    *end,
+                                    moved.contains(&face_id).then_some(translation),
+                                    tolerance,
+                                )?;
+                            }
+                        }
+                    }
+                    actions.insert(edge.id, action);
                 }
             }
             EdgeMoveClass::Boundary {
@@ -1735,6 +2066,67 @@ pub fn move_faces(
                         // staying on the translated moved carrier — exact for any
                         // curve type, no re-intersection needed.
                         actions.insert(edge.id, EdgeMoveAction::Translate);
+                    } else if let Some((frame, rho0, rho1, height)) =
+                        carrier_ruled(solid, &face_lookup, *moved_face).filter(|_| {
+                            !carrier_invariant_under(
+                                solid,
+                                &face_lookup,
+                                *moved_face,
+                                translation,
+                                parallel_tolerance,
+                            )
+                        })
+                    {
+                        // THE MIRROR RIM — the pushed bore's mouth. The same
+                        // `plane ∩ quadric` the arm above re-intersects, with the
+                        // roles swapped: here the CYLINDER (or cone) is what
+                        // moved and the FLAT is what stayed, so the rim's exact
+                        // affine is `moved_ruled_rim_map` rather than
+                        // `rim_ruled_map`. It carries the whole conic — a closed
+                        // mouth included — so the parametrisation and every
+                        // coedge's sense survive the push untouched.
+                        let map = moved_ruled_rim_map(
+                            &frame,
+                            rho0,
+                            rho1,
+                            height,
+                            &fixed_plane,
+                            translation,
+                            tolerance,
+                        )?;
+                        verify_rim_on_carriers(
+                            edge,
+                            &map,
+                            &shift_ruled_frame(&frame, translation),
+                            rho0,
+                            rho1,
+                            height,
+                            &fixed_plane,
+                            Vec3::default(),
+                            tolerance,
+                        )?;
+                        // The affine carries the conic, but it only agrees with
+                        // the corners the vertex pass solved when both ends of
+                        // this rim ride the SAME flat. An open rim whose two ends
+                        // sit on different flats has two maps and no single
+                        // affine; it refuses by name rather than tearing.
+                        if edge.start_vertex_id != edge.end_vertex_id {
+                            let drift = map
+                                .point(start_old)
+                                .sub(start_new)
+                                .length()
+                                .max(map.point(end_old).sub(end_new).length());
+                            if drift > 10.0 * tolerance {
+                                return Err(format!(
+                                    "move_faces: the rim of boundary edge {} does not reach the corners the \
+                                     push re-solved (off {drift:.3e}) — its two ends ride \
+                                     different fixed flats, which no single affine carries — \
+                                     refusing",
+                                    edge.id
+                                ));
+                            }
+                        }
+                        actions.insert(edge.id, EdgeMoveAction::Transform(map));
                     } else {
                         // Real re-intersection: line = translated moved plane ∩
                         // fixed plane, delimited by the re-solved corners. The
@@ -1805,7 +2197,27 @@ pub fn move_faces(
                     .map(|coedge| coedge.edge_id)
             };
             if moved.contains(&face.id) {
-                if edge_ids().any(|edge_id| reshaped.contains(&edge_id)) {
+                if edge_ids().any(|edge_id| reshaped.contains(&edge_id))
+                    && carrier_ruled(solid, &face_lookup, face.id).is_some()
+                    && !carrier_invariant_under(
+                        solid,
+                        &face_lookup,
+                        face.id,
+                        translation,
+                        parallel_tolerance,
+                    )
+                {
+                    // THE PUSHED WALL ITSELF. Its rims were re-intersected, so
+                    // the pcurves on record are stale — a bore whose mouths sat
+                    // at one station of its own carrier now meets the flats at
+                    // another, and in the wall's own parameters that is a shift
+                    // in v, not the curve on file. Shifting the control net is
+                    // exact (a translated cylinder is the same cylinder moved),
+                    // and the re-trim afterwards rebuilds the loops on THAT
+                    // carrier, grown along its axis to cover the new rims.
+                    face_actions.push((shell_index, face_index, FaceMoveAction::TranslateSurface));
+                    ruled_retrim_faces.push(face.id);
+                } else if edge_ids().any(|edge_id| reshaped.contains(&edge_id)) {
                     // A boundary edge changed shape (stretched, or a cap rim grown
                     // by the radial-scale map), so the patch must be re-trimmed
                     // around it; the moved cap is planar (translated), so its plane
@@ -1957,7 +2369,7 @@ pub fn move_faces(
     // SM1: fixed ruled (cylinder) neighbours grow along their axis and recompute
     // pcurves on the grown carrier — a separate pass because it needs `&mut result`.
     for face_id in ruled_retrim_faces {
-        retrim_ruled_face(&mut result, face_id, &final_edges, tolerance)?;
+        retrim_ruled_face(&mut result, face_id, &final_edges, tolerance, "move_faces")?;
     }
 
     // Topology (and therefore genus) is untouched — only geometry moved — so
@@ -2401,4 +2813,3 @@ fn patch_seam_meridian_pcurve(
     }
 }
 
-// BREP private tests: 3d717f5b2660e67f

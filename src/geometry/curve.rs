@@ -17,6 +17,13 @@ pub const KNOT_IDENTITY_TOL: f64 = 1e-9;
 /// answers "are these two knot floats the same value?", NOT "are these the same
 /// knot for snapping?" — so it stays at 1e-12 and must NOT be unified with the
 /// looser [`KNOT_IDENTITY_TOL`].
+///
+/// Comparand: the absolute difference of two knot values of ONE knot vector,
+/// and a knot's distance from either end of the active domain
+/// (`knots[degree]`, `knots[len − 1 − degree]`), in that curve's parameter
+/// units. Two knots within it count as one, and a knot within it of an end is
+/// not interior. The containment lanes' per-pcurve sample count
+/// ([`crate::trim_sample_count`]) counts interior knots this way.
 pub const KNOT_DEDUP_EPS: f64 = 1e-12;
 
 /// Count distinct knots strictly inside a valid knot vector's active domain.
@@ -543,6 +550,17 @@ pub struct NurbsCurve {
 }
 
 impl NurbsCurve {
+    /// Whether the one-time validation has run. For the boolean's
+    /// operand-state instrument (`BREP_DEBUG_OPERAND_STATE`).
+    pub(crate) fn is_validated(&self) -> bool {
+        self.validated.get()
+    }
+
+    /// Sets the validation cache: for the operand-state instrument only.
+    pub(crate) fn set_validated(&mut self, validated: bool) {
+        self.validated = std::cell::Cell::new(validated);
+    }
+
     pub fn new(degree: usize, knots: Vec<f64>, control_points: Vec<Vec4>) -> Result<Self, String> {
         let curve = Self {
             degree,
@@ -617,6 +635,55 @@ impl NurbsCurve {
 
     pub fn evaluate(&self, parameter: f64) -> Result<Vec3, String> {
         self.evaluate_homogeneous(parameter)?.point()
+    }
+
+    /// The straight segment this curve traces, as `(start, end)`, or `None`
+    /// when it genuinely bends.
+    ///
+    /// What a direct-edit heal actually needs to know about an edge is
+    /// *geometric* — "is this a straight segment I may rebuild between two
+    /// re-solved corners?" — but it used to be answered by the
+    /// *representation* `degree == 1 && control_points.len() == 2`. That
+    /// answer is wrong for a line that carries an interior knot, which is what
+    /// an offset shell or a boolean leaves behind when it splits a box edge and
+    /// rejoins the pieces: the same line, three control points, and every heal
+    /// that asked the representation question called it "curved".
+    ///
+    /// Weights are strictly positive (`ensure_valid`), so every point of the
+    /// curve is a convex combination of its control points and the curve is a
+    /// straight segment **iff** those control points are collinear — for any
+    /// degree, not just degree 1. Monotone projections onto the chord are
+    /// required too, so a polyline that doubles back along its own line (it
+    /// covers the segment but does not parameterise it) is not mistaken for
+    /// one.
+    pub(crate) fn straight_segment(&self, tolerance: f64) -> Option<(Vec3, Vec3)> {
+        self.ensure_valid().ok()?;
+        let points = self
+            .control_points
+            .iter()
+            .map(|point| point.point().ok())
+            .collect::<Option<Vec<Vec3>>>()?;
+        let start = *points.first()?;
+        let end = *points.last()?;
+        let chord = end.sub(start);
+        let length = chord.length();
+        if length <= tolerance {
+            return None;
+        }
+        let direction = chord.scale(1.0 / length);
+        let mut reached = 0.0f64;
+        for point in &points {
+            let offset = point.sub(start);
+            let axial = offset.dot(direction);
+            if offset.sub(direction.scale(axial)).length() > tolerance {
+                return None; // off the chord — the curve genuinely bends
+            }
+            if axial < reached - tolerance {
+                return None; // collinear, but the polygon doubles back
+            }
+            reached = reached.max(axial);
+        }
+        Some((start, end))
     }
 
     /// Value beyond the domain (Golovanov §2.15): every curve must answer
@@ -722,6 +789,212 @@ impl NurbsCurve {
         }
         result.resize(derivative_count + 1, Vec3::default());
         Ok(result)
+    }
+
+    /// The curve's unit TANGENT at `parameter`, read as the one-sided limit
+    /// when the first derivative vanishes there.
+    ///
+    /// This is what `derivatives(t, 1)?[1].normalized()?` should always have
+    /// been. That shape refuses on a curve class that is not exotic at all —
+    /// any Hermite segment whose end tangent is the zero vector, of which an
+    /// INVOLUTE flank is the standard source (speed `r_base * t`, so a profile
+    /// sampled from the base circle outwards carries an exactly zero tangent at
+    /// its start, one per flank per tooth). The direction of travel is still
+    /// defined there, as the limit from inside the range, and
+    /// [`Self::stationary_tangent_rescue`] reads it.
+    ///
+    /// Pass the range the CALLER owns — an edge's `[t0, t1]`, not the curve's
+    /// domain, where the two differ (an `EdgeRecord` keeps the whole curve and
+    /// records the sub-range it uses), so the probe never reads geometry
+    /// outside the caller's own span.
+    ///
+    /// The error names the parameter and the range it probed, because the only
+    /// curve that reaches it is stationary EVERYWHERE the range allows, and the
+    /// caller's own identifier is the half this function cannot supply.
+    ///
+    /// Escape hatch for tamper-verification: `BREP_CUSP_TANGENT_RESCUE=0`
+    /// restores the bare `normalized()` refusal, the same hatch the imprint
+    /// driver's seed loop carries.
+    pub fn unit_tangent(
+        &self,
+        parameter: f64,
+        range_start: f64,
+        range_end: f64,
+    ) -> Result<Vec3, String> {
+        let derivative = self.derivatives(parameter, 1)?[1];
+        self.tangent_or_one_sided_limit(derivative, parameter, range_start, range_end)
+    }
+
+    /// The point and unit tangent that `derivatives_extended(parameter, 1)`
+    /// reads, with the tangent taken as [`Self::unit_tangent`] takes it.
+    ///
+    /// The blend march reads its section plane — the point and the edge's
+    /// unit tangent — through the EXTENDED evaluation at every station,
+    /// overshoot stations past the edge's ends included, and `unit_tangent`
+    /// cannot stand in for that read: it evaluates `derivatives`, which CLAMPS
+    /// a parameter outside the domain, where `derivatives_extended` WRAPS it on
+    /// a closed curve. A closed rim's overshoot station would read a different
+    /// tangent. This is the same one evaluation the march always made, so a
+    /// non-zero derivative returns the vector `derivatives[1].normalized()`
+    /// returned, to the bit, at no extra cost.
+    ///
+    /// Where the derivative vanishes, the one-sided limit is read at the
+    /// parameter the extended evaluation actually took its derivative from —
+    /// the parameter itself inside the domain, the wrapped one on a closed
+    /// curve, the boundary past an open end, where the extension's direction
+    /// IS the boundary's one-sided limit. The caller's range is widened to
+    /// contain that parameter, because an overshoot station reads outside the
+    /// caller's span on purpose; the ladder still probes from the side the
+    /// range lies on.
+    pub fn point_and_unit_tangent_extended(
+        &self,
+        parameter: f64,
+        range_start: f64,
+        range_end: f64,
+    ) -> Result<(Vec3, Vec3), String> {
+        let derivatives = self.derivatives_extended(parameter, 1)?;
+        if let Ok(tangent) = derivatives[1].normalized() {
+            return Ok((derivatives[0], tangent));
+        }
+        let read_at = self.extended_read_parameter(parameter)?;
+        let low = range_start.min(range_end).min(read_at);
+        let high = range_start.max(range_end).max(read_at);
+        let tangent = self.tangent_or_one_sided_limit(derivatives[1], read_at, low, high)?;
+        Ok((derivatives[0], tangent))
+    }
+
+    /// The in-domain parameter whose derivatives `derivatives_extended` reads
+    /// for `parameter`: itself inside the domain, wrapped on a closed curve,
+    /// the nearer boundary past an open end. Mirrors that function's three
+    /// cases; only the zero-derivative lane of
+    /// [`Self::point_and_unit_tangent_extended`] pays for it.
+    fn extended_read_parameter(&self, parameter: f64) -> Result<f64, String> {
+        let [start, end] = self.domain()?;
+        if parameter >= start && parameter <= end {
+            return Ok(parameter);
+        }
+        if self.extension_wraps(start, end)? {
+            return Ok(start + (parameter - start).rem_euclid(end - start));
+        }
+        Ok(if parameter < start { start } else { end })
+    }
+
+    /// `derivatives_extended`'s closed test: a curve whose ends meet WRAPS an
+    /// out-of-domain parameter instead of extending it.
+    fn extension_wraps(&self, start: f64, end: f64) -> Result<bool, String> {
+        let period = end - start;
+        Ok(period > 0.0
+            && self.evaluate(start)?.sub(self.evaluate(end)?).length() <= 1e-9 * (1.0 + period))
+    }
+
+    /// The open end `parameter` lies past, when the first derivative VANISHES
+    /// there — the one case in which `derivatives_extended`'s point does not
+    /// move with its parameter: past an open end it returns
+    /// `P(end) + C'(end)·(t − end)`, which is `P(end)` for every `t` when
+    /// `C'(end) = 0`. `None` inside the domain, on a closed curve (which wraps
+    /// onto the real curve), and past an end whose derivative is regular.
+    ///
+    /// The zero test is [`Self::point_and_unit_tangent_extended`]'s own: the
+    /// derivative has no unit vector. A caller that extends past such an end
+    /// supplies the SPEED the parameterization does not; the direction is the
+    /// one-sided limit that function already reads there.
+    pub(crate) fn stationary_open_end(&self, parameter: f64) -> Result<Option<f64>, String> {
+        let [start, end] = self.domain()?;
+        if parameter >= start && parameter <= end {
+            return Ok(None);
+        }
+        let boundary = if parameter < start { start } else { end };
+        if self.derivatives(boundary, 1)?[1].normalized().is_ok()
+            || self.extension_wraps(start, end)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(boundary))
+    }
+
+    /// `derivative`, normalized — or, where it vanishes, the one-sided limit
+    /// from inside `[range_start, range_end]` at `parameter`, or the named
+    /// refusal. The one failure lane [`Self::unit_tangent`] and
+    /// [`Self::point_and_unit_tangent_extended`] share.
+    fn tangent_or_one_sided_limit(
+        &self,
+        derivative: Vec3,
+        parameter: f64,
+        range_start: f64,
+        range_end: f64,
+    ) -> Result<Vec3, String> {
+        let error = match derivative.normalized() {
+            Ok(tangent) => return Ok(tangent),
+            Err(error) => error,
+        };
+        if std::env::var("BREP_CUSP_TANGENT_RESCUE").as_deref() == Ok("0") {
+            return Err(error);
+        }
+        self.stationary_tangent_rescue(parameter, range_start, range_end)
+            .ok_or_else(|| {
+                format!(
+                    "curve tangent: the first derivative vanishes at t = {parameter} and \
+                     everywhere in [{range_start}, {range_end}] the probe can reach, so this \
+                     curve has no direction of travel to report"
+                )
+            })
+    }
+
+    /// The unit tangent just inside `[range_start, range_end]`, for a
+    /// `parameter` where the first derivative VANISHES.
+    ///
+    /// A curve can be stationary at a parameter where the curve itself is
+    /// perfectly well behaved, and the direction of travel is then still
+    /// defined as the one-sided limit. The standard case is a cubic Bezier
+    /// whose first two control points coincide — the shape a Hermite segment
+    /// takes when its end tangent is the zero vector — and an INVOLUTE is the
+    /// standard source of one: the involute's speed is `r_base * t`, so a gear
+    /// flank sampled from the base circle outwards starts with an exactly zero
+    /// tangent and every tooth profile carries one per flank. The 2026-09-14
+    /// herringbone report is that shape: a hit landing exactly on the cusp
+    /// parameter made `derivatives(t, 1)[1].normalized()` fail and killed the
+    /// whole union.
+    ///
+    /// The range bounds the probe — pass an edge's own `[t0, t1]` and the
+    /// rescue never reads the curve outside the span the caller owns. The
+    /// ladder walks OUTWARDS, and it starts at 1e-6 of the span rather than at
+    /// the smallest representable step: the rescued direction is a ONE-SIDED
+    /// limit, so a nearer probe truncates less, but the derivative at a
+    /// stationary point is a CANCELLING sum that shrinks with the step while
+    /// its rounding error does not — at 1e-9 of the span the involute cusp
+    /// below reads its own limit direction only to 1e-6, worse than at 1e-6 of
+    /// the span. Later rungs exist for a higher-order stationary point, whose
+    /// derivative is still under the zero-length floor at the first. `None`
+    /// means the curve is stationary everywhere the range allows, where no
+    /// direction exists to report at all.
+    pub fn stationary_tangent_rescue(
+        &self,
+        parameter: f64,
+        range_start: f64,
+        range_end: f64,
+    ) -> Option<Vec3> {
+        let low = range_start.min(range_end);
+        let high = range_start.max(range_end);
+        let span = high - low;
+        if !(span > 0.0) {
+            return None;
+        }
+        for scale in [1e-6, 1e-4, 1e-2, 1e-1] {
+            let step = span * scale;
+            for probe in [parameter + step, parameter - step] {
+                if probe < low || probe > high {
+                    continue;
+                }
+                if let Some(unit) = self
+                    .derivatives(probe, 1)
+                    .ok()
+                    .and_then(|derivatives| derivatives[1].normalized().ok())
+                {
+                    return Some(unit);
+                }
+            }
+        }
+        None
     }
 
     /// Allocation-free twin of [`Self::derivatives`] for the hot
@@ -1173,6 +1446,5 @@ fn binomial(n: usize, k: usize) -> f64 {
     })
 }
 
-// BREP private tests: 6ef392d382ba5b75
 
-// BREP private tests: 94ba6c381a283411
+

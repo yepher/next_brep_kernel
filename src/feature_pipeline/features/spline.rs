@@ -38,8 +38,10 @@
 //!
 //! # Port attachments (the wire-harness network)
 //!
-//! A point may carry `attachment: { portRef, side }` — the id of a PORT feature
-//! and the port side (`A` | `B`) the wire leaves it on. Such an anchor is
+//! A point may carry `attachment: { portRef, side }` — the ADDRESS of a
+//! connection point (`J1.VCC`, `ACOMP3:J1.VCC`, or a WAYPOINT's feature id; see
+//! `feature_pipeline/ports.rs`) and the side (`A` | `B`) the wire leaves it on.
+//! Such an anchor is
 //! LIVE-RESOLVED against the scene's port records on every run: its position
 //! is the port's base point, its travel direction the port direction (negated
 //! for side `B`), and its forward/backward distance the port's `extension`.
@@ -151,7 +153,7 @@ pub(crate) fn parse_spline_points(persistent: &Value, scene: &SceneMap) -> (Vec<
 }
 
 fn parse_point(point: &Value, scene: &SceneMap, unresolved: &mut Vec<String>) -> SplinePoint {
-    // An attached anchor is the PORT's placement, live (see the module doc).
+    // An attached anchor is the connection point's placement, live (module doc).
     if let Some(attachment) = Attachment::parse(point.get("attachment")) {
         match scene.resolve_port(&attachment.port_ref) {
             Some(port) => {
@@ -334,7 +336,7 @@ pub fn schema() -> serde_json::Value {
         "bendRadius": {
             "type": "number",
             "default_value": 1,
-            "label": "Bend Radius",
+            "label": "Bend radius",
             "hint": "Controls the smoothness of curve transitions. Lower values create sharper bends, higher values create smoother curves.",
             "min": 0.1,
             "step": 0.5
@@ -348,4 +350,3 @@ pub fn schema() -> serde_json::Value {
 })
 }
 
-// BREP private tests: f5bf8e9b1d53e567

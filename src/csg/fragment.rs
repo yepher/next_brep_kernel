@@ -17,7 +17,6 @@ mod sampling;
 mod loops;
 #[path = "fragment/face_split.rs"]
 mod face_split;
-// BREP private tests: 828414594ad0c543
 
 pub use face_split::{fragment_face, fragment_solid};
 pub use types::{FaceFragmentRecord, FragmentCoedge, FragmentEdgeSource, FragmentLoop};

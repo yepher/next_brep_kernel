@@ -600,7 +600,11 @@ pub(super) fn is_untrimmed(face: &FaceRecord) -> Result<bool, String> {
     let [u0, u1] = ku.domain();
     let [v0, v1] = kv.domain();
     let domain_area = (u1 - u0) * (v1 - v0);
-    Ok((parameter_space_area(face)?.abs() - domain_area).abs() <= 1e-6 * domain_area)
+    // The loop's own joints closed: this asks whether the trim IS the domain, and a
+    // trim that misses its own joints by 8e-9 is still the domain. The bar is 1e-6 of
+    // the DOMAIN area, so on a small parameter box (1.4e-3 on a STEP import) it is
+    // 1.4e-9 — under the miss — and the face took the trimmed path though it is whole.
+    Ok((closed_parameter_space_area_on_carrier(face)?.abs() - domain_area).abs() <= 1e-6 * domain_area)
 }
 
 /// Symmetric degree-5 triangle cubature (barycentric points and weights,
@@ -648,9 +652,21 @@ pub(super) fn polygon_signed_area(polygon: &[[f64; 2]]) -> f64 {
 /// loop clips to nothing — so clipping every loop handles containment,
 /// holes, and partial coverage uniformly, with the loop's winding as the
 /// contribution sign.
-pub(super) fn clip_polygon_to_cell(polygon: &[[f64; 2]], cell: [f64; 4]) -> Vec<[f64; 2]> {
+///
+/// The four half-plane passes write into caller-owned buffers: the two working
+/// vectors are ping-ponged for the whole call instead of allocated per pass. The integrator clips every trim loop
+/// against every cell of a knot-conforming grid and then against every
+/// quadtree child of every boundary cell, so the five vectors a call used to
+/// allocate were the shape of its clipping cost.
+pub(super) fn clip_polygon_to_cell_into(
+    polygon: &[[f64; 2]],
+    cell: [f64; 4],
+    scratch: &mut Vec<[f64; 2]>,
+    out: &mut Vec<[f64; 2]>,
+) {
     let [u_low, u_high, v_low, v_high] = cell;
-    let mut current = polygon.to_vec();
+    out.clear();
+    out.extend_from_slice(polygon);
     // (axis, bound, keep_below)
     for (axis, bound, keep_below) in [
         (0, u_low, false),
@@ -658,8 +674,9 @@ pub(super) fn clip_polygon_to_cell(polygon: &[[f64; 2]], cell: [f64; 4]) -> Vec<
         (1, v_low, false),
         (1, v_high, true),
     ] {
-        if current.len() < 3 {
-            return Vec::new();
+        if out.len() < 3 {
+            out.clear();
+            return;
         }
         let inside = |point: &[f64; 2]| {
             if keep_below {
@@ -668,26 +685,26 @@ pub(super) fn clip_polygon_to_cell(polygon: &[[f64; 2]], cell: [f64; 4]) -> Vec<
                 point[axis] >= bound
             }
         };
-        let mut next = Vec::with_capacity(current.len() + 4);
-        for index in 0..current.len() {
-            let a = current[index];
-            let b = current[(index + 1) % current.len()];
+        scratch.clear();
+        scratch.reserve(out.len() + 4);
+        for index in 0..out.len() {
+            let a = out[index];
+            let b = out[(index + 1) % out.len()];
             let a_in = inside(&a);
             let b_in = inside(&b);
             if a_in {
-                next.push(a);
+                scratch.push(a);
             }
             if a_in != b_in {
                 let t = (bound - a[axis]) / (b[axis] - a[axis]);
                 let mut crossing = [0.0; 2];
                 crossing[axis] = bound;
                 crossing[1 - axis] = a[1 - axis] + t * (b[1 - axis] - a[1 - axis]);
-                next.push(crossing);
+                scratch.push(crossing);
             }
         }
-        current = next;
+        std::mem::swap(scratch, out);
     }
-    current
 }
 
 pub(super) fn cell_breaks(knots: &[f64], degree: usize, low: f64, high: f64) -> Vec<f64> {

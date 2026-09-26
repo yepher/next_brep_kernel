@@ -430,8 +430,7 @@ pub fn curve_model_scale(curve: &crate::NurbsCurve, t0: f64, t1: f64) -> Result<
 /// matter beside the Newton solve whose tolerance it scales.
 pub const CURVE_SCALE_SAMPLES: usize = 16;
 
-/// Migration diagnostic for the one-[`model_scale`] change
-/// (`docs/developer/kernel-plans/offset-unification-audit.md`, slice 0).
+/// Migration diagnostic for the one-[`model_scale`] change (slice 0).
 ///
 /// Switching a pipeline's `scale` definition moves EVERY tolerance derived from
 /// it at once, so the corpus must be measurable before and after.  Call this at
@@ -517,13 +516,11 @@ pub fn solid_scale(solid: &BrepSolid) -> f64 {
 ///
 /// Alongside the constructed entity, in the transient result struct the
 /// construction already returns — never as a field on [`crate::BrepSolid`]'s
-/// records.  `BrepSolid` is serialized by `io/snapshot.rs`, which is a
+/// records. `BrepSolid` is serialized by `io/snapshot.rs`, which is a
 /// documented durable format; a record field would be a format change with a
-/// reader obligation.  Persisting per-entity tolerances is a real and planned
-/// piece of work with its own design
-/// (`docs/developer/kernel-plans/per-entity-tolerances.md`, slice S3) — this
-/// type is the measurement layer beneath it, and lands with no format churn at
-/// all.
+/// reader obligation. Persisting per-entity tolerances is a real and planned
+/// piece of work with its own design (slice S3) — this type is the measurement
+/// layer beneath it, and lands with no format churn at all.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MeasuredTolerance {
     deviation: f64,
@@ -627,6 +624,18 @@ impl MeasuredTolerance {
     }
 }
 
+/// Relative volume drift between two measurements of the same body that is
+/// still the same answer: the case gate's band between a replay and its
+/// baseline (`examples/case_replay.rs`), and the perturbation rescue's bar for
+/// a rung against the exact lane's inclusion–exclusion identity
+/// (`csg::boolean::perturbation_retry`). One number, so the rescue can never
+/// accept a body the gate would call a different one. It only absorbs
+/// last-bit summation noise.
+pub const VOLUME_DRIFT_REL: f64 = 1e-9;
+
+/// Absolute floor of the volume drift band, see [`VOLUME_DRIFT_REL`].
+pub const VOLUME_DRIFT_ABS: f64 = 1e-9;
+
 /// Fraction of the local characteristic length an APPROXIMATE offset
 /// construction may deviate from the exact geometry it approximates — see
 /// [`offset_construction_band`].
@@ -724,4 +733,3 @@ pub fn vertex_tolerance_from_edges(
         .fold(0.0f64, f64::max)
 }
 
-// BREP private tests: d6bc0defc8dc7f57

@@ -173,13 +173,31 @@ fn blend_closed_edge_impl(
     let marched = match march_stations(edge, &first_mate, &second_mate, radius_at, anchor_u) {
         Ok(stations) => Ok(stations),
         Err(anchored_error) if anchor_u.is_some() => {
-            march_stations(edge, &first_mate, &second_mate, radius_at, None)
-                .map_err(|_| anchored_error)
+            march_stations(edge, &first_mate, &second_mate, radius_at, None).map_err(
+                |retry_error| {
+                    // A FOLD found by the un-anchored march is the SHAPE's
+                    // answer, and it outranks the anchored march's complaint:
+                    // reporting the anchor's non-convergence instead would send
+                    // a proven-folding centre curve on to the edge-preserving
+                    // construction below.
+                    if crate::blend::is_wall_fold(&retry_error) {
+                        retry_error
+                    } else {
+                        anchored_error
+                    }
+                },
+            )
         }
         Err(anchored_error) => Err(anchored_error),
     };
     let stations = match marched {
         Ok(stations) => stations,
+        // A wall that FOLDS is refused here for the same reason an escaped
+        // march is: the edge-preserving construction would build a blend on the
+        // same folding centre curve, and if it converged it would return the
+        // very surface this refusal exists to stop.  It is not the fallback's
+        // question to answer, so the geometry is reported as-is.
+        Err(march_error) if crate::blend::is_wall_fold(&march_error) => return Err(march_error),
         Err(march_error) if march_error.starts_with(crate::blend::BALL_OFF_CARRIER) => {
             // An ESCAPED march is not a non-convergence: the tangency system
             // had no solution at all, so no fallback can build the blend the

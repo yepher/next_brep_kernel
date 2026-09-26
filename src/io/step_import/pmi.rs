@@ -112,12 +112,19 @@ fn measure_value(value: &Value) -> Option<f64> {
     }
 }
 
+/// What a reference name opens with when the file named geometry this
+/// importer did not mint: the STEP entity id of the shape aspect that named
+/// it. Nothing resolves it, which is the point — the annotation reaches the
+/// PMI panel as a row in error, naming the entity a reader can look up in the
+/// file, instead of vanishing between the two formats.
+pub(super) const UNRESOLVED_REF_PREFIX: &str = "STEP#";
+
 /// The geometry a reference name points at, as the IMPORT3D feature names it.
-struct NameMap {
+pub(super) struct NameMap {
     faces: HashMap<usize, String>,
     edges: HashMap<usize, String>,
     vertices: HashMap<usize, String>,
-    length_scale: f64,
+    pub(super) length_scale: f64,
     /// Degrees per file plane-angle unit.
     angle_to_degrees: f64,
 }
@@ -146,35 +153,71 @@ fn angle_scale_degrees(entities: &HashMap<usize, Entity>) -> f64 {
 }
 
 impl NameMap {
+    /// The FLAT lane's map: every solid in the file, in file order, named by
+    /// the IMPORT3D feature that is about to stamp them.
     fn build(text: &str, entities: &HashMap<usize, Entity>, feature_name: &str) -> Result<Self, String> {
         let imported = collect_step_solids(text)?;
-        let resolver = Resolver {
-            entities,
-            length_scale: derive_length_scale_mm(entities),
-        };
+        let scale = derive_length_scale_mm(entities);
+        let resolver = Resolver::new(entities, scale);
         let count = imported.solids.len();
         let body_names = crate::feature_pipeline::imported_solid_names(count, feature_name);
-        let mut faces = HashMap::default();
-        let mut edges = HashMap::default();
-        let mut vertices = HashMap::default();
-        for (body_index, body_faces) in imported.face_refs.iter().enumerate() {
+        let mut map = Self {
+            faces: HashMap::default(),
+            edges: HashMap::default(),
+            vertices: HashMap::default(),
+            length_scale: scale,
+            angle_to_degrees: angle_scale_degrees(entities),
+        };
+        map.add_bodies(entities, &resolver, &body_names, &imported.face_refs, "");
+        Ok(map)
+    }
+
+    /// An EMPTY map at the file's global units — the base a structured lift
+    /// adds one product at a time to ([`Self::add_bodies`]).
+    pub(super) fn empty(entities: &HashMap<usize, Entity>, length_scale: f64) -> Self {
+        Self {
+            faces: HashMap::default(),
+            edges: HashMap::default(),
+            vertices: HashMap::default(),
+            length_scale,
+            angle_to_degrees: angle_scale_degrees(entities),
+        }
+    }
+
+    /// Name one set of bodies — `face_refs[b]` is body `b`'s ordered face refs,
+    /// `body_names[b]` the scene name the pipeline will stamp on it.
+    ///
+    /// `qualifier` is prepended to every name this call mints. The flat lane
+    /// passes `""`; a STRUCTURED lift passes a per-product tag, because two
+    /// part documents both call their first body `IMPORT3D1` and their names
+    /// would otherwise collide in one map (`assembly_pmi.rs`).
+    pub(super) fn add_bodies(
+        &mut self,
+        entities: &HashMap<usize, Entity>,
+        resolver: &Resolver,
+        body_names: &[String],
+        face_refs: &[Vec<usize>],
+        qualifier: &str,
+    ) {
+        for (body_index, body_faces) in face_refs.iter().enumerate() {
             let Some(body_name) = body_names.get(body_index) else {
                 continue;
             };
             // Faces, positionally.
             for (face_index, face_ref) in body_faces.iter().enumerate() {
-                faces
+                self.faces
                     .entry(*face_ref)
-                    .or_insert_with(|| format!("{body_name}_Face_{face_index}"));
+                    .or_insert_with(|| format!("{qualifier}{body_name}_Face_{face_index}"));
             }
             // Edges: `{A}|{B}[n]` in first-encounter (face → loop → coedge)
             // order, with the two adjacent face names sorted — the pipeline's
-            // `stamp_derived_edge_names` convention.
+            // `stamp_derived_edge_names` convention. The qualifier goes on the
+            // FINISHED name, so the two face names it joins stay local.
             let mut adjacency: HashMap<usize, Vec<String>> = HashMap::default();
             let mut order: Vec<usize> = Vec::new();
             for (face_index, face_ref) in body_faces.iter().enumerate() {
                 let face_name = format!("{body_name}_Face_{face_index}");
-                for edge_ref in face_edge_refs(&resolver, *face_ref) {
+                for edge_ref in face_edge_refs(resolver, *face_ref) {
                     let uses = adjacency.entry(edge_ref).or_default();
                     if uses.is_empty() {
                         order.push(edge_ref);
@@ -186,8 +229,8 @@ impl NameMap {
                             for slot in [1usize, 2] {
                                 if let Some(vertex_ref) = arg_ref(args, slot) {
                                     if let Ok(point) = resolver.step_vertex_point(vertex_ref) {
-                                        vertices.entry(vertex_ref).or_insert_with(|| {
-                                            format!("{body_name}@{},{},{}", trim_real(point.x), trim_real(point.y), trim_real(point.z))
+                                        self.vertices.entry(vertex_ref).or_insert_with(|| {
+                                            format!("{qualifier}{body_name}@{},{},{}", trim_real(point.x), trim_real(point.y), trim_real(point.z))
                                         });
                                     }
                                 }
@@ -203,17 +246,12 @@ impl NameMap {
                 names.dedup();
                 let base = names.join("|");
                 let n = counts.entry(base.clone()).or_default();
-                edges.entry(edge_ref).or_insert_with(|| format!("{base}[{n}]"));
+                self.edges
+                    .entry(edge_ref)
+                    .or_insert_with(|| format!("{qualifier}{base}[{n}]"));
                 *n += 1;
             }
         }
-        Ok(Self {
-            faces,
-            edges,
-            vertices,
-            length_scale: resolver.length_scale,
-            angle_to_degrees: angle_scale_degrees(entities),
-        })
     }
 
     fn name_of(&self, geometry_ref: usize) -> Option<String> {
@@ -297,7 +335,18 @@ struct Semantic {
 
 /// The aspect → geometry-name map (SHAPE_ASPECT / DATUM_FEATURE →
 /// GEOMETRIC_ITEM_SPECIFIC_USAGE → geometry).
-fn aspect_names(entities: &HashMap<usize, Entity>, names: &NameMap) -> HashMap<usize, String> {
+///
+/// `pins` is the STRUCTURED lane's occurrence map: a shape aspect whose
+/// `of_shape` is an OCCURRENCE's `PRODUCT_DEFINITION_SHAPE` — the file saying
+/// "this tolerance is on THIS instance", not on the part — has its geometry
+/// name tagged with that occurrence, which `assembly_pmi.rs` reads back off
+/// the finished annotation. Empty for the flat lane, where there are no
+/// occurrences to pin to.
+fn aspect_names(
+    entities: &HashMap<usize, Entity>,
+    names: &NameMap,
+    pins: &HashMap<usize, usize>,
+) -> HashMap<usize, String> {
     let mut out = HashMap::default();
     for entity in entities.values() {
         let Some(args) = entity.find("GEOMETRIC_ITEM_SPECIFIC_USAGE") else {
@@ -323,6 +372,11 @@ fn aspect_names(entities: &HashMap<usize, Entity>, names: &NameMap) -> HashMap<u
         };
         if let Some(name) = geometry.and_then(|g| names.name_of(g)) {
             out.entry(aspect).or_insert(name);
+        }
+    }
+    for (aspect, occurrence) in pins {
+        if let Some(name) = out.get_mut(aspect) {
+            *name = assembly_pmi::pin_occurrence(name, *occurrence);
         }
     }
     out
@@ -553,6 +607,79 @@ fn read_camera(entities: &HashMap<usize, Entity>, resolver: &Resolver, camera_re
     ))
 }
 
+/// The `draughting_callout` record of an entity, whatever SUBTYPE keyword a
+/// producer wrote it under: the supertype itself (what the CAx-IF practice
+/// recommends and what our own writer emits), or one of the AP214-era
+/// draughting subtypes a vendor file carries instead —
+/// `LEADER_DIRECTED_CALLOUT`, `PROJECTION_DIRECTED_CALLOUT`,
+/// `DIMENSION_CURVE_DIRECTED_CALLOUT`. None of them adds an attribute AHEAD of
+/// `contents`, so the contents list is slot 1 under every one of those
+/// keywords, and matching on the suffix reads them all.
+///
+/// `io1-ac-214.stp` is the reason this is not simply `has("DRAUGHTING_CALLOUT")`:
+/// its two annotations are `LEADER_DIRECTED_CALLOUT`s, so an exact-keyword test
+/// lifted nothing at all from the file.
+fn callout_contents(entity: &Entity) -> Option<&[Value]> {
+    entity
+        .records
+        .iter()
+        .find(|(keyword, _)| keyword.ends_with("CALLOUT"))
+        .map(|(_, args)| args.as_slice())
+}
+
+/// Whether an entity is a `draughting_callout` of any subtype.
+fn is_callout(entity: &Entity) -> bool {
+    callout_contents(entity).is_some()
+}
+
+/// The literal text of a `text_literal` of any subtype
+/// (`TEXT_LITERAL_WITH_EXTENT` and friends). `text_literal` is a
+/// `geometric_representation_item`, so the INHERITED `name` is slot 0 and the
+/// literal itself is slot 1 — reading slot 0 returns the producer's entity
+/// label (`'C9C'`), not the annotation's words.
+fn text_literal(entity: &Entity) -> Option<String> {
+    entity
+        .records
+        .iter()
+        .find(|(keyword, _)| keyword.starts_with("TEXT_LITERAL"))
+        .map(|(_, args)| arg_string(args, 1))
+        .filter(|text| !text.is_empty())
+}
+
+/// The sub-items one presentation entity collects, in the file's own list
+/// order. Covers the simple and the COMPLEX spellings of the same thing: an
+/// `annotation_occurrence` written as a complex instance carries its item on
+/// the `STYLED_ITEM` record (slot 1), not on its own.
+fn presentation_children(entity: &Entity) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut take = |args: &[Value], slot: usize| match args.get(slot) {
+        Some(Value::Ref(target)) => out.push(*target),
+        Some(Value::List(items)) => {
+            out.extend(items.iter().filter_map(|item| item.as_ref_id().ok()))
+        }
+        _ => {}
+    };
+    for (keyword, args) in &entity.records {
+        let slot = if keyword.ends_with("CALLOUT")
+            || keyword.starts_with("COMPOSITE_TEXT")
+            || keyword == "GEOMETRIC_CURVE_SET"
+            || keyword == "STYLED_ITEM"
+        {
+            1
+        } else if keyword.ends_with("ANNOTATION_OCCURRENCE")
+            || keyword == "ANNOTATION_CURVE_OCCURRENCE"
+            || keyword == "ANNOTATION_TEXT_OCCURRENCE"
+            || keyword == "ANNOTATION_SYMBOL_OCCURRENCE"
+        {
+            2
+        } else {
+            continue;
+        };
+        take(args, slot);
+    }
+    out
+}
+
 /// The callouts of an ANNOTATION_PLANE (its elements) or a callout itself.
 fn expand_item(entities: &HashMap<usize, Entity>, item: usize, out: &mut Vec<usize>) {
     let Some(entity) = entities.get(&item) else { return };
@@ -560,7 +687,7 @@ fn expand_item(entities: &HashMap<usize, Entity>, item: usize, out: &mut Vec<usi
         for element in arg_refs(args, 3) {
             expand_item(entities, element, out);
         }
-    } else if entity.has("DRAUGHTING_CALLOUT") || entity.has("ANNOTATION_OCCURRENCE") || entity.has("ANNOTATION_CURVE_OCCURRENCE") || entity.has("ANNOTATION_TEXT_OCCURRENCE") {
+    } else if is_callout(entity) || entity.has("ANNOTATION_OCCURRENCE") || entity.has("ANNOTATION_CURVE_OCCURRENCE") || entity.has("ANNOTATION_TEXT_OCCURRENCE") {
         out.push(item);
     }
 }
@@ -684,24 +811,32 @@ fn callout_label(
     props: &ValidationProps,
     callout: usize,
 ) -> (Option<[f64; 3]>, String) {
-    let mut text = props.unicode.get(&callout).cloned().unwrap_or_default();
+    let unicode = props.unicode.get(&callout).cloned().unwrap_or_default();
     let mut position = entities
         .get(&callout)
-        .and_then(|e| e.find("DRAUGHTING_CALLOUT"))
+        .and_then(|entity| callout_contents(entity))
         .map(|args| arg_refs(args, 1))
         .unwrap_or_default()
         .iter()
         .find_map(|subset| props.centre.get(subset).copied())
         .or_else(|| props.centre.get(&callout).copied());
     let mut fallback = None;
-    let mut visit = |id: usize| {
-        let Some(entity) = entities.get(&id) else { return };
-        if let Some(args) = entity.find("TEXT_LITERAL") {
-            if text.is_empty() {
-                text = arg_string(args, 0);
-            }
+    // Every literal the callout collects, in the file's own list order: a
+    // `composite_text` splits one annotation's words across several
+    // `text_literal`s (io1-ac-214's note is two lines), and taking whichever
+    // one the walk reached first would keep half the sentence.
+    let mut literals: Vec<String> = Vec::new();
+    let mut visit = |id: usize, entity: &Entity| {
+        if let Some(literal) = text_literal(entity) {
+            literals.push(literal);
             if position.is_none() {
-                if let Some(frame) = arg_ref(args, 1).and_then(|p| resolver.placement(p).ok()) {
+                if let Some(frame) = entity
+                    .records
+                    .iter()
+                    .find(|(keyword, _)| keyword.starts_with("TEXT_LITERAL"))
+                    .and_then(|(_, args)| arg_ref(args, 2))
+                    .and_then(|placement| resolver.placement(placement).ok())
+                {
                     position = Some([frame.origin.x, frame.origin.y, frame.origin.z]);
                 }
             }
@@ -713,25 +848,27 @@ fn callout_label(
                 }
             }
         }
+        let _ = id;
     };
-    let mut queue = vec![callout];
+    // Depth first in LIST order (children pushed reversed onto the stack), so
+    // the literals come out in the order the file wrote them.
+    let mut stack = vec![callout];
     let mut seen: HashSet<usize> = HashSet::default();
-    while let Some(id) = queue.pop() {
+    while let Some(id) = stack.pop() {
         if !seen.insert(id) {
             continue;
         }
-        visit(id);
         let Some(entity) = entities.get(&id) else { continue };
-        for (keyword, slot) in [("DRAUGHTING_CALLOUT", 1usize), ("ANNOTATION_CURVE_OCCURRENCE", 2), ("ANNOTATION_TEXT_OCCURRENCE", 2), ("ANNOTATION_OCCURRENCE", 2), ("GEOMETRIC_CURVE_SET", 1)] {
-            if let Some(args) = entity.find(keyword) {
-                match args.get(slot) {
-                    Some(Value::Ref(target)) => queue.push(*target),
-                    Some(Value::List(items)) => queue.extend(items.iter().filter_map(|v| v.as_ref_id().ok())),
-                    _ => {}
-                }
-            }
-        }
+        visit(id, entity);
+        let mut children = presentation_children(entity);
+        children.reverse();
+        stack.extend(children);
     }
+    let text = if unicode.is_empty() {
+        literals.join("\n")
+    } else {
+        unicode
+    };
     (position.or(fallback), text)
 }
 
@@ -739,22 +876,55 @@ fn callout_label(
 /// an IMPORT3D feature `feature_name` will stamp. `Ok(None)` when the file
 /// carries no PMI.
 pub fn read_step_pmi(text: &str, feature_name: &str) -> Result<Option<PmiState>, String> {
-    if !text.contains("DIMENSIONAL_")
-        && !text.contains("_TOLERANCE(")
-        && !text.contains("DATUM(")
-        && !text.contains("CAMERA_MODEL_D3(")
-        && !text.contains("DRAUGHTING_CALLOUT(")
-    {
+    if !file_mentions_pmi(text) {
         return Ok(None);
     }
     let entities = parse_data_section(text)?;
     let names = NameMap::build(text, &entities, feature_name)?;
-    let resolver = Resolver {
-        entities: &entities,
-        length_scale: names.length_scale,
+    Ok(lift_pmi(text, &entities, &names, &HashMap::default(), &mut Vec::new()))
+}
+
+/// The cheap text test that keeps a PMI-less file off the parse. A superset of
+/// the entity test — a mention inside a comment merely costs one parse.
+pub(super) fn file_mentions_pmi(text: &str) -> bool {
+    text.contains("DIMENSIONAL_")
+        || text.contains("_TOLERANCE(")
+        || text.contains("DATUM(")
+        || text.contains("CAMERA_MODEL_D3(")
+        || text.contains("CALLOUT(")
+}
+
+/// The lift itself, against an ALREADY-BUILT name map — so the flat lane
+/// (one map for the whole file) and the structured lane (one map per product,
+/// each entry tagged with its product, `assembly_pmi.rs`) read the file's PMI
+/// through exactly the same code.
+///
+/// `diagnostics` collects references the file made that named geometry this
+/// importer did not mint. Such an annotation is KEPT, carrying the file's own
+/// entity id as its reference (`STEP#1234`), so it reaches the PMI panel as a
+/// row with an error rather than disappearing between two file formats.
+pub(super) fn lift_pmi(
+    text: &str,
+    entities: &HashMap<usize, Entity>,
+    names: &NameMap,
+    pins: &HashMap<usize, usize>,
+    diagnostics: &mut Vec<String>,
+) -> Option<PmiState> {
+        let resolver = Resolver::new(entities, names.length_scale);
+    let aspects = aspect_names(entities, names, pins);
+    // A shape aspect whose geometry this importer did not mint still names
+    // something: the file's own entity. `read_step_pmi`'s contract is that an
+    // annotation is never dropped for want of a reference.
+    let mut unresolved: Vec<usize> = Vec::new();
+    let mut aspect_ref = |id: usize| -> String {
+        match aspects.get(&id) {
+            Some(name) => name.clone(),
+            None => {
+                unresolved.push(id);
+                format!("{UNRESOLVED_REF_PREFIX}{id}")
+            }
+        }
     };
-    let aspects = aspect_names(&entities, &names);
-    let aspect_name = |id: usize| -> Option<String> { aspects.get(&id).cloned() };
     let mut ids: BTreeMap<usize, &Entity> = entities.iter().map(|(id, entity)| (*id, entity)).collect();
     let mut state = PmiState::default();
     let mut semantics: Vec<Semantic> = Vec::new();
@@ -779,8 +949,8 @@ pub fn read_step_pmi(text: &str, feature_name: &str) -> Result<Option<PmiState>,
             let rel = candidate.find("SHAPE_ASPECT_RELATIONSHIP")?;
             (arg_ref(rel, 3) == Some(*id)).then(|| arg_ref(rel, 2)).flatten()
         });
-        let Some(target) = feature.and_then(aspect_name) else {
-            continue;
+        let Some(target) = feature.map(&mut aspect_ref) else {
+            continue; // the datum names no shape aspect at all
         };
         let annotation_id = state.next_id("DTM");
         datum_ids.insert(*id, letter.clone());
@@ -803,10 +973,13 @@ pub fn read_step_pmi(text: &str, feature_name: &str) -> Result<Option<PmiState>,
     for (id, entity) in ids.iter() {
         let mut fields: Option<(&str, serde_json::Map<String, serde_json::Value>)> = None;
         if let Some(args) = entity.find("ANGULAR_LOCATION").or_else(|| entity.find("DIMENSIONAL_LOCATION")) {
-            let (Some(a), Some(b)) = (arg_ref(args, 2).and_then(aspect_name), arg_ref(args, 3).and_then(aspect_name)) else {
-                continue;
+            let (Some(a), Some(b)) = (
+                arg_ref(args, 2).map(&mut aspect_ref),
+                arg_ref(args, 3).map(&mut aspect_ref),
+            ) else {
+                continue; // not a two-aspect location: not a dimension we read
             };
-            let values = dimension_values(&entities, *id, &names);
+            let values = dimension_values(entities, *id, &names);
             if entity.has("ANGULAR_LOCATION") {
                 let mut map = params(vec![("targets", serde_json::json!([a, b])), ("decimals", 1.into())]);
                 if let Some(nominal) = values.nominal {
@@ -817,18 +990,18 @@ pub fn read_step_pmi(text: &str, feature_name: &str) -> Result<Option<PmiState>,
                 fields = Some(("angle", map));
             } else {
                 let mut map = params(vec![("targets", serde_json::json!([a, b]))]);
-                if let Some(orientation) = orientation_axis(&entities, *id) {
+                if let Some(orientation) = orientation_axis(entities, *id) {
                     map.insert("alignment".into(), orientation.into());
                 }
                 apply_values(&mut map, &values);
                 fields = Some(("linear", map));
             }
         } else if let Some(args) = entity.find("DIMENSIONAL_SIZE") {
-            let Some(target) = arg_ref(args, 0).and_then(aspect_name) else {
-                continue;
+            let Some(target) = arg_ref(args, 0).map(&mut aspect_ref) else {
+                continue; // the size names no shape aspect
             };
             let name = arg_string(args, 1).to_ascii_lowercase();
-            let values = dimension_values(&entities, *id, &names);
+            let values = dimension_values(entities, *id, &names);
             if let Some(callout) = &values.callout {
                 let _ = callout;
                 let map = params(vec![("target", target.into()), ("showQuantity", true.into())]);
@@ -879,8 +1052,8 @@ pub fn read_step_pmi(text: &str, feature_name: &str) -> Result<Option<PmiState>,
         if args.len() < 4 {
             continue;
         }
-        let Some(target) = arg_ref(args, 3).and_then(aspect_name) else {
-            continue;
+        let Some(target) = arg_ref(args, 3).map(&mut aspect_ref) else {
+            continue; // the tolerance names no shape aspect
         };
         let magnitude = arg_ref(args, 2)
             .and_then(|m| entities.get(&m))
@@ -907,11 +1080,11 @@ pub fn read_step_pmi(text: &str, feature_name: &str) -> Result<Option<PmiState>,
                 let Some(system) = entities.get(&system_ref) else { continue };
                 if let Some(system_args) = system.find("DATUM_SYSTEM") {
                     for constituent in arg_refs(system_args, 4) {
-                        if let Some(pair) = datum_letter(&entities, constituent, 0) {
+                        if let Some(pair) = datum_letter(entities, constituent, 0) {
                             letters.push(pair);
                         }
                     }
-                } else if let Some(pair) = datum_letter(&entities, system_ref, 0) {
+                } else if let Some(pair) = datum_letter(entities, system_ref, 0) {
                     letters.push(pair);
                 }
             }
@@ -971,14 +1144,14 @@ pub fn read_step_pmi(text: &str, feature_name: &str) -> Result<Option<PmiState>,
     // A callout's ANNOTATION_PLANE that coincides with a planar face becomes
     // the annotation's `plane` reference; any other plane leaves it aligned
     // to the view.
-    let plane_of = plane_of_callouts(&entities);
-    let props = ValidationProps::read(&entities, &resolver);
+    let plane_of = plane_of_callouts(entities);
+    let props = ValidationProps::read(entities, &resolver);
     let mut plane_faces: HashMap<usize, Option<String>> = HashMap::default();
     let mut plane_param = |callout: usize, annotation: &mut PmiAnnotation| {
         let Some(plane) = plane_of.get(&callout).copied() else { return };
         let face = plane_faces
             .entry(plane)
-            .or_insert_with(|| plane_face_name(&entities, &resolver, &names, plane))
+            .or_insert_with(|| plane_face_name(entities, &resolver, &names, plane))
             .clone();
         if let (Some(face), Some(object)) = (face, annotation.params.as_object_mut()) {
             object.insert("plane".into(), serde_json::Value::String(face));
@@ -992,7 +1165,7 @@ pub fn read_step_pmi(text: &str, feature_name: &str) -> Result<Option<PmiState>,
         let mut annotation = semantic.annotation;
         if let Some(callout) = callout {
             linked_callouts.insert(callout);
-            let (position, _) = callout_label(&entities, &resolver, &props, callout);
+            let (position, _) = callout_label(entities, &resolver, &props, callout);
             annotation.label_world = position;
             plane_param(callout, &mut annotation);
         }
@@ -1000,10 +1173,10 @@ pub fn read_step_pmi(text: &str, feature_name: &str) -> Result<Option<PmiState>,
     }
     // Free 3D text callouts become notes.
     for (id, entity) in entities.iter() {
-        if !entity.has("DRAUGHTING_CALLOUT") || linked_callouts.contains(id) {
+        if !is_callout(entity) || linked_callouts.contains(id) {
             continue;
         }
-        let (position, text) = callout_label(&entities, &resolver, &props, *id);
+        let (position, text) = callout_label(entities, &resolver, &props, *id);
         if text.trim().is_empty() {
             continue;
         }
@@ -1018,7 +1191,7 @@ pub fn read_step_pmi(text: &str, feature_name: &str) -> Result<Option<PmiState>,
         annotations.push((Some(*id), annotation));
     }
     if annotations.is_empty() && !text.contains("CAMERA_MODEL_D3(") {
-        return Ok(None);
+        return None;
     }
 
     // Saved views.
@@ -1030,13 +1203,13 @@ pub fn read_step_pmi(text: &str, feature_name: &str) -> Result<Option<PmiState>,
         let items = arg_refs(args, 1);
         let camera = items
             .iter()
-            .find_map(|item| read_camera(&entities, &resolver, *item));
+            .find_map(|item| read_camera(entities, &resolver, *item));
         let Some((camera_name, camera)) = camera else {
             continue; // the global model (no camera) is not a saved view
         };
         let mut callouts = Vec::new();
         for item in &items {
-            expand_item(&entities, *item, &mut callouts);
+            expand_item(entities, *item, &mut callouts);
         }
         let model_name = arg_string(args, 0);
         views_in.push(ViewIn {
@@ -1082,9 +1255,15 @@ pub fn read_step_pmi(text: &str, feature_name: &str) -> Result<Option<PmiState>,
         });
     }
     if state.views.is_empty() {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(state))
+    for aspect in unresolved {
+        diagnostics.push(format!(
+            "PMI: shape aspect #{aspect} names geometry this import did not build; \
+             the annotation is kept with an unresolved reference"
+        ));
+    }
+    Some(state)
 }
 
 /// The world axis of an oriented dimension's 'orientation' placement (X / Y / Z).

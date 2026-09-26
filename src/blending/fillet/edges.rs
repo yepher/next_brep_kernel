@@ -27,6 +27,7 @@ pub(crate) fn fillet_edge_cutter(
     check_mixed_concavity(solid, edge_id, "fillet_edge")?;
     check_support_extent(solid, edge_id, radius, "fillet_edge")?;
     fillet_or_chamfer(solid, edge_id, radius, false, name, ToolEnds::default(), Lane::CutterFirst)
+        .map(settle_cutter_scaffold)
 }
 
 /// Equal-leg chamfer of one edge (Golovanov §6.11: the same construction
@@ -63,23 +64,23 @@ fn apply_chamfer_offsets_profile(
             );
         }
     };
-    if let Some(name) = name {
-        // Side faces are emitted in input-curve order; the chamfer wall is the
-        // second profile curve (index 1).
-        let mut side_index = 0usize;
-        for shell in &mut tool.shells {
-            for face in &mut shell.faces {
-                if side_index == 1 && face.name.is_none() {
-                    face.name = Some(name.to_string());
+    // Side faces are emitted in input-curve order; the chamfer wall is the
+    // second profile curve (index 1). Every other face is the cutter's
+    // scaffold, tagged and settled exactly as the symmetric cutter's is.
+    let mut side_index = 0usize;
+    for shell in &mut tool.shells {
+        for face in &mut shell.faces {
+            if side_index == 1 {
+                if face.name.is_none() {
+                    face.name = name.map(str::to_string);
                 }
-                side_index += 1;
-                if side_index >= profile.len() {
-                    break;
-                }
+            } else {
+                face.name = Some(scaffold_tag(name));
             }
+            side_index += 1;
         }
     }
-    apply_tool(solid, &tool, cross.convex)
+    apply_tool(solid, &tool, cross.convex).map(settle_cutter_scaffold)
 }
 
 /// Asymmetric (two-distance) chamfer of one STRAIGHT edge between two planar
@@ -157,13 +158,17 @@ fn resolve_edge_by_point(solid: &BrepSolid, point: Vec3) -> Result<u64, String> 
 /// corner where a revolve axis/pole edge meets the adjacent cap edges can
 /// defeat the sequential corner surgery even though each edge and every proper
 /// SUBSET of the selection blends cleanly (the three fillets converge on the
-/// pole with no single end face across the corner) — we do NOT hard-reject the
-/// whole selection (which makes the app refuse it outright with "does not yet
-/// support the selected edge geometry").  Instead we blend the LARGEST subset
-/// of the selected edges that yields a VALID solid, dropping only the edge(s)
-/// that cannot co-blend at the corner.  A selection that already composes is
-/// returned unchanged (byte-identical) — the subset search only runs after the
-/// full-group attempt errors.
+/// pole with no single end face across the corner) — a maximal-valid-SUBSET
+/// search blends the largest subset that works, dropping only the edges that
+/// cannot co-blend.  That is a real outcome and [`fillet_edges_reported`]
+/// returns it, WITH the list of edges it could not blend.
+///
+/// This entry point does not.  A solid holding eight of the ten walls that
+/// were asked for is not the answer to the question that was asked, and
+/// returning it as a plain `Ok` reports success for a different result; so an
+/// incomplete selection is an error here, naming every edge that was dropped
+/// and the group refusal behind them.  A caller that genuinely wants the
+/// partial answer asks for it by name.
 ///
 /// `edge_names` (when `Some`) is the per-edge blend-FACE name parallel to
 /// `edge_points` — each grown wall is named after ITS originating edge; `None`
@@ -178,6 +183,80 @@ pub fn fillet_edges(
     chamfer: bool,
     name: Option<&str>,
 ) -> Result<BrepSolid, String> {
+    let entry = if chamfer { "chamfer_edges" } else { "fillet_edges" };
+    let (result, selection) =
+        fillet_edges_reported(solid, edge_points, edge_names, radius, chamfer, name)?;
+    if selection.is_complete() {
+        return Ok(result);
+    }
+    let dropped: Vec<String> = selection
+        .rejected
+        .iter()
+        .map(|index| {
+            let point = edge_points[*index];
+            format!(
+                "#{index} at ({:.6}, {:.6}, {:.6})",
+                point.x, point.y, point.z
+            )
+        })
+        .collect();
+    Err(format!(
+        "{entry}: {} of the {} selected edges were blended — {} could not co-blend with the \
+         rest of the selection and carry no wall in the result ({}). The group refusal was: \
+         {}. Blend them separately, or call the reported entry point to accept the partial \
+         selection deliberately.",
+        selection.applied.len(),
+        selection.requested,
+        selection.rejected.len(),
+        dropped.join(", "),
+        selection
+            .reason
+            .as_deref()
+            .unwrap_or("the whole group built but not every edge grew a wall"),
+    ))
+}
+
+/// What a blend selection actually achieved.
+///
+/// The kernel can answer a group blend with fewer walls than were asked for —
+/// the maximal-valid-subset search drops the edges that cannot co-blend at a
+/// shared corner rather than failing outright. This says WHICH, so partial
+/// fulfilment is a statement instead of a silence.
+#[derive(Clone, Debug)]
+pub struct BlendSelection {
+    /// How many edges the caller selected.
+    pub requested: usize,
+    /// Indices into that selection that carry a blend wall in the result.
+    pub applied: Vec<usize>,
+    /// Indices that do not.
+    pub rejected: Vec<usize>,
+    /// Why the whole selection could not be built, when something was dropped.
+    pub reason: Option<String>,
+}
+
+impl BlendSelection {
+    /// Every requested edge carries a wall.
+    pub fn is_complete(&self) -> bool {
+        self.rejected.is_empty()
+    }
+}
+
+/// [`fillet_edges`] with the selection outcome reported rather than refused.
+///
+/// The result is the same solid `fillet_edges` would build; the difference is
+/// that an incomplete selection comes back as `Ok` with the misses named,
+/// which is the explicit partial-result contract.  Every named refusal that
+/// applies to the WHOLE selection — mixed concavity, a radius the local wall
+/// cannot hold, a mixed-convexity corner — is still an `Err`: dropping edges
+/// cannot rescue those, so a partial answer would be a different defect.
+pub fn fillet_edges_reported(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    radius: f64,
+    chamfer: bool,
+    name: Option<&str>,
+) -> Result<(BrepSolid, BlendSelection), String> {
     if !(radius > 0.0) || !radius.is_finite() {
         return Err("fillet_edges: radius must be positive".into());
     }
@@ -208,55 +287,174 @@ pub fn fillet_edges(
     // cutter "succeeds" on this shape by shredding the solid (a sliver end cap
     // per corner, the carrier face split and renamed), which is worse than
     // the named refusal — see the 2026-09-09 rib-spine report.
+    //
+    // Nor can PARTITIONING the selection at the corner rescue it, which is
+    // why this is still a refusal and not a split (measured 2026-09-13, the
+    // partition record): the two convexity-pure halves each build on the
+    // network, and composing them walls every selected edge and leaves
+    // every other face's area identical to twelve digits — but the convex
+    // wall comes out as the full untrimmed quarter-round prism
+    // (2·(1 − π/4)·r²·L to 2.2e-10, with NO rolled-corner term) because its
+    // contact rail runs off its own face at the TRI-TANGENT STATION and the
+    // surgery splices the overhang in rather than clipping it.  The faces it
+    // runs along come back with self-crossing loops that `validate()`,
+    // `solid_self_intersections`, the connectivity report and the Euler check
+    // all pass — and that `check_loop_self_crossings` REFUSES since
+    // 9e50f6d55, so the split is not a route to ten walls either: blend the
+    // concave half first and the acceptance refuses every convex edge whose
+    // wall runs out into it — on the rib both spines, at that same station, so
+    // that feature fails outright; blend the convex half first and the
+    // maximal-valid-subset search drops one ring edge and returns NINE walls
+    // of ten.  The construction that is missing
+    // is the runout itself: past that station the ball rolls on one input
+    // face and on the concave stripe's own surface, so the march needs a
+    // STRIPE as its second carrier (`fillet-stripe-network.md` item 2).
+    //
+    // And more than that, measured 2026-09-13 (`blend/runout.rs`, which this
+    // refusal now reports): the KEPT mate runs out too, at the mirror-image
+    // station, so the FIRST carrier becomes the other concave stripe and the
+    // last stretch rolls on two stripes; that stretch ends in a POLE where the
+    // two stripes' rails on the face they share meet and the section shrinks
+    // to a point. Two carrier switches and a degenerate terminus, not a march
+    // with a stop.
     if !chamfer {
         check_mixed_corner_convexity(solid, &selected_ids, edge_points, edge_names, radius, name)?;
+        // A selection whose corner setbacks consume a whole edge — the exact
+        // degenerate radius, every face shrunk to a point — has no strip for
+        // the network to build and nothing the cutter or the subset search
+        // can rescue (the search answered the r = 10 cube with nine walls and
+        // a 5174 volume against the sphere's 4189).  Terminal, by name, here.
+        check_degenerate_corner_setbacks(
+            solid,
+            &selected_ids,
+            edge_points,
+            edge_names,
+            radius,
+            name,
+        )?;
     }
 
-    match fillet_edges_group(solid, edge_points, edge_names, radius, chamfer, name) {
-        Ok(result) => Ok(result),
-        Err(group_err) => {
-            // Fewer than two edges: nothing to drop, so the group error is final.
-            // Cap the combinatorial search so a large malformed selection cannot
-            // explode (the full group carries the common case; the search is a
-            // rare fallback).
-            let n = edge_points.len();
-            if n < 2 || n > 12 {
-                return Err(group_err);
+    let n = edge_points.len();
+    let complete = |applied: Vec<usize>| BlendSelection {
+        requested: n,
+        applied,
+        rejected: Vec::new(),
+        reason: None,
+    };
+    let group_err = match fillet_edges_group(solid, edge_points, edge_names, radius, chamfer, name)
+    {
+        Ok(result) => {
+            // The group returned a solid, which is NOT the same as the group
+            // having blended every edge.  `validate()` cannot tell the
+            // difference — it checks incidence, and a solid missing a wall is
+            // perfectly incident — so the walls are COUNTED.
+            let missing = walls_missing(&result, edge_names, &(0..n).collect::<Vec<_>>());
+            if missing.is_empty() {
+                return Ok((result, complete((0..n).collect())));
             }
-            // Drop the fewest edges first (largest surviving subset), trying the
-            // drop-sets in lexicographic order so the result is deterministic.
-            // Return the first subset that blends to a VALID (watertight) solid.
-            for drop in 1..n {
-                for dropped in index_combinations(n, drop) {
-                    let kept: Vec<Vec3> = (0..n)
-                        .filter(|i| !dropped.contains(i))
-                        .map(|i| edge_points[i])
-                        .collect();
-                    // Subset the per-edge blend-face names with the IDENTICAL
-                    // drop-set so `kept_names[k]` still names `kept[k]`.
-                    let kept_names: Option<Vec<String>> = edge_names.map(|names| {
-                        (0..n)
-                            .filter(|i| !dropped.contains(i))
-                            .map(|i| names[i].clone())
-                            .collect()
-                    });
-                    if let Ok(result) = fillet_edges_group(
-                        solid,
-                        &kept,
-                        kept_names.as_deref(),
-                        radius,
-                        chamfer,
-                        name,
-                    ) {
-                        if result.validate().is_empty() {
-                            return Ok(result);
-                        }
-                    }
-                }
+            let applied: Vec<usize> = (0..n).filter(|index| !missing.contains(index)).collect();
+            return Ok((
+                result,
+                BlendSelection {
+                    requested: n,
+                    applied,
+                    rejected: missing,
+                    reason: None,
+                },
+            ));
+        }
+        Err(error) => error,
+    };
+    // A wall that FOLDS THROUGH ITSELF is terminal for the whole selection, and
+    // for the reason the two checks above are: dropping edges cannot rescue it.
+    // The subset search would happily answer this document's two collars with
+    // the ONE that does not fold, and return a solid whose volume is a blend
+    // short — the same silent partial `both_collars_add_independently` exists
+    // to catch.  Reported by name instead (`blend/fold.rs`).
+    if crate::blend::is_wall_fold(&group_err) {
+        return Err(group_err);
+    }
+    // Fewer than two edges: nothing to drop, so the group error is final.
+    // Cap the combinatorial search so a large malformed selection cannot
+    // explode (the full group carries the common case; the search is a
+    // rare fallback).
+    if n < 2 || n > 12 {
+        return Err(group_err);
+    }
+    // Drop the fewest edges first (largest surviving subset), trying the
+    // drop-sets in lexicographic order so the result is deterministic.
+    // Take the first subset that blends to a valid solid IN WHICH EVERY KEPT
+    // EDGE GREW A WALL: a subset that itself silently drops one of its own
+    // edges is not the maximal subset, it is a smaller one wearing a larger
+    // one's label.
+    for drop in 1..n {
+        for dropped in index_combinations(n, drop) {
+            let keep: Vec<usize> = (0..n).filter(|i| !dropped.contains(i)).collect();
+            let points: Vec<Vec3> = keep.iter().map(|i| edge_points[*i]).collect();
+            // Subset the per-edge blend-face names with the IDENTICAL
+            // drop-set so `kept_names[k]` still names `kept[k]`.
+            let kept_names: Option<Vec<String>> =
+                edge_names.map(|names| keep.iter().map(|i| names[*i].clone()).collect());
+            let Ok(result) = fillet_edges_group(
+                solid,
+                &points,
+                kept_names.as_deref(),
+                radius,
+                chamfer,
+                name,
+            ) else {
+                continue;
+            };
+            if !result.validate().is_empty() {
+                continue;
             }
-            Err(group_err)
+            if !walls_missing(&result, kept_names.as_deref(), &keep).is_empty() {
+                continue;
+            }
+            return Ok((
+                result,
+                BlendSelection {
+                    requested: n,
+                    applied: keep,
+                    rejected: dropped,
+                    reason: Some(group_err),
+                },
+            ));
         }
     }
+    Err(group_err)
+}
+
+/// Which of `selected` (indices into the caller's own selection) carry NO blend
+/// wall in `result`.
+///
+/// Attribution is by NAME, which is exact: the feature path names each wall
+/// after its own edge (`{fid}:BLEND:{edge}`), so a missing name is a missing
+/// wall and nothing else.  Without per-edge names — the legacy and test path,
+/// where every wall carries one base name — there is nothing to attribute
+/// with, and the count of faces the surgery GREW is the only available
+/// statement; it cannot say which edge is missing, so it says none are rather
+/// than guessing, and the subset search's own drop list still reports exactly.
+fn walls_missing(
+    result: &BrepSolid,
+    edge_names: Option<&[String]>,
+    selected: &[usize],
+) -> Vec<usize> {
+    let Some(names) = edge_names else {
+        return Vec::new();
+    };
+    let built: Vec<&str> = result
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .filter_map(|face| face.name.as_deref())
+        .collect();
+    selected
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| !built.contains(&names[*position].as_str()))
+        .map(|(_, index)| *index)
+        .collect()
 }
 
 /// The blend-FACE name for the `i`-th selected edge: its per-edge name when the
@@ -305,13 +503,12 @@ fn corner_face_name(
 /// **A corner with two concave edges cannot also take a convex one.**
 ///
 /// Where selected edges meet, the rolling ball has to touch every face around
-/// the vertex from ONE side.  A convex edge running into the concave edges it
+/// the vertex from ONE side. A convex edge running into the concave edges it
 /// meets (a rib spine dying into the fillets at its own base) asks the ball to
 /// sit under the shared face for one blend and over it for the other, so no
 /// ball seats there and the corner has no closure: physically the convex blend
 /// runs out against the concave beads partway along the edge, which is a vertex
-/// blend the stripe network does not construct
-/// (`docs/developer/kernel-plans/fillet-stripe-network.md`).
+/// blend the stripe network does not construct.
 ///
 /// The re-entrant vertex of a notch — ONE concave edge, the rest convex — is
 /// NOT this: the ball rolls round that single concave edge from one convex
@@ -333,9 +530,95 @@ fn check_mixed_corner_convexity(
     name: Option<&str>,
 ) -> Result<(), String> {
     match crate::blend::mixed_convexity_corner(solid, edge_ids, radius) {
-        Some(corner) => Err(mixed_corner_message(&corner, edge_points, edge_names, name)),
+        Some(corner) => {
+            // The refusal carries the RUNOUT's own numbers when they can be
+            // measured — the station, the carrier pair, the stop and the pole
+            // — so it says which construction is missing and where, not only
+            // that the corner has none.  A measurement that fails leaves the
+            // refusal exactly as it was: the corner is refused either way.
+            let measured = match crate::blend::plan_runout(solid, edge_ids, radius, &corner) {
+                Ok(plan) => Some(plan),
+                Err(error) => {
+                    if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                        eprintln!("runout not measured: {error}");
+                    }
+                    None
+                }
+            };
+            Err(mixed_corner_message(
+                &corner,
+                edge_points,
+                edge_names,
+                name,
+                measured.as_ref(),
+            ))
+        }
         None => Ok(()),
     }
+}
+
+/// Refuse a selection one of whose edges keeps NO blend strip between the
+/// corner balls at its two ends (see `degenerate_corner_setbacks`).
+fn check_degenerate_corner_setbacks(
+    solid: &BrepSolid,
+    edge_ids: &[u64],
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    radius: f64,
+    name: Option<&str>,
+) -> Result<(), String> {
+    let Some(setback) = crate::blend::degenerate_corner_setbacks(solid, edge_ids, radius) else {
+        return Ok(());
+    };
+    let [from, to] = setback.stops;
+    let how = if setback.crossed {
+        format!(
+            "run {:.3e} PAST each other along it (the radius is beyond the limit)",
+            setback.strip
+        )
+    } else {
+        format!(
+            "meet there ({:.3e} apart against a bar of {:.3e})",
+            setback.strip, setback.bar
+        )
+    };
+    Err(format!(
+        "fillet_edges: at r = {radius} the corner setbacks consume the whole of {} — the rolling \
+         balls seated at its two corners touch face {} at ({:.4}, {:.4}, {:.4}) and ({:.4}, \
+         {:.4}, {:.4}) and {how}, so no blend strip is left between them and the faces it lies \
+         on are consumed whole. The radius is at or past the degenerate limit for this \
+         selection; reduce it.",
+        selection_label(setback.edge, edge_points, edge_names, name),
+        setback.face_id,
+        from.x,
+        from.y,
+        from.z,
+        to.x,
+        to.y,
+        to.z,
+    ))
+}
+
+/// How a refusal names the `index`-th selected edge: its originating edge
+/// name when the feature layer supplied one (with the feature's base prefix
+/// stripped), else the picked point.
+fn selection_label(
+    index: usize,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    name: Option<&str>,
+) -> String {
+    let named = edge_names.and_then(|names| names.get(index)).map(|composed| match name {
+        Some(base) => composed
+            .strip_prefix(&format!("{base}:"))
+            .unwrap_or(composed)
+            .to_string(),
+        None => composed.clone(),
+    });
+    named.unwrap_or_else(|| match edge_points.get(index) {
+        Some(point) => format!("the edge at ({:.3}, {:.3}, {:.3})", point.x, point.y, point.z),
+        None => format!("selection #{}", index + 1),
+    })
 }
 
 /// The refusal text for [`check_mixed_corner_convexity`], naming the edges the
@@ -346,22 +629,9 @@ fn mixed_corner_message(
     edge_points: &[Vec3],
     edge_names: Option<&[String]>,
     name: Option<&str>,
+    measured: Option<&crate::blend::RunoutPlan>,
 ) -> String {
-    let label = |index: usize| -> String {
-        let named = edge_names.and_then(|names| names.get(index)).map(|composed| {
-            match name {
-                Some(base) => composed
-                    .strip_prefix(&format!("{base}:"))
-                    .unwrap_or(composed)
-                    .to_string(),
-                None => composed.clone(),
-            }
-        });
-        named.unwrap_or_else(|| match edge_points.get(index) {
-            Some(point) => format!("the edge at ({:.3}, {:.3}, {:.3})", point.x, point.y, point.z),
-            None => format!("selection #{}", index + 1),
-        })
-    };
+    let label = |index: usize| selection_label(index, edge_points, edge_names, name);
     let list = |indices: &[usize]| -> String {
         let parts: Vec<String> = indices.iter().map(|index| label(*index)).collect();
         match parts.split_last() {
@@ -370,19 +640,75 @@ fn mixed_corner_message(
             Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
         }
     };
-    format!(
+    let mut message = format!(
         "fillet_edges: the selection mixes convexity at the corner ({:.3}, {:.3}, {:.3}) — convex \
          {} meets concave {} there. One rolling ball cannot touch the face they share from both \
          sides at once, so that corner has no closure: the convex blend runs out against the \
-         concave ones partway along the edge, and this kernel does not build that vertex blend \
-         yet. Blend the concave edges in one fillet and the convex ones in a later \
-         fillet — both orders build, and concave-first is the tidier result.",
+         concave ones partway along the edge, and this kernel does not build that runout yet. \
+         Blending the concave edges in one fillet and the convex ones in another does not reach \
+         a wall on every one of them either: the convex wall comes out at FULL length in either \
+         order, and its contact leaves the faces it runs along where their own loops would then \
+         cross. Blend the concave edges first and the blend acceptance refuses each convex edge \
+         whose wall runs out into them; blend the convex ones first and the subset search drops \
+         the concave edges it cannot compose instead, leaving those unfilleted.",
         corner.point.x,
         corner.point.y,
         corner.point.z,
         list(&corner.convex),
         list(&corner.concave),
-    )
+    );
+    // The runout, measured: where the ball's carriers switch, what they switch
+    // to, and where the last stretch degenerates.  These are the numbers the
+    // construction owes, so the refusal states them rather than leaving the
+    // reader to derive them (`blend/runout.rs`).
+    if let Some(plan) = measured {
+        message.push_str(&format!(
+            " Measured on this selection: the convex edge {}'s ball becomes tangent to face {} — \
+             the face its two concave neighbours share — at s = {:.6} from the corner, centred \
+             ({:.6}, {:.6}, {:.6}), where its contact on face {} reaches edge {}'s own rail \
+             (ball-to-stripe residual {:.3e}). Past that station the second carrier is edge {}'s \
+             STRIPE SURFACE, not a face of the input, and the march holds on it for {} \
+             stations that fit rows reproducing their own contacts to {:.3e}. On the way the \
+             kept mate's contact walks {:.3e} of a span off that face's own patch — into the \
+             strip the concave stripe's pad ADDS to it — which is the shape, not an escape: \
+             the bar a march is refused at is a full span.",
+            plan.convex_edge,
+            plan.shared_face,
+            plan.station.s,
+            plan.station.center.x,
+            plan.station.center.y,
+            plan.station.center.z,
+            plan.replaced_mate,
+            plan.second_carrier,
+            plan.station.stripe_residual,
+            plan.second_carrier,
+            plan.marched,
+            plan.fit_residual,
+            plan.carrier_excursion,
+        ));
+        match (&plan.stop, plan.first_carrier) {
+            (Some(stop), Some(first)) => message.push_str(&format!(
+                " It does not simply stop there: at s = {:.6} the KEPT mate (face {}) runs out too \
+                 — the ball's contact on it reaches edge {}'s rail, residual {:.3e} — so the FIRST \
+                 carrier becomes that stripe as well and the last stretch rolls on two stripes.",
+                stop.s, plan.kept_mate, first, stop.stripe_residual,
+            )),
+            _ => message.push_str(&format!(
+                " Where the kept mate (face {}) runs out was not measurable on this selection.",
+                plan.kept_mate
+            )),
+        }
+        if let Some(pole) = plan.pole {
+            message.push_str(&format!(
+                " That stretch ends at a POLE, ({:.6}, {:.6}, {:.6}), where the two concave \
+                 stripes' rails on face {} meet and the ball's two contacts merge, so the blend \
+                 section shrinks to a point. Two carrier switches and a degenerate terminus is \
+                 more than a stop station on a stripe, and none of it is composed yet.",
+                pole.x, pole.y, pole.z, plan.shared_face,
+            ));
+        }
+    }
+    message
 }
 
 /// All ways to choose `k` distinct indices from `0..n`, in lexicographic order.
@@ -412,10 +738,56 @@ fn index_combinations(n: usize, k: usize) -> Vec<Vec<usize>> {
     }
 }
 
+thread_local! {
+    /// Running count (per thread) of group builds that reached the CUTTER
+    /// COMPOSITION — every network lane above it refused or was rejected.  A
+    /// zero delta across a call is the witness that the network answered it;
+    /// a face count or a volume cannot say which lane built a solid, since the
+    /// cutter can build the same one.  Test-observable; not part of any result.
+    pub(crate) static CUTTER_COMPOSITIONS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Blend the WHOLE selection as one group (the single-shot multi-edge fillet).
 /// Errors if any selected edge or the shared-corner surgery cannot compose;
 /// `fillet_edges` wraps this with a maximal-valid-subset fallback.
+/// [`fillet_edges_group_unchecked`] held to the ONE soundness question every
+/// other acceptance in this file passes: no face of the result may have a trim
+/// loop that crosses itself ([`check_loop_self_crossings`]).
+///
+/// It sits here, at the group's single exit, rather than beside each `Ok`
+/// inside it, because the group has four of them — the closed rim, the stripe
+/// network, the per-component composition and the cutter composition — and the
+/// cutter's is the one no other check guards at all. The network and the rim
+/// ALSO ask it inside, where a bowtie falls through to the next lane instead of
+/// failing the group; here there is no next lane, so it refuses.
+///
+/// The maximal-valid-subset search in [`fillet_edges_reported`] calls this
+/// entry, so a subset that blends to a bowtie is not a valid subset either.
 fn fillet_edges_group(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    radius: f64,
+    chamfer: bool,
+    name: Option<&str>,
+) -> Result<BrepSolid, String> {
+    let entry = if chamfer { "chamfer_edges" } else { "fillet_edges" };
+    let result =
+        fillet_edges_group_unchecked(solid, edge_points, edge_names, radius, chamfer, name)?;
+    check_loop_self_crossings(&result, entry)?;
+    // The BODY's own soundness, beside the loop's. A blend wall is a FITTED
+    // surface and a fit can carry two parameters of one wall to one point in
+    // space — measured on `inbox-20260902-fillet-two-torus-box-edges`, whose
+    // wall `F8:BLEND:Box_NZ|P.T5_Side[0]` does exactly that while `validate()`,
+    // connectivity, Euler parity, the loop scan and the face-versus-face scan
+    // are all silent. Two walls crossing each other is the same class and is
+    // repaired where it can be. Neither is visible to a volume oracle, so a
+    // result carrying one reports success for a different shape.
+    crate::accept_sound(result, entry)
+}
+
+fn fillet_edges_group_unchecked(
     solid: &BrepSolid,
     edge_points: &[Vec3],
     edge_names: Option<&[String]>,
@@ -567,9 +939,70 @@ fn fillet_edges_group(
     //     nothing is subtracted, so no cutter can overshoot into a neighbour
     //     and no leftover cap has to be identified afterwards.  It refuses
     //     BY NAME on what it does not yet construct (mixed-convexity corners,
-    //     no-common-ball stars, chamfer corners, pinched edges), and those
-    //     fall through to the cutter composition below.
+    //     no-common-ball stars, pinched edges), and those fall through to the
+    //     cutter composition below.
+    //
+    //     A CLOSED edge is one of those refusals and it has an answer the
+    //     network is simply not the lane for: a closed rim has no corner to
+    //     share, so `blend_star_network` says "edge N is closed and has no
+    //     corner to share" and the composition took it.  `blend_closed_edge`
+    //     builds exactly that case and the single-edge ladder in `tool.rs`
+    //     has always tried it first — but this function reached only the
+    //     network, so a closed rim inside a GROUP went to a cutter that the
+    //     same rim selected on its own never saw.  A bored hole's rim splits
+    //     out as its own one-edge component (see the component partition
+    //     above), so that was every hole rim chamfered as part of a face
+    //     selection.  Try it here too, under the same acceptance the network
+    //     result gets, and under the same `BREP_NO_NETWORK` A/B.
     if std::env::var("BREP_NO_NETWORK").is_err() {
+        if selected_edge_ids.len() == 1 {
+            let edge_id = selected_edge_ids[0];
+            let closed = solid
+                .edges
+                .iter()
+                .find(|edge| edge.id == edge_id)
+                .is_some_and(|edge| edge.start_vertex_id == edge.end_vertex_id);
+            if closed {
+                let rim_name = per_edge_name(edge_names, name, 0);
+                match crate::blend::blend_closed_edge(solid, edge_id, radius, chamfer, rim_name) {
+                    Ok(mut rim) => {
+                        let entry = if chamfer { "chamfer_edges" } else { "fillet_edges" };
+                        let healed = heal_edge_vertex_gaps(&mut rim, radius);
+                        // A trim the surgery ran outside its planar carrier's
+                        // chart is a wrong body the three checks below all pass
+                        // (`crate::blend::fit_planar_charts_to_trims`), so the
+                        // carrier is widened here, after the heal has settled
+                        // the edges the trims are rebuilt from and before the
+                        // bowtie scan reads them.  Its refusals are TERMINAL:
+                        // the composition is not a second opinion on a body
+                        // whose trims left their carrier.
+                        crate::blend::fit_planar_charts_to_trims(solid, &mut rim)?;
+                        let issues = rim.validate();
+                        let interference =
+                            check_blend_interference(solid, &rim, &selected_edge_ids, entry);
+                        let bowtie = check_loop_self_crossings(&rim, entry);
+                        if healed.is_ok()
+                            && issues.is_empty()
+                            && interference.is_ok()
+                            && bowtie.is_ok()
+                        {
+                            return Ok(rim);
+                        }
+                        if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                            eprintln!(
+                                "closed-rim result rejected: heal={healed:?} issues={issues:?} \
+                                 interference={interference:?} bowtie={bowtie:?}"
+                            );
+                        }
+                    }
+                    Err(refusal) => {
+                        if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                            eprintln!("closed-rim refused: {refusal}");
+                        }
+                    }
+                }
+            }
+        }
         let network_names: Vec<Option<String>> = (0..edge_points.len())
             .map(|index| per_edge_name(edge_names, name, index).map(str::to_string))
             .collect();
@@ -593,16 +1026,25 @@ fn fillet_edges_group(
                 // self-intersecting solid is still a watertight one.
                 let entry = if chamfer { "chamfer_edges" } else { "fillet_edges" };
                 let healed = heal_edge_vertex_gaps(&mut network, radius);
+                // See the closed-rim lane above: widen a planar carrier the
+                // surgery overran, or refuse — terminally — rather than fall
+                // through to a composition that cannot answer that question.
+                crate::blend::fit_planar_charts_to_trims(solid, &mut network)?;
                 let issues = network.validate();
                 let interference =
                     check_blend_interference(solid, &network, &selected_edge_ids, entry);
-                if healed.is_ok() && issues.is_empty() && interference.is_ok() {
+                // And the fourth question, which the other three all pass: does
+                // any face of the result have a loop that crosses ITSELF? A
+                // wall whose rail ran off its own face comes back as a bowtie,
+                // and a bowtie is watertight, incident and connected.
+                let bowtie = check_loop_self_crossings(&network, entry);
+                if healed.is_ok() && issues.is_empty() && interference.is_ok() && bowtie.is_ok() {
                     return Ok(network);
                 }
                 if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
                     eprintln!(
                         "network result rejected: heal={healed:?} issues={issues:?} \
-                         interference={interference:?}"
+                         interference={interference:?} bowtie={bowtie:?}"
                     );
                     dump_loops_debug("INPUT", solid);
                     dump_loops_debug("RESULT", &network);
@@ -612,10 +1054,55 @@ fn fillet_edges_group(
                 if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
                     eprintln!("network refused: {refusal}");
                 }
+                // The fail-safe above is for a refusal that says "not this
+                // lane".  A marched fit that left its carriers does not say
+                // that, and the cutter's answer to the same selection is not a
+                // second opinion on it: on the notched cap's stuck connector
+                // the composition reads 1724.506048919, +1.81e-2 against the
+                // closed form, and it VALIDATES.  A refusal that falls through
+                // to a validating wrong solid is not a refusal.
+                //
+                // Only that one, not all of `is_terminal_blend_refusal`.  The
+                // single-edge tool also reads the WALL FOLD as terminal, and
+                // making the group build agree costs
+                // `inbox_20260902_corner_torus_collar_fillet::each_collar_has_its_own_fold_threshold`
+                // a collar that the cutter composes today (measured
+                // 2026-09-16: refuses at fold factor 1.035935 on a radius-2.1
+                // wall). Whether a group selection should refuse where a
+                // single edge does is a decision with a test standing on the
+                // current answer, and it is not this slice's.
+                //
+                // A blend stopping within a sliver of its face's width that
+                // cannot be snapped onto the far edge without opening the shell
+                // is terminal for the same reason: the SIZE is the question
+                // (`blend::CONSUMED_SNAP_UNSOUND`), and the composition's tool
+                // cut a sliver short of an edge leaves the sliver no lane keeps.
+                //
+                // And a FULL-WIDTH corner the network cannot collapse soundly
+                // (`blend::RAIL_COLLAPSE_UNSUPPORTED`,
+                // `blend::FULL_WIDTH_COLLAPSE_UNSOUND`): the composition's answer
+                // to a full-width corner was measured wrong — a 5F/8E/5V miter
+                // 8.0e-4 off its closed form at 1e-5 short of the width, and the
+                // picture-frame corner at a full-width chamfer star.
+                //
+                // And a trim that left its planar carrier's chart
+                // (`blend::PLANAR_CHART_EDGE_OFF_PLANE`,
+                // `blend::PLANAR_CHART_WIDEN_UNSOUND`): the clamped body the
+                // composition would answer with is the defect being refused.
+                if refusal.starts_with(crate::blend::MARCHED_FIT_OFF_CARRIERS)
+                    || refusal.starts_with(crate::blend::CONSUMED_SNAP_UNSOUND)
+                    || refusal.starts_with(crate::blend::RAIL_COLLAPSE_UNSUPPORTED)
+                    || refusal.starts_with(crate::blend::FULL_WIDTH_COLLAPSE_UNSOUND)
+                    || refusal.starts_with(crate::blend::PLANAR_CHART_EDGE_OFF_PLANE)
+                    || refusal.starts_with(crate::blend::PLANAR_CHART_WIDEN_UNSOUND)
+                {
+                    return Err(refusal);
+                }
             }
         }
     }
 
+    CUTTER_COMPOSITIONS.with(|count| count.set(count.get() + 1));
     // 2. Build the blends.
     //
     //    CHAIN corners (§6.9.6 — exactly TWO selected edges share a vertex):
@@ -737,7 +1224,13 @@ fn fillet_edges_group(
     };
 
     let mut result = if let Some(operation) = miter_operation {
-        let options = crate::BooleanOptions::default();
+        // The per-edge results still carry their cutters' standing scaffold,
+        // which the group settles once its corners are closed. A scaffold face
+        // merged here would hand its tag to whatever it merged with.
+        let options = crate::BooleanOptions {
+            keep_unmerged_name_substrs: vec![CUTTER_SCAFFOLD_NAME.to_string()],
+            ..crate::BooleanOptions::default()
+        };
         let mut combined: Result<Option<BrepSolid>, String> = Ok(None);
         for (index, point) in edge_points.iter().enumerate() {
             let edge_id = resolve_edge_by_point(solid, *point)?;
@@ -856,7 +1349,8 @@ fn fillet_edges_group(
     // Heal any residual vertex/edge gaps introduced by the corner-rounding
     // surgery (the per-edge results are already healed inside fillet_or_chamfer).
     heal_edge_vertex_gaps(&mut result, radius)?;
-    Ok(result)
+    crate::blend::fit_planar_charts_to_trims(solid, &mut result)?;
+    Ok(settle_cutter_scaffold(result))
 }
 
 /// Variable-radius fillet/chamfer of a GROUP of edges (§4.9.5), the app entry
@@ -1094,6 +1588,7 @@ fn fillet_edges_variable_impl(
     // Heal §6.9 surgery so re-trimmed edges meet their vertices exactly; scale
     // the heal bound by the largest radius stop in the taper profile.
     heal_edge_vertex_gaps(&mut result, max_radius)?;
+    crate::blend::fit_planar_charts_to_trims(solid, &mut result)?;
     // Final honesty gate: a genuinely TAPERED chain (different radii at the
     // shared corner) has mismatched trim stations there — the blends cannot
     // meet without a transition patch (not implemented), and the sequential
@@ -1117,7 +1612,11 @@ fn fillet_edges_variable_impl(
                 .unwrap_or_default()
         ));
     }
-    Ok(result)
+    // The variable-radius lane's own soundness acceptance, the same one the
+    // constant-radius group exit takes. `validate()` above is an INCIDENCE
+    // test: a tapered wall that passes through a neighbour, or through itself,
+    // satisfies every check it makes and still measures a volume.
+    crate::accept_sound(result, entry)
 }
 
 /// One selected edge placed on the ordered chain, with its arc-length

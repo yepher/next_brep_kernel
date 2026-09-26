@@ -148,10 +148,9 @@ mod recognition;
 mod intersect;
 #[path = "analytic_surface/revolution.rs"]
 mod revolution;
-// BREP private tests: de7909b049d7a211
-// BREP private tests: f49ddbd4287c384e
 
-pub use intersect::intersect_analytic_pair;
+pub use intersect::{intersect_analytic_pair, plane_ruled_section_arc};
+pub(crate) use intersect::{intersect_analytic_pair_with, ruled_gate, ruled_gate_census, RuledGate};
 pub use recognition::recognize;
 pub use revolution::{revolution_structure, RevolutionStructure};
 pub(crate) use revolution::circumcenter;

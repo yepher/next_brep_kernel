@@ -148,14 +148,15 @@ impl Engine {
                     if let (Some(p0), Some(p1), Some(p2), Some(p3)) =
                         (get(0), get(1), get(2), get(3))
                     {
-                        // Spline end pairs first, mirroring c_tangent's
-                        // dispatch. Spline tangency is direction-only (G1):
-                        // vs a spline or line it is a parallel row, vs a
-                        // circle a perpendicular row against the radial
-                        // direction at the endpoint. Both cover the ±
-                        // orientation, so no side constant is frozen.
-                        let s01 = self.spline_end_info(p0, p1);
-                        let s23 = self.spline_end_info(p2, p3);
+                        // Spline anchor pairs (end or interior) first,
+                        // mirroring c_tangent's dispatch. Spline tangency is
+                        // direction-only (G1): vs a spline or line it is a
+                        // parallel row, vs a circle a perpendicular row
+                        // against the radial direction at the anchor. Both
+                        // cover the ± orientation, so no side constant is
+                        // frozen.
+                        let s01 = self.spline_anchor_info(p0, p1);
+                        let s23 = self.spline_anchor_info(p2, p3);
                         if let (Some((a1, h1)), Some((a2, h2))) = (s01, s23) {
                             atoms.push(DofResidual::Parallel(a1, h1, a2, h2));
                         } else if let Some((anchor, handle)) = s01 {
@@ -191,6 +192,183 @@ impl Engine {
                                 -1.0
                             };
                             atoms.push(DofResidual::TangentCircleCircle(p0, p1, p2, p3, sign));
+                        }
+                    }
+                }
+                CType::SplineCurvature => {
+                    if let (Some(p0), Some(p1), Some(p2), Some(p3)) =
+                        (get(0), get(1), get(2), get(3))
+                    {
+                        // Same dispatch as `c_spline_curvature`: spline pairs
+                        // first, then a circle/arc. A degenerate handle (or a
+                        // degenerate circle) drops the WHOLE constraint rather
+                        // than contributing a zero row, which would read as a
+                        // redundant equation on a sketch that is only reporting
+                        // a degenerate handle.
+                        let s01 = self.spline_curvature_side(p0, p1);
+                        let s23 = self.spline_curvature_side(p2, p3);
+                        let xy = |i: usize| [gx(i), gy(i)];
+                        // The SAME bar the relaxation refuses on, so the named
+                        // error and the row are one statement: a handle (or a
+                        // radius) the constraint calls degenerate contributes
+                        // no equation either.
+                        let tolerance = self.tolerance();
+                        let usable = |k: Option<(f64, f64)>| {
+                            k.filter(|&(_, length)| length >= tolerance).map(|(k, _)| k)
+                        };
+                        match (s01, s23) {
+                            (Some(side1), Some(side2)) => {
+                                if let (Some(second1), Some(second2)) = (side1.second, side2.second)
+                                {
+                                    let k1 = usable(spline_end_curvature(
+                                        xy(side1.anchor),
+                                        xy(side1.handle),
+                                        xy(second1),
+                                    ));
+                                    let k2 = usable(spline_end_curvature(
+                                        xy(side2.anchor),
+                                        xy(side2.handle),
+                                        xy(second2),
+                                    ));
+                                    if k1.is_some() && k2.is_some() && side1.handle != side2.handle {
+                                        // The tangency the join needs, unless the
+                                        // implied `⏛` at an interior anchor is
+                                        // already holding it (emitting it there
+                                        // too would duplicate that row).
+                                        if !self.joint_g1_is_implied(&side1, &side2) {
+                                            atoms.push(DofResidual::Parallel(
+                                                side1.anchor,
+                                                side1.handle,
+                                                side2.anchor,
+                                                side2.handle,
+                                            ));
+                                        }
+                                        atoms.push(DofResidual::SplineG2Joint(
+                                            second1,
+                                            side1.handle,
+                                            side1.anchor,
+                                            side2.handle,
+                                            second2,
+                                        ));
+                                    }
+                                }
+                            }
+                            (Some(side), None) | (None, Some(side)) => {
+                                let (center, boundary) = if s01.is_some() { (p2, p3) } else { (p0, p1) };
+                                let radius = ((gx(boundary) - gx(center)).powi(2)
+                                    + (gy(boundary) - gy(center)).powi(2))
+                                .sqrt();
+                                let curvature = side.second.and_then(|second| {
+                                    usable(spline_end_curvature(
+                                        xy(side.anchor),
+                                        xy(side.handle),
+                                        xy(second),
+                                    ))
+                                });
+                                // A line's two ends are not a circle: `⌒`'s own
+                                // dispatch refuses that pair too.
+                                if let (Some(second), Some(_)) = (side.second, curvature) {
+                                    if radius >= tolerance && !self.is_line_pair(center, boundary) {
+                                        // dot(handle−anchor, anchor−center) = 0
+                                        atoms.push(DofResidual::Perpendicular(
+                                            side.anchor,
+                                            side.handle,
+                                            center,
+                                            side.anchor,
+                                        ));
+                                        atoms.push(DofResidual::SplineG2Circle {
+                                            anchor: side.anchor,
+                                            handle: side.handle,
+                                            second,
+                                            center,
+                                            boundary,
+                                            sigma: circle_curvature_sign(
+                                                xy(side.anchor),
+                                                xy(side.handle),
+                                                xy(center),
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                            (None, None) => {}
+                        }
+                    }
+                }
+                CType::SplineFootTangent => {
+                    // Tangency at a point INTERIOR to a span: ONE row, the
+                    // residual evaluated at the eliminated foot parameter.
+                    //
+                    // Two constants are frozen here, the way the tangent side
+                    // signs are: the SPAN the foot sits in, and the parameter the
+                    // eval-time foot solve seeds from. Both come from re-solving
+                    // the foot on THIS configuration (seeded by the persisted
+                    // `_splineFootT` that relaxation just updated), so the model
+                    // is frozen to where the solve actually arrived and not to
+                    // where the document last was. Freezing is what keeps the
+                    // finite-difference Jacobian smooth: `t*` may slide with the
+                    // coordinates, but it never changes which span, and never
+                    // jumps to another root.
+                    //
+                    // No row when there is no simple root: a configuration with
+                    // no touch point, or a foot sitting on an inflection (a double
+                    // root, where `dt*/dcoords` is unbounded), is a state this
+                    // construction has no equation for. The relaxation names both
+                    // by error — the same division of labour the `ϰ` lanes make
+                    // for a degenerate handle.
+                    if let (Some(p0), Some(p1), Some(p2), Some(p3)) =
+                        (get(0), get(1), get(2), get(3))
+                    {
+                        let indices = [Some(p0), Some(p1), Some(p2), Some(p3)];
+                        if let Ok((body, q0, q1)) = self.foot_roles(&indices) {
+                            let xy = |i: usize| [gx(i), gy(i)];
+                            let length = ((gx(q1) - gx(q0)).powi(2) + (gy(q1) - gy(q0)).powi(2))
+                                .sqrt();
+                            let tolerance = self.tolerance();
+                            let is_line = self.is_line_pair(q0, q1);
+                            let target = (length >= tolerance).then(|| {
+                                if is_line {
+                                    FootTarget::Line {
+                                        origin: xy(q0),
+                                        dir: [
+                                            (gx(q1) - gx(q0)) / length,
+                                            (gy(q1) - gy(q0)) / length,
+                                        ],
+                                    }
+                                } else {
+                                    FootTarget::Circle {
+                                        center: xy(q0),
+                                        rho: length,
+                                    }
+                                }
+                            });
+                            if let Some(target) = target {
+                                let spans: Vec<SpanControls> = (0..body.seg_count)
+                                    .map(|span| {
+                                        Engine::span_point_indices(&body, span).map(xy)
+                                    })
+                                    .collect();
+                                if let Some(hit) = solve_spline_foot(&target, &spans, c.foot_t) {
+                                    if hit.simple {
+                                        let span = Engine::span_point_indices(&body, hit.span);
+                                        atoms.push(if is_line {
+                                            DofResidual::SplineFootLine {
+                                                span,
+                                                a: q0,
+                                                b: q1,
+                                                seed: hit.t,
+                                            }
+                                        } else {
+                                            DofResidual::SplineFootCircle {
+                                                span,
+                                                center: q0,
+                                                boundary: q1,
+                                                seed: hit.t,
+                                            }
+                                        });
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -772,6 +950,50 @@ pub(super) enum DofResidual {
     TangentLineCircle(usize, usize, usize, usize, f64),
     /// circles (`c1`,`b1`) & (`c2`,`b2`), +1 external / -1 internal.
     TangentCircleCircle(usize, usize, usize, usize, f64),
+    /// Curvature (G2) at a spline joint: `(l2, l, a, r, r2)` — the arriving
+    /// side's second control and handle, the shared anchor, then the leaving
+    /// side's handle and second control. One row, `(κ₁ − κ₂)·ℓ²`, in length
+    /// units. Swapping the two sides leaves the row unchanged.
+    SplineG2Joint(usize, usize, usize, usize, usize),
+    /// Curvature (G2) between a spline end (`anchor`, `handle`, `second`) and a
+    /// circle (`center`, `boundary`), with the side sign frozen from the solved
+    /// configuration. One row, `(κρ − σ)·ρ`, in length units.
+    SplineG2Circle {
+        anchor: usize,
+        handle: usize,
+        second: usize,
+        center: usize,
+        boundary: usize,
+        sigma: f64,
+    },
+    /// Tangency between a line `a→b` and the spline span whose four control
+    /// points are `span`, at a point INTERIOR to that span. One row, the signed
+    /// distance of the touch point from the line, in length units.
+    ///
+    /// The touch parameter is no unknown: it is the root of `cross(d̂, B′) = 0`
+    /// nearest `seed`, solved in closed form inside `eval` at whatever
+    /// coordinates it is handed — which is what lets the finite-difference
+    /// Jacobian differentiate through the elimination. `span` and `seed` are
+    /// frozen by the builder; everything else the row depends on moves.
+    SplineFootLine {
+        span: [usize; 4],
+        a: usize,
+        b: usize,
+        seed: f64,
+    },
+    /// Tangency between a circle (`center`, `boundary`) and a spline span at a
+    /// point interior to it. One row, `|B(t*) − c| − ρ`, in length units, with
+    /// `t*` the root of `dot(B − c, B′) = 0` reached by Newton from `seed`.
+    ///
+    /// No side constant, unlike [`DofResidual::TangentLineCircle`]: internal and
+    /// external tangency both zero this residual, and which of them the sketch
+    /// is on is carried by the BRANCH the seed keeps rather than by a sign.
+    SplineFootCircle {
+        span: [usize; 4],
+        center: usize,
+        boundary: usize,
+        seed: f64,
+    },
 }
 
 impl DofResidual {
@@ -876,6 +1098,70 @@ impl DofResidual {
                 let d = ((gx(c2) - gx(c1)).powi(2) + (gy(c2) - gy(c1)).powi(2)).sqrt();
                 out.push(d - (r1 + sign * r2));
             }
+            // The two curvature rows always push exactly one value, degenerate
+            // or not: the builder is what decides whether a G2 row exists at
+            // all, and the row count has to stay fixed while the
+            // finite-difference Jacobian perturbs coordinates through a
+            // degeneracy.
+            DofResidual::SplineG2Joint(l2, l, a, r, r2) => {
+                let xy = |i: usize| [gx(i), gy(i)];
+                match (
+                    spline_end_curvature(xy(a), xy(l), xy(l2)),
+                    spline_end_curvature(xy(a), xy(r), xy(r2)),
+                ) {
+                    (Some((k1, a1)), Some((k2, a2))) => {
+                        out.push(joint_curvature_residual(k1, k2, a1, a2))
+                    }
+                    _ => out.push(0.0),
+                }
+            }
+            DofResidual::SplineG2Circle { anchor, handle, second, center, boundary, sigma } => {
+                let xy = |i: usize| [gx(i), gy(i)];
+                let radius = ((gx(boundary) - gx(center)).powi(2)
+                    + (gy(boundary) - gy(center)).powi(2))
+                .sqrt();
+                match spline_end_curvature(xy(anchor), xy(handle), xy(second)) {
+                    Some((k, _)) => out.push(circle_curvature_residual(k, radius, sigma)),
+                    None => out.push(0.0),
+                }
+            }
+            // The two FOOT rows re-solve the eliminated parameter here, at the
+            // coordinates they are handed: that is the whole mechanism — the
+            // central-difference Jacobian then differentiates through `t*(x)`
+            // with no changes of its own. The frozen `seed` is what keeps the
+            // root on one branch while a coordinate is perturbed; the span is
+            // frozen by the builder. Like every other atom, exactly one value is
+            // pushed on every path, degenerate or not, because the row COUNT has
+            // to survive a perturbation that makes the geometry degenerate.
+            DofResidual::SplineFootLine { span, a, b, seed } => {
+                let controls: SpanControls = span.map(|i| [gx(i), gy(i)]);
+                let (dx, dy) = (gx(b) - gx(a), gy(b) - gy(a));
+                let length = dx.hypot(dy);
+                if length < 1e-12 {
+                    out.push(0.0);
+                } else {
+                    let target = FootTarget::Line {
+                        origin: [gx(a), gy(a)],
+                        dir: [dx / length, dy / length],
+                    };
+                    out.push(foot_row(&target, &controls, seed));
+                }
+            }
+            DofResidual::SplineFootCircle { span, center, boundary, seed } => {
+                let controls: SpanControls = span.map(|i| [gx(i), gy(i)]);
+                let rho = ((gx(boundary) - gx(center)).powi(2)
+                    + (gy(boundary) - gy(center)).powi(2))
+                .sqrt();
+                if rho < 1e-12 {
+                    out.push(0.0);
+                } else {
+                    let target = FootTarget::Circle {
+                        center: [gx(center), gy(center)],
+                        rho,
+                    };
+                    out.push(foot_row(&target, &controls, seed));
+                }
+            }
         }
     }
 
@@ -896,8 +1182,43 @@ impl DofResidual {
             | DofResidual::Symmetric(a, b, c, d)
             | DofResidual::TangentLineCircle(a, b, c, d, _)
             | DofResidual::TangentCircleCircle(a, b, c, d, _) => vec![a, b, c, d],
+            DofResidual::SplineG2Joint(l2, l, a, r, r2) => vec![l2, l, a, r, r2],
+            DofResidual::SplineG2Circle { anchor, handle, second, center, boundary, .. } => {
+                vec![anchor, handle, second, center, boundary]
+            }
+            // All four span controls: the row moves with every one of them
+            // (through `B(t*)` AND through the foot the stationarity condition
+            // puts there), so `any_free` and the per-point mobility null space
+            // must see them all.
+            DofResidual::SplineFootLine { span, a, b, .. } => {
+                vec![span[0], span[1], span[2], span[3], a, b]
+            }
+            DofResidual::SplineFootCircle { span, center, boundary, .. } => {
+                vec![span[0], span[1], span[2], span[3], center, boundary]
+            }
         }
     }
+}
+
+/// One foot row's value: the residual at the foot, or — when a perturbation has
+/// destroyed the root the builder froze this row on — at the frozen seed itself.
+///
+/// The fallback is reachable only where `dt*/dcoords` is already unbounded, which
+/// is the state the builder refuses to emit a row for at all; it exists so the
+/// row COUNT is a constant of the residual model, which the Jacobian assembly
+/// requires. The search follows the root a bounded [`FOOT_EVAL_MARGIN`] past the
+/// span's ends, so a foot that solves to a span SEAM stays differentiable there
+/// instead of falling off its own span under a finite difference.
+fn foot_row(target: &FootTarget, controls: &SpanControls, seed: f64) -> f64 {
+    let t = foot_in_span(
+        target,
+        controls,
+        seed,
+        -FOOT_EVAL_MARGIN,
+        1.0 + FOOT_EVAL_MARGIN,
+    )
+    .unwrap_or_else(|| seed.clamp(0.0, 1.0));
+    target.residual(controls, t)
 }
 
 /// Stack every residual atom into the flat residual vector `r(x)` at `coords`.

@@ -19,7 +19,12 @@
 //! refinement pass splits such regions: seed-plane-anchored coplanar groups
 //! are peeled off first (gated by `planar_extraction_angle_deg` and
 //! `planar_min_area_percent`) and the leftover connected components are
-//! re-fitted through the same cascade.
+//! re-fitted through the same cascade.  A component the cascade still
+//! rejects is then peeled into cylinders — a rounded outline of tangent
+//! arcs with different radii, a fillet running out into a boss — by
+//! seed-and-grow over its planar strips at the mesh's own precision, so the
+//! first strip past a tangent junction is refused where the acceptance
+//! tolerance would have admitted it.
 //!
 //! `segment_mesh_faces` is geometry-only analysis: no `BrepSolid` is built
 //! there.  The output — per-triangle region ids plus per-region carrier
@@ -198,4 +203,3 @@ pub use segmentation::segment_mesh_faces;
 // Tests
 // ---------------------------------------------------------------------------
 
-// BREP private tests: 70cb6bf52947feea

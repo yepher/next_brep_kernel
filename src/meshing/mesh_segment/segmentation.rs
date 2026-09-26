@@ -259,10 +259,15 @@ fn connected_components(data: &MeshData, tri_ids: &[u32]) -> Vec<Vec<u32>> {
     components
 }
 
-/// Split a region the cascade could not classify: peel off seed-plane-
-/// anchored coplanar groups (the app's planar extraction), then re-fit the
-/// remaining connected components.  Returns the partition with each piece's
-/// fit outcome.
+/// Split a region the cascade could not classify: peel tangent cylinders,
+/// cones and spheres out of it first (the most specific test — a group
+/// must lie on ONE carrier at the mesh's precision), then seed-plane-
+/// anchored coplanar groups (the app's planar extraction) out of what is
+/// left, and re-fit the remaining connected components.  Planes come second
+/// because a coarse strip of a cylinder is a coplanar group too, and one
+/// wide enough to pass the planar area gate would otherwise be peeled as a
+/// plane before the cylinder it belongs to was ever tried.  Returns the
+/// partition with each piece's fit outcome.
 fn refine_region(
     data: &MeshData,
     tri_ids: &[u32],
@@ -284,8 +289,9 @@ fn refine_region(
     let min_group_area = region_area * (options.planar_min_area_percent / 100.0).clamp(0.0, 1.0);
     let min_group_tris = options.min_region_triangles.max(2);
 
-    let member: rustc_hash::FxHashSet<u32> = tri_ids.iter().copied().collect();
-    let mut order: Vec<u32> = tri_ids.to_vec();
+    let (mut pieces, leftover) = peel_carriers(data, tri_ids, options);
+    let member: rustc_hash::FxHashSet<u32> = leftover.iter().copied().collect();
+    let mut order: Vec<u32> = leftover.clone();
     order.sort_by(|&a, &b| {
         data.tris[b as usize]
             .area
@@ -357,13 +363,12 @@ fn refine_region(
         }
     }
 
-    let remainder: Vec<u32> = tri_ids
+    let remainder: Vec<u32> = leftover
         .iter()
         .copied()
         .filter(|t| !group_of.contains_key(t))
         .collect();
 
-    let mut pieces = Vec::new();
     for group in planar_groups {
         let outcome = fit_region(data, &group, options);
         pieces.push((group, outcome));
@@ -373,6 +378,384 @@ fn refine_region(
         pieces.push((component, outcome));
     }
     pieces
+}
+
+/// Precision bar of the cylinder peel as a fraction of the compound
+/// region's scale: far below the acceptance tolerance (so the first strip
+/// past a tangent junction is refused) and far above the vertex noise of an
+/// exact tessellation.
+const CYLINDER_PEEL_PRECISION_FRACTION: f64 = 1e-5;
+/// Floor of that bar from the coordinate magnitude: single-precision
+/// sources quantize at a few ulps of their largest coordinate.
+const CYLINDER_PEEL_COORDINATE_FRACTION: f64 = 1e-6;
+/// Adjacent triangles whose normals agree within this angle are one planar
+/// facet (a tessellated strip) and are peeled together.
+const CYLINDER_PEEL_FACET_ANGLE_RAD: f64 = 1e-4;
+/// Rings of facets gathered around a seed facet before the seed fit: three
+/// rows at least, because two rows of cells lie on two coaxial circles,
+/// which every revolve fits exactly.
+const CYLINDER_PEEL_SEED_RINGS: usize = 3;
+
+/// Carrier kinds the peel tries, in cascade order, with the smallest vertex
+/// support that makes a claim at the precision bar evidence rather than an
+/// interpolation: three times the carrier's degrees of freedom (a cylinder
+/// has five, a cone six, a sphere four).  Each pass works on what the
+/// previous ones left.
+const PEEL_KINDS: [(&str, usize); 3] = [("cylinder", 15), ("cone", 18), ("sphere", 12)];
+
+/// Peel single-carrier groups off a tangent-smooth compound the cascade
+/// could not classify: a rounded outline (arcs of different radii joined on
+/// rulings), a fillet running out into a boss, a dome sitting on a chamfer
+/// ring.
+///
+/// The acceptance tolerance is far too loose to separate tangent surfaces:
+/// at the junction of two arcs the first strip on the far side deviates by
+/// a fraction of the acceptance bar and the normal gate admits several
+/// more.  Growth therefore runs at a precision bar and is judged by the
+/// re-fit residual of the grown group: a wave of neighboring facets is kept
+/// when the joint fit still sits at precision, otherwise each facet is
+/// tried alone.  Facets — coplanar triangle groups, the strips of a
+/// tessellated cylinder — move as a whole so a region boundary never runs
+/// down a strip's diagonal.  Each finished group is then accepted through
+/// the ordinary cascade at the user tolerance.  Cylinders are peeled
+/// first, then cones, then spheres.  Returns the pieces and the triangles
+/// no carrier claimed.
+fn peel_carriers(
+    data: &MeshData,
+    tri_ids: &[u32],
+    options: &SegmentOptions,
+) -> (Vec<(Vec<u32>, RegionOutcome)>, Vec<u32>) {
+    let debug = std::env::var("BREP_DEBUG_SEG").is_ok();
+    let local: HashMap<u32, usize> = tri_ids
+        .iter()
+        .enumerate()
+        .map(|(index, &t)| (t, index))
+        .collect();
+    let vert_ids = region_vertices(data, tri_ids);
+    let (low, high) = region_bbox(data, &vert_ids);
+    let scale = {
+        let diag = high.sub(low).length();
+        if diag > 0.0 {
+            diag
+        } else {
+            data.diag.max(1e-12)
+        }
+    };
+    let accept_tol = options.fit_tolerance * scale;
+    let coordinate = vert_ids
+        .iter()
+        .map(|&v| {
+            let p = data.verts[v];
+            p.x.abs().max(p.y.abs()).max(p.z.abs())
+        })
+        .fold(0.0_f64, f64::max);
+    let bar = (scale * CYLINDER_PEEL_PRECISION_FRACTION)
+        .max(coordinate * CYLINDER_PEEL_COORDINATE_FRACTION);
+    if bar >= accept_tol {
+        return (Vec::new(), tri_ids.to_vec());
+    }
+    let cos_normal_gate = options.normal_tolerance_deg.to_radians().cos();
+    let cos_facet = CYLINDER_PEEL_FACET_ANGLE_RAD.cos();
+
+    // Facets: union of coplanar edge-adjacent member triangles.
+    let mut parent: Vec<usize> = (0..tri_ids.len()).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); tri_ids.len()];
+    for (index, &t) in tri_ids.iter().enumerate() {
+        let tri = &data.tris[t as usize];
+        for corner in 0..3 {
+            let first = tri.verts[corner];
+            let second = tri.verts[(corner + 1) % 3];
+            if first == second {
+                continue;
+            }
+            let Some(incident) = data.edges.get(&edge_key(first, second)) else {
+                continue;
+            };
+            for &other in incident {
+                let Some(&other_index) = local.get(&other) else {
+                    continue;
+                };
+                if other_index == index {
+                    continue;
+                }
+                adjacency[index].push(other_index);
+                if tri.normal.dot(data.tris[other as usize].normal) >= cos_facet {
+                    let a = find(&mut parent, index);
+                    let b = find(&mut parent, other_index);
+                    if a != b {
+                        parent[a] = b;
+                    }
+                }
+            }
+        }
+    }
+    let mut facet_of = vec![usize::MAX; tri_ids.len()];
+    let mut facets: Vec<Vec<usize>> = Vec::new();
+    for index in 0..tri_ids.len() {
+        let root = find(&mut parent, index);
+        if facet_of[root] == usize::MAX {
+            facet_of[root] = facets.len();
+            facets.push(Vec::new());
+        }
+        facet_of[index] = facet_of[root];
+        facets[facet_of[index]].push(index);
+    }
+    let mut facet_neighbors: Vec<Vec<usize>> = vec![Vec::new(); facets.len()];
+    for (index, others) in adjacency.iter().enumerate() {
+        for &other in others {
+            let (a, b) = (facet_of[index], facet_of[other]);
+            if a != b && !facet_neighbors[a].contains(&b) {
+                facet_neighbors[a].push(b);
+            }
+        }
+    }
+    let facet_area: Vec<f64> = facets
+        .iter()
+        .map(|facet| {
+            facet
+                .iter()
+                .map(|&index| data.tris[tri_ids[index] as usize].area)
+                .sum()
+        })
+        .collect();
+
+    let facet_tris = |facet_ids: &[usize]| -> Vec<u32> {
+        facet_ids
+            .iter()
+            .flat_map(|&facet| facets[facet].iter().map(|&index| tri_ids[index]))
+            .collect()
+    };
+    let fit_kind = |kind: &str, facet_ids: &[usize]| -> Option<CandidateFit> {
+        let tris = facet_tris(facet_ids);
+        let verts = region_vertices(data, &tris);
+        match kind {
+            "cylinder" => fit_cylinder(data, &tris, &verts),
+            "cone" => fit_cone(data, &tris, &verts, accept_tol),
+            "sphere" => fit_sphere(data, &tris, &verts),
+            _ => None,
+        }
+    };
+    let fit_facets = |kind: &str, facet_ids: &[usize]| -> Option<CandidateFit> {
+        fit_kind(kind, facet_ids).filter(|fit| fit.max_dev.is_finite() && fit.max_dev <= bar)
+    };
+    // Loose pre-filter against the current carrier: the refit decides.
+    let plausible = |carrier: &RegionCarrier, facet: usize| -> bool {
+        let sense = carrier_sense(carrier);
+        facets[facet].iter().all(|&index| {
+            let tri = &data.tris[tri_ids[index] as usize];
+            let Some(normal) = carrier_normal(carrier, tri.centroid) else {
+                return false;
+            };
+            tri.normal.dot(normal) * sense >= cos_normal_gate
+                && tri
+                    .verts
+                    .iter()
+                    .all(|&v| carrier_distance(carrier, data.verts[v]) <= accept_tol)
+        })
+    };
+
+    let mut order: Vec<usize> = (0..facets.len()).collect();
+    order.sort_by(|&a, &b| facet_area[b].total_cmp(&facet_area[a]).then(a.cmp(&b)));
+    let mut assigned = vec![false; facets.len()];
+    let mut pieces: Vec<(Vec<u32>, RegionOutcome)> = Vec::new();
+    // Rounds until nothing new is claimed: a wall one strip tall has its
+    // seed neighborhood polluted by the dome or fillet beyond its rim until
+    // that neighbor has been claimed by its own pass.
+    loop {
+    let claimed = pieces.len();
+    for (kind, min_vertices) in PEEL_KINDS {
+    let mut tried = vec![false; facets.len()];
+    for &seed in &order {
+        if assigned[seed] || tried[seed] {
+            continue;
+        }
+        tried[seed] = true;
+        let mut group = vec![seed];
+        let mut in_group = vec![false; facets.len()];
+        in_group[seed] = true;
+        let mut frontier = vec![seed];
+        for _ in 0..CYLINDER_PEEL_SEED_RINGS {
+            let mut next = Vec::new();
+            for &facet in &frontier {
+                for &other in &facet_neighbors[facet] {
+                    if !assigned[other] && !in_group[other] {
+                        in_group[other] = true;
+                        group.push(other);
+                        next.push(other);
+                    }
+                }
+            }
+            frontier = next;
+        }
+        let Some(seed_fit) = fit_facets(kind, &group) else {
+            continue;
+        };
+        let mut carrier = seed_fit.carrier;
+        let mut blocked = vec![false; facets.len()];
+        loop {
+            let mut wave = Vec::new();
+            for &facet in &group {
+                for &other in &facet_neighbors[facet] {
+                    if !assigned[other]
+                        && !in_group[other]
+                        && !blocked[other]
+                        && !wave.contains(&other)
+                        && plausible(&carrier, other)
+                    {
+                        wave.push(other);
+                    }
+                }
+            }
+            if wave.is_empty() {
+                break;
+            }
+            let mut trial = group.clone();
+            trial.extend(wave.iter().copied());
+            if let Some(fit) = fit_facets(kind, &trial) {
+                for &facet in &wave {
+                    in_group[facet] = true;
+                }
+                group = trial;
+                carrier = fit.carrier;
+                continue;
+            }
+            // The wave crossed a junction: admit its facets one at a time.
+            let mut accepted_any = false;
+            for facet in wave {
+                let mut trial = group.clone();
+                trial.push(facet);
+                if let Some(fit) = fit_facets(kind, &trial) {
+                    in_group[facet] = true;
+                    group = trial;
+                    carrier = fit.carrier;
+                    accepted_any = true;
+                } else {
+                    blocked[facet] = true;
+                }
+            }
+            if !accepted_any {
+                break;
+            }
+        }
+        let mut tris = facet_tris(&group);
+        if tris.len() < options.min_region_triangles.max(4)
+            || region_vertices(data, &tris).len() < min_vertices
+        {
+            continue;
+        }
+        tris.sort_unstable();
+        let outcome = fit_region(data, &tris, options);
+        if debug {
+            let size = match outcome.fit.carrier {
+                RegionCarrier::Cylinder { radius, .. } | RegionCarrier::Sphere { radius, .. } => {
+                    format!(" r={radius:.4}")
+                }
+                RegionCarrier::Cone { half_angle_rad, .. } => {
+                    format!(" ha={:.2}deg", half_angle_rad.to_degrees())
+                }
+                _ => String::new(),
+            };
+            let (low, high) = region_bbox(data, &region_vertices(data, &tris));
+            eprintln!(
+                "[seg] peel {kind}: seed facet {seed} grew {} facets / {} tris at {bar:.3e}; cascade {}{size} accepted={} max_dev={:.3e} max_ang={:.2} bbox [{:.2},{:.2},{:.2}]..[{:.2},{:.2},{:.2}]",
+                group.len(),
+                tris.len(),
+                outcome.fit.carrier.kind(),
+                outcome.accepted,
+                outcome.fit.max_dev,
+                outcome.fit.max_normal_angle_deg,
+                low.x, low.y, low.z, high.x, high.y, high.z
+            );
+        }
+        if !outcome.accepted || outcome.fit.carrier.kind() != kind {
+            continue;
+        }
+        for &facet in &group {
+            assigned[facet] = true;
+        }
+        pieces.push((tris, outcome));
+    }
+    }
+    if pieces.len() == claimed {
+        break;
+    }
+    }
+    if pieces.is_empty() {
+        return (pieces, tri_ids.to_vec());
+    }
+    // A leftover strip whose every peeled neighbor is the same carrier is an
+    // interior gap — a tessellator T-vertex on a rim chord — not a
+    // junction: it rejoins that carrier when the union still passes the
+    // cascade at the user tolerance.  A strip straddling the tangent point
+    // of two different carriers stays out and becomes its own small facet.
+    let mut piece_of_facet = vec![usize::MAX; facets.len()];
+    for (piece, (tris, _)) in pieces.iter().enumerate() {
+        for &t in tris {
+            piece_of_facet[facet_of[local[&t]]] = piece;
+        }
+    }
+    let leftover_tris: Vec<u32> = (0..tri_ids.len())
+        .filter(|&index| !assigned[facet_of[index]])
+        .map(|index| tri_ids[index])
+        .collect();
+    let compat_tol = options.fit_tolerance * data.diag.max(1e-12);
+    let mut remainder = Vec::new();
+    for component in connected_components(data, &leftover_tris) {
+        let mut adjacent_pieces: Vec<usize> = Vec::new();
+        for &t in &component {
+            for &other in &facet_neighbors[facet_of[local[&t]]] {
+                let piece = piece_of_facet[other];
+                if piece != usize::MAX && !adjacent_pieces.contains(&piece) {
+                    adjacent_pieces.push(piece);
+                }
+            }
+        }
+        let Some(&first) = adjacent_pieces.first() else {
+            remainder.extend(component);
+            continue;
+        };
+        let same_carrier = adjacent_pieces.iter().all(|&piece| {
+            carriers_compatible(
+                &pieces[first].1.fit.carrier,
+                &pieces[piece].1.fit.carrier,
+                compat_tol,
+                true,
+            )
+        });
+        if !same_carrier {
+            remainder.extend(component);
+            continue;
+        }
+        let mut union: Vec<u32> = pieces[first].0.iter().chain(component.iter()).copied().collect();
+        union.sort_unstable();
+        let outcome = fit_region(data, &union, options);
+        let rejoined = outcome.accepted
+            && outcome.fit.carrier.kind() == pieces[first].1.fit.carrier.kind();
+        if debug {
+            eprintln!(
+                "[seg] peel: leftover of {} tris between {} peeled piece(s): union {} accepted={} max_dev={:.3e}",
+                component.len(),
+                adjacent_pieces.len(),
+                outcome.fit.carrier.kind(),
+                outcome.accepted,
+                outcome.fit.max_dev
+            );
+        }
+        if rejoined {
+            pieces[first] = (union, outcome);
+        } else {
+            remainder.extend(component);
+        }
+    }
+    remainder.sort_unstable();
+    (pieces, remainder)
 }
 
 // ---------------------------------------------------------------------------
@@ -448,8 +831,10 @@ pub(super) fn segment_prepared(data: &MeshData, options: &SegmentOptions) -> Mes
     }
 
     // Attach degenerate/micro triangles to an adjacent region when one
-    // exists.  Multi-pass so chains of skipped slivers resolve through
-    // their assigned neighbors.
+    // exists: the neighbor whose carrier the sliver's vertices actually sit
+    // on (a T-junction needle lies in one of its neighboring planes, not
+    // on the fillet it happens to touch first).  Multi-pass so chains of
+    // skipped slivers resolve through their assigned neighbors.
     let mut changed = true;
     while changed {
         changed = false;
@@ -458,7 +843,7 @@ pub(super) fn segment_prepared(data: &MeshData, options: &SegmentOptions) -> Mes
                 continue;
             }
             let tri = &data.tris[t];
-            let mut adopted = UNASSIGNED_REGION;
+            let mut adopted: Option<(f64, u32)> = None;
             for corner in 0..3 {
                 let first = tri.verts[corner];
                 let second = tri.verts[(corner + 1) % 3];
@@ -468,14 +853,30 @@ pub(super) fn segment_prepared(data: &MeshData, options: &SegmentOptions) -> Mes
                 if let Some(incident) = data.edges.get(&edge_key(first, second)) {
                     for &other in incident {
                         let region = triangle_region_ids[other as usize];
-                        if other as usize != t && region != UNASSIGNED_REGION {
-                            adopted = adopted.min(region);
+                        if other as usize == t || region == UNASSIGNED_REGION {
+                            continue;
                         }
+                        let carrier = &regions[region as usize].carrier;
+                        let distance = tri
+                            .verts
+                            .iter()
+                            .map(|&v| carrier_distance(carrier, data.verts[v]))
+                            .fold(0.0_f64, f64::max);
+                        let candidate = (distance, region);
+                        adopted = Some(match adopted {
+                            Some(current)
+                                if current.0 < candidate.0
+                                    || (current.0 == candidate.0 && current.1 <= candidate.1) =>
+                            {
+                                current
+                            }
+                            _ => candidate,
+                        });
                     }
                 }
             }
-            if adopted != UNASSIGNED_REGION {
-                triangle_region_ids[t] = adopted;
+            if let Some((_, region)) = adopted {
+                triangle_region_ids[t] = region;
                 changed = true;
             }
         }
@@ -489,9 +890,106 @@ pub(super) fn segment_prepared(data: &MeshData, options: &SegmentOptions) -> Mes
     }
 }
 
+/// Outward carrier normal at a point (before the region's sense), or `None`
+/// where the field is singular (on an axis, at a center) or for `Freeform`.
+fn carrier_normal(carrier: &RegionCarrier, p: Vec3) -> Option<Vec3> {
+    match carrier {
+        RegionCarrier::Plane { normal, .. } => Some(*normal),
+        RegionCarrier::Cylinder {
+            axis_point,
+            axis_dir,
+            ..
+        } => {
+            let d = p.sub(*axis_point);
+            d.sub(axis_dir.scale(d.dot(*axis_dir))).normalized().ok()
+        }
+        RegionCarrier::Cone {
+            apex,
+            axis_dir,
+            half_angle_rad,
+            ..
+        } => {
+            let d = p.sub(*apex);
+            let radial = d.sub(axis_dir.scale(d.dot(*axis_dir))).normalized().ok()?;
+            let (sin_a, cos_a) = half_angle_rad.sin_cos();
+            Some(radial.scale(cos_a).sub(axis_dir.scale(sin_a)))
+        }
+        RegionCarrier::Sphere { center, .. } => p.sub(*center).normalized().ok(),
+        RegionCarrier::Torus {
+            center,
+            axis_dir,
+            major_radius,
+            ..
+        } => {
+            let d = p.sub(*center);
+            let s = d.dot(*axis_dir);
+            let radial = d.sub(axis_dir.scale(s)).normalized().ok()?;
+            let tube_center = center.add(radial.scale(*major_radius));
+            p.sub(tube_center).normalized().ok()
+        }
+        RegionCarrier::Freeform => None,
+    }
+}
+
+/// The region's orientation sense as a sign, `1.0` for planes and freeform.
+fn carrier_sense(carrier: &RegionCarrier) -> f64 {
+    match carrier {
+        RegionCarrier::Cylinder { sense, .. }
+        | RegionCarrier::Cone { sense, .. }
+        | RegionCarrier::Sphere { sense, .. }
+        | RegionCarrier::Torus { sense, .. } => f64::from(*sense),
+        _ => 1.0,
+    }
+}
+
+/// Distance of a point from a carrier; `Freeform` is infinitely far.
+fn carrier_distance(carrier: &RegionCarrier, p: Vec3) -> f64 {
+    match carrier {
+        RegionCarrier::Plane { origin, normal } => p.sub(*origin).dot(*normal).abs(),
+        RegionCarrier::Cylinder {
+            axis_point,
+            axis_dir,
+            radius,
+            ..
+        } => {
+            let d = p.sub(*axis_point);
+            (d.sub(axis_dir.scale(d.dot(*axis_dir))).length() - radius).abs()
+        }
+        RegionCarrier::Cone {
+            apex,
+            axis_dir,
+            half_angle_rad,
+            ..
+        } => {
+            let d = p.sub(*apex);
+            let s = d.dot(*axis_dir);
+            let r = d.sub(axis_dir.scale(s)).length();
+            ((r - s * half_angle_rad.tan()) * half_angle_rad.cos()).abs()
+        }
+        RegionCarrier::Sphere { center, radius, .. } => (p.sub(*center).length() - radius).abs(),
+        RegionCarrier::Torus {
+            center,
+            axis_dir,
+            major_radius,
+            minor_radius,
+            ..
+        } => {
+            let d = p.sub(*center);
+            let s = d.dot(*axis_dir);
+            let rho = d.sub(axis_dir.scale(s)).length();
+            ((rho - major_radius).hypot(s) - minor_radius).abs()
+        }
+        RegionCarrier::Freeform => f64::INFINITY,
+    }
+}
+
 /// Do two accepted carriers describe the same surface (within `tol` for
 /// distances, tight angular bands for directions)?  Freeform never matches.
-fn carriers_compatible(a: &RegionCarrier, b: &RegionCarrier, tol: f64) -> bool {
+/// `adjacent` says the regions share an edge: only then may two cylinder
+/// fits disagree on their axis by the noise over the axial extent, because
+/// two disjoint faces of one infinite cylinder (the two ends of a mirrored
+/// part, the two levels of a slot) must stay two regions.
+fn carriers_compatible(a: &RegionCarrier, b: &RegionCarrier, tol: f64, adjacent: bool) -> bool {
     const ANGULAR: f64 = 1e-6;
     match (a, b) {
         (
@@ -522,9 +1020,18 @@ fn carriers_compatible(a: &RegionCarrier, b: &RegionCarrier, tol: f64) -> bool {
                 sense: s2,
             },
         ) => {
+            // Independent fits of one cylinder from noisy vertices disagree
+            // on the axis direction by the noise over the axial extent; the
+            // band is the angle that moves the surface by `tol` at the rim.
+            // The union re-fit is the real test.
+            let angular = if adjacent {
+                ANGULAR.max(tol / r1.max(*r2).max(1e-12))
+            } else {
+                ANGULAR
+            };
             let offset = p2.sub(*p1);
             s1 == s2
-                && a1.cross(*a2).length() <= ANGULAR
+                && a1.cross(*a2).length() <= angular
                 && (r1 - r2).abs() <= tol
                 && offset.sub(a1.scale(offset.dot(*a1))).length() <= tol
         }
@@ -605,7 +1112,7 @@ fn merge_compatible_regions(
             }
         }
         // Directly edge-adjacent pairs.
-        let mut pairs: std::collections::BTreeSet<(usize, usize)> =
+        let mut direct: std::collections::BTreeSet<(usize, usize)> =
             std::collections::BTreeSet::new();
         for incident in data.edges.values() {
             if incident.len() != 2 {
@@ -616,9 +1123,10 @@ fn merge_compatible_regions(
                 region_of[incident[1] as usize],
             );
             if a != b && a != usize::MAX && b != usize::MAX {
-                pairs.insert((a.min(b), a.max(b)));
+                direct.insert((a.min(b), a.max(b)));
             }
         }
+        let mut pairs = direct.clone();
         // Pairs bridged by connected runs of region-less (skipped) triangles.
         let mut seen = vec![false; data.tris.len()];
         for seed in 0..data.tris.len() {
@@ -669,7 +1177,12 @@ fn merge_compatible_regions(
             if !first.1.accepted || !second.1.accepted {
                 continue;
             }
-            if !carriers_compatible(&first.1.fit.carrier, &second.1.fit.carrier, tol) {
+            if !carriers_compatible(
+                &first.1.fit.carrier,
+                &second.1.fit.carrier,
+                tol,
+                direct.contains(&(a, b)),
+            ) {
                 continue;
             }
             let mut union: Vec<u32> = first.0.iter().chain(second.0.iter()).copied().collect();

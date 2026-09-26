@@ -31,7 +31,7 @@ pub fn feature_schema_catalogue() -> serde_json::Value {
             super::features::import3d::schema(),
             super::features::sketch::schema(),
             super::features::spline::schema(),
-            super::features::port::schema(),
+            super::features::waypoint::schema(),
             super::features::helix::schema(),
             super::features::extrude::schema(),
             super::features::boolean::schema(),
@@ -40,6 +40,7 @@ pub fn feature_schema_catalogue() -> serde_json::Value {
             super::features::offset_shell::schema(),
             super::features::offset_face::schema(),
             super::features::push_face::schema(),
+            super::features::transform_face::schema(),
             super::features::delete_face::schema(),
             super::features::thicken::schema(),
             super::features::sheet_metal_tab::schema(),
@@ -71,4 +72,24 @@ pub fn feature_schemas_json() -> String {
     feature_schema_catalogue().to_string()
 }
 
-// BREP private tests: 23a6405db0c47c4f
+/// The DIALOG FIELD-VISIBILITY hook, kernel-owned like the schemas themselves.
+///
+/// Given a feature's `type` (its `shortName`, e.g. `"H"`) and the dialog's
+/// CURRENT param values, return the param keys that should be HIDDEN for those
+/// values — the choke point every schema-driven dialog consults to decide which
+/// fields to draw. A feature opts in by exposing its own `hidden_params(values)`
+/// beside its `schema()` (see `features::hole::hidden_params`); the mechanism is
+/// uniform across every dialog, and a feature that declares no hook (or an
+/// unknown type) hides nothing, so all its fields stay visible.
+///
+/// The form engine is immediate-mode and re-runs this every frame against the
+/// live values, which is what makes one pure function serve both "the dialog was
+/// just opened" and "a field just changed" — there is no separate event to wire.
+pub fn feature_hidden_params(feature_type: &str, values: &serde_json::Value) -> Vec<String> {
+    let keys: Vec<&'static str> = match feature_type {
+        "H" => super::features::hole::hidden_params(values),
+        _ => Vec::new(),
+    };
+    keys.into_iter().map(str::to_owned).collect()
+}
+

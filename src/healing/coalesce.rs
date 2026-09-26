@@ -330,6 +330,25 @@ pub fn merge_curve_continuation_edges(
     solid: &BrepSolid,
     tolerance: f64,
 ) -> Result<BrepSolid, String> {
+    merge_curve_continuation_edges_impl(solid, tolerance, None)
+}
+
+/// [`merge_curve_continuation_edges`] at the listed vertices only: a pair of
+/// continuation edges is joined when the vertex between them is in `at`, and
+/// every other vertex of the solid is left standing.
+pub(crate) fn merge_curve_continuation_edges_at(
+    solid: &BrepSolid,
+    tolerance: f64,
+    at: &rustc_hash::FxHashSet<u64>,
+) -> Result<BrepSolid, String> {
+    merge_curve_continuation_edges_impl(solid, tolerance, Some(at))
+}
+
+fn merge_curve_continuation_edges_impl(
+    solid: &BrepSolid,
+    tolerance: f64,
+    at: Option<&rustc_hash::FxHashSet<u64>>,
+) -> Result<BrepSolid, String> {
     let mut result = solid.clone();
     let mut rejected = rustc_hash::FxHashSet::<(u64, u64)>::default();
     loop {
@@ -386,6 +405,9 @@ pub fn merge_curve_continuation_edges(
                     let (_, first_end) = traversal_vertex_ids(first_edge, first);
                     let (second_start, _) = traversal_vertex_ids(second_edge, second);
                     if first_end != second_start {
+                        continue;
+                    }
+                    if at.is_some_and(|at| !at.contains(&first_end)) {
                         continue;
                     }
                     let Some(first_uses) = uses.get(&first.edge_id) else {
@@ -836,4 +858,3 @@ pub fn merge_curve_continuation_edges(
     Ok(result)
 }
 
-// BREP private tests: 558cbd2292d8508e

@@ -191,19 +191,114 @@ pub(in crate::blend) fn solve_corner_ball(
         .scale(1.0 / centers.len() as f64);
     let mut contacts = Vec::with_capacity(faces.len());
     for (index, face) in faces.iter().enumerate() {
-        let sample = blend_offset(&face.face.surface).at(x[2 * index], x[2 * index + 1], face.rho)?;
+        let (u, v) = (x[2 * index], x[2 * index + 1]);
+        let offset = blend_offset(&face.face.surface);
+        // The root is only a corner ball if it landed on the CARRIERS.
+        // `Raw` evaluates through `deriv1_extended`, which continues an open
+        // direction along its boundary tangent plane rather than refusing, so
+        // a configuration with no seated ball still converges — onto that
+        // continuation, with a residual of zero, because the extended point
+        // is a genuine root of the EXTENDED system.  At N = 3 the system is
+        // square, so `final_residual` cannot distinguish the two: it is ~0
+        // either way (which is why the residual test above is scoped to
+        // N >= 4).  Domain membership is the only thing that can.
+        //
+        // The test is geometric, not a domain comparison: a plane is a
+        // bounded patch here and a cylinder's axial direction is open, and
+        // BOTH extend exactly, so refusing every out-of-domain tangency would
+        // reject the re-entrant corners that touch a wall's carrier beyond a
+        // concave edge — which `CornerContact::uv` documents and depends on.
+        // Only an excursion along a direction with normal curvature is
+        // fiction.  `tolerance` is the solver's own bar, so the ball is only
+        // accepted where the extension cannot have moved it further than the
+        // accuracy this solve claims.
+        if !offset.on_real_carrier(u, v, tolerance)? {
+            let [u0, u1] = face.face.surface.domain_u()?;
+            let [v0, v1] = face.face.surface.domain_v()?;
+            trace_corner_ball("REFUSED by on_real_carrier", faces, &x, final_residual, tolerance)?;
+            return Err(format!(
+                "corner ball: the tangency on face {} converged onto a fictitious EXTENSION of \
+                 that carrier — (u={u:.6}, v={v:.6}) against u∈[{u0:.6}, {u1:.6}], \
+                 v∈[{v0:.6}, {v1:.6}], far enough past a curved direction that the evaluator's \
+                 ruled continuation has left the surface. No ball of this radius is tangent to \
+                 the real face here.",
+                face.face.id
+            ));
+        }
+        let sample = offset.at(u, v, face.rho)?;
         contacts.push(CornerContact {
             face_id: face.face.id,
-            uv: [x[2 * index], x[2 * index + 1]],
+            uv: [u, v],
             point: sample.source,
             normal: sample.normal,
         });
     }
+    trace_corner_ball("ACCEPTED", faces, &x, final_residual, tolerance)?;
     Ok(CornerBall {
         center,
         contacts,
         residual: final_residual,
     })
+}
+
+/// `BREP_DEBUG_CORNER_BALL`: one line per solve outcome recording where every
+/// tangency landed relative to its support's parameter domain — the
+/// measurement `certified-construction-checks.md` asks for before any
+/// enclosure is built. Overshoot is measured the way `on_real_carrier`
+/// measures it: zero along a CLOSED direction (the evaluator wraps there, so
+/// an out-of-range parameter is the same point, not an excursion), otherwise
+/// the signed excess past `[lo, hi]`, also given as a fraction of the span.
+/// `faithful` is `on_real_carrier`'s own verdict on that contact, so a
+/// reader can separate a straight-direction excursion (a wall's carrier
+/// beyond a concave edge, which the guard accepts by design) from a curved
+/// one. No behaviour change: the line is only printed.
+fn trace_corner_ball(
+    verdict: &str,
+    faces: &[CornerFace<'_>],
+    x: &[f64],
+    residual: f64,
+    tolerance: f64,
+) -> Result<(), String> {
+    if std::env::var("BREP_DEBUG_CORNER_BALL").is_err() {
+        return Ok(());
+    }
+    let mut line = format!(
+        "corner ball {verdict}: n={} residual={residual:.3e} tolerance={tolerance:.3e}",
+        faces.len()
+    );
+    for (index, face) in faces.iter().enumerate() {
+        let (u, v) = (x[2 * index], x[2 * index + 1]);
+        let surface = &face.face.surface;
+        let [u0, u1] = surface.domain_u()?;
+        let [v0, v1] = surface.domain_v()?;
+        let (closed_u, closed_v) = surface.closed_directions()?;
+        let out = |value: f64, lo: f64, hi: f64, closed: bool| -> f64 {
+            if closed {
+                0.0
+            } else if value < lo {
+                value - lo
+            } else if value > hi {
+                value - hi
+            } else {
+                0.0
+            }
+        };
+        let du = out(u, u0, u1, closed_u);
+        let dv = out(v, v0, v1, closed_v);
+        let span = |lo: f64, hi: f64| (hi - lo).abs().max(f64::MIN_POSITIVE);
+        let faithful = blend_offset(surface).on_real_carrier(u, v, tolerance)?;
+        line.push_str(&format!(
+            " | face={} u={u:.6} v={v:.6} du=[{u0:.6},{u1:.6}]{} dv=[{v0:.6},{v1:.6}]{} \
+             out_u={du:.3e} out_v={dv:.3e} out_frac={:.3e} outside={} faithful={faithful}",
+            face.face.id,
+            if closed_u { "c" } else { "" },
+            if closed_v { "c" } else { "" },
+            (du.abs() / span(u0, u1)).max(dv.abs() / span(v0, v1)),
+            du != 0.0 || dv != 0.0,
+        ));
+    }
+    eprintln!("{line}");
+    Ok(())
 }
 
 /// Build the solver input for the faces meeting at `corner`, seeding each

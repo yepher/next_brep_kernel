@@ -120,12 +120,18 @@ pub(super) struct MarchedCurve {
     pub(super) uv_second: Vec<[f64; 2]>,
 }
 
+/// A marched curve's fit: the 3D curve and its images on the two surfaces,
+/// in the order the [`MarchedCurve`] stores them, on one parameterisation.
+pub(super) type MarchedFit = (crate::NurbsCurve, crate::NurbsCurve, crate::NurbsCurve);
+
 /// How the seam closes the corner.
 pub(super) enum MiterClosure {
     /// The seam leaves both strips at one point, on the sharp edge.
     Symmetric {
         /// From P to the exit; images on stripe 0 then stripe 1.
         seam: MarchedCurve,
+        /// The seam's fit, measured against its carriers ([`fit_marched`]).
+        seam_fit: MarchedFit,
         /// Row parameter on each stripe where its OTHER rail stops.
         exit: [f64; 2],
         /// Where the exit lands on the sharp edge.
@@ -136,16 +142,71 @@ pub(super) enum MiterClosure {
     /// seam's exit to the sharp edge.
     Asymmetric {
         seam: MarchedCurve,
+        seam_fit: MarchedFit,
         leader: usize,
         /// Row parameter on the leader where its other rail stops.
         exit_leader: f64,
-        /// The connector, images on the FOLLOWER's blend then on the
+        /// The connector's fit, images on the FOLLOWER's blend then on the
         /// leader's other mate face.
-        connector: MarchedCurve,
+        connector_fit: MarchedFit,
         /// Row parameter on the follower where its other rail stops.
         exit_follower: f64,
         sharp_parameter: f64,
     },
+}
+
+/// How far `point` stands off `surface` the way the marches here solve "on":
+/// along the surface normal at the point's projection.
+///
+/// The projection clamps to the patch, and a march places points on a patch's
+/// continuation — a wall through `evaluate_extended`, a face's plane past its
+/// own parameter box — where the clamped foot is away from the point ALONG the
+/// patch and not across it.  `march_connector`'s level is this same reading,
+/// signed.  Measured on the 2026-09-08 rib-base fixture: a connector whose
+/// every sample its march had put on both carriers read 0.303 off them by
+/// projection distance, and 1.1e-12 at its samples (9.8e-7 between them) by
+/// this.
+fn off_surface(surface: &crate::NurbsSurface, point: Vec3) -> Result<f64, String> {
+    let foot = crate::project_point_to_surface(surface, point)?;
+    let normal = raw_normal(surface, foot.u, foot.v)?;
+    Ok(point.sub(foot.point).dot(normal).abs())
+}
+
+/// Signed distance from `point` to `stripe`'s ruled BEVEL, positive on the
+/// side AWAY from the rolling ball's centre.
+///
+/// This is the chamfer's level, and it is a different surface — not a
+/// different section of the same one.  A fillet's wall IS the sibling's
+/// radius-`r` canal, so `dist(p, spine) − r` vanishes exactly on it; a
+/// chamfer's wall is the CHORD ruling inside that canal, and the canal level
+/// would converge on a seam that is nowhere near the bevel, without failing.
+/// The sense is carried over unchanged: the ball's centre sits at `−r` on the
+/// canal level, and on the negative side of its own chord here, so both
+/// levels are positive on the material the sibling has not taken and negative
+/// on what it has.  `station`'s two end tests read the same way for either.
+///
+/// The projection CLAMPS to the bevel's own uv box.  On planar supports —
+/// where the bevel is a plane — that costs nothing: `(p − q)·n` is the
+/// distance to the whole plane wherever `q` landed on it.  Off a planar
+/// support the clamp bounds the level's reach, which the marched rows'
+/// overshoot already covers.
+fn bevel_level(stripe: &MiterStripe<'_>, point: Vec3, scale: f64) -> Result<f64, String> {
+    let projection = crate::project_point_to_surface(&stripe.rows.surface, point)?;
+    let normal = raw_normal(&stripe.rows.surface, projection.u, projection.v)?;
+    let center = stripe.center()?.evaluate(projection.u)?;
+    // The ball stands off its own chord by `r·cos(half the dihedral)`, which
+    // only collapses on a knife edge.  Take the sign from that stand-off
+    // rather than from the blend's own normal orientation, and refuse where
+    // there is no stand-off to read it from.
+    let seated = center.sub(projection.point).dot(normal);
+    if seated.abs() <= 1e-9 * (1.0 + scale) {
+        return Err(
+            "miter: the chamfer's rolling ball sits on its own chord — the supports meet too \
+             sharply to sign the seam's level"
+                .into(),
+        );
+    }
+    Ok(point.sub(projection.point).dot(normal) * -seated.signum())
 }
 
 /// Bisection to a relative bar on an interval with a sign change.
@@ -178,24 +239,93 @@ const SEAM_STEPS: usize = 48;
 /// Samples over the seam's own length once its exit is known.
 const SEAM_SAMPLES: usize = 64;
 
+/// Rungs of the resample ladder a marched curve climbs until its fit is on its
+/// carriers ([`fit_marched`]), doubling the seam's samples and the connector's
+/// steps on each.  The top rung's refusal is the one that stands.
+const MARCH_RUNGS: usize = 4;
+
+/// Where the seam's `step`-th of `samples` resamples sits between P (0) and the
+/// exit (1): crowded toward the exit as `1 − (1 − s)²`.
+///
+/// The seam runs across its strip toward the rail it exits through, so its
+/// speed in the row parameter climbs steeply at the exit and the last even span
+/// carries the fit's error.  Measured 2026-09-15 on the notched cap,
+/// `revolve_test` and the oblique bore mouth: the exit span is 7 to 9 times the
+/// median chord and reads 1.8e-5, 7.1e-5 and 1.4e-5 off the carriers, against
+/// 9.6e-7, 3.8e-6 and 6.8e-7 on the span before it; doubling the even samples
+/// takes only 3.5 to 3.9 off per doubling, where a cubic on smooth data takes
+/// 16.  Crowded toward the exit, 64 samples read 1.5e-8, 7.7e-8 and 1.1e-8.
+///
+/// Even samples on rung zero, crowded above it, sent 104 of the lib suite's
+/// 142 seams and all 12 of the case corpus's up a rung, paying a whole
+/// resample to throw away; crowded from rung zero, none of the lib suite's
+/// 142, the integration suite's 82 or the corpus's 12 climbs.
+fn seam_spacing(step: usize, samples: usize) -> f64 {
+    let s = step as f64 / samples as f64;
+    1.0 - (1.0 - s) * (1.0 - s)
+}
+
+/// Climb the resample ladder: march rung by rung and keep the first whose fit
+/// stands on its carriers.  Only [`MARCHED_FIT_OFF_CARRIERS`] climbs; any other
+/// failure, and the top rung's refusal, is returned as it came.
+fn fit_on_ladder(
+    march: &dyn Fn(usize) -> Result<MarchedCurve, String>,
+    what: &str,
+    off_carriers: &dyn Fn(Vec3) -> Result<f64, String>,
+    tolerance: f64,
+) -> Result<(MarchedCurve, MarchedFit), String> {
+    let mut rung = 0;
+    loop {
+        let curve = march(rung)?;
+        match fit_marched(&curve, what, off_carriers, tolerance) {
+            Ok(fit) => return Ok((curve, fit)),
+            Err(error) if error.starts_with(MARCHED_FIT_OFF_CARRIERS) && rung + 1 < MARCH_RUNGS => {
+                rung += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// March the seam and decide how the corner closes.
 ///
 /// `scale` is the model scale for the tolerance bars; `sharp` the vertex's
-/// unselected third edge.
+/// unselected third edge.  `fit_tolerance` is what the seam's and the
+/// connector's fits are held to against their carriers (the kernel's
+/// `intersection_fit`): each climbs [`fit_on_ladder`] and refuses by name at
+/// its top.
 pub(super) fn solve_miter(
     stripes: [&MiterStripe<'_>; 2],
     radius: f64,
+    chamfer: bool,
     sharp: &EdgeRecord,
     scale: f64,
+    fit_tolerance: f64,
 ) -> Result<MiterClosure, String> {
     let [first, second] = stripes;
-    let bar = 1e-11 * (1.0 + scale);
+    // The bar the EXIT is bisected to, and the exit is an endpoint of the
+    // fitted seam, so its error does not stay local — it tilts the whole curve
+    // away from every sample between it and P.  Both levels are smooth with an
+    // O(1) gradient in the row parameter, so the root is there to be had at the
+    // parameter's own resolution, and it is worth having: at the old
+    // `1e-11·(1 + scale)` the tilt left a seam that is exactly straight sitting
+    // 4.5e-11 off its own chord, which is enough for `fit_marched` to miss that
+    // it is a line.  A row parameter is a PARAMETER; the bar does not scale
+    // with the model.
+    let bar = 1e-14;
     let center_second = second.center()?;
     // Distance-to-the-sibling's-spine level: zero where a point of stripe 0
-    // lies on stripe 1.
-    let level = |u: f64, fraction: f64| -> Result<f64, String> {
-        let point = first.point(u, fraction)?;
+    // lies on stripe 1.  A CHAMFER's wall is the chord ruling INSIDE that
+    // canal, not the canal, so the level asks the same question of the right
+    // surface (§6.11) — see `bevel_level`.
+    let sibling_level = |point: Vec3| -> Result<f64, String> {
+        if chamfer {
+            return bevel_level(second, point, scale);
+        }
         Ok(crate::project_point_to_curve(center_second, point)?.distance - radius)
+    };
+    let level = |u: f64, fraction: f64| -> Result<f64, String> {
+        sibling_level(first.point(u, fraction)?)
     };
     // Where a point lands on the second stripe, as (u, fraction from the
     // shared rail, how far the projection had to clamp to get there).  A seam
@@ -209,6 +339,15 @@ pub(super) fn solve_miter(
             second.fraction_of_z(projection.v),
             projection.distance,
         ))
+    };
+    // The seam's samples on the second stripe are its pcurve there, ONE branch
+    // of that surface from the ball's own station outward: each continues from
+    // the previous sample's foot. `on_second` stays the nearest-point question,
+    // because the exit measure below is a level, not a sample.
+    let sample_second = |point: Vec3, seed: [f64; 2]| -> Result<[f64; 2], String> {
+        let projection =
+            crate::projection::project_point_to_surface_from_seed(&second.rows.surface, point, seed)?;
+        Ok([projection.u, projection.v])
     };
     // Signed measure of stripe 1's far rail: negative while the seam is still
     // on the strip, zero on the rail, positive once it has run off.  The
@@ -268,7 +407,7 @@ pub(super) fn solve_miter(
         let left_first = station_here.is_none();
         let left_second = past_second(seam_point(u)?)? >= 0.0;
         if let (false, false, Some((fraction, point))) = (left_first, left_second, station_here) {
-            let (uv2, _, _) = on_second(point)?;
+            let uv2 = sample_second(point, uv_second[uv_second.len() - 1])?;
             points.push(point);
             uv_first.push([u, first.z(fraction)]);
             uv_second.push(uv2);
@@ -305,51 +444,64 @@ pub(super) fn solve_miter(
                 .into(),
         );
     };
+    // The exit point, and whether the other stripe leaves there too.  Its foot
+    // on stripe 1 continues from the COARSE march's last sample: the resample
+    // below is a closure the ladder may run more than once, so its own last
+    // foot is not available here, and both seeds sit on the same branch.
+    let (exit_point, exit_uv_first, exit_uv_second, exit_u_second) = if leaves_first == 0 {
+        let point = first.point(u_exit, 1.0)?;
+        let uv2 = sample_second(point, uv_second[uv_second.len() - 1])?;
+        (point, [u_exit, first.z(1.0)], uv2, uv2[0])
+    } else {
+        let (fraction, point) = station(u_exit)?
+            .ok_or("miter: the exit station lost the seam")?;
+        let uv2 = sample_second(point, uv_second[uv_second.len() - 1])?;
+        (point, [u_exit, first.z(fraction)], [uv2[0], second.z(1.0)], uv2[0])
+    };
     // The exit is known: resample the seam densely between P and the exit so
     // the fitted edge rides both blends between samples too.  The coarse
     // march above stepped the whole row span and put only a dozen samples on
     // a seam that leaves within a fifth of it; a cubic through those bows
     // ~1e-4 off the cylinders at r = 1.  Sixty-four samples over the seam's
-    // own length bring that to the fit's noise.
-    let mut points = vec![first.point(u_start, 0.0)?];
-    let mut uv_first = vec![[u_start, first.z(0.0)]];
-    let mut uv_second = vec![[second.u_ball, second.z(0.0)]];
-    for step in 1..SEAM_SAMPLES {
-        let u = u_start + (u_exit - u_start) * step as f64 / SEAM_SAMPLES as f64;
-        let Some((fraction, point)) = station(u)? else {
-            return Err("miter: the seam vanished while being resampled".into());
-        };
-        let (uv2, _, _) = on_second(point)?;
-        points.push(point);
-        uv_first.push([u, first.z(fraction)]);
-        uv_second.push(uv2);
-    }
-
-    // The exit point, and whether the other stripe leaves there too.
-    let (exit_point, exit_uv_first, exit_uv_second, exit_u_second) = if leaves_first == 0 {
-        let point = first.point(u_exit, 1.0)?;
-        let (uv2, _, _) = on_second(point)?;
-        (point, [u_exit, first.z(1.0)], uv2, uv2[0])
-    } else {
-        let (fraction, point) = station(u_exit)?
-            .ok_or("miter: the exit station lost the seam")?;
-        let (uv2, _, _) = on_second(point)?;
-        (point, [u_exit, first.z(fraction)], [uv2[0], second.z(1.0)], uv2[0])
+    // own length, crowded toward the exit (`seam_spacing`), bring that to the
+    // fit's noise.
+    let resample = |rung: usize| -> Result<MarchedCurve, String> {
+        let samples = SEAM_SAMPLES << rung;
+        let mut points = vec![first.point(u_start, 0.0)?];
+        let mut uv_first = vec![[u_start, first.z(0.0)]];
+        let mut uv_second = vec![[second.u_ball, second.z(0.0)]];
+        for step in 1..samples {
+            let u = u_start + (u_exit - u_start) * seam_spacing(step, samples);
+            let Some((fraction, point)) = station(u)? else {
+                return Err("miter: the seam vanished while being resampled".into());
+            };
+            let uv2 = sample_second(point, *uv_second.last().expect("a seeded sample"))?;
+            points.push(point);
+            uv_first.push([u, first.z(fraction)]);
+            uv_second.push(uv2);
+        }
+        points.push(exit_point);
+        uv_first.push(exit_uv_first);
+        uv_second.push(exit_uv_second);
+        Ok(MarchedCurve {
+            points,
+            uv_first,
+            uv_second,
+        })
     };
-    points.push(exit_point);
-    uv_first.push(exit_uv_first);
-    uv_second.push(exit_uv_second);
-    let seam = MarchedCurve {
-        points,
-        uv_first,
-        uv_second,
+    // The seam is evaluated on stripe 0's wall and bisected onto stripe 1's
+    // level, so those are what its fit is read against.
+    let seam_off_carriers = |point: Vec3| -> Result<f64, String> {
+        Ok(off_surface(&first.rows.surface, point)?.max(sibling_level(point)?.abs()))
     };
+    let (seam, seam_fit) = fit_on_ladder(&resample, "seam", &seam_off_carriers, fit_tolerance)?;
 
     let on_sharp = crate::project_point_to_curve(&sharp.curve, exit_point)?;
     let symmetric_bar = 1e-6 * (1.0 + radius);
     if on_sharp.distance <= symmetric_bar {
         return Ok(MiterClosure::Symmetric {
             seam,
+            seam_fit,
             exit: [u_exit, exit_u_second],
             sharp_parameter: on_sharp.u,
         });
@@ -367,14 +519,24 @@ pub(super) fn solve_miter(
     } else {
         (exit_uv_first, first.fraction_of_z(exit_uv_first[1]))
     };
-    let connector = march_connector(
-        follower,
-        leader.other_face,
-        follower_uv_at_exit[0],
-        follower_fraction_at_exit,
-        exit_point,
-        scale,
-    )?;
+    let march = |rung: usize| {
+        march_connector(
+            follower,
+            leader.other_face,
+            follower_uv_at_exit[0],
+            follower_fraction_at_exit,
+            exit_point,
+            scale,
+            CONNECTOR_STEPS << rung,
+        )
+    };
+    // Evaluated on the follower's wall, bisected onto the leader's other face.
+    let connector_off_carriers = |point: Vec3| -> Result<f64, String> {
+        Ok(off_surface(&follower.rows.surface, point)?
+            .max(off_surface(&leader.other_face.surface, point)?))
+    };
+    let (connector, connector_fit) =
+        fit_on_ladder(&march, "connector", &connector_off_carriers, fit_tolerance)?;
     let connector_end = *connector
         .points
         .last()
@@ -389,19 +551,21 @@ pub(super) fn solve_miter(
     let exit_follower = connector.uv_first.last().map(|uv| uv[0]).unwrap_or(0.0);
     Ok(MiterClosure::Asymmetric {
         seam,
+        seam_fit,
         leader: leaves_first,
         // The seam is marched on stripe 0's domain, so `u_exit` is stripe 0's
         // row parameter.  The caller trims the LEADER's rail at this station,
         // and when the leader is stripe 1 that is the exit's parameter on
         // stripe 1's own rows.
         exit_leader: if leaves_first == 0 { u_exit } else { exit_u_second },
-        connector,
+        connector_fit,
         exit_follower,
         sharp_parameter: on_sharp.u,
     })
 }
 
-/// Connector steps from the seam's exit to the sharp edge.
+/// Connector steps from the seam's exit to the sharp edge, on the ladder's
+/// first rung; each later rung doubles them.
 const CONNECTOR_STEPS: usize = 24;
 
 /// The follower's section by `face`, from `(u0, fraction0)` (the seam's exit,
@@ -416,8 +580,29 @@ fn march_connector(
     fraction0: f64,
     start: Vec3,
     scale: f64,
+    steps: usize,
 ) -> Result<MarchedCurve, String> {
-    let bar = 1e-11 * (1.0 + scale);
+    // `bisect` below converges an interval of the follower's ROW PARAMETER `u`,
+    // and `station_parameters` normalises that parameter to [0, 1] (chord length
+    // over the mean support polyline). So `u` is dimensionless and does not grow
+    // with the model, while `scale` is `march_model_scale` — a LENGTH. Comparing
+    // one against the other is dimensionally inconsistent, and it was inconsistent
+    // in the expensive direction: the position the crossing lands on is off by
+    // roughly `bar * |dP/du|`, and `|dP/du|` is itself about the row's arc length,
+    // so multiplying by the scale made the positional error grow as the SQUARE of
+    // model size — about 1e-9 on a 10 mm model and 1e-5 on a metre.
+    //
+    // Dividing is what turns a length tolerance into the equivalent parameter
+    // tolerance, which makes the positional error scale-invariant at ~1e-11
+    // instead. The floor keeps a very large model from spending all 80 bisection
+    // steps chasing a bar below what f64 can resolve on a [0, 1] interval.
+    //
+    // The three sibling bars are NOT this defect and are deliberately untouched:
+    // `stations.rs` (both) and `corner/ball.rs` compare a RESIDUAL whose every
+    // component is a length — point-to-point mismatches, and a displacement
+    // dotted with a NORMALISED section tangent — so scaling those by model size
+    // is a relative tolerance and correct.
+    let bar = (1e-11 / (1.0 + scale)).max(1e-15);
     let signed_distance = |point: Vec3| -> Result<f64, String> {
         let projection = crate::project_point_to_surface(&face.surface, point)?;
         let normal = raw_normal(&face.surface, projection.u, projection.v)?;
@@ -431,8 +616,8 @@ fn march_connector(
     let first_projection = crate::project_point_to_surface(&face.surface, start)?;
     let mut uv_face = vec![[first_projection.u, first_projection.v]];
     let mut previous_u = u0;
-    for step in 1..=CONNECTOR_STEPS {
-        let fraction = fraction0 + (1.0 - fraction0) * step as f64 / CONNECTOR_STEPS as f64;
+    for step in 1..=steps {
+        let fraction = fraction0 + (1.0 - fraction0) * step as f64 / steps as f64;
         // Signed distance to the face along the station parameter at this
         // fraction; bracket from the previous station toward the row end and
         // back, whichever side changes sign.
@@ -470,7 +655,11 @@ fn march_connector(
             }
         };
         let point = follower.point(u, fraction)?;
-        let projection = crate::project_point_to_surface(&face.surface, point)?;
+        // The connector's pcurve on the face is ONE branch: each sample
+        // continues from the previous sample's foot.
+        let seed = *uv_face.last().ok_or("miter: the connector has no face sample")?;
+        let projection =
+            crate::projection::project_point_to_surface_from_seed(&face.surface, point, seed)?;
         points.push(point);
         uv_follower.push([u, follower.z(fraction)]);
         uv_face.push([projection.u, projection.v]);
@@ -483,11 +672,144 @@ fn march_connector(
     })
 }
 
+/// The band a marched curve's samples must sit inside the straight line
+/// between its ends — at their own chord-length parameters — to BE that line.
+///
+/// It is the march's own arithmetic, not a shape allowance: each sample is
+/// placed by a bisection that stops at `1e-13` of the section's width, so a
+/// sample of a genuinely straight seam sits that far off the line and no
+/// further, while a seam with any curvature to it bows orders of magnitude
+/// more.  `BREP_DEBUG_NETWORK` prints the measured deviation of every marched
+/// curve so the band can be read against the real numbers.
+///
+/// # What this band now decides, and what it was derived against
+///
+/// Its derivation above is BISECTION NOISE — "the march's own arithmetic". That
+/// was the whole story while `march_connector`'s own bar was
+/// `1e-11 * (1.0 + scale)`, which scaled a NORMALISED row parameter by model
+/// size and left every connector sitting orders over this band on noise alone:
+/// the groove rim's read 3.592e-9 against a 1.791e-11 bar, 200x over, and no
+/// connector could come near collapsing. Inverting that bar (see the comment at
+/// the head of `march_connector`) drops the same connector to 3.514e-12, 5.1x
+/// UNDER. So this band's job changed with it: it used to separate "straight"
+/// from "noisy samples", and it now separates "straight" from "genuinely curved
+/// by a few times 1e-11" — a finer judgement than the number was chosen for.
+///
+/// Surveyed over `cargo test --test all` under `BREP_DEBUG_NETWORK` at the
+/// commit that inverted that bar: 72 marched curves, 20 distinct shapes.
+///
+/// ```text
+/// no collapse (some deviation over its bar)   59   closest 8.05e+08x OVER
+/// collapses (worst deviation < bar/3)         13   closest 0.1962 of its bar
+/// all three under, worst within 3x of bar      0
+/// ```
+///
+/// About nine orders of empty parameter space between the two populations, so
+/// nothing in that suite is a judgement call. That is evidence the band
+/// separates cleanly in practice; it is not the reason the band is safe.
+///
+/// # Why a near-miss does not matter, and what actually constrains this
+///
+/// It is tempting to read "a curve that only just fits under the band" as the
+/// dangerous case. It is not. `line_deviation` maxes over the SAMPLES at their
+/// own chord-length parameters, so all-three-under says the sampled polyline
+/// lies within `bar` of the chord — and replacing it with that chord therefore
+/// moves nothing by more than `bar` itself, `1e-11·(1 + extent)`, about 1.1e-10
+/// on a 10 mm model against the 1e-7 the kernel treats as linear. A curve at
+/// 0.9 of the band and one at 0.001 of it are both discarded at a magnitude
+/// nothing downstream can see, so "genuinely curved or merely noisy" has no
+/// consequence here.
+///
+/// Which tolerance, though, decides whether that margin is constant — and the
+/// 1e-7 above is the kernel's STRICTEST, not the one that adjudicates this
+/// property. Against `model` alone the margin does shrink with size: 909x on a
+/// 10 mm part, 10x at a metre, and exactly 1x at a ten-metre extent. But what
+/// actually tests an edge's curve against its pcurve — the thing this collapse
+/// changes — is `KernelTolerances::pcurve_acceptance`, which is
+/// `max(pcurve_consistency, 0.025 · model diagonal)` and so scales WITH the
+/// model. Both sides then grow together and the margin is AT LEAST about 2.5e9
+/// at every size: 1.1e-10 against 0.25 on a 10 mm part, 1.0e-7 against 250 at
+/// ten metres. There is no crossover against the comparand that matters.
+///
+/// At least, not exactly, and the gap is in the reader's favour: this band
+/// scales with the CURVE's own chord (`extent` is `last - first` of its
+/// samples) while the limit scales with the MODEL's diagonal. Those are equal
+/// only for a curve spanning the whole model, which is the worst case and the
+/// one these figures assume. A miter seam or connector is a blend-sized feature
+/// on a part-sized model, so its extent is orders below the diagonal and the
+/// real margin is larger still.
+///
+/// Quote the figures and the comparand, never an order count: the count hides
+/// the model size, and a bare crossover hides which tolerance it crossed. Both
+/// read as facts about the collapse when they are facts about a comparison. The band's JOB changed when `march_connector`'s bar was
+/// inverted; its SAFETY never depended on that.
+///
+/// What the safety does depend on is the PAIR (band, sample count), because the
+/// bound above holds only at the samples. Re-derive this if the band is ever
+/// LOOSENED, or if `SEAM_SAMPLES` (64) or `CONNECTOR_STEPS` (24) is ever cut far
+/// enough that a smooth curve could bow between samples by more than the band.
+/// Neither is a free parameter once the other is fixed.
+const MARCH_STRAIGHT: f64 = 1e-11;
+
+/// How far `points` sit from the straight line between their ends, measured at
+/// their own `parameters` — so this answers both questions the collapse below
+/// needs: whether the samples are COLLINEAR, and whether the chord-length
+/// parameterisation is already the line's own affine one.
+fn line_deviation(points: &[Vec3], parameters: &[f64]) -> f64 {
+    let (Some(first), Some(last)) = (points.first(), points.last()) else {
+        return f64::INFINITY;
+    };
+    let travel = last.sub(*first);
+    points
+        .iter()
+        .zip(parameters)
+        .fold(0.0f64, |worst, (point, parameter)| {
+            worst.max(point.sub(first.add(travel.scale(*parameter))).length())
+        })
+}
+
+/// The refusal [`fit_marched`] answers with when the curve it fitted leaves the
+/// surfaces it was marched on.
+pub(crate) const MARCHED_FIT_OFF_CARRIERS: &str = "miter: a marched curve's fit leaves its carriers";
+
 /// Fit a marched curve and its two images with ONE chord-length
 /// parameterisation, so the pcurves reproduce the 3D curve parameter for
 /// parameter.  Returns (curve, first image, second image).
+///
+/// # The fit is measured, between its samples, against its carriers
+///
+/// An interpolant passes through its samples, so the samples cannot say
+/// whether the curve between them is the marched curve.  `off_carriers` is the
+/// march's own witness — how far a point lies from the two surfaces the curve
+/// was solved on — and the returned 3D curve is read by it at 0.25, 0.5 and
+/// 0.75 of every span between samples, the fit record's between-station
+/// sampling.  Against the carriers, not the sample polyline: a seam's chord
+/// sags off its own curve by more than any fit tolerance (2.8e-3 over the last
+/// span of a 64-sample seam at r = 0.5), and a fit that is right between its
+/// samples leaves the polyline by exactly that.  A curve further off its
+/// carriers than `tolerance` is refused by name with the number
+/// ([`MARCHED_FIT_OFF_CARRIERS`]); `what` names the curve.
+///
+/// Measured on the 2026-09-15 notched-cap report at `2dd14cdef`: an asymmetric
+/// miter's connector had no section left to cross and marched one chord of
+/// 1.444e-5 and then 23 of 1.19e-12, so 24 of its 25 chord-length parameters
+/// sat within 1.9e-6 of 1.  The interpolant passed through every sample to
+/// 4e-15, stood 38 units off them at the first span's middle with poles 102
+/// units out, and nothing noticed until the network's acceptance read the
+/// edge 44 units off its pcurve.
+///
+/// A STRAIGHT marched curve is returned as the line it is rather than fitted.
+/// A chamfer miter on planar supports has an exactly straight seam — the two
+/// bevel planes meet in a line — and interpolating the 64 resamples of it
+/// spends 65 control points saying so, less accurately than the two a line
+/// needs.  The collapse is all-or-nothing across the 3D curve and both images
+/// because they share one parameterisation: a line's is affine in the
+/// chord-length parameter, which is exactly what `line_deviation` measures.
 pub(super) fn fit_marched(
     curve: &MarchedCurve,
+    what: &str,
+    off_carriers: &dyn Fn(Vec3) -> Result<f64, String>,
+    tolerance: f64,
 ) -> Result<(crate::NurbsCurve, crate::NurbsCurve, crate::NurbsCurve), String> {
     use crate::Vec4;
     let count = curve.points.len();
@@ -506,20 +828,96 @@ pub(super) fn fit_marched(
         *parameter /= total;
     }
     let degree = FIT_DEGREE.min(count - 1);
-    let as_points = |samples: &[[f64; 2]]| {
+    let flatten = |samples: &[[f64; 2]]| {
         samples
             .iter()
-            .map(|uv| Vec4::from_point(Vec3::new(uv[0], uv[1], 0.0), 1.0))
+            .map(|uv| Vec3::new(uv[0], uv[1], 0.0))
             .collect::<Vec<_>>()
     };
-    let points3 = curve
-        .points
-        .iter()
-        .map(|point| Vec4::from_point(*point, 1.0))
-        .collect::<Vec<_>>();
-    Ok((
-        crate::fit::interpolate_homogeneous(&points3, degree, &parameters)?,
-        crate::fit::interpolate_homogeneous(&as_points(&curve.uv_first), degree, &parameters)?,
-        crate::fit::interpolate_homogeneous(&as_points(&curve.uv_second), degree, &parameters)?,
-    ))
+    let as_points = |samples: &[Vec3]| {
+        samples
+            .iter()
+            .map(|point| Vec4::from_point(*point, 1.0))
+            .collect::<Vec<_>>()
+    };
+    let first_image = flatten(&curve.uv_first);
+    let second_image = flatten(&curve.uv_second);
+    let extent = |points: &[Vec3]| {
+        let (Some(first), Some(last)) = (points.first(), points.last()) else {
+            return 0.0;
+        };
+        last.sub(*first).length()
+    };
+    let straight: Vec<(f64, f64)> = [&curve.points[..], &first_image[..], &second_image[..]]
+        .into_iter()
+        .map(|points| {
+            (
+                line_deviation(points, &parameters),
+                MARCH_STRAIGHT * (1.0 + extent(points)),
+            )
+        })
+        .collect();
+    if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+        eprintln!(
+            "marched curve: {count} samples, off its own chord 3d {:.3e} / first {:.3e} / \
+             second {:.3e} (bars {:.3e} / {:.3e} / {:.3e})",
+            straight[0].0, straight[1].0, straight[2].0,
+            straight[0].1, straight[1].1, straight[2].1,
+        );
+    }
+    let fitted = if straight.iter().all(|(deviation, bar)| deviation <= bar) {
+        let line = |points: &[Vec3]| -> Result<crate::NurbsCurve, String> {
+            crate::make_line(points[0], points[count - 1])
+        };
+        (
+            line(&curve.points)?,
+            line(&first_image)?,
+            line(&second_image)?,
+        )
+    } else {
+        (
+            crate::fit::interpolate_homogeneous(&as_points(&curve.points), degree, &parameters)?,
+            crate::fit::interpolate_homogeneous(&as_points(&first_image), degree, &parameters)?,
+            crate::fit::interpolate_homogeneous(&as_points(&second_image), degree, &parameters)?,
+        )
+    };
+    // A NaN reading is the worst there is, and stays so.
+    let worse = |worst: f64, off: f64| !worst.is_nan() && (off.is_nan() || off > worst);
+    let mut worst = 0.0f64;
+    let mut worst_span = 0;
+    for (span, pair) in parameters.windows(2).enumerate() {
+        for fraction in [0.25, 0.5, 0.75] {
+            let off = off_carriers(fitted.0.evaluate(pair[0] + (pair[1] - pair[0]) * fraction)?)?;
+            if worse(worst, off) {
+                (worst, worst_span) = (off, span);
+            }
+        }
+    }
+    // The samples' own reading is for the refusal and the debug line only.
+    let debug = std::env::var("BREP_DEBUG_NETWORK").is_ok();
+    let mut at_samples = f64::NAN;
+    if debug || !(worst <= tolerance) {
+        at_samples = 0.0;
+        for point in &curve.points {
+            let off = off_carriers(*point)?;
+            if worse(at_samples, off) {
+                at_samples = off;
+            }
+        }
+    }
+    if debug {
+        eprintln!(
+            "marched {what} [{}]: {count} samples, fit off its carriers {worst:.3e} between them \
+             (span {worst_span}), {at_samples:.3e} at them, tolerance {tolerance:.3e}",
+            std::thread::current().name().unwrap_or("main"),
+        );
+    }
+    if !(worst <= tolerance) {
+        return Err(format!(
+            "{MARCHED_FIT_OFF_CARRIERS}: the {what}'s fit stands {worst:.3e} off them between its \
+             {count} samples (span {worst_span}; the samples themselves {at_samples:.3e}), over the \
+             fit tolerance {tolerance:.3e}"
+        ));
+    }
+    Ok(fitted)
 }

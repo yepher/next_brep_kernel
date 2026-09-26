@@ -21,6 +21,11 @@ fn rebuild_pcurve_preserving_branch(
     // a section riding a compressed carrier row does not fold; the canonicalize
     // rebuild must use it too or the fold returns. Fail-soft to the global build.
     let mut rebuilt = build_pcurve_on_surface_marched(surface, curve).or_refuse(KernelStage::Intersect, "build_pcurve_on_surface_marched")?;
+    // NOTE (2026-09-16): this hatch's ONLY tamper guard,
+    // `csg/fragment/tests.rs::seam_band_cut_chain_splits_periodic_face`, went
+    // INERT when the march-window lift landed — that test now passes with this
+    // hatch off, so nothing tamper-verifies this mechanism any more. Not that it
+    // is untested: no other test NAMES this hatch.
     if std::env::var("BREP_PCURVE_BRANCH_ALIGN").as_deref() == Ok("0") {
         return Ok(rebuilt);
     }
@@ -70,6 +75,7 @@ pub(super) fn canonicalize_imprint_junctions(
     result: &mut ImprintResultRecord,
     solid_a: &BrepSolid,
     solid_b: &BrepSolid,
+    charts: &FaceCharts<'_>,
     tolerance: f64,
 ) -> Result<(), KernelRefusal> {
     let face_map = faces(solid_a, 0)
@@ -107,6 +113,7 @@ pub(super) fn canonicalize_imprint_junctions(
         && merge_residual_coincident_vertices(
             result,
             &face_map,
+            charts,
             &incident_faces,
             tolerance,
             raw_extent,
@@ -233,7 +240,9 @@ pub(super) fn canonicalize_imprint_junctions(
             let face = face_map
                 .get(&key)
                 .ok_or_else(|| KernelRefusal::internal(KernelStage::Intersect, "imprint.junctions", format!("missing imprint support face {key:?}")))?;
-            pcurve.pcurve = rebuild_pcurve_preserving_branch(&face.surface, &piece.curve, &pcurve.pcurve)?;
+            // In the face's CHART: the mint drew this pcurve there, and on a
+            // lifted face the carrier's own frame is a period away from it.
+            pcurve.pcurve = rebuild_pcurve_preserving_branch(chart_of(charts, key, face), &piece.curve, &pcurve.pcurve)?;
         }
     }
     Ok(())
@@ -328,6 +337,7 @@ fn junction_find(parent: &mut HashMap<u64, u64>, mut x: u64) -> u64 {
 pub(super) fn merge_residual_coincident_vertices(
     result: &mut ImprintResultRecord,
     face_map: &HashMap<FaceKey, &FaceRecord>,
+    charts: &FaceCharts<'_>,
     incident_faces: &HashMap<u64, HashSet<FaceKey>>,
     tolerance: f64,
     raw_extent: f64,
@@ -532,7 +542,13 @@ pub(super) fn merge_residual_coincident_vertices(
                 let face = face_map
                     .get(&key)
                     .ok_or_else(|| KernelRefusal::internal(KernelStage::Intersect, "imprint.junctions", format!("missing imprint support face {key:?}")))?;
-                pcurve.pcurve = rebuild_pcurve_preserving_branch(&face.surface, &piece.curve, &pcurve.pcurve)?;
+                // In the face's CHART: the mint drew this pcurve there, and
+                // on a lifted face the carrier's frame is a period from it.
+                pcurve.pcurve = rebuild_pcurve_preserving_branch(
+                    chart_of(charts, key, face),
+                    &piece.curve,
+                    &pcurve.pcurve,
+                )?;
             }
         }
         kept_pieces.push(piece);

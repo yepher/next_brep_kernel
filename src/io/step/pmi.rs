@@ -38,6 +38,7 @@
 //! Non-ASCII text (⌀ ± ° and the GD&T symbols) is written with Part 21's
 //! `\X2\…\X0\` control directives, per the CAx-IF Unicode recommendation.
 
+use super::styles::{write_colour_rgb, write_style_assignment, write_styled_item};
 use super::{
     id_list, real, write_direction, write_placement, write_point, StepItemOwner, StepWriter,
 };
@@ -798,14 +799,17 @@ pub(crate) fn write_pmi(
         return Ok(0);
     }
     let env = Env::build("", &serde_json::Value::Null).unwrap_or_else(Env::poisoned);
-    let null_style = writer.add("PRESENTATION_STYLE_ASSIGNMENT((NULL_STYLE(.NULL.)))");
-    let colour = writer.add("COLOUR_RGB('',0.,0.,0.)");
+    // The presentation entities here are the SHARED ones (`step/styles.rs`), so
+    // annotation style and geometry colour cannot drift into two spellings of
+    // the same AP242 chain.
+    let null_style = write_style_assignment(writer, "NULL_STYLE(.NULL.)");
+    let colour = write_colour_rgb(writer, [0.0, 0.0, 0.0])?;
     let curve_font = writer.add("DRAUGHTING_PRE_DEFINED_CURVE_FONT('continuous')");
     let curve_style = writer.add(format!(
         "CURVE_STYLE('',#{curve_font},POSITIVE_LENGTH_MEASURE({}),#{colour})",
         real(LINE_WIDTH)?
     ));
-    let curve_style = writer.add(format!("PRESENTATION_STYLE_ASSIGNMENT((#{curve_style}))"));
+    let curve_style = write_style_assignment(writer, &format!("#{curve_style}"));
     let mut emitter = Emitter {
         writer,
         context,
@@ -824,7 +828,7 @@ pub(crate) fn write_pmi(
     )?;
     let map = emitter.add(format!("REPRESENTATION_MAP(#{identity},#{})", context.representation));
     let mapped = emitter.add(format!("MAPPED_ITEM('',#{map},#{identity})"));
-    let styled_shape = emitter.add(format!("STYLED_ITEM('',(#{null_style}),#{mapped})"));
+    let styled_shape = write_styled_item(emitter.writer, "", null_style, mapped);
 
     emitter.write_datums(pmi);
 

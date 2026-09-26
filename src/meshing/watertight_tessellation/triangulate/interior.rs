@@ -43,6 +43,7 @@ pub(in crate::watertight_tessellation) fn seed_interior_grid(
     // region, so "lands in a triangle" IS "inside the trim").
     boundary: BoundaryForm,
 ) -> Result<(), String> {
+    let _timer = stage_timer(Stage::Seed);
     let [u0, u1, v0, v1] = domains;
     let [su, sv] = scale;
     let boundary_count = vertices.len();
@@ -208,39 +209,28 @@ pub(in crate::watertight_tessellation) fn seed_interior_grid(
         .map(|index| vertices[index].uv)
         .collect();
     let margin = 0.35 * (du * su).min(dv * sv).max(1e-12);
+    // Both rejection tests below are decided by geometry local to the station,
+    // so they are bucket lookups rather than scans of the whole boundary — the
+    // candidates each station receives are a conservative superset of the ones
+    // a scan would have tested, and each receives the identical test, so the
+    // answer is the same boolean. See `station_index.rs`.
+    let index = BoundaryIndex::new(
+        &segments,
+        if single_ring { &polygon } else { &[] },
+        scale,
+        margin,
+    );
     let inside_with_margin = |uv: [f64; 2]| -> bool {
-        for &(a, b) in &segments {
-            // Scaled distance from the grid point to this boundary segment.
-            let ax = (uv[0] - a[0]) * su;
-            let ay = (uv[1] - a[1]) * sv;
-            let bx = (b[0] - a[0]) * su;
-            let by = (b[1] - a[1]) * sv;
-            let dot = ax * bx + ay * by;
-            let len2 = (bx * bx + by * by).max(1e-30);
-            let t = (dot / len2).clamp(0.0, 1.0);
-            let dx = ax - bx * t;
-            let dy = ay - by * t;
-            if (dx * dx + dy * dy).sqrt() < margin {
-                return false;
-            }
+        if index.near_segment(uv) {
+            return false;
         }
         if !single_ring {
             // Containment is decided by the host-triangle search.
             return true;
         }
-        let mut crossings = 0usize;
-        for index in 0..polygon.len() {
-            let a = polygon[index];
-            let b = polygon[(index + 1) % polygon.len()];
-            if (a[1] > uv[1]) != (b[1] > uv[1]) {
-                let x = a[0] + (uv[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0]);
-                if x > uv[0] {
-                    crossings += 1;
-                }
-            }
-        }
-        crossings % 2 == 1
+        index.ring_encloses(uv)
     };
+    tess_profile(|p| p.stations += (nu.saturating_sub(1) * nv.saturating_sub(1)) as u64);
     for iu in 1..nu {
         for iv in 1..nv {
             let uv = [
@@ -254,7 +244,11 @@ pub(in crate::watertight_tessellation) fn seed_interior_grid(
             // order: row-major grid points land in freshly split triangles,
             // so the newest entries are the likeliest hosts.
             let mut host = None;
+            tess_profile(|p| p.stations_placed += 1);
+            let host_timer = stage_timer(Stage::Host);
+            let mut visits = 0u64;
             for (triangle_index, triangle) in triangles.iter().enumerate().rev() {
+                visits += 1;
                 let a = vertices[triangle[0]].uv;
                 let b = vertices[triangle[1]].uv;
                 let c = vertices[triangle[2]].uv;
@@ -270,6 +264,8 @@ pub(in crate::watertight_tessellation) fn seed_interior_grid(
                     break;
                 }
             }
+            tess_profile(|p| p.host_visits += visits);
+            drop(host_timer);
             let Some(host) = host else {
                 continue;
             };
@@ -304,6 +300,7 @@ pub(in crate::watertight_tessellation) fn refine_interior(
     // surface. Every non-periodic face passes `false` (bit-identical path).
     periodic: bool,
 ) -> Result<(), String> {
+    let _timer = stage_timer(Stage::Refine);
     // The raw ear-clip output is a boundary fan; flips must reshape it
     // BEFORE the chord criterion runs, or fan diagonals trigger an
     // avalanche of unnecessary splits. UNGUARDED: nothing in an ear-clip fan is
@@ -312,15 +309,20 @@ pub(in crate::watertight_tessellation) fn refine_interior(
     // sees, so paying two surface evaluations per candidate is pure cost.
     lawson_flips(vertices, triangles, boundary_pairs, scale);
     for _ in 0..MAX_REFINE_PASSES {
-        let mut edge_use: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+        tess_profile(|p| p.refine_passes += 1);
+        // Corner list sorted into edge groups rather than a map of `Vec`s: the
+        // groups come out in ascending edge order, which is what the explicit
+        // `candidates.sort_unstable()` below produced, so the midpoint indices
+        // — and therefore `lawson_flips`' cocircular tie-break — are unchanged.
+        let mut corners: Vec<(usize, usize, usize)> = Vec::with_capacity(triangles.len() * 3);
         for (triangle_index, triangle) in triangles.iter().enumerate() {
             for corner in 0..3 {
                 let a = triangle[corner];
                 let b = triangle[(corner + 1) % 3];
-                let key = (a.min(b), a.max(b));
-                edge_use.entry(key).or_default().push(triangle_index);
+                corners.push((a.min(b), a.max(b), triangle_index));
             }
         }
+        corners.sort_unstable();
         let mut splits: HashMap<(usize, usize), usize> = HashMap::new();
         // Iterate the candidate edges in SORTED order, not `HashMap` order. The
         // midpoint vertices are pushed as they are accepted, so the iteration
@@ -330,14 +332,19 @@ pub(in crate::watertight_tessellation) fn refine_interior(
         // two runs over the same face would otherwise number the midpoints
         // differently and mesh a dense, highly cocircular grid (a torus) two
         // different ways — the snapshot round-trip fixtures caught exactly that.
-        let mut candidates: Vec<(usize, usize)> = edge_use.keys().copied().collect();
-        candidates.sort_unstable();
-        for (a, b) in candidates {
-            let users = &edge_use[&(a, b)];
+        let mut group = 0usize;
+        while group < corners.len() {
+            let (a, b, _) = corners[group];
+            let mut end = group + 1;
+            while end < corners.len() && corners[end].0 == a && corners[end].1 == b {
+                end += 1;
+            }
+            let users = end - group;
+            group = end;
             if boundary_pairs.contains(&(a, b)) {
                 continue;
             }
-            if users.len() != 2 {
+            if users != 2 {
                 continue;
             }
             let uv_mid = [
@@ -371,6 +378,7 @@ pub(in crate::watertight_tessellation) fn refine_interior(
                 position: surface_mid,
             });
             splits.insert((a, b), index);
+            tess_profile(|p| p.splits += 1);
         }
         if std::env::var("BREP_DEBUG_TESS").is_ok() {
             // Histogram the split midpoints by v-band + the worst sag, so a

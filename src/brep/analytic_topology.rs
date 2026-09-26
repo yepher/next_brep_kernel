@@ -467,4 +467,3 @@ pub fn make_cone_brep(
     )
 }
 
-// BREP private tests: 6ff868ac08fe9d2a

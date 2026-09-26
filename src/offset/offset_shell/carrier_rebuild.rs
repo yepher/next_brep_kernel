@@ -33,14 +33,15 @@ use super::*;
 /// from the analytic intersection.
 ///
 /// Qualification is deliberately narrow so every landed lane keeps its
-/// existing path (straight holes: coplanar rim-pair welds; frustum outer
-/// walls: ruled band weld):
+/// existing path (straight holes: coplanar rim-pair welds; a frustum's outer
+/// wall: the carrier is grown to its opening plane and the imprint cuts it,
+/// `fallshort_opening_reach`):
 /// - the carrier face is a closed band: nothing but closed full-period
 ///   rims (exactly two), face-local seams, and degenerate placeholders;
 /// - each rim edge is shared with a PLANAR opening face as an INNER
 ///   (hole) loop of that face — an outer-loop rim is the frustum lane,
-///   where the opening face ends at the wall and the ruled band is the
-///   landed closure;
+///   where the opening face ends at the wall and the closure is the annulus
+///   the opening plane cuts;
 /// - the rim's offset image genuinely leaves the opening plane (beyond
 ///   the weld tolerance band) — an in-plane image is the straight-hole
 ///   lane;
@@ -1208,6 +1209,498 @@ pub(super) fn outward_wall_pad(
         }
     }
     Ok(amount * outward_miter_scale(worst))
+}
+
+/// A curved opening face whose surface is RULED along v — a degree-1 net with
+/// two control rows in v and at least three in u, the lateral face every
+/// revolved or swept straight profile edge makes (a cone, a cylinder) — over a
+/// single loop. An outward shell builds such an opening's wall by
+/// [`extended_ruled_wall`].
+pub(super) fn ruled_opening(face: &FaceRecord) -> Result<bool, String> {
+    let surface = &face.surface;
+    Ok(face.loops.len() == 1
+        && !surface.is_affine()?
+        && surface.degree_v == 1
+        && surface.control_points.len() >= 3
+        && surface.control_points.iter().all(|row| row.len() == 2))
+}
+
+/// The OUTWARD wall of a ruled opening face: the face's own surface continued
+/// past every open side by `pad`, as one face over the whole continuation.
+///
+/// A planar opening's wall is its plane padded on all four sides, and the pad
+/// on the sides it shares with other openings is not decoration. A wall that
+/// stops exactly on an adjacent opening's plane meets that plane along its own
+/// BOUNDARY, and the imprint rejects a section lying on a face boundary that is
+/// not a seam ("invalid-boundary"): measured on the torus wedge with the cone
+/// grown only along its rulings, both caps lost the chord's section that way and
+/// shredded into 57 fragments each. So the ruled wall grows along u as well.
+///
+/// The continuation is `NurbsSurface::extend_natural` — the analytic
+/// continuation of each terminal Bézier span in homogeneous coordinates, so a
+/// cone stays the same cone and a circle the same circle — followed by an AFFINE
+/// re-mapping of both knot vectors back onto the original domain. The face's
+/// cloned pcurves therefore bound the whole extended sheet, exactly as a padded
+/// plane's cloned trim bounds the grown outline. That is only the intended wall
+/// when the trim IS the whole face, so anything else declines. Each side's
+/// parameter increment is sized from the boundary's own speed and then measured:
+/// every station along the new boundary must lie as far from the old one as
+/// the side asked. A side asks for `pad` unless that would outgrow the surface
+/// it continues (`MAXIMUM_GROWTH_RATIO`), and then for just under the limit.
+///
+/// The inner `Err` carries the reason the construction does not apply, which
+/// the shell refuses with. A closed direction has no sides to grow and is left
+/// as it is.
+pub(super) fn extended_ruled_wall(
+    source: &BrepSolid,
+    face: &FaceRecord,
+    pad: f64,
+    tolerance: f64,
+) -> Result<Result<RuledWall, String>, String> {
+    use crate::{NurbsSurface, SurfaceSide};
+    let surface = &face.surface;
+    let [u0, u1] = surface.domain_u()?;
+    let [v0, v1] = surface.domain_v()?;
+    let loops = face
+        .loops
+        .iter()
+        .map(|record| {
+            record
+                .coedges
+                .iter()
+                .map(|coedge| coedge.pcurve.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    if !crate::thicken::band::whole_face(&loops, [u0, u1], [v0, v1])? {
+        return Ok(Err("the opening's trim is not the whole face".into()));
+    }
+    let mut wall = standalone_face(source, face.id)?;
+    if wall.edges.iter().any(|edge| edge.degenerate) {
+        return Ok(Err("the opening has a degenerate edge".into()));
+    }
+    let (closed_u, closed_v) = surface.closed_directions()?;
+    const STATIONS: usize = 8;
+    // The largest distance, over stations across the side, between a point on
+    // the old boundary and the point `delta` past it: the side's growth.
+    let side_growth = |grown: &NurbsSurface, side: SurfaceSide, delta: f64| -> Result<f64, String> {
+        let mut least = f64::INFINITY;
+        for index in 0..=STATIONS {
+            let fraction = index as f64 / STATIONS as f64;
+            let (old, new) = match side {
+                SurfaceSide::UMin | SurfaceSide::UMax => {
+                    let v = v0 + (v1 - v0) * fraction;
+                    let u = if matches!(side, SurfaceSide::UMin) { u0 } else { u1 };
+                    let step = if matches!(side, SurfaceSide::UMin) { -delta } else { delta };
+                    ((u, v), (u + step, v))
+                }
+                SurfaceSide::VMin | SurfaceSide::VMax => {
+                    let u = u0 + (u1 - u0) * fraction;
+                    let v = if matches!(side, SurfaceSide::VMin) { v0 } else { v1 };
+                    let step = if matches!(side, SurfaceSide::VMin) { -delta } else { delta };
+                    ((u, v), (u, v + step))
+                }
+            };
+            let from = grown.evaluate(old.0, old.1)?;
+            let to = grown.evaluate(new.0, new.1)?;
+            least = least.min(to.sub(from).length());
+        }
+        Ok(least)
+    };
+    let mut grown = surface.clone();
+    let mut deltas = [0.0f64; 4];
+    let mut reached = [0.0f64; 4];
+    for (slot, side) in [
+        SurfaceSide::UMin,
+        SurfaceSide::UMax,
+        SurfaceSide::VMin,
+        SurfaceSide::VMax,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if (side.is_u() && closed_u) || (!side.is_u() && closed_v) {
+            continue;
+        }
+        // First guess from the boundary's speed, then measured: a chord of a
+        // continued arc is shorter than its parameter speed says.
+        let mut speed = f64::INFINITY;
+        for index in 0..=STATIONS {
+            let fraction = index as f64 / STATIONS as f64;
+            let (u, v) = match side {
+                SurfaceSide::UMin => (u0, v0 + (v1 - v0) * fraction),
+                SurfaceSide::UMax => (u1, v0 + (v1 - v0) * fraction),
+                SurfaceSide::VMin => (u0 + (u1 - u0) * fraction, v0),
+                SurfaceSide::VMax => (u0 + (u1 - u0) * fraction, v1),
+            };
+            let derivatives = surface.derivatives(u, v, 1)?;
+            let along = if side.is_u() { derivatives[1][0] } else { derivatives[0][1] };
+            speed = speed.min(along.length());
+        }
+        if !(speed > 0.0) {
+            return Ok(Err(format!("the opening's {side:?} side has no speed to grow along")));
+        }
+        let mut delta = pad / speed;
+        // What this side is asked to reach. It shrinks only where the
+        // continuation would outgrow the surface it continues
+        // (`MAXIMUM_GROWTH_RATIO`): the pad carries the plane's miter headroom,
+        // and a wall reaching less far than the pad but past the grown offset
+        // still closes. One that falls short leaves the rim open, and the shell
+        // refuses downstream rather than building.
+        let mut reach = pad;
+        let mut attempt = None;
+        for _ in 0..8 {
+            let candidate = match grown.extend_natural(side, delta) {
+                Ok(candidate) => candidate,
+                Err(crate::ExtendRefusal::ExcessiveGrowth { ratio, limit }) if ratio > limit => {
+                    let shrink = limit / ratio * 0.95;
+                    reach *= shrink;
+                    delta *= shrink;
+                    continue;
+                }
+                Err(refusal) => {
+                    return Ok(Err(format!(
+                        "the opening cannot be continued past its {side:?} side by {reach:.6}: {refusal}"
+                    )));
+                }
+            };
+            let growth = side_growth(&candidate, side, delta)?;
+            if growth >= reach * (1.0 - 1e-9) {
+                attempt = Some((candidate, growth));
+                break;
+            }
+            delta *= (reach / growth.max(reach * 1e-3)) * 1.05;
+        }
+        let Some((candidate, growth)) = attempt else {
+            return Ok(Err(format!(
+                "the opening's {side:?} side does not reach {reach:.6} along its continuation"
+            )));
+        };
+        reached[slot] = growth;
+        grown = candidate;
+        deltas[slot] = delta;
+    }
+    // Back onto the original domain, affinely: the extended [u0 − δ, u1 + δ]
+    // becomes [u0, u1], so the unchanged pcurves bound the whole continuation.
+    let remap = |knots: &[f64], low: f64, high: f64, start: f64, end: f64| -> Vec<f64> {
+        knots
+            .iter()
+            .map(|knot| start + (knot - low) * (end - start) / (high - low))
+            .collect()
+    };
+    let surface = NurbsSurface::new(
+        grown.degree_u,
+        grown.degree_v,
+        remap(&grown.knots_u, u0 - deltas[0], u1 + deltas[1], u0, u1),
+        remap(&grown.knots_v, v0 - deltas[2], v1 + deltas[3], v0, v1),
+        grown.control_points.clone(),
+    )?;
+    // Every edge and vertex is the image of the same pcurves on the grown
+    // sheet. An edge runs from its start vertex to its end; a pcurve runs in
+    // its coedge's direction, which is the edge's exactly when `forward`.
+    let wall_face = &mut wall.shells[0].faces[0];
+    wall_face.surface = surface.clone();
+    let uses = wall_face
+        .loops
+        .iter()
+        .flat_map(|record| &record.coedges)
+        .cloned()
+        .collect::<Vec<_>>();
+    for edge in &mut wall.edges {
+        let Some(coedge) = uses.iter().find(|coedge| coedge.edge_id == edge.id) else {
+            continue;
+        };
+        let image = crate::image_curve(&surface, &coedge.pcurve, tolerance, "offset_shell ruled wall")?;
+        let (mut first, mut last) = (image.t0, image.t1);
+        if !coedge.forward {
+            std::mem::swap(&mut first, &mut last);
+        }
+        let mut curve = image.curve;
+        if first > last {
+            let [start, end] = curve.domain()?;
+            curve = curve.reversed()?;
+            first = start + end - first;
+            last = start + end - last;
+        }
+        let (start_point, end_point) = (curve.evaluate(first)?, curve.evaluate(last)?);
+        for vertex in &mut wall.vertices {
+            if vertex.id == edge.start_vertex_id {
+                vertex.point = start_point;
+            } else if vertex.id == edge.end_vertex_id {
+                vertex.point = end_point;
+            }
+        }
+        edge.curve = curve;
+        edge.t0 = first;
+        edge.t1 = last;
+    }
+    Ok(Ok(RuledWall { solid: wall, reached }))
+}
+
+/// A ruled opening's extended wall, and how far each side (u low, u high, v
+/// low, v high) actually reaches — 0 for a closed direction.
+pub(super) struct RuledWall {
+    pub solid: BrepSolid,
+    pub reached: [f64; 4],
+}
+
+/// The worst fold factor of a retained face's OUTWARD offset over its trim,
+/// when it reaches the collapse factor: a fold the carve's own probe did not
+/// see.
+///
+/// The carve lane reads a face through `ScanBudget::SHELL_FACE`, a coverage
+/// budget, and acts only on samples it finds collapsed. A fold band narrower
+/// than that grid is invisible to it, and the face is then built whole. Measured
+/// on the torus wedge grown by 1.001, whose offset folds across its axis over a
+/// band 2.9° wide: 0 of 448 samples collapsed, and once the chord cone's wall
+/// reached the grown offset the pipeline built a valid single shell holding the
+/// REFLECTED lemon's witness beyond the axis, which the answer leaves out. The
+/// same torus with a knot inserted — identical geometry that no longer reads as
+/// a revolution — built that solid through `offset_shell` too, because the
+/// revolved-wedge lane declines a carrier it cannot recognize.
+///
+/// So this asks the same regularity question with the SAME field the carve
+/// reads (`fold_sample_at`, the per-direction area factor `1 − δ·κ`), densely
+/// and with refinement toward the worst node, which is where a band's minimum
+/// is. The factor is `1 − grow` at the torus's inner equator, so the tangent
+/// onset reads zero and refuses too. A caller asks only about faces the carve
+/// did not carve and the collapse probe did not omit: a fold the carve DID see
+/// is the carve's to build or refuse (the conic crater grown outward crosses its
+/// axis near the apex, is carved, and reads its exact volume).
+pub(super) fn outward_fold_the_carve_missed(
+    face: &FaceRecord,
+    distance: f64,
+) -> Result<Option<crate::offset_regularity::FoldSample>, String> {
+    use crate::offset_regularity::{fold_sample_at, scan_offset_regularity, TrimRegion};
+    if distance >= 0.0 || face.surface.is_affine()? {
+        return Ok(None);
+    }
+    let region = TrimRegion::from_face(face)?;
+    let displacement = [shell_displacement(face, distance)];
+    let scan = scan_offset_regularity(
+        &face.surface,
+        &region,
+        &displacement,
+        COLLAPSE_FACTOR,
+        UNSEEN_FOLD_BUDGET,
+    )?;
+    let Some(mut worst) = scan.worst else {
+        return Ok(None);
+    };
+    // The scan's refinement stops at a fixed depth, which leaves a smooth
+    // minimum a few 1e-6 above its value — enough to read the tangent onset,
+    // whose minimum IS zero, as regular. Polish to the minimum itself, one
+    // coordinate at a time, on the same field.
+    let [u_low, u_high, v_low, v_high] = region.bounds();
+    let mut radius = [(u_high - u_low) / 64.0, (v_high - v_low) / 64.0];
+    let ratio = 0.5 * (5f64.sqrt() - 1.0);
+    for _ in 0..6 {
+        for along_u in [true, false] {
+            let (centre, low, high, reach) = if along_u {
+                (worst.u, u_low, u_high, radius[0])
+            } else {
+                (worst.v, v_low, v_high, radius[1])
+            };
+            let sample = |t: f64| {
+                let (u, v) = if along_u { (t, worst.v) } else { (worst.u, t) };
+                region
+                    .contains(u, v)
+                    .then(|| fold_sample_at(&face.surface, u, v, &displacement))
+                    .flatten()
+            };
+            let (mut a, mut b) = ((centre - reach).max(low), (centre + reach).min(high));
+            for _ in 0..48 {
+                let (c, d) = (b - ratio * (b - a), a + ratio * (b - a));
+                match (sample(c), sample(d)) {
+                    (Some(first), Some(second)) if first.factor < second.factor => b = d,
+                    (Some(_), Some(_)) => a = c,
+                    _ => break,
+                }
+            }
+            if let Some(polished) = sample(0.5 * (a + b)) {
+                if polished.factor < worst.factor {
+                    worst = polished;
+                }
+            }
+        }
+        radius = [radius[0] * 0.5, radius[1] * 0.5];
+    }
+    Ok((worst.factor <= COLLAPSE_FACTOR).then_some(worst))
+}
+
+/// A fold hunt over one face: the sheet gate's density per span, a coverage cap
+/// between the shell probe's and the sheet gate's, and the refinement that
+/// walks to the minimum a band's thinness would otherwise hide.
+const UNSEEN_FOLD_BUDGET: crate::offset_regularity::ScanBudget =
+    crate::offset_regularity::ScanBudget {
+        per_span: 9,
+        steps_per_distance: 2.0,
+        max_nodes: 4096,
+        refine: true,
+    };
+
+/// How far an INWARD offset carrier must grow along its rulings to reach the
+/// PLANAR opening its source face meets, and at which v end: `Some((at_v_max,
+/// reach))`.
+///
+/// An inward offset moves the skin into the material, so the offset image of
+/// the rim the opening shares lies short of the opening plane: a frustum's
+/// r 2 → 1 h 4 shelled by 0.4 has its offset rim at z = 3.903 against an
+/// opening at z = 4. The carrier and the opening wall are then genuinely
+/// disjoint, their pair is skipped on bounds, nothing cuts the skin at the
+/// plane, and the rim was left orphaned for the ruled cork weld (retired with
+/// this change), which ends the wall BELOW the plane it opens. The opening plane truncates
+/// the offset skin it opens, so the carrier is grown until it crosses that
+/// plane and the ordinary imprint cuts it back exactly.
+///
+/// The reach is measured, not assumed: for each station on the shared rim, the
+/// offset image is walked along the carrier's own ruling until it meets the
+/// plane, and the worst station wins. A ruling parallel to the plane never
+/// meets it and declines.
+pub(super) fn fallshort_opening_reach(
+    source: &BrepSolid,
+    face: &FaceRecord,
+    source_faces: &[&FaceRecord],
+    opening_set: &HashSet<u64>,
+    distance: f64,
+) -> Result<Option<(bool, f64)>, String> {
+    if distance <= 0.0 || face.surface.is_affine()? {
+        return Ok(None);
+    }
+    let surface = &face.surface;
+    // Ruled along v is what `offset_surface`'s ruled extension can grow.
+    if surface.degree_v != 1 || surface.control_points.iter().any(|row| row.len() != 2) {
+        return Ok(None);
+    }
+    let [u0, u1] = surface.domain_u()?;
+    let [v0, v1] = surface.domain_v()?;
+    let edge_by_id = source
+        .edges
+        .iter()
+        .map(|edge| (edge.id, edge))
+        .collect::<HashMap<_, _>>();
+    let offsets = face_offsets(face);
+    let mut best: Option<(bool, f64)> = None;
+    for coedge in face.loops.iter().flat_map(|record| &record.coedges) {
+        let Some(edge) = edge_by_id.get(&coedge.edge_id) else {
+            continue;
+        };
+        if edge.degenerate {
+            continue;
+        }
+        // The opening this rim is shared with, and its plane.
+        let Some((opening, _)) = junction_mate(source_faces, face, coedge.edge_id)
+            .filter(|(mate, _)| opening_set.contains(&mate.id))
+        else {
+            continue;
+        };
+        if !surface_is_planar(&opening.surface, 1e-6 * crate::solid_scale(source).max(1.0))? {
+            continue;
+        }
+        let [ou0, ou1] = opening.surface.domain_u()?;
+        let [ov0, ov1] = opening.surface.domain_v()?;
+        let (ou, ov) = ((ou0 + ou1) * 0.5, (ov0 + ov1) * 0.5);
+        let plane_point = opening.surface.evaluate(ou, ov)?;
+        // A pole or an apex has no readable normal, and neither has an offset
+        // ruling to walk: such a station is skipped, not refused.
+        let Ok(plane_normal) = face_normal(opening, ou, ov) else {
+            continue;
+        };
+        let [p0, p1] = coedge.pcurve.domain()?;
+        for index in 0..=8 {
+            let uv = coedge.pcurve.evaluate(p0 + (p1 - p0) * index as f64 / 8.0)?;
+            // Which v end of the trim this rim sits at, and the ruling that
+            // leaves the trim there.
+            let at_v_max = (uv.y - v1).abs() < (uv.y - v0).abs();
+            let u = uv.x.clamp(u0, u1);
+            let (near, far) = if at_v_max { (v0, v1) } else { (v1, v0) };
+            let image = |v: f64| offsets.at(u, v, -distance).map(|sample| sample.point).ok();
+            let (Some(from), Some(to)) = (image(near), image(far)) else {
+                continue;
+            };
+            let ruling = to.sub(from);
+            let length = ruling.length();
+            if length <= 1e-12 {
+                continue;
+            }
+            let direction = ruling.scale(1.0 / length);
+            let denominator = direction.dot(plane_normal);
+            if denominator.abs() <= 1e-9 {
+                continue;
+            }
+            // How far past the rim's own image the plane is, along the ruling.
+            let reach = plane_point.sub(to).dot(plane_normal) / denominator;
+            if reach <= 0.0 {
+                continue;
+            }
+            if best.is_none_or(|(_, worst)| reach > worst) {
+                best = Some((at_v_max, reach));
+            }
+        }
+    }
+    Ok(best)
+}
+
+/// A retained face whose INWARD offset skin stops short of a CURVED opening it
+/// meets: `Some((opening face, the gap))`.
+///
+/// The planar case is grown to reach ([`fallshort_opening_reach`]). A curved
+/// opening has no such construction: the wall would have to be the part of that
+/// face between its rim and the offset skin's section with it, and nothing
+/// builds that section when the skin never arrives. Left alone the pipeline
+/// closes the cavity with whatever the completion reaches for — measured on the
+/// hemisphere cup shelled through its DOME by 0.4, a valid single shell of
+/// 16.788671 against 18.164 for the operation's own definition (a 400³ grid
+/// integral of "the source less every point farther than d from a retained
+/// face"), 7.6% short. That is refused by name instead.
+pub(super) fn offset_falls_short_of_curved_opening(
+    source: &BrepSolid,
+    face: &FaceRecord,
+    source_faces: &[&FaceRecord],
+    opening_set: &HashSet<u64>,
+    distance: f64,
+) -> Result<Option<(u64, f64)>, String> {
+    if distance <= 0.0 {
+        return Ok(None);
+    }
+    let band = 2e-3f64.max(crate::solid_scale(source) * 5e-5);
+    let edge_by_id = source
+        .edges
+        .iter()
+        .map(|edge| (edge.id, edge))
+        .collect::<HashMap<_, _>>();
+    let offsets = face_offsets(face);
+    let mut worst: Option<(u64, f64)> = None;
+    for coedge in face.loops.iter().flat_map(|record| &record.coedges) {
+        let Some(edge) = edge_by_id.get(&coedge.edge_id) else {
+            continue;
+        };
+        if edge.degenerate {
+            continue;
+        }
+        let Some((opening, _)) = junction_mate(source_faces, face, coedge.edge_id)
+            .filter(|(mate, _)| opening_set.contains(&mate.id))
+        else {
+            continue;
+        };
+        // GEOMETRIC planarity: a disk from a revolve is a rational patch lying
+        // in a plane, and `is_affine` reads the net, not the geometry.
+        if surface_is_planar(&opening.surface, band)? {
+            continue;
+        }
+        let [p0, p1] = coedge.pcurve.domain()?;
+        for index in 0..=8 {
+            let uv = coedge.pcurve.evaluate(p0 + (p1 - p0) * index as f64 / 8.0)?;
+            let Ok(image) = offsets.at(uv.x, uv.y, -distance) else {
+                continue;
+            };
+            let gap = project_point_to_surface(&opening.surface, image.point)?.distance;
+            if gap > band && worst.is_none_or(|(_, seen)| gap > seen) {
+                worst = Some((opening.id, gap));
+            }
+        }
+    }
+    Ok(worst)
 }
 
 pub(super) fn source_by_id_lookup<'a>(

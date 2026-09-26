@@ -38,6 +38,18 @@ pub(super) fn surface_scale(surface: &NurbsSurface) -> Result<f64, String> {
     Ok(scale.max(1.0))
 }
 
+/// The pcurve fit target for every trim on `surface`.
+///
+/// It must stay INSIDE the validator's pcurve band, whose floor is ABSOLUTE
+/// (4e-3): a purely scale-proportional target lets the fitter stop above the
+/// validation limit on large (BIM-sized) parts even though the locus is
+/// exactly representable.
+pub(super) fn loop_pcurve_tolerance(surface: &NurbsSurface) -> Result<f64, String> {
+    let scale = surface_scale(surface)?;
+    Ok((1e-6 * (1.0 + scale))
+        .min(0.5 * crate::KernelTolerances::for_scale(scale, 1e-7).pcurve_consistency))
+}
+
 /// The on-surface seam ruling between two rim seam-vertices of a periodic
 /// BAND face (see `stitch_seam_circle_loops`). When the two rim circles ride
 /// the SAME seam meridian (constant u) at different v — a toroidal/spherical
@@ -940,6 +952,37 @@ pub(super) fn build_torus(frame: &Frame, major: f64, minor: f64) -> Result<Nurbs
     make_revolution(frame.origin, frame.z, &tube, TAU)
 }
 
+/// How far a STEP conic edge's VERTEX_POINT may sit off the conic the edge is
+/// trimmed on before the edge is refused as mismatched.
+///
+/// The reconstructed endpoint is the vertex PROJECTED onto the conic, so the
+/// miss measured against it is purely the vertex's distance off the ideal
+/// curve. Two regimes are telling it apart: a wrong radius, placement or sense
+/// puts the vertex O(semi-axis) off, hence the relative term; vendor vertex
+/// noise is an ABSOLUTE export-precision quantity that does not shrink with the
+/// arc, hence the floor.
+///
+/// The floor is [`crate::VERTEX_MATCH_FLOOR`] — the band under which
+/// [`crate::BrepSolid::validate`] calls a curve end and its vertex the SAME
+/// point — because that is the miss the kernel accepts as-is for every other
+/// curve type (`heal_imported_edge_endpoints` leaves misses inside it
+/// untouched). Refusing a conic tighter than that refuses geometry the kernel
+/// already validates. It used to be floored at `WELD_FLOOR` (1e-5, the boolean
+/// assembler's weld radius — a different identity question), which left a
+/// small arc with only its relative term: on `raspbery_pi_3.step` body #171923
+/// (`MOLEX_672983090` 'Imported3', face #157815) two r = 0.15 mm fillet arcs
+/// (#78939, #229506) meet a shared-corner vertex that SolidWorks placed 4.13e-4
+/// mm radially off the circle, above the 1.5e-4 mm relative term and a whole
+/// body was refused for a 0.4 µm miss.
+///
+/// A conic miss ABOVE this band is still refused: degree-2 curves are
+/// deliberately excluded from `heal_imported_edge_endpoints` (translating a
+/// rational conic's control points would deform the exact circle), so there is
+/// no heal lane to hand it to.
+fn conic_vertex_band(semi_axis: f64) -> f64 {
+    (semi_axis * 1e-3).max(crate::VERTEX_MATCH_FLOOR)
+}
+
 /// Build a circle (`a == b`) or ellipse arc on `frame`, oriented so
 /// `evaluate(t0) == p_start` and `evaluate(t1) == p_end`. The STEP conic is
 /// parameterised CCW in the placement plane; `same_sense` picks the direction.
@@ -989,20 +1032,17 @@ pub(super) fn build_conic_edge(
     // travels BETWEEN them, never where the endpoints land. So this deviation is
     // purely how far each vertex sits off the ideal conic — genuine CAD
     // modelling noise (the source system placed the vertex, an intersection with
-    // a neighbouring edge, a micron or two off the nominal circle), not a parse
-    // error, and OpenCASCADE imports the same edges without complaint.
+    // a neighbouring edge, a fraction of a micron off the nominal circle), not a
+    // parse error, and OpenCASCADE imports the same edges without complaint.
     //
-    // Accept it with a vertex-identity band: the assembler weld floor
-    // (`WELD_FLOOR`, the kernel's "these two endpoints are the SAME vertex"
-    // radius) size-coupled to the conic's OWN semi-axis. A wrong radius or
-    // placement would put a vertex O(radius) off — orders of magnitude above
-    // this — so a genuinely-mismatched conic is still rejected, while the ~µm
-    // vertex noise that closed loops downstream tolerate anyway is absorbed
-    // rather than aborting the whole solid. The former `1e-6 * (1 + max)` band
-    // degraded to a near-absolute 1e-6 for sub-unit radii, tighter than the
-    // weld floor and than real modelling noise (observed up to ~2.4 µm here).
+    // The band is [`conic_vertex_band`]: a wrong radius or placement puts a
+    // vertex O(radius) off — orders of magnitude above it — so a genuinely
+    // mismatched conic is still rejected, while vertex noise inside the kernel's
+    // own "curve end and vertex are the same point" band is accepted exactly as
+    // it is for every other curve type. The band only GATES: the returned arc is
+    // the same exact conic either way, trimmed at the projected vertices.
     let [t0, t1] = curve.domain()?;
-    let tolerance = (a.max(b) * 1e-3).max(crate::tolerance::WELD_FLOOR);
+    let tolerance = conic_vertex_band(a.max(b));
     if curve.evaluate(t0)?.sub(p_start).length() > tolerance
         || curve.evaluate(t1)?.sub(p_end).length() > tolerance
     {
@@ -1036,7 +1076,7 @@ pub(super) fn build_hyperbola_edge(
         t_start,
         t_end,
         same_sense,
-        (a.max(b) * 1e-3).max(crate::tolerance::WELD_FLOOR),
+        conic_vertex_band(a.max(b)),
         p_start,
         p_end,
         |lo, hi| make_hyperbola(frame.origin, frame.x, frame.y, a, b, lo, hi),
@@ -1066,7 +1106,7 @@ pub(super) fn build_parabola_edge(
         t_start,
         t_end,
         same_sense,
-        (focal * 1e-3).max(crate::tolerance::WELD_FLOOR),
+        conic_vertex_band(focal),
         p_start,
         p_end,
         |lo, hi| make_parabola(frame.origin, frame.x, frame.y, focal, lo, hi),
@@ -1425,12 +1465,7 @@ pub(super) fn euler_genus(solid: &BrepSolid) -> i64 {
         .iter()
         .map(|shell| shell.faces.len() as i64)
         .sum();
-    let hole_count: i64 = solid
-        .shells
-        .iter()
-        .flat_map(|shell| &shell.faces)
-        .map(|face| face.loops.len().saturating_sub(1) as i64)
-        .sum();
+    let hole_count = solid.bounding_hole_count();
     let shell_count = solid.shells.len() as i64;
     // Credit OCC coincident parallel edge pairs exactly like validate() does,
     // so the derived genus matches the Euler check.

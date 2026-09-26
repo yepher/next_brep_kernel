@@ -6,7 +6,10 @@
 //! original implementation: same constraint residual handling, same pass
 //! ordering, same rounding (6 decimals per tidy pass), same distance-target
 //! slide/throttle semantics, and the same convergence check based on point
-//! state signatures.
+//! state signatures. The rounding is the RELAXATION's: a committed (polished)
+//! solve starts its polish from the caller's own digits wherever relaxation
+//! left a coordinate on the grid, so a sketch that already satisfies its
+//! constraints comes back as it was stored rather than snapped.
 //!
 //! Constraints round-trip as JSON objects so that solver bookkeeping fields
 //! (`status`, `error`, `previousPointValues`, `_previousSolveValue`,
@@ -36,8 +39,12 @@
 //!   (horizontal/vertical, distance, point-line distance, equal distance,
 //!   parallel, perpendicular, angle, coincident, point-on-line, midpoint).
 //! - [`constraints_shape`] — point-based shape constraints added in Rust
-//!   (tangent incl. splines, concentric, equal-radius, collinear, symmetric)
-//!   plus their line/spline/circle geometry helpers.
+//!   (tangent incl. splines, spline curvature continuity, concentric,
+//!   equal-radius, collinear, symmetric) plus their line/spline/circle
+//!   geometry helpers.
+//! - [`constraints_foot`] — foot-parameter tangency (`∿`): the stationarity
+//!   solve that eliminates the touch parameter, its per-span roots, the
+//!   residuals and the relaxation nudges.
 //! - [`dof_polish`] — DOF diagnostics (residual atoms, finite-difference
 //!   Jacobian, rank/null-space) and the Levenberg-Marquardt exactness polish.
 //! - [`api`] — implied-duplicate constraint removal and the public
@@ -138,6 +145,15 @@ const CONCENTRIC_TYPE: &str = "◎";
 const EQUAL_RADIUS_TYPE: &str = "⊜";
 const COLLINEAR_TYPE: &str = "⋰";
 const SYMMETRIC_TYPE: &str = "⋈";
+/// Curvature (G2) continuity. The plan's WORKING glyph — the final glyph is
+/// still an open question there, and it is the stored constraint `type`, so
+/// changing it later changes saved documents.
+const SPLINE_CURVATURE_TYPE: &str = "ϰ";
+/// Tangency at a point INTERIOR TO A SPAN — the foot-parameter lane. A separate
+/// type string because `⌒` with a spline pair already MEANS anchor tangency and
+/// this constraint's point list names a spline BODY, not an (anchor, handle)
+/// pair. The plan's working glyph, an open question the same way `ϰ`'s is.
+const SPLINE_FOOT_TANGENT_TYPE: &str = "∿";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum CType {
@@ -155,6 +171,17 @@ enum CType {
     Ground,
     // New point-based constraints (all CAD math lives here in Rust).
     Tangent,
+    /// Curvature (G2) continuity at a spline joint, or between a spline end and
+    /// a circle/arc. Emitted rows always INCLUDE the tangency (G1) the join
+    /// needs, so "curvature continuous" implies "tangent" the way every
+    /// mainstream CAD UX reads it.
+    SplineCurvature,
+    /// Tangency between a spline and a line or circle/arc at a point INTERIOR
+    /// to one of the spline's spans. The touch parameter is not a solver
+    /// unknown: it is eliminated by projection (the foot of the stationarity
+    /// condition) and the residual is evaluated there, so the constraint is one
+    /// row like every other tangency.
+    SplineFootTangent,
     Concentric,
     EqualRadius,
     Collinear,
@@ -178,6 +205,8 @@ fn ctype_from(type_str: &str) -> CType {
         "⋯" => CType::Midpoint,
         "⏚" => CType::Ground,
         TANGENT_TYPE => CType::Tangent,
+        SPLINE_CURVATURE_TYPE => CType::SplineCurvature,
+        SPLINE_FOOT_TANGENT_TYPE => CType::SplineFootTangent,
         CONCENTRIC_TYPE => CType::Concentric,
         EQUAL_RADIUS_TYPE => CType::EqualRadius,
         COLLINEAR_TYPE => CType::Collinear,
@@ -289,6 +318,15 @@ struct HotConstraint {
     /// Number() view of `_linePointDistanceSign` (missing → NaN, null → 0).
     line_sign: f64,
     line_sign_written: bool,
+    /// `_splineFootT`: the foot-parameter tangency's touch point as
+    /// `span + t` in the spline's own chain parameter. The SEED the next solve's
+    /// foot solve starts from and the span index it freezes, so the touch point
+    /// is stable across solves and across the relaxation-only frames an
+    /// interactive drag runs. `None` when the field is absent or not finite —
+    /// which is the FIRST solve of a freshly applied constraint, and is why the
+    /// foot solve has a no-seed path (a coarse scan) at all.
+    foot_t: Option<f64>,
+    foot_t_written: bool,
 }
 
 enum Filter<'a> {
@@ -314,6 +352,14 @@ type CResult = Result<Value, String>;
 
 struct Engine {
     points: Vec<EnginePoint>,
+    /// `point_key` → index into `points`. Built once in [`Engine::new`] and valid
+    /// for the whole solve: a solve moves points and flips their `fixed` flag but
+    /// never adds, removes or renames one. Constraint point lists are resolved
+    /// through it at parse time; the geometry lookups that resolve a control
+    /// point's id DURING the solve (a curvature side's second control, a spline
+    /// body's whole polygon) go through it too, because a linear scan per control
+    /// per pass is quadratic in the sketch.
+    point_index: HashMap<PointKey, usize>,
     geometries: Vec<Value>,
     constraints: Vec<HotConstraint>,
     settings: SketchSolverSettings,
@@ -333,6 +379,8 @@ mod engine;
 mod constraints_basic;
 #[path = "sketch_solver/constraints_shape.rs"]
 mod constraints_shape;
+#[path = "sketch_solver/constraints_foot.rs"]
+mod constraints_foot;
 #[path = "sketch_solver/dof_polish.rs"]
 mod dof_polish;
 #[path = "sketch_solver/api.rs"]
@@ -342,8 +390,14 @@ mod api;
 // Tests
 // ---------------------------------------------------------------------------
 
-// BREP private tests: 27e500795ef801f8
 
+use constraints_foot::{
+    foot_in_span, solve_spline_foot, FootTarget, SpanControls, FOOT_EVAL_MARGIN,
+};
+use constraints_shape::{
+    circle_curvature_residual, circle_curvature_sign, joint_curvature_residual,
+    spline_end_curvature,
+};
 use jsnum::*;
 
 pub use api::{solve_sketch, solve_sketch_from_json};

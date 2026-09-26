@@ -66,6 +66,7 @@ impl Engine {
         }
         Ok(Self {
             points,
+            point_index,
             geometries,
             constraints,
             settings,
@@ -168,6 +169,28 @@ impl Engine {
         self.points[point].y = (x2 - center_x) * sin + (y2 - center_y) * cos + center_y;
     }
 
+    /// A curvature constraint's point list plus the SECOND control point on
+    /// each side — `P₃ᵢ±₂`, read off the spline's own polygon. Those are the
+    /// points its relaxation moves, so they belong to its move signature; see
+    /// the note in [`Engine::process_single_constraint`]. A side that does not
+    /// resolve contributes a `None` slot, which the signature renders as the
+    /// same "null;" a missing constraint point gets.
+    fn curvature_signature_indices(&self, indices: &[Option<usize>]) -> Vec<Option<usize>> {
+        let mut out = indices.to_vec();
+        for (first, second) in [(0usize, 1usize), (2, 3)] {
+            let pair = (
+                indices.get(first).copied().flatten(),
+                indices.get(second).copied().flatten(),
+            );
+            if let (Some(a), Some(b)) = pair {
+                if let Some(side) = self.spline_curvature_side(a, b) {
+                    out.push(side.second);
+                }
+            }
+        }
+        out
+    }
+
     /// `participateInConstraint` from constraintDefinitions.
     pub(super) fn participate_in_constraint(&self, ctype: CType, indices: &[usize]) -> bool {
         self.constraints.iter().any(|c| {
@@ -252,6 +275,8 @@ impl Engine {
                 Ok(Value::Null)
             }
             CType::Tangent => self.c_tangent(constraint, indices),
+            CType::SplineCurvature => self.c_spline_curvature(constraint, indices),
+            CType::SplineFootTangent => self.c_spline_foot_tangent(constraint, indices),
             CType::Concentric => {
                 let a = self.req(indices, 0)?;
                 let b = self.req(indices, 1)?;
@@ -293,11 +318,27 @@ impl Engine {
         // constraint swapped `constraint.points` mid-run. Mirror that by
         // snapshotting the resolved indices here.
         let indices = constraint.point_idx.clone();
+        // The points the "did anything move?" signature has to cover. For every
+        // constraint but one that is exactly its own point list. A CURVATURE
+        // constraint also reads — and nudges — the control point beyond each
+        // handle, derived from the spline's polygon rather than named in the
+        // record: leave those out and a pass that moved only a second control
+        // reads as a pass that changed nothing, which sets `status_solved`, arms
+        // the shortcut below, and freezes the constraint one nudge into its
+        // convergence (measured: it stopped at half the curvature violation).
+        // A FOOT tangency has the same problem for the same reason: its point
+        // list names the spline by its leading pair, and it moves span controls
+        // that pair never mentions.
+        let signature_indices = match constraint.ctype {
+            CType::SplineCurvature => self.curvature_signature_indices(&indices),
+            CType::SplineFootTangent => self.foot_signature_indices(&indices),
+            _ => indices.clone(),
+        };
 
         // `before` signature in bit form; the string is only built when a
         // comparison against an input JSON signature requires it.
         let mut before = std::mem::take(&mut self.sig_scratch_before);
-        Self::fill_signature(&self.points, &indices, &mut before);
+        Self::fill_signature(&self.points, &signature_indices, &mut before);
 
         let same_solve_value = match constraint.prev_solve {
             PrevSolve::Num(previous) => {
@@ -311,7 +352,9 @@ impl Engine {
         if same_solve_value && !distance_slide_pending && constraint.status_solved {
             let signature_matches = match &constraint.prev_points {
                 PrevPoints::Bits(bits, _) => bits.as_slice() == before.as_slice(),
-                PrevPoints::Str(text) => self.signature_string(&indices, &before) == *text,
+                PrevPoints::Str(text) => {
+                    self.signature_string(&signature_indices, &before) == *text
+                }
                 PrevPoints::Missing | PrevPoints::PresentNonString => false,
             };
             if signature_matches {
@@ -330,12 +373,12 @@ impl Engine {
         let swapped_points = constraint.point_idx != indices;
 
         let mut after = std::mem::take(&mut self.sig_scratch_after);
-        Self::fill_signature(&self.points, &indices, &mut after);
+        Self::fill_signature(&self.points, &signature_indices, &mut after);
         constraint.prev_solve = PrevSolve::Num(constraint_value);
         constraint.prev_solve_written = true;
         if before == after {
             constraint.status_solved = true;
-            let text = self.signature_string(&indices, &after);
+            let text = self.signature_string(&signature_indices, &after);
             // After an ∠ point swap the stored bits would no longer line up
             // with the constraint's slots, so keep only the string form (the
             // previous engine compared strings that then simply mismatch).
@@ -442,6 +485,10 @@ impl Engine {
         let cycle_id = GLOBAL_DISTANCE_SOLVE_CYCLE_ID.fetch_add(1, Ordering::SeqCst) + 1;
 
         self.push_implied_temp_constraints()?;
+        // The coordinates as the caller stored them, before the tidy below
+        // rounds them onto the relaxation's six-decimal grid. The polish starts
+        // from these wherever relaxation never moved a coordinate off that grid.
+        let stored: Vec<(f64, f64)> = self.points.iter().map(|p| (p.x, p.y)).collect();
         self.tidy_decimals_of_points(decimals_places, true);
 
         // Ground first, then everything.
@@ -465,6 +512,15 @@ impl Engine {
             Filter::Type(CType::EqualRadius, EQUAL_RADIUS_TYPE),
             Filter::Type(CType::Symmetric, SYMMETRIC_TYPE),
             Filter::Type(CType::Tangent, TANGENT_TYPE),
+            // Curvature AFTER tangency: a `ϰ` carries its own G1 stage, and
+            // running it behind `⌒` lets a sketch that states both on one anchor
+            // settle on the tangent direction first.
+            Filter::Type(CType::SplineCurvature, SPLINE_CURVATURE_TYPE),
+            // Foot-parameter tangency behind both: `∿` states where a curve
+            // TOUCHES something, and running it after the anchor lanes lets a
+            // sketch that states both settle the anchor's direction first — the
+            // same reasoning that put `ϰ` behind `⌒`.
+            Filter::Type(CType::SplineFootTangent, SPLINE_FOOT_TANGENT_TYPE),
             Filter::Type(CType::EqualDistance, "⇌"),
             Filter::Type(CType::Distance, "⟺"),
             Filter::Type(CType::PointLine, POINT_LINE_DISTANCE_TYPE),
@@ -505,7 +561,58 @@ impl Engine {
         // so downstream features receive exact geometry. It runs AFTER the final
         // `tidy` pass and its result is deliberately NOT re-rounded, so the gained
         // precision survives into the emitted points below.
+        //
+        // The tidy also ROUNDS THE INPUT, and the polish cannot recover a digit
+        // it was never given. When relaxation moved NOTHING — every coordinate
+        // is still bit for bit its stored value rounded — the sketch was already
+        // at rest on the grid, and the polish starts from the stored digits
+        // instead. Without that, a sketch already consistent to machine
+        // precision comes out on a DIFFERENT consistent configuration: an arc
+        // drawn through (7, 0), (6, −√3), (5, 0) had −√3 rounded to −1.732051,
+        // its implied equal-radius row read 1.66e-7, and the polish settled on a
+        // circle of radius 2 + 8.3e-8 about a centre 5.6e-8 away — which moved
+        // the thicken-torus-fold-band-full-revolution row 4.0e-6 off a closed
+        // form its lib fixture reads to 1.3e-8.
+        //
+        // All or nothing, never coordinate by coordinate. Once relaxation has
+        // moved a point, it moved it to satisfy a row against its partners'
+        // ROUNDED values, and handing those partners back their stored digits
+        // reopens that row by up to half a grid step: restored per coordinate,
+        // two spline fixtures ended with an anchor 2.1e-7 and 2.5e-7 off its
+        // rim. Such a sketch keeps the grid start it always had.
+        //
+        // The relaxation itself is unchanged, so only the polish's starting
+        // point moves, by at most the grid's half step — inside relaxation's own
+        // floor, which is also why a polish SKIPPED for cost leaves the restored
+        // points standing unpolished without harm. A sketch whose every stored
+        // coordinate is on the grid restores to itself, and so does any sketch
+        // this solver saved: its output rounds back to the grid point it was
+        // polished from.
+        if self.settings.newton_polish {
+            let k = 10f64.powi(decimals_places);
+            let on_grid = |stored: f64, now: f64| {
+                stored.is_finite() && (js_round(stored * k) / k).to_bits() == now.to_bits()
+            };
+            let at_rest = self
+                .points
+                .iter()
+                .zip(&stored)
+                .all(|(point, &(x, y))| on_grid(x, point.x) && on_grid(y, point.y));
+            if at_rest {
+                for (point, (x, y)) in self.points.iter_mut().zip(stored) {
+                    point.x = x;
+                    point.y = y;
+                }
+            }
+        }
         let polish_complete = self.newton_polish();
+
+        // The polish moved the points, so every `∿` constraint's persisted touch
+        // point now describes a configuration that no longer exists. Re-solve the
+        // feet on the configuration the sketch actually ends on, so the seed the
+        // NEXT solve (or the next drag frame) starts from belongs to the geometry
+        // it is emitted beside.
+        self.refresh_spline_foot_seeds();
 
         // Constraint diagnostics (degrees of freedom, over/under status,
         // per-point + per-geometry mobility). Computed on the SOLVED

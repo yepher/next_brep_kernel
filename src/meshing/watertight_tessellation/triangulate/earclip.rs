@@ -430,19 +430,36 @@ pub(super) fn lawson_flips_guarded(
     // it each time dominated the cost of the deeper round budget above.
     let mut sag_memo: HashMap<(usize, usize), f64> = HashMap::new();
     let mut total_flips = 0usize;
+    let _timer = stage_timer(Stage::Flip);
+    // The per-round edge table, rebuilt in place each round. It was a
+    // `HashMap<(usize, usize), Vec<usize>>` plus a sort of its keys, which
+    // allocated one `Vec` per edge and rehashed every corner of every triangle
+    // on every round — 90% of a fine-chord tessellation (2026-09-13 profile:
+    // 57.7 s of 64.4 s over 12 722 rounds). Sorting the corner list gives the
+    // SAME thing without either: the groups come out in ascending edge order,
+    // which is what `edges.sort_unstable()` produced, and each group's triangle
+    // indices come out ascending, which is what pushing them in triangle order
+    // produced. Same edges, same order, same owners.
+    let mut corners: Vec<(usize, usize, usize)> = Vec::with_capacity(triangles.len() * 3);
+    let mut touched: Vec<bool> = Vec::with_capacity(triangles.len());
+    // Protected segments, bucketed once per call — they are boundary vertices,
+    // which no flip or split ever moves.
+    let protected = ProtectedSegments::new(boundary_pairs.iter().copied(), |index| {
+        vertices[index].uv
+    });
     for _ in 0..maximum_rounds {
-        let mut edge_owner: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+        tess_profile(|p| p.flip_rounds += 1);
+        corners.clear();
         for (triangle_index, triangle) in triangles.iter().enumerate() {
             for corner in 0..3 {
                 let a = triangle[corner];
                 let b = triangle[(corner + 1) % 3];
-                edge_owner
-                    .entry((a.min(b), a.max(b)))
-                    .or_default()
-                    .push(triangle_index);
+                corners.push((a.min(b), a.max(b), triangle_index));
             }
         }
-        let mut touched = vec![false; triangles.len()];
+        corners.sort_unstable();
+        touched.clear();
+        touched.resize(triangles.len(), false);
         let mut flipped_any = false;
         // Iterate edges in a DETERMINISTIC (sorted) order, not HashMap order.
         // The per-round `touched` guard makes the chosen flips order-sensitive
@@ -453,14 +470,19 @@ pub(super) fn lawson_flips_guarded(
         // ambiguous ones resolve identically every run — the serial==parallel
         // fingerprint holds even where the curvature-adaptive refinement makes a
         // face dense enough to be cocircular.
-        let mut edges: Vec<(usize, usize)> = edge_owner.keys().copied().collect();
-        edges.sort_unstable();
-        for (a, b) in edges {
-            let owners = &edge_owner[&(a, b)];
+        let mut group = 0usize;
+        while group < corners.len() {
+            let (a, b, _) = corners[group];
+            let mut end = group + 1;
+            while end < corners.len() && corners[end].0 == a && corners[end].1 == b {
+                end += 1;
+            }
+            let owners = &corners[group..end];
+            group = end;
             if boundary_pairs.contains(&(a, b)) || owners.len() != 2 {
                 continue;
             }
-            let (first, second) = (owners[0], owners[1]);
+            let (first, second) = (owners[0].2, owners[1].2);
             if touched[first] || touched[second] {
                 continue;
             }
@@ -529,19 +551,9 @@ pub(super) fn lawson_flips_guarded(
             // near a concave hole rim the empty-circumcircle winner can be a
             // diagonal straight across the hole (boxy frame face: flip
             // diagonals dipped into the bolt holes).
-            let crosses_boundary = boundary_pairs.iter().any(|&(b0, b1)| {
-                if b0 == c || b0 == d || b1 == c || b1 == d {
-                    return false;
-                }
-                segments_properly_cross(
-                    vertices[c].uv,
-                    vertices[d].uv,
-                    vertices[b0].uv,
-                    vertices[b1].uv,
-                    1e-14,
-                )
-            });
-            if crosses_boundary {
+            if !protected.is_empty()
+                && protected.crosses(c, d, |index| vertices[index].uv, 1e-14)
+            {
                 continue;
             }
             triangles[first] = candidates[0];
@@ -550,6 +562,7 @@ pub(super) fn lawson_flips_guarded(
             touched[second] = true;
             flipped_any = true;
             total_flips += 1;
+            tess_profile(|p| p.flips += 1);
         }
         if !flipped_any {
             break;

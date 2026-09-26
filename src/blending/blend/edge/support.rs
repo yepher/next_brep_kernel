@@ -20,8 +20,68 @@ pub(in crate::blend) fn march_open_stations(
     radius_at: &dyn Fn(f64) -> f64,
     overshoot_fraction: f64,
 ) -> Result<(Vec<Station>, [usize; 2]), String> {
+    march_open_stations_ending(
+        edge,
+        first,
+        second,
+        radius_at,
+        overshoot_fraction,
+        [edge.t0, edge.t1],
+        STATIONS,
+        [false, false],
+    )
+}
+
+/// [`march_open_stations`] with the two snapped stations placed at `ends`
+/// instead of at the edge's own vertices.
+///
+/// The snapped stations are where the rows are broken, so they belong where
+/// the blend actually ENDS and the marched data stops being the blend: a
+/// flush join across a seam stops a stripe at the ball seated on the seam,
+/// which is where its side contact runs off its carrier onto the ruled
+/// continuation — the same curvature jump [`fit_open_rows`] breaks at the
+/// vertex for, one section along.  `ends` must lie inside the overshot span.
+///
+/// `poles` marks an end whose section is a POINT ([`pole_end`]): the two mates
+/// are tangent at that vertex from the ball's side, so the ball seated there
+/// touches both at the vertex itself.  The station Newton is singular there —
+/// both offset carriers are tangent, so every column of its Jacobian lies in
+/// one plane — and past it the two contacts cross over, so such an end is
+/// marched with NO overshoot and its station is the pole itself, set from the
+/// edge's own pcurves rather than solved.  Its end must be the edge's vertex.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::blend) fn march_open_stations_ending(
+    edge: &EdgeRecord,
+    first: &BlendMate,
+    second: &BlendMate,
+    radius_at: &dyn Fn(f64) -> f64,
+    overshoot_fraction: f64,
+    ends: [f64; 2],
+    station_count: usize,
+    poles: [bool; 2],
+) -> Result<(Vec<Station>, [usize; 2]), String> {
     let span = edge.t1 - edge.t0;
     let overshoot = span * overshoot_fraction;
+    let [overshoot_before, overshoot_after] =
+        poles.map(|pole| if pole { 0.0 } else { overshoot });
+    // The overshot span, written `span + 2·overshoot` when neither end is a
+    // pole: `(span + o) + o` can round an ulp away from it, and every station
+    // parameter and the section step are read off this, so a march with no
+    // pole stays the march it was to the bit.
+    let marched = if poles == [false, false] {
+        span + 2.0 * overshoot
+    } else {
+        span + overshoot_before + overshoot_after
+    };
+    for (slot, pole) in poles.into_iter().enumerate() {
+        let vertex_t = if slot == 0 { edge.t0 } else { edge.t1 };
+        if pole && ends[slot] != vertex_t {
+            return Err(format!(
+                "blend march: edge {}'s pole end is not at its vertex",
+                edge.id
+            ));
+        }
+    }
     let radius_extent = [0.0, 0.5, 1.0]
         .into_iter()
         .map(|fraction| radius_at(edge.t0 + span * fraction).abs())
@@ -44,7 +104,7 @@ pub(in crate::blend) fn march_open_stations(
     };
     // Seed at the middle (the best-conditioned station), then march
     // outward to both ends so every station is seeded by its neighbour.
-    let mid_index = STATIONS / 2;
+    let mid_index = station_count / 2;
     // Uniform parameters across the overshot span, with the two marched
     // parameters nearest the BLEND ENDS snapped to exactly t0 / t1: the
     // end stations are analytically knowable (the end radius's tangent
@@ -53,13 +113,13 @@ pub(in crate::blend) fn march_open_stations(
     // miter boolean read these row endpoints.  A half-step snap keeps the
     // parameter list strictly increasing.
     let (station_ts, vertex_indices): (Vec<f64>, [usize; 2]) = {
-        let mut ts: Vec<f64> = (0..=STATIONS)
+        let mut ts: Vec<f64> = (0..=station_count)
             .map(|index| {
-                edge.t0 - overshoot + (span + 2.0 * overshoot) * index as f64 / STATIONS as f64
+                edge.t0 - overshoot_before + marched * index as f64 / station_count as f64
             })
             .collect();
         let mut snapped = [0usize; 2];
-        for (slot, target) in [edge.t0, edge.t1].into_iter().enumerate() {
+        for (slot, target) in ends.into_iter().enumerate() {
             let mut nearest = 0usize;
             for (index, t) in ts.iter().enumerate() {
                 if (t - target).abs() < (ts[nearest] - target).abs() {
@@ -72,15 +132,24 @@ pub(in crate::blend) fn march_open_stations(
         (ts, snapped)
     };
     let station_t = |index: usize| station_ts[index];
+    // The section plane at `t` — the extended point and the edge's unit
+    // tangent, the one-sided limit where the parameterization is stationary —
+    // advancing past a stationary open end by the march's own chord
+    // (`march_section`), so the overshoot stations seat the ball's contacts
+    // beyond the vertex instead of on its section plane.
+    let station_step = marched.abs() / station_count as f64;
+    let section_frame = |t: f64| -> Result<(Vec3, Vec3), String> {
+        march_section(edge, t, station_step, "blend march")
+    };
     let solve_at = |t: f64, seed: [f64; 4]| -> Result<[f64; 4], String> {
-        let derivatives = edge.curve.derivatives_extended(t, 1)?;
+        let (section_point, section_tangent) = section_frame(t)?;
         solve_station(
             surface1,
             surface2,
             rho_at(t),
             seed,
-            derivatives[0],
-            derivatives[1].normalized()?,
+            section_point,
+            section_tangent,
             scale,
         )
     };
@@ -90,20 +159,80 @@ pub(in crate::blend) fn march_open_stations(
         let uv2 = edge_uv_on_face(second.coedge, edge, t)?;
         [uv1[0], uv1[1], uv2[0], uv2[1]]
     };
-    let mut solutions = vec![[0.0f64; 4]; STATIONS + 1];
-    solutions[mid_index] = solve_at(station_t(mid_index), mid_seed)?;
+    // A pole's station is the vertex on both mates, read off the edge's own
+    // pcurves: the ball there touches both carriers at the one point.
+    let pole_index = |index: usize| {
+        (poles[0] && index == 0) || (poles[1] && index == station_count)
+    };
+    let pole_solution = |t: f64| -> Result<[f64; 4], String> {
+        let uv1 = edge_uv_on_face(first.coedge, edge, t)?;
+        let uv2 = edge_uv_on_face(second.coedge, edge, t)?;
+        Ok([uv1[0], uv1[1], uv2[0], uv2[1]])
+    };
+    let solve_or_pole = |index: usize, seed: [f64; 4]| -> Result<[f64; 4], String> {
+        if pole_index(index) {
+            pole_solution(station_t(index))
+        } else {
+            solve_at(station_t(index), seed)
+        }
+    };
+    let mut solutions = vec![[0.0f64; 4]; station_count + 1];
+    solutions[mid_index] = solve_or_pole(mid_index, mid_seed)?;
     for index in (0..mid_index).rev() {
-        solutions[index] = solve_at(station_t(index), solutions[index + 1])?;
+        solutions[index] = solve_or_pole(index, solutions[index + 1])?;
     }
-    for index in mid_index + 1..=STATIONS {
-        solutions[index] = solve_at(station_t(index), solutions[index - 1])?;
+    for index in mid_index + 1..=station_count {
+        solutions[index] = solve_or_pole(index, solutions[index - 1])?;
     }
-    let mut stations = Vec::with_capacity(STATIONS + 1);
+    // Does the wall this march would carry FOLD?  Same question the chain and
+    // closed-edge marches ask (`blend/fold.rs`), asked here because this is the
+    // third march in the kernel and the open-edge and network lanes are the two
+    // that reach it.
+    //
+    // Only the stations INSIDE the edge's own domain are measured.  This march
+    // overshoots both ends on extended evaluation, and the centre curve past a
+    // carrier's real extent may turn any way at all — refusing on extrapolated
+    // geometry would refuse walls that build.  `vertex_indices` are the two
+    // stations snapped exactly onto `t0` and `t1`, so they bound the real span.
+    {
+        let probe = |t: f64,
+                     seed: [f64; 4]|
+         -> Result<([f64; 4], Vec3, Vec3, Vec3), String> {
+            let uv = solve_at(t, seed)?;
+            let (section_point, section_tangent) = section_frame(t)?;
+            let (_, p1, p2, center) = tangency_residual(
+                surface1,
+                surface2,
+                rho_at(t),
+                uv,
+                section_point,
+                section_tangent,
+            )?;
+            Ok((uv, p1, p2, center))
+        };
+        let [low, high] = vertex_indices;
+        let (low, high) = (low.min(high), low.max(high));
+        // A pole is not probed: the ball has no seat past it to read a
+        // curvature from, and its section is a point, which cannot fold.
+        let probed: Vec<(f64, [f64; 4])> = (low..=high)
+            .filter(|index| !pole_index(*index))
+            .map(|index| (station_t(index), solutions[index]))
+            .collect();
+        let fold_radius = |t: f64| radius_at(t).abs();
+        crate::blend::fold::check_wall_fold(
+            &fold_radius,
+            span,
+            &probed,
+            &probe,
+            edge,
+            [first.face, second.face],
+            scale,
+        )?;
+    }
+    let mut stations = Vec::with_capacity(station_count + 1);
     for (index, uv) in solutions.iter().enumerate() {
         let t = station_t(index);
-        let derivatives = edge.curve.derivatives_extended(t, 1)?;
-        let section_point = derivatives[0];
-        let section_tangent = derivatives[1].normalized()?;
+        let (section_point, section_tangent) = section_frame(t)?;
         let (_, p1, p2, center) = tangency_residual(
             surface1,
             surface2,
@@ -119,7 +248,14 @@ pub(in crate::blend) fn march_open_stations(
         if weight <= 1e-6 {
             return Err("blend: faces are tangent at a station (α = π)".into());
         }
-        let apex = apex_point(p1, n1, p2, n2, center)?;
+        // At a pole the section is a point, so its tangent lines have no
+        // meeting point of their own: the section's middle control point is
+        // the pole too (a zero-sweep arc).
+        let apex = if pole_index(index) {
+            p1
+        } else {
+            apex_point(p1, n1, p2, n2, center)?
+        };
         stations.push(Station {
             uv1: [uv[0], uv[1]],
             uv2: [uv[2], uv[3]],
@@ -131,6 +267,32 @@ pub(in crate::blend) fn march_open_stations(
         });
     }
     Ok((stations, vertex_indices))
+}
+
+/// Whether the stripe along `edge` runs out into a POLE at its `at_start` end:
+/// its two mates are tangent at that vertex from the side the ball sits on, so
+/// the ball seated there touches both carriers AT the vertex and the blend's
+/// section shrinks to that one point.
+///
+/// This is the end of an edge whose dihedral closes to π along it — the seam
+/// between two rounds that meet where both run tangent into a third face, the
+/// crease of two tangent-meeting blends.  Read as the two offset carriers
+/// meeting at the vertex: `p + ρ·n` on each mate, at the vertex, is one point
+/// within `bar`.  Faces tangent from OPPOSITE sides (a knife edge) put the two
+/// offsets `2ρ` apart and are not a pole.
+pub(in crate::blend) fn pole_end(
+    edge: &EdgeRecord,
+    first: &BlendMate,
+    second: &BlendMate,
+    at_start: bool,
+    bar: f64,
+) -> Result<bool, String> {
+    let t = if at_start { edge.t0 } else { edge.t1 };
+    let uv1 = edge_uv_on_face(first.coedge, edge, t)?;
+    let uv2 = edge_uv_on_face(second.coedge, edge, t)?;
+    let one = blend_offset(&first.face.surface).at(uv1[0], uv1[1], first.rho)?;
+    let two = blend_offset(&second.face.surface).at(uv2[0], uv2[1], second.rho)?;
+    Ok(one.point.sub(two.point).length() <= bar)
 }
 
 /// Clamped open interpolation of the blend rows (no wrap, no seam).
@@ -163,10 +325,108 @@ pub(in crate::blend) fn vertex_stations(
     ])
 }
 
+/// Fit the rows of an open march.
+///
+/// `vertex_indices` are the two stations [`march_open_stations`] snapped onto
+/// the edge's vertices, when the caller has them.  The rows are interpolated
+/// in independent pieces between them and rejoined C0 at those two stations.
+///
+/// # Why the fit breaks at the vertex stations
+///
+/// The march overshoots both ends on `derivatives_extended` and
+/// `evaluate_extended`, which continue a curve along its end TANGENT and a
+/// surface along its boundary TANGENT PLANE.  So on a curved carrier the
+/// stations are a circle (say) up to the vertex station and a straight line
+/// past it: the data is G1 there and its curvature jumps.  One cubic
+/// interpolant through both rings across that jump, and the ringing lands
+/// inside the edge's own span, where the corner closures read the rows.
+/// Measured on the 2026-09-15 report (a sketch arc notch at r = 0.5, 64
+/// stations): the notch stripe's centre row stood 1.9e-4 off tangency one
+/// station inside its vertex against 2e-7 mid-span, a miter seam read against
+/// it left the strip 1.4e-5 past the sharp edge, the geometrically symmetric
+/// corner was built as an asymmetric one with a 1.4e-5 connector, and the
+/// network's result was refused for that connector's fit.  Fitted in pieces
+/// the same row reads 6.1e-7 at its worst and the seam exits on the sharp edge
+/// to 8e-15.
+///
+/// The pieces need `FIT_DEGREE + 1` samples each; a march too short for that
+/// keeps the single fit.
+///
+/// `extrusion` is [`extrusion_direction`] of the edge and its two mates, when
+/// the caller has them: the direction both carriers are invariant along, which
+/// is what makes every section of a constant-radius blend the same section.
+/// How far a fitted rail stands off the carrier it is tangent to, read
+/// BETWEEN the stations it was fitted through.
+///
+/// The rows are a cubic through the march's stations, so at a station the rail
+/// is on its carrier by construction and the reading has to be taken between
+/// them — at 0.25, 0.5 and 0.75 of every span, the fit record's between-station
+/// sampling, the same places [`crate::blend::MARCHED_FIT_OFF_CARRIERS`] reads a
+/// marched seam.
+///
+/// This is the term that decides a filleted solid's volume, and it is not the
+/// one any gate was watching.  Measured on the notched cap 2026-09-16, the
+/// lobe's 305-degree coaxial stripe against its cylinder, by THIS function (3
+/// points per span, in range): 1.419e-6 at 64 stations, where the solid reads
+/// -1.618e-5 against its closed form; 3.534e-7 at 128, -1.723e-6; 3.019e-8 at
+/// 256, -1.127e-6.  The five straight stripes in the same solid read 7e-15 at
+/// every count, because the exact-extrusion lane makes them exact rather than
+/// fitted.
+///
+/// `exact_extrusion_probe closure` reads the same rail as 1.360e-6 / 1.329e-7 /
+/// 6.29e-8, because it samples the TRIMMED edge at 129 evenly spaced points
+/// rather than three per station span.  Same rail, two instruments; the
+/// ladder's numbers are the ones its bar is compared with.
+///
+/// The reading keeps falling as the march refines, so it has no floor worth
+/// naming at these counts; what caps the climb is cost, not the reading
+/// ([`crate::blend::stations::MAX_OPEN_STATIONS`]).
+pub(in crate::blend) fn rails_off_carriers(
+    rows: &FittedRows,
+    parameters: &[f64],
+    carriers: [&NurbsSurface; 2],
+) -> Result<f64, String> {
+    // Only BETWEEN the vertex stations.  The march deliberately overshoots
+    // past both vertices onto the carriers' tangent continuation, so out there
+    // the rail is off the carrier by construction and by a lot -- the notched
+    // cap's seven stripes read 0.14 to 1.4 with the overshoot included, on
+    // stripes whose in-range rails are 7e-15.  That span is not the blend.
+    let [low, high] = match rows.vertex_stations {
+        Some([a, b]) if a < b => [a, b],
+        Some([a, b]) => [b, a],
+        None => [
+            *parameters.first().unwrap_or(&0.0),
+            *parameters.last().unwrap_or(&1.0),
+        ],
+    };
+    let mut worst = 0.0f64;
+    for (rail, surface) in [(&rows.cr, carriers[0]), (&rows.cs, carriers[1])] {
+        for pair in parameters.windows(2) {
+            if pair[1] <= low || pair[0] >= high {
+                continue;
+            }
+            for fraction in [0.25, 0.5, 0.75] {
+                let u = pair[0] + (pair[1] - pair[0]) * fraction;
+                if u < low || u > high {
+                    continue;
+                }
+                let point = rail.evaluate(u)?;
+                let off = crate::project_point_to_surface(surface, point)?.distance;
+                if !worst.is_nan() && (off.is_nan() || off > worst) {
+                    worst = off;
+                }
+            }
+        }
+    }
+    Ok(worst)
+}
+
 pub(in crate::blend) fn fit_open_rows(
     stations: &[Station],
     parameters: &[f64],
     chamfer: bool,
+    vertex_indices: Option<[usize; 2]>,
+    extrusion: Option<Vec3>,
 ) -> Result<FittedRows, String> {
     let mut samples_cr = Vec::new();
     let mut samples_mid = Vec::new();
@@ -197,23 +457,28 @@ pub(in crate::blend) fn fit_open_rows(
     let cs_pcurve = fit::interpolate_homogeneous(&samples_uv2, FIT_DEGREE, parameters)?;
     // Rigidly translated sections admit exact extrusion rows, preserving an
     // analytic carrier instead of approximating it with a cubic fitted surface.
-    if let Some(rows) = exact_extrusion_rows(stations, parameters, chamfer, cr_pcurve.clone(), cs_pcurve.clone())? {
+    if let Some(rows) =
+        exact_extrusion_rows(stations, parameters, chamfer, extrusion, cr_pcurve.clone(), cs_pcurve.clone())?
+    {
         return Ok(rows);
     }
-    let cr = fit::interpolate_homogeneous(&samples_cr, FIT_DEGREE, parameters)?;
-    let cs = fit::interpolate_homogeneous(&samples_cs, FIT_DEGREE, parameters)?;
+    let breaks = row_breaks(stations.len(), vertex_indices);
+    let interpolate = |samples: &[Vec4]| interpolate_in_pieces(samples, parameters, &breaks);
+    let (cr_pcurve, cs_pcurve) = if breaks.is_empty() {
+        (cr_pcurve, cs_pcurve)
+    } else {
+        (interpolate(&samples_uv1)?, interpolate(&samples_uv2)?)
+    };
+    let cr = interpolate(&samples_cr)?;
+    let cs = interpolate(&samples_cs)?;
     let mid = if chamfer {
         None
     } else {
-        Some(fit::interpolate_homogeneous(
-            &samples_mid,
-            FIT_DEGREE,
-            parameters,
-        )?)
+        Some(interpolate(&samples_mid)?)
     };
     let u_domain = cr.domain()?;
     let surface = crate::blend::rows::surface_from_rows(FIT_DEGREE, &cr, &cs, mid.as_ref(), false)?;
-    let center = fit::interpolate_homogeneous(&samples_center, FIT_DEGREE, parameters)?;
+    let center = interpolate(&samples_center)?;
     Ok(FittedRows {
         surface,
         cr,
@@ -227,6 +492,130 @@ pub(in crate::blend) fn fit_open_rows(
     })
 }
 
+/// The interior sample indices the rows break at — the vertex stations that
+/// are not already an end of the march — or none when a piece between them
+/// would be too short to carry the fit degree.
+fn row_breaks(count: usize, vertex_indices: Option<[usize; 2]>) -> Vec<usize> {
+    let Some(indices) = vertex_indices else {
+        return Vec::new();
+    };
+    let mut breaks: Vec<usize> = indices
+        .into_iter()
+        .filter(|&index| index > 0 && index + 1 < count)
+        .collect();
+    breaks.sort_unstable();
+    breaks.dedup();
+    let mut bounds = Vec::with_capacity(breaks.len() + 2);
+    bounds.push(0);
+    bounds.extend(breaks.iter().copied());
+    bounds.push(count.saturating_sub(1));
+    if bounds.windows(2).all(|pair| pair[1] - pair[0] >= FIT_DEGREE) {
+        breaks
+    } else {
+        Vec::new()
+    }
+}
+
+/// Interpolate `samples` at `parameters` as one cubic per piece between the
+/// sample indices in `breaks`, each clamped over its own parameter interval,
+/// joined into one curve with a knot of multiplicity `FIT_DEGREE` at every
+/// break.  Both neighbours interpolate the break sample, so the shared control
+/// point is that sample and the curve passes through it.  No breaks is the
+/// single interpolant.
+fn interpolate_in_pieces(
+    samples: &[Vec4],
+    parameters: &[f64],
+    breaks: &[usize],
+) -> Result<NurbsCurve, String> {
+    if breaks.is_empty() {
+        return fit::interpolate_homogeneous(samples, FIT_DEGREE, parameters);
+    }
+    let mut bounds = Vec::with_capacity(breaks.len() + 2);
+    bounds.push(0);
+    bounds.extend(breaks.iter().copied());
+    bounds.push(samples.len() - 1);
+    let pieces = bounds.len() - 1;
+    let mut knots: Vec<f64> = Vec::new();
+    let mut control: Vec<Vec4> = Vec::new();
+    for (piece, pair) in bounds.windows(2).enumerate() {
+        let (from, to) = (pair[0], pair[1]);
+        let (low, high) = (parameters[from], parameters[to]);
+        // `interpolate_homogeneous` clamps over [0, 1], so each piece is
+        // fitted on its own normalized parameters and its knots mapped back.
+        let local: Vec<f64> = parameters[from..=to]
+            .iter()
+            .map(|parameter| (parameter - low) / (high - low))
+            .collect();
+        let fitted = fit::interpolate_homogeneous(&samples[from..=to], FIT_DEGREE, &local)?;
+        if fitted.degree != FIT_DEGREE {
+            return Err("blend: a row piece is too short for the fit degree".into());
+        }
+        if piece == 0 {
+            knots.extend(std::iter::repeat(low).take(FIT_DEGREE + 1));
+        }
+        let interior = &fitted.knots[FIT_DEGREE + 1..fitted.knots.len() - FIT_DEGREE - 1];
+        knots.extend(interior.iter().map(|knot| low + knot * (high - low)));
+        let multiplicity = if piece + 1 == pieces { FIT_DEGREE + 1 } else { FIT_DEGREE };
+        knots.extend(std::iter::repeat(high).take(multiplicity));
+        control.extend(fitted.control_points.iter().skip(usize::from(piece > 0)).copied());
+    }
+    NurbsCurve::new(FIT_DEGREE, knots, control)
+}
+
+/// The direction a blend along `edge` between these two mates is an
+/// EXTRUSION along, or `None` when the geometry does not say it is one.
+///
+/// It is one when the edge is a straight segment and both carriers are
+/// invariant under translation along it: a plane containing it, or a cylinder
+/// — a `RuledRevolution` whose two radii agree, or a general `Revolution`
+/// (a partial sweep, which is what an extruded sketch arc recognizes as)
+/// whose generatrix is a straight segment parallel to the axis — with its
+/// axis parallel to the edge.  Every comparison is a lateral distance against
+/// the kernel's `model` tolerance, the one `straight_segment` is asked with.
+///
+/// The question is geometric, never the representation's: an edge rejoined
+/// with a redundant pole is still straight, and a quarter cylinder recognized
+/// as a general revolution is still a cylinder.
+pub(in crate::blend) fn extrusion_direction(
+    edge: &EdgeRecord,
+    first: &BlendMate,
+    second: &BlendMate,
+) -> Option<Vec3> {
+    let tolerance = crate::KernelTolerances::for_scale(
+        march_model_scale(&edge.curve, edge.t0, edge.t1, 0.0).ok()?,
+        1e-7,
+    )
+    .model;
+    let (start, end) = edge.curve.straight_segment(tolerance)?;
+    let chord = end.sub(start);
+    let direction = chord.normalized().ok()?;
+    // How far `vector` leans off `axis` (a unit vector) over its own length.
+    let lean = |vector: Vec3, axis: Vec3| vector.sub(axis.scale(vector.dot(axis))).length();
+    let invariant = |mate: &BlendMate| -> Option<()> {
+        match mate.face.surface.analytic()? {
+            crate::AnalyticSurface::Plane { u_dir, v_dir, .. } => {
+                let normal = u_dir.cross(*v_dir).normalized().ok()?;
+                (chord.dot(normal).abs() <= tolerance).then_some(())
+            }
+            crate::AnalyticSurface::RuledRevolution {
+                frame, rho0, rho1, ..
+            } => ((rho1 - rho0).abs() <= tolerance && lean(chord, frame.axis) <= tolerance)
+                .then_some(()),
+            crate::AnalyticSurface::Revolution {
+                frame, generatrix, ..
+            } => {
+                let (from, to) = generatrix.straight_segment(tolerance)?;
+                (lean(to.sub(from), frame.axis) <= tolerance && lean(chord, frame.axis) <= tolerance)
+                    .then_some(())
+            }
+            _ => None,
+        }
+    };
+    invariant(first)?;
+    invariant(second)?;
+    Some(direction)
+}
+
 /// The exact rows of a translational march, or `None` when the stations are
 /// not rigid translates of the first along one direction.
 ///
@@ -236,10 +625,30 @@ pub(in crate::blend) fn fit_open_rows(
 /// to the same bar.  The station solver converges to `1e-11·(1 + scale)`, so
 /// a genuinely straight×planar edge passes with two orders of margin, and a
 /// curved carrier fails by its sagitta at the second station.
+///
+/// # The section weight, and the geometric door
+///
+/// The weight is compared too, to an absolute `1e-12`.  It is not an
+/// independent quantity — it is the cosine of the section's half angle, set by
+/// the contacts and the centre already held to the bar above — and on a curved
+/// carrier the solve does not land it that close: the D-prism's plane ×
+/// cylinder edge (`open_heal_tests::d_prism`) reads every position within
+/// 1.2e-10 of its translate against a 1.2e-8 bar and the weight 6.0e-12 off, so
+/// a straight edge between a plane and a cylinder took the 65-row cubic.
+///
+/// When the caller's `extrusion` says the carriers ARE an extrusion along the
+/// edge, every section is the same section by construction, so the weight is
+/// not asked of the stations: the rows are the FIRST section and that section
+/// translated along the travel, and the stations remain the witness that the
+/// march is one — the positions to the same bar, and the travel along the
+/// extrusion.  A varying radius law fails that witness at its second station.
+/// Without `extrusion`, and wherever the weights do agree, the rows are the
+/// first and last stations as they always were.
 fn exact_extrusion_rows(
     stations: &[Station],
     parameters: &[f64],
     chamfer: bool,
+    extrusion: Option<Vec3>,
     cr_pcurve: NurbsCurve,
     cs_pcurve: NurbsCurve,
 ) -> Result<Option<FittedRows>, String> {
@@ -260,6 +669,7 @@ fn exact_extrusion_rows(
         .fold(0.0f64, |worst, station| worst.max(station.center.length()))
         .max(1.0);
     let bar = 1e-9 * (1.0 + scale);
+    let mut weights_agree = true;
     for (station, parameter) in stations.iter().zip(parameters) {
         let shift = station.center.sub(first.center);
         // Collinear with the travel, at the row parameter's fraction of it.
@@ -272,34 +682,52 @@ fn exact_extrusion_rows(
         if station.p1.sub(translate(first.p1)).length() > bar
             || station.p2.sub(translate(first.p2)).length() > bar
             || station.apex.sub(translate(first.apex)).length() > bar
-            || (station.weight - first.weight).abs() > 1e-12
         {
             return Ok(None);
         }
+        if (station.weight - first.weight).abs() > 1e-12 {
+            weights_agree = false;
+        }
     }
+    // The last row: the last station, or the first section carried along the
+    // travel when only the geometry vouches for the section.
+    let (end, offset) = if weights_agree {
+        (last, Vec3::default())
+    } else {
+        let Some(along) = extrusion else {
+            return Ok(None);
+        };
+        if travel.sub(along.scale(travel.dot(along))).length() > bar {
+            return Ok(None);
+        }
+        (first, travel)
+    };
     // Section along v (z), spine along u: the blend's own convention.
-    let section = |z_index: usize, station: &Station| -> Vec4 {
+    let section = |z_index: usize, station: &Station, offset: Vec3| -> Vec4 {
         match z_index {
-            0 => Vec4::from_point(station.p1, 1.0),
-            1 if !chamfer => Vec4 {
-                x: station.apex.x * station.weight,
-                y: station.apex.y * station.weight,
-                z: station.apex.z * station.weight,
-                w: station.weight,
-            },
-            _ => Vec4::from_point(station.p2, 1.0),
+            0 => Vec4::from_point(station.p1.add(offset), 1.0),
+            1 if !chamfer => {
+                let apex = station.apex.add(offset);
+                Vec4 {
+                    x: apex.x * station.weight,
+                    y: apex.y * station.weight,
+                    z: apex.z * station.weight,
+                    w: station.weight,
+                }
+            }
+            _ => Vec4::from_point(station.p2.add(offset), 1.0),
         }
     };
     let columns = if chamfer { 2 } else { 3 };
     let control = vec![
-        (0..columns).map(|j| section(j, first)).collect::<Vec<_>>(),
-        (0..columns).map(|j| section(j, last)).collect::<Vec<_>>(),
+        (0..columns).map(|j| section(j, first, Vec3::default())).collect::<Vec<_>>(),
+        (0..columns).map(|j| section(j, end, offset)).collect::<Vec<_>>(),
     ];
     let (degree_v, knots_v) = crate::blend::rows::cross_section_basis(chamfer);
     let surface = NurbsSurface::new(1, degree_v, vec![0.0, 0.0, 1.0, 1.0], knots_v, control)?;
-    let cr = crate::make_line(first.p1, last.p1)?;
-    let cs = crate::make_line(first.p2, last.p2)?;
-    let center = crate::make_line(first.center, last.center)?;
+    let cr = crate::make_line(first.p1, end.p1.add(offset))?;
+    let cs = crate::make_line(first.p2, end.p2.add(offset))?;
+    let center = crate::make_line(first.center, end.center.add(offset))?;
     Ok(Some(FittedRows {
         surface,
         cr,
@@ -477,10 +905,28 @@ impl EndPlan {
 /// against: the ids of the two rail edges it created (a network needs them to
 /// insert a miter connector between a rail and the trimmed sharp edge) and
 /// the blend face.
+///
+/// A mate the blend CONSUMED whole is not there any more: the surgery sewed
+/// the blend onto the existing edge its rail retraces and dropped the face
+/// (`detect_row_coincidence`).  `consumed` says so per side, first then
+/// second, and on that side the rail id is that PRE-EXISTING edge rather
+/// than one this stripe created — so no later pass may look the mate up or
+/// treat the rail as new.
+///
+/// A rail that COLLAPSED to a point (its two stops within [`consumed_band`])
+/// has no edge: its id is `None`, and its two rim vertices are one vertex,
+/// listed in `identified` for the orchestrator to merge once every stripe is
+/// in (the other rim may be another stripe's, not yet built).
 pub(in crate::blend) struct SewnStripe {
-    pub(in crate::blend) cr_edge_id: u64,
-    pub(in crate::blend) cs_edge_id: u64,
+    pub(in crate::blend) cr_edge_id: Option<u64>,
+    pub(in crate::blend) cs_edge_id: Option<u64>,
     pub(in crate::blend) blend_face_id: u64,
+    pub(in crate::blend) consumed: [bool; 2],
+    /// The farthest any rail of this stripe was snapped onto an existing
+    /// vertex or edge, for [`check_snap_closure`].
+    pub(in crate::blend) snap: f64,
+    /// Rim vertex pairs a collapsed rail makes one vertex.
+    pub(in crate::blend) identified: Vec<(u64, u64)>,
 }
 
 /// How one of the four rim points of a stripe resolves.
@@ -644,6 +1090,16 @@ pub(in crate::blend) fn resolve_free_end(
 /// `None` when the configuration is not that, and the fitted intersection
 /// applies.  This is what keeps a straight×planar fillet's ends exact to the
 /// mass integrator's bar instead of a cubic's chord error.
+///
+/// The control points go through the plane's own affine chart, UNCLAMPED.  A
+/// section's middle control point is where the tangents at its two contacts
+/// meet; between two planes that is the sharp corner, inside the end face, but
+/// a cylinder's tangent meets the plane's past the corner, and past the end
+/// face's parameter domain once the section turns far enough.  A projection
+/// clamps it back onto the domain and bends the trim: the D-prism's plane ×
+/// cylinder edge at r = 1.5 (a 131.8° section) put the middle control point at
+/// y = 4.47 on a cap whose domain stops at y = 3, and the solid read 2.04 too
+/// light while its blend face kept its exact area.
 fn exact_section_transverse(
     rows: &FittedRows,
     end_face: &FaceRecord,
@@ -653,10 +1109,21 @@ fn exact_section_transverse(
     if !rows.exact_extrusion || (cr_parameter - cs_parameter).abs() > 1e-9 {
         return Ok(None);
     }
-    let Some(crate::AnalyticSurface::Plane { u_dir, v_dir, .. }) = end_face.surface.analytic()
+    let Some(crate::AnalyticSurface::Plane {
+        origin,
+        u_dir,
+        v_dir,
+        u_domain,
+        v_domain,
+    }) = end_face.surface.analytic()
     else {
         return Ok(None);
     };
+    let (a, b, c) = (u_dir.dot(*u_dir), u_dir.dot(*v_dir), v_dir.dot(*v_dir));
+    let determinant = a * c - b * b;
+    if determinant.abs() <= 1e-16 * (a * c).max(1.0) {
+        return Ok(None);
+    }
     let Ok(normal) = u_dir.cross(*v_dir).normalized() else {
         return Ok(None);
     };
@@ -675,11 +1142,13 @@ fn exact_section_transverse(
         crate::sweep_topology::parameter_line(cr_parameter, v0, cr_parameter, v1)?;
     let mut mapped = Vec::with_capacity(section.control_points.len());
     for control in &section.control_points {
-        let point = control.point()?;
-        let projection = crate::project_point_to_surface(&end_face.surface, point)?;
+        let offset = control.point()?.sub(*origin);
+        let (fu, fv) = (u_dir.dot(offset), v_dir.dot(offset));
+        let u = (fu * c - fv * b) / determinant + u_domain[0];
+        let v = (fv * a - fu * b) / determinant + v_domain[0];
         mapped.push(Vec4 {
-            x: projection.u * control.w,
-            y: projection.v * control.w,
+            x: u * control.w,
+            y: v * control.w,
             z: 0.0,
             w: control.w,
         });
@@ -875,12 +1344,10 @@ pub(in crate::blend) fn splice_end_corner(
 /// boundary's trim, keeps its endpoints on the branch it started on.
 ///
 /// Representing what the arc actually wants needs the end face SPLIT along the
-/// blend and the fragments re-classified (slice E₃ of
-/// `docs/developer/kernel-plans/fillet-stripe-network.md` §4); a NURBS
-/// carrier's parameter extension does not wrap, so the loop cannot simply be
-/// unwrapped across the seam.  Until that lands the surgery refuses by name
-/// and the selection routes to the cutter, whose boolean does split crossing
-/// faces.
+/// blend and the fragments re-classified; a NURBS carrier's parameter
+/// extension does not wrap, so the loop cannot simply be unwrapped across the
+/// seam. Until that lands the surgery refuses by name and the selection routes
+/// to the cutter, whose boolean does split crossing faces.
 fn check_loop_branches(surface: &NurbsSurface, coedges: &[CoedgeRecord]) -> Result<(), String> {
     let (closed_u, closed_v) = surface.closed_directions().unwrap_or((false, false));
     if !closed_u && !closed_v {
@@ -918,21 +1385,112 @@ fn check_loop_branches(surface: &NurbsSurface, coedges: &[CoedgeRecord]) -> Resu
     Ok(())
 }
 
+/// The refusal for a blend whose rail runs PAST the far edge of a face it
+/// must lie on, by more than [`consumed_band`] — read at a crossing past the
+/// far vertex (`build_open_surgery`) and along a row that leaves the face
+/// ([`detect_row_coincidence`]).  Not terminal: the r = 10.001 pinch past an
+/// earlier round reads the same way, and the composition's ridge answers it.
+pub(in crate::blend) const BLEND_WIDER_THAN_FACE: &str =
+    "blend: the blend is wider than the face it must lie on —";
+
+/// The refusal for a rail that shrinks to a point where the surgery has no
+/// corner to identify its two rims through.  TERMINAL in the group lane: the
+/// selection is a full-width blend, and the cutter composition's answer to a
+/// full-width corner the network does not build was measured wrong (a 5F/8E/5V
+/// body 8.0e-4 off its closed form at 1e-5 short of the width).
+pub(crate) const RAIL_COLLAPSE_UNSUPPORTED: &str =
+    "blend: a full-width rail collapse is not built here —";
+
 /// How far inside the fitted-row domain a support crossing must land for the
 /// surgery to be able to split the rows there.
 pub(in crate::blend) const RIM_MARGIN: f64 = 2.0e-3;
 
-/// Part-per-extent width of the row ↔ existing-edge coincidence band used by
-/// [`detect_row_coincidence`]: the coincidence must hold to
-/// `heal_band(extent, ROW_COINCIDENCE_REL)` = `max(model, extent · 1e-6)`,
-/// where `extent` is the far-vertex separation the row spans.  Chosen orders
-/// of magnitude ABOVE the march/fit numerics (stations solve to ~1e-11·scale
-/// and the rows interpolate them) and orders BELOW any genuine sliver the
-/// endpoint classifier can admit (the r = 9.999-on-width-10 near miss leaves
-/// a 1e-4-of-extent gap — 100× this band — so it can never be eaten).
-/// Identity/coincidence taxonomy: size-coupled at the site via `heal_band`,
-/// the chartered pattern (geometry/tolerance.rs), never a fat magic band.
-const ROW_COINCIDENCE_REL: f64 = 1e-6;
+/// The ONE band that decides whether a blend consumes a support face whole:
+/// a rail that comes within it of an existing edge is snapped onto that edge,
+/// and a rail that stops further short keeps the strip between them as a face.
+///
+/// Both sides of that choice have a kernel number, and the band is set from
+/// them rather than picked:
+///
+/// * NOT snapping must not build a face narrower than the solid's own
+///   [`crate::KernelTolerances::sliver`] — the width below which a feature is a
+///   sliver to be repaired, not a face.  So the band is at least that.
+/// * Snapping must not leave the shell over its closure bar: a rail snapped
+///   across δ leaves its trims δ off the edge they were sewn onto, and
+///   [`crate::shell_vector_areas`] allows each trim the refinement floor.
+///   That limit depends on the SHAPE (the snapped length against the whole
+///   shell's edge length), so it is not read into the band; it is measured on
+///   the result by [`check_snap_closure`], and a snap that breaks it refuses.
+///
+/// Three sites ask the question and all three read this band, because any gap
+/// between them is a shape the kernel builds wrong without refusing.  Measured
+/// 2026-09-17 on a 20-cube's top-front edge, when the endpoint classifier in
+/// `build_open_surgery` read `1e-6·(1 + boundary length)` and
+/// [`detect_row_coincidence`] read `max(1e-7, 1e-6·far-vertex separation)`:
+/// at r = 20.00002 the ends were consumed (2e-5 ≤ 2.1e-5) and the row was not
+/// (2e-5 > 2e-5), so both boundary edges were deleted AND a fresh rail was
+/// built coincident with the far edge — a zero-width face, 6F/10E/6V, that
+/// `validate()` passes.  The third site is `check_support_extent`
+/// (`fillet/analyze.rs`), which refuses a blend wider than its face: a
+/// refusal slack WIDER than this band admits a rail that runs past the face
+/// and is neither snapped nor refused (7F/11E/6V at r = 20.0000001 with a
+/// 1e-7 snap band and the old slack, and no detector flags it).
+///
+/// That old `1e-6·extent` band was 2.1e-5 on the 20-cube, fifty times the
+/// sliver tolerance, and every snap in the upper part of it built a shell over
+/// its bar: 2.8e-4 against 2.0e-5 at 1e-5 short of the width, identical on
+/// the base commit through the cutter composition's lane.
+pub(crate) fn consumed_band(solid: &BrepSolid) -> f64 {
+    crate::KernelTolerances::for_solid(solid, 1e-7).sliver
+}
+
+/// The refusal for a snap that breaks the shell's closure — see
+/// [`check_snap_closure`].
+pub(crate) const CONSUMED_SNAP_UNSOUND: &str =
+    "blend: the blend is within a sliver of its face's width without matching it";
+
+/// Accept a body whose rails were snapped across `snap` only while its shells
+/// still close: a snap is a trim moved off the edge it claims, and a shell
+/// whose trims no longer enclose zero vector area is a wrong body that
+/// `validate()` passes.  A snap inside the refinement floor is exactly what
+/// every trim is allowed, so it is not measured.
+///
+/// Refusing here is a statement about the WINDOW between the two rules of
+/// [`consumed_band`]: this rail is too close to the far edge to keep the strip
+/// as a face (narrower than the sliver tolerance) and too far to be snapped
+/// onto it soundly on this shape.  The input is measured only when the result
+/// fails, so a body that arrived already open is not blamed on the snap.
+pub(in crate::blend) fn check_snap_closure(
+    input: &BrepSolid,
+    result: &BrepSolid,
+    snap: f64,
+) -> Result<(), String> {
+    if !(snap > crate::pcurve::PCURVE_REFINEMENT_TOLERANCE) {
+        return Ok(());
+    }
+    let report = crate::shell_vector_areas(result);
+    if !report.is_flagged() && report.unreadable.is_empty() {
+        return Ok(());
+    }
+    if crate::shell_vector_areas(input).is_flagged() {
+        return Ok(());
+    }
+    let (residual, bar) = report
+        .worst_shell()
+        .map_or((f64::NAN, f64::NAN), |shell| (shell.residual(), shell.bar));
+    Err(format!(
+        "{CONSUMED_SNAP_UNSOUND} — its rail ends {snap:.3e} from the face's far edge, inside \
+         the {:.3e} sliver band, so the strip between them is no face; and snapped onto that \
+         edge, the shell's trims close to {residual:.3e} against a bar of {bar:.3e}{}. Make \
+         the size the width, or move it away from the width by more than the band",
+        consumed_band(input),
+        if report.unreadable.is_empty() {
+            String::new()
+        } else {
+            format!(" ({} faces unreadable)", report.unreadable.len())
+        }
+    ))
+}
 
 /// A detected full-span coincidence of a blend support row with an EXISTING
 /// mate-face boundary edge (OCCT PR #1449 lesson 3, the r = face-width
@@ -949,6 +1507,9 @@ pub(in crate::blend) struct RowSew {
     /// Lesson-7 leftovers of the collapsing loop: zero-span edges wholly
     /// owned by the dropped face, collapsed (deleted) with it.
     pub(in crate::blend) collapsed_edges: Vec<u64>,
+    /// The largest distance from the row to the edge it was sewn onto: how
+    /// far the snap moved the rail.
+    pub(in crate::blend) deviation: f64,
 }
 
 /// Detect that the trimmed support `row` coincides with an existing boundary
@@ -969,8 +1530,9 @@ pub(in crate::blend) struct RowSew {
 ///   coedge will carry — sampled in 3D, the exact metric `validate`'s
 ///   `adaptive_coedge_error` measures (the pr1449 doc sketches this check in
 ///   the mate's UV space; 3D avoids the anisotropic UV-metric conversion and
-///   validates the true downstream contract) — within the tolerance-derived
-///   [`ROW_COINCIDENCE_REL`] band, with the OPPOSITE map refused;
+///   validates the true downstream contract) — within `band`, the
+///   [`consumed_band`] the caller classified both ends against, with the
+///   OPPOSITE map refused;
 /// * relative orientation (the parameter-delta sign of the matching map)
 ///   agrees with the vertex correspondence, with the dropped face's own use
 ///   of the edge, and with exactly one opposing use by the surviving
@@ -988,6 +1550,7 @@ pub(in crate::blend) fn detect_row_coincidence(
     finish_far_vertex: u64,
     row: &NurbsCurve,
     row_traversed_from_start: bool,
+    band: f64,
 ) -> Result<Option<RowSew>, String> {
     if !(start_consumed && finish_consumed) {
         return Ok(None);
@@ -1045,8 +1608,6 @@ pub(in crate::blend) fn detect_row_coincidence(
         return Ok(None);
     };
     let extent = finish_point.sub(start_point).length();
-    let tolerances = crate::KernelTolerances::for_solid(solid, 1e-7);
-    let band = tolerances.heal_band(extent, ROW_COINCIDENCE_REL);
     if extent <= band * 4.0 {
         // Far vertices too close to discriminate orientation — ambiguous.
         return Ok(None);
@@ -1055,7 +1616,17 @@ pub(in crate::blend) fn detect_row_coincidence(
     // affine map (the parameter-delta sign) and the manifold senses.
     let aligned = target.start_vertex_id == start_far_vertex;
     let [row_t0, row_t1] = row.domain()?;
+    // Which way is INTO the face from the far edge: toward the blended edge.
+    // A row that leaves the band on the other side runs outside its face —
+    // both ends read consumed only because each end's crossing is clamped to
+    // the far vertex, and the pristine path would build a lens face between
+    // the rail and the edge where the part has no material at all
+    // (7F/11E/6V at r = 20.0000008 on a 20-cube, closure clean).
+    let blended_middle = edge_by_id(blended_edge_id)
+        .map(|blended| blended.curve.evaluate(0.5 * (blended.t0 + blended.t1)))
+        .transpose()?;
     const ROW_COINCIDENCE_SAMPLES: usize = 16;
+    let mut deviation = 0.0f64;
     for sample in 0..=ROW_COINCIDENCE_SAMPLES {
         let fraction = sample as f64 / ROW_COINCIDENCE_SAMPLES as f64;
         let on_row = row.evaluate(row_t0 + (row_t1 - row_t0) * fraction)?;
@@ -1063,9 +1634,20 @@ pub(in crate::blend) fn detect_row_coincidence(
         let on_edge = target
             .curve
             .evaluate(target.t0 + (target.t1 - target.t0) * edge_fraction)?;
-        if on_row.sub(on_edge).length() > band {
+        let gap = on_row.sub(on_edge).length();
+        if gap > band {
+            let outside = blended_middle
+                .is_some_and(|middle| on_row.sub(on_edge).dot(middle.sub(on_edge)) < 0.0);
+            if outside {
+                return Err(format!(
+                    "{BLEND_WIDER_THAN_FACE} its rail runs {gap:.3e} past face {}'s far edge \
+                     {} (more than the {band:.3e} it can be snapped across), outside the face",
+                    mate.face.id, target.id
+                ));
+            }
             return Ok(None);
         }
+        deviation = deviation.max(gap);
     }
     // The OPPOSITE map must NOT also fit — a both-ways match means the edge
     // is degenerate at this band and orientation is ambiguous.
@@ -1142,6 +1724,7 @@ pub(in crate::blend) fn detect_row_coincidence(
         edge_id: target.id,
         forward,
         collapsed_edges: leftovers,
+        deviation,
     }))
 }
 
@@ -1536,13 +2119,24 @@ pub(in crate::blend) fn transverse_curve(
     let mut blend_uv = Vec::with_capacity(SECTIONS + 1);
     let mut end_uv: Vec<[f64; 2]> = Vec::with_capacity(SECTIONS + 1);
     let mut parameters = Vec::with_capacity(SECTIONS + 1);
+    // The curve is ONE branch of the end carrier: after the first section every
+    // foot continues from the last one found — the previous section's, the
+    // previous iterate's, and for the difference quotient the iterate's own —
+    // so the level the Newton differences is the distance to that sheet, and no
+    // sample of the end pcurve is the nearest point of another.
+    let project = |point: Vec3, seed: Option<[f64; 2]>| match seed {
+        None => crate::project_point_to_surface(&end_face.surface, point),
+        Some(seed) => crate::projection::project_point_to_surface_from_seed(&end_face.surface, point, seed),
+    };
     for section in 0..=SECTIONS {
         let z = section as f64 / SECTIONS as f64;
         let mut t = cr_parameter + (cs_parameter - cr_parameter) * z;
+        let mut foot = end_uv.last().copied();
         if section > 0 && section < SECTIONS {
             for _ in 0..NEWTON_ITERATIONS {
                 let point = rows.surface.evaluate_extended(t, z)?;
-                let projection = crate::project_point_to_surface(&end_face.surface, point)?;
+                let projection = project(point, foot)?;
+                foot = Some([projection.u, projection.v]);
                 let normal = raw_normal(&end_face.surface, projection.u, projection.v)?;
                 let distance = point.sub(projection.point).dot(normal);
                 if distance.abs() <= 1e-11 {
@@ -1550,7 +2144,7 @@ pub(in crate::blend) fn transverse_curve(
                 }
                 let step = 1e-7;
                 let probe = rows.surface.evaluate_extended(t + step, z)?;
-                let probe_projection = crate::project_point_to_surface(&end_face.surface, probe)?;
+                let probe_projection = project(probe, foot)?;
                 let probe_distance = probe.sub(probe_projection.point).dot(raw_normal(
                     &end_face.surface,
                     probe_projection.u,
@@ -1564,7 +2158,7 @@ pub(in crate::blend) fn transverse_curve(
             }
         }
         let point = rows.surface.evaluate_extended(t, z)?;
-        let projection = crate::project_point_to_surface(&end_face.surface, point)?;
+        let projection = project(point, foot)?;
         points3.push(Vec4::from_point(point, 1.0));
         blend_uv.push(Vec4::from_point(Vec3::new(t, z, 0.0), 1.0));
         end_uv.push([projection.u, projection.v]);
@@ -1665,6 +2259,18 @@ pub(in crate::blend) fn trim_edge_at(
     if !interior && !extends {
         return Err("blend: end trim degenerates the boundary edge".into());
     }
+    if extends {
+        let curved = solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .flat_map(|face| &face.loops)
+            .flat_map(|loop_record| &loop_record.coedges)
+            .any(|coedge| coedge.edge_id == edge_id && coedge.pcurve.degree != 1);
+        if curved {
+            return extend_edge_on_carriers(solid, edge_id, parameter, old_vertex, new_vertex);
+        }
+    }
     for shell in &mut solid.shells {
         for face in &mut shell.faces {
             for loop_record in &mut face.loops {
@@ -1721,6 +2327,242 @@ pub(in crate::blend) fn trim_edge_at(
     } else {
         edge.t1 = parameter;
         edge.end_vertex_id = new_vertex;
+    }
+    Ok(())
+}
+
+/// Stations per original edge span, and per extension, of the refit in
+/// [`extend_edge_on_carriers`].
+const EXTENSION_REFIT_SAMPLES: usize = 96;
+const EXTENSION_SAMPLES: usize = 8;
+
+/// The §6.9 EXTEND on a CURVED boundary: the edge continues past `old_vertex`
+/// to `new_vertex` along the intersection of the two faces it bounds, and its
+/// curve and both pcurves are refitted over the extended range.
+///
+/// # Why the intersection, and not the curve's own continuation
+/// A boundary is where its two carriers meet, so that is the only curve its
+/// continuation can be: a cone's rim runs on round the cone, not along its end
+/// tangent (whose departure is `½·d²·κ` — 4e-4 over the 0.08 a concave r = 0.1
+/// blend's rail runs past a radius-7.4 rim), and a pcurve extrapolated in
+/// parameter space leaves its surface image the same way. So every extension
+/// point is SOLVED on both carriers, Newton on the two faces' (u, v) with the
+/// point held in a plane across the chord, and the pcurves take the solved
+/// parameters; the original span is resampled from the edge as it stands.
+///
+/// Only a boundary whose pcurves are not straight lines comes here: a straight
+/// one extends exactly by moving its end control point, as before.
+fn extend_edge_on_carriers(
+    solid: &mut BrepSolid,
+    edge_id: u64,
+    parameter: f64,
+    old_vertex: u64,
+    new_vertex: u64,
+) -> Result<(), String> {
+    let edge = solid
+        .edges
+        .iter()
+        .find(|edge| edge.id == edge_id)
+        .ok_or("blend: edge to extend is missing")?
+        .clone();
+    let trims_start = edge.start_vertex_id == old_vertex;
+    let target = solid
+        .vertices
+        .iter()
+        .find(|vertex| vertex.id == new_vertex)
+        .ok_or("blend: the extended boundary's new vertex is missing")?
+        .point;
+    // The two faces the boundary bounds, with their coedges' pcurves.
+    let mut uses: Vec<(u64, CoedgeRecord)> = Vec::new();
+    for face in solid.shells.iter().flat_map(|shell| &shell.faces) {
+        for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+            if coedge.edge_id == edge_id {
+                uses.push((face.id, coedge.clone()));
+            }
+        }
+    }
+    let [(face_a, coedge_a), (face_b, coedge_b)] = <[(u64, CoedgeRecord); 2]>::try_from(uses)
+        .map_err(|uses| {
+            format!(
+                "blend: cannot extend boundary edge {edge_id} along its carriers — it is used \
+                 {} times, not twice",
+                uses.len()
+            )
+        })?;
+    let surface_of = |face_id: u64| {
+        solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .find(|face| face.id == face_id)
+            .map(|face| face.surface.clone())
+            .ok_or("blend: a face of the extended boundary is missing")
+    };
+    let (surface_a, surface_b) = (surface_of(face_a)?, surface_of(face_b)?);
+    let (t0, t1) = (edge.t0, edge.t1);
+    // A pcurve read at an EDGE parameter of the original range, honouring the
+    // affine traversal contract.
+    let uv_at = |coedge: &CoedgeRecord, t: f64| -> Result<[f64; 2], String> {
+        let point = edge_uv_on_face(coedge, &edge, t)?;
+        Ok(point)
+    };
+    let end_t = if trims_start { t0 } else { t1 };
+    let end_point = edge.curve.evaluate(end_t)?;
+    let chord = target.sub(end_point);
+    let reach = chord.length();
+    let direction = chord
+        .normalized()
+        .map_err(|_| "blend: the boundary extension has no length".to_string())?;
+    let scale = target.length().max(end_point.length()).max(1.0);
+    let tolerance = 1e-11 * (1.0 + scale);
+    // March the carriers' intersection from the old end to the new vertex.
+    let mut seed = {
+        let a = uv_at(&coedge_a, end_t)?;
+        let b = uv_at(&coedge_b, end_t)?;
+        [a[0], a[1], b[0], b[1]]
+    };
+    let mut extension: Vec<(f64, Vec3, [f64; 4])> = Vec::with_capacity(EXTENSION_SAMPLES);
+    for step in 1..=EXTENSION_SAMPLES {
+        let fraction = step as f64 / EXTENSION_SAMPLES as f64;
+        let level = reach * fraction;
+        let mut x = seed;
+        let mut solved = None;
+        for _ in 0..NEWTON_ITERATIONS {
+            let da = surface_a.derivatives_extended(x[0], x[1], 1)?;
+            let db = surface_b.derivatives_extended(x[2], x[3], 1)?;
+            let mismatch = da[0][0].sub(db[0][0]);
+            let plane = da[0][0].sub(end_point).dot(direction) - level;
+            if mismatch.length() <= tolerance && plane.abs() <= tolerance {
+                solved = Some(da[0][0]);
+                break;
+            }
+            let matrix = [
+                [da[1][0].x, da[0][1].x, -db[1][0].x, -db[0][1].x],
+                [da[1][0].y, da[0][1].y, -db[1][0].y, -db[0][1].y],
+                [da[1][0].z, da[0][1].z, -db[1][0].z, -db[0][1].z],
+                [da[1][0].dot(direction), da[0][1].dot(direction), 0.0, 0.0],
+            ];
+            let delta = fit::solve_small::<4>(
+                matrix,
+                [mismatch.x, mismatch.y, mismatch.z, plane],
+                4,
+            )
+            .map_err(|error| {
+                format!(
+                    "blend: the carriers of boundary edge {edge_id} do not cross transversally \
+                     where it must extend ({error})"
+                )
+            })?;
+            for (value, correction) in x.iter_mut().zip(delta) {
+                *value -= correction;
+            }
+        }
+        let point = solved.ok_or_else(|| {
+            format!(
+                "blend: the carriers' intersection could not be followed along boundary edge \
+                 {edge_id} to the blend"
+            )
+        })?;
+        let t = end_t + (parameter - end_t) * fraction;
+        extension.push((t, point, x));
+        seed = x;
+    }
+    // The last solved point is the carriers' own crossing of the plane through
+    // the new vertex, which sits on that crossing to the rail's fit.
+    let arrival = extension
+        .last()
+        .map(|(_, point, _)| point.sub(target).length())
+        .unwrap_or(f64::INFINITY);
+    let bar = crate::KernelTolerances::for_solid(solid, 1e-7).pcurve_consistency;
+    if arrival > bar {
+        return Err(format!(
+            "blend: boundary edge {edge_id} extended along its carriers arrives {arrival:.3e} \
+             from the blend's rim"
+        ));
+    }
+    // Every sample over the new range, in increasing edge parameter.
+    let mut samples: Vec<(f64, Vec3, [f64; 2], [f64; 2])> =
+        Vec::with_capacity(EXTENSION_REFIT_SAMPLES + EXTENSION_SAMPLES + 1);
+    for index in 0..=EXTENSION_REFIT_SAMPLES {
+        let t = t0 + (t1 - t0) * index as f64 / EXTENSION_REFIT_SAMPLES as f64;
+        samples.push((
+            t,
+            edge.curve.evaluate(t)?,
+            uv_at(&coedge_a, t)?,
+            uv_at(&coedge_b, t)?,
+        ));
+    }
+    for (t, point, x) in extension {
+        samples.push((t, point, [x[0], x[1]], [x[2], x[3]]));
+    }
+    samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let (new_t0, new_t1) = if trims_start {
+        (parameter, t1)
+    } else {
+        (t0, parameter)
+    };
+    let parameters: Vec<f64> = samples.iter().map(|sample| sample.0).collect();
+    if parameters.windows(2).any(|pair| pair[1] <= pair[0]) {
+        return Err(format!(
+            "blend: boundary edge {edge_id} extends in the wrong direction"
+        ));
+    }
+    let curve = fit::interpolate_curve(
+        &samples.iter().map(|sample| sample.1).collect::<Vec<_>>(),
+        3,
+        &parameters,
+    )?;
+    // Each pcurve keeps its own domain and the affine contract over the NEW
+    // edge range.
+    let refit = |coedge: &CoedgeRecord, side: usize| -> Result<NurbsCurve, String> {
+        let [q0, q1] = coedge.pcurve.domain()?;
+        let mut pairs: Vec<(f64, Vec3)> = samples
+            .iter()
+            .map(|sample| {
+                let fraction = (sample.0 - new_t0) / (new_t1 - new_t0);
+                let q = if coedge.forward {
+                    q0 + (q1 - q0) * fraction
+                } else {
+                    q1 - (q1 - q0) * fraction
+                };
+                let uv = if side == 0 { sample.2 } else { sample.3 };
+                (q, Vec3::new(uv[0], uv[1], 0.0))
+            })
+            .collect();
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        fit::interpolate_curve(
+            &pairs.iter().map(|pair| pair.1).collect::<Vec<_>>(),
+            3,
+            &pairs.iter().map(|pair| pair.0).collect::<Vec<_>>(),
+        )
+    };
+    let pcurve_a = refit(&coedge_a, 0)?;
+    let pcurve_b = refit(&coedge_b, 1)?;
+    for shell in &mut solid.shells {
+        for face in &mut shell.faces {
+            for loop_record in &mut face.loops {
+                for coedge in &mut loop_record.coedges {
+                    if coedge.id == coedge_a.id {
+                        coedge.pcurve = pcurve_a.clone();
+                    } else if coedge.id == coedge_b.id {
+                        coedge.pcurve = pcurve_b.clone();
+                    }
+                }
+            }
+        }
+    }
+    let record = solid
+        .edges
+        .iter_mut()
+        .find(|edge| edge.id == edge_id)
+        .ok_or("blend: edge to extend is missing")?;
+    record.curve = curve;
+    record.t0 = new_t0;
+    record.t1 = new_t1;
+    if trims_start {
+        record.start_vertex_id = new_vertex;
+    } else {
+        record.end_vertex_id = new_vertex;
     }
     Ok(())
 }

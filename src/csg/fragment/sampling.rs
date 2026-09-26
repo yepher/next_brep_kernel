@@ -74,6 +74,10 @@ pub(super) fn sample_chain(curve: &NurbsCurve) -> Result<Vec<Vec2>, KernelRefusa
 /// no point is moved, merged or snapped — capped defensively (best-effort:
 /// hitting the cap leaves the chain no worse than the unrefined sampling).
 /// Escape hatch: BREP_CHAIN_SAG_REFINE=0 restores the raw uniform sampling.
+/// Turning it off costs three known outcomes, not one: boolean `fixture_21`,
+/// plus corpus rows `AnotherOffsetShellProblem2` and `BadBoolean` (both
+/// `success` -> `refused` in the offset shell's watertight close), measured by
+/// the 2026-09-16 coarseness census.
 ///
 /// Returns the refined points plus a parallel flag vector marking which points
 /// belong to the ORIGINAL sampling (`true`) versus refinement insertions

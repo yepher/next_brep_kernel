@@ -20,8 +20,8 @@ pub mod transform_bake;
 // Construction geometry and editable curves.
 pub mod datum;
 pub mod helix;
-pub mod port;
 pub mod spline;
+pub mod waypoint;
 pub mod face_profile;
 pub mod plane;
 pub mod sketch;
@@ -51,6 +51,7 @@ pub mod offset_face;
 pub mod offset_shell;
 pub mod push_face;
 pub mod thicken;
+pub mod transform_face;
 
 // Imported geometry and sheet metal.
 pub mod import3d;

@@ -4,7 +4,9 @@
 //! Semantics:
 //!
 //! - `inputParams.face` — a `reference_selection` (FACE names), `multiple`.
-//!   Each selected face thickens into its OWN solid.
+//!   Each selected face thickens into its OWN solid — or into SEVERAL, when a
+//!   fold band across its trim is dropped and leaves a regular piece on either
+//!   side of the band.
 //! - `inputParams.distance` — the signed thickness along the face normal; NaN / 0
 //!   is a soft no-op.
 //!
@@ -23,7 +25,8 @@
 //! Naming (contract rule 2): a single selected face
 //! names its solid `${featureId}`; with N > 1 faces each is
 //! `${featureId}_${index:0width}_${sanitize(sourceFaceName)}` (width =
-//! max(2, digits(N))). Per-face BUILD failures are collected and the feature
+//! max(2, digits(N))).  A face that thickens into MORE THAN ONE body suffixes
+//! each with `_${piece:0width}` on top of that, off the same rule. Per-face BUILD failures are collected and the feature
 //! hard-errors ONLY if NOTHING thickened; a
 //! reference miss records `unresolved` (contract rule 1) and is skipped.
 //!
@@ -81,17 +84,35 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
             feature_id.clone()
         };
         match thicken_face(face.handle, face.face_id, distance) {
-            Ok(solid) => {
-                let face_names = common::collect_face_names(&solid);
-                let edge_names = common::collect_edge_names(&solid);
-                let handle = crate::register_solid_value(solid);
-                result.added.push(AddedSolid {
-                    handle,
-                    name: result_name,
-                    face_names,
-                    edge_names,
-                    ..AddedSolid::default()
-                });
+            Ok(bodies) => {
+                // ONE face can thicken into more than one body: a fold BAND
+                // across its trim is dropped and the regular piece on either
+                // side of the band is its own slab, sharing no edge with the
+                // other. They are numbered off the same `_{index:0width}` shape
+                // the multi-FACE rule uses, so a document that selected one face
+                // and got two bodies still names them predictably.
+                let bodies_width = bodies.len().to_string().len().max(2);
+                let split = bodies.len() > 1;
+                for (piece, solid) in bodies.into_iter().enumerate() {
+                    let face_names = common::collect_face_names(&solid);
+                    let edge_names = common::collect_edge_names(&solid);
+                    let handle = crate::register_solid_value(solid);
+                    result.added.push(AddedSolid {
+                        handle,
+                        name: if split {
+                            format!(
+                                "{result_name}_{:0>width$}",
+                                piece + 1,
+                                width = bodies_width
+                            )
+                        } else {
+                            result_name.clone()
+                        },
+                        face_names,
+                        edge_names,
+                        ..AddedSolid::default()
+                    });
+                }
             }
             Err(error) => failures.push(format!("{face_name}: {error}")),
         }
@@ -133,7 +154,7 @@ fn sanitize_token(value: &str) -> String {
 }
 
 /// Thicken one face (by resident handle + face id) into a slab solid.
-fn thicken_face(handle: u32, face_id: u64, distance: f64) -> Result<BrepSolid, String> {
+fn thicken_face(handle: u32, face_id: u64, distance: f64) -> Result<Vec<BrepSolid>, String> {
     crate::with_registered_solid_str(handle, |solid| {
         let face = solid
             .shells
@@ -247,4 +268,3 @@ pub fn schema() -> serde_json::Value {
 })
 }
 
-// BREP private tests: e29dc9fa086e311a

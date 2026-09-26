@@ -20,8 +20,6 @@ use crate::{
     Vec3,
 };
 
-/// Zero gate for direction tests (unit vectors).
-pub const PARALLEL_EPS: f64 = 1e-9;
 
 pub fn v3(a: [f64; 3]) -> Vec3 {
     Vec3::new(a[0], a[1], a[2])

@@ -59,6 +59,12 @@ pub use exports::{
     assembly_remove_constraint_json, assembly_run_solve_json,
     assembly_set_constraint_enabled_json, assembly_set_constraint_open_json,
     assembly_state_json, assembly_statuses_json, assembly_update_constraint_json,
+    // The native doors: the same mutations with their errors as text. A native
+    // caller must use these — a `JsValue` error aborts a native build.
+    assembly_add_constraint_impl, assembly_apply_document_impl, assembly_move_constraint_impl,
+    assembly_remove_constraint_impl, assembly_run_solve_impl,
+    assembly_set_constraint_enabled_impl, assembly_set_constraint_open_impl,
+    assembly_update_constraint_impl,
 };
 pub use constraints::{
     constraint_schema_catalogue, constraint_type, ConstraintTypeDef, CONSTRAINT_TYPES,
@@ -234,4 +240,3 @@ pub(crate) fn finish_history_run(
     );
 }
 
-// BREP private tests: 69e3f36328911803

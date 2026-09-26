@@ -36,6 +36,18 @@
 //! point. A part reached from two different parents gets a product each — the
 //! rigid-nesting model already stores it once per level, so there is no content
 //! identity to dedup across levels.
+//!
+//! # Identity
+//!
+//! `PRODUCT.name` is the parts-library entry name. `PRODUCT.id` is the part's
+//! BOM part number — the `Part_Number` field of the embedded document's
+//! top-level [`PART_ATTRIBUTES`] record, the same record the BOM panel's
+//! `part.` columns and the Part Properties dialog read and write — because that
+//! is the identity a downstream PDM keys on. A part with no part number falls
+//! back to the library entry's `sourceKey` (the file it was imported from), and
+//! a part with neither writes an empty id, which the writer fills with the
+//! name. The ROOT product's id is empty: [`assembly_export_tree`] never sees
+//! the root document, only its name.
 
 use std::collections::BTreeMap;
 
@@ -51,6 +63,25 @@ use crate::{is_component_reference, restore_solids, BrepSolid};
 /// documents is far past anything a real assembly carries, and the guard is
 /// what keeps a malformed (but acyclic) document off the native stack.
 const MAX_DEPTH: usize = 64;
+
+/// The top-level document key holding a part's own BOM attribute record
+/// (`{ "Part_Number": "PN-7", "Material": "6061", ... }`). Owned by the app's
+/// document model; the kernel reads it only to stamp `PRODUCT.id`.
+pub const PART_ATTRIBUTES: &str = "partAttributes";
+/// The BOM part-number field inside [`PART_ATTRIBUTES`].
+pub const PART_NUMBER: &str = "Part_Number";
+
+/// A part document's BOM part number: `partAttributes.Part_Number`, trimmed;
+/// `None` when the record, the field, or its text is absent or blank.
+fn part_number(document: &serde_json::Value) -> Option<String> {
+    document
+        .get(PART_ATTRIBUTES)?
+        .get(PART_NUMBER)?
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
 
 /// The component namespace prefix a scene name opens with, if any:
 /// `ACOMP3:Extrude1` -> `Some("ACOMP3")`, `Extrude1` -> `None`.
@@ -82,6 +113,10 @@ pub fn assembly_export_tree(
             name: document_name.to_string(),
             id: String::new(),
             bodies: own,
+            // The ROOT document's own PMI is not a product's: it rides the
+            // export's `pmi` argument, resolved against the live scene, and is
+            // written through the occurrence paths (`assembly.rs` step 7b).
+            pmi: None,
         }],
         occurrences: Vec::new(),
     };
@@ -159,10 +194,20 @@ fn add_part(
         .map(|solid| (solid.name, solid.solid))
         .collect();
     let index = assembly.products.len();
+    // The BOM part number is the identity a PDM reads; a part that was never
+    // given one is still identified by the file it came from.
+    let id = part_number(&entry.document).unwrap_or_else(|| entry.source_key.clone());
+    // The part's OWN PMI, resolved against the part's own geometry. Read from
+    // the embedded document rather than the snapshot, because an annotation is
+    // a reference plus a value, not geometry — and resolved here, where the
+    // part document is in hand, so the writer can put it in the part's product
+    // instead of the assembly's (`assembly.rs` step 7a).
+    let pmi = parts_library::document_pmi(&entry.document);
     assembly.products.push(StepExportProduct {
         name: part_name.to_string(),
-        id: entry.source_key.clone(),
+        id,
         bodies,
+        pmi,
     });
     let (library, instances) = document_components(&entry.document, part_name)?;
     place_children(assembly, index, &library, &instances, depth + 1)?;
@@ -231,3 +276,4 @@ fn document_components(
     }
     Ok((request.parts_library, instances))
 }
+

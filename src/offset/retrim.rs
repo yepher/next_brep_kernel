@@ -2,10 +2,8 @@
 //!
 //! # "Trim" means two different things in this kernel — this is the second one
 //!
-//! The audit
-//! ([offset-unification-audit.md](../../../docs/developer/kernel-plans/offset-unification-audit.md) §3.3)
-//! records that "trimming an offset surface to a face" is not one problem but
-//! two, with different failure modes and different tolerances:
+//! The audit records that "trimming an offset surface to a face" is not one
+//! problem but two, with different failure modes and different tolerances:
 //!
 //! 1. **Parametric-image trimming.** Offset-shell reuses the *source face's own
 //!    pcurves verbatim* on the offset carrier (`offset/offset.rs`,
@@ -55,10 +53,13 @@
 //!   (`feature_pipeline/features/common.rs` and `solvers/assembly_resolve.rs`,
 //!   both computing a plane frame's AABB centre) *do* skip degenerate edges.
 //!   Those are a different question and are deliberately not routed here.
-//! * **The pcurve fit lane is [`PcurveFit`], chosen by the caller.** The planar
-//!   lane maps each edge's WHOLE curve; the ruled lane is subrange-aware. That
-//!   asymmetry is deliberate and pre-existing: giving the planar lane subrange
-//!   awareness "for symmetry" would be a behavioural change, not a refactor.
+//! * **Every pcurve is subrange-aware.** A full-domain edge takes the exact
+//!   whole-curve build; a strict subrange is fitted over exactly `[t0, t1]`.
+//!   The planar lane used to map every edge's WHOLE curve, and this note used
+//!   to defend that asymmetry as pre-existing. It was a defect: a cap face
+//!   carrying a second blend's trimmed edges got pcurves spanning the whole
+//!   curve, and deleting one of two chamfers was refused with the pcurve off
+//!   its edge by exactly the chamfer size (2026-09-16). One lane now.
 //! * **The refusal prefix is the caller's `op` string**, so every message keeps
 //!   the operation name it has always reported under.
 //!
@@ -204,45 +205,29 @@ pub(crate) fn boundary_samples(
     Ok(points)
 }
 
-/// Which builder a re-trim hands each coedge's pcurve to.
-///
-/// The two lanes exist in the tree and differ in behaviour; a shared re-trim
-/// must let the caller keep the one it has rather than pick for it.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum PcurveFit {
-    /// Map the edge's WHOLE curve onto the carrier
-    /// (`build_pcurve_on_surface`), reversing for a backward coedge.
-    ///
-    /// The planar re-trim's lane. A plane's parameterization is affine, so a
-    /// whole-curve pcurve of a partial edge is still the right partial pcurve;
-    /// there is no periodic direction for it to wrap the wrong way round.
-    WholeCurve,
-    /// [`PcurveFit::WholeCurve`] except for an edge that is a strict SUBRANGE
-    /// of its own curve domain, which is fitted over exactly `[t0, t1]` with
-    /// `build_pcurve_on_surface_range`.
-    ///
-    /// The ruled re-trim's lane, and it is load-bearing there: a conic ARC on a
-    /// ruled wall (a split cylinder band under an oblique multi-rim cap, whose
-    /// bottom rim is a partial circle of a full-domain circle curve) would
-    /// otherwise get a pcurve laid across the *entire* circle and read as an
-    /// antipodal miss. Full-domain rims keep the exact whole-curve build.
-    SubrangeAware {
-        /// Passed through to `build_pcurve_on_surface_range`.
-        tolerance: f64,
-    },
-}
-
 /// Rebuild every coedge pcurve of `face` on `surface`, from the updated edge
 /// curves in `edges`. Every loop is visited, so holes carry.
 ///
-/// Was the pcurve loop of `edit/direct_edit/delete_face.rs:107-118`
-/// ([`PcurveFit::WholeCurve`]), `edit/direct_edit/face_offset.rs:905-935` and
-/// `edit/direct_edit/face_move.rs:604-634` ([`PcurveFit::SubrangeAware`]).
+/// A full-domain edge maps its WHOLE curve (`build_pcurve_on_surface`),
+/// reversed for a backward coedge — the exact build. An edge that is a strict
+/// SUBRANGE of its curve's domain is fitted over exactly `[t0, t1]` with
+/// `build_pcurve_on_surface_range`, `tolerance` passed through.
+///
+/// Both halves are load-bearing. On a ruled wall, a conic ARC that is a partial
+/// circle of a full-domain circle curve would otherwise get a pcurve laid across
+/// the entire circle and read as an antipodal miss. On a plane, where the affine
+/// parameterization makes the whole-curve pcurve the right SHAPE, it is still
+/// the wrong RANGE: a cap carrying another blend's trimmed edges failed
+/// validation by exactly the trimmed length.
+///
+/// Was the pcurve loop of `edit/direct_edit/delete_face.rs:107-118` (then
+/// whole-curve only), `edit/direct_edit/face_offset.rs:905-935` and
+/// `edit/direct_edit/face_move.rs:604-634`.
 pub(crate) fn rebuild_loop_pcurves(
     face: &mut FaceRecord,
     edges: &HashMap<u64, EdgeRecord>,
     surface: &NurbsSurface,
-    fit: PcurveFit,
+    tolerance: f64,
     op: &str,
 ) -> Result<(), String> {
     for loop_record in &mut face.loops {
@@ -250,17 +235,11 @@ pub(crate) fn rebuild_loop_pcurves(
             let edge = edges
                 .get(&coedge.edge_id)
                 .ok_or_else(|| format!("{op}: missing edge {}", coedge.edge_id))?;
-            let subrange_tolerance = match fit {
-                PcurveFit::WholeCurve => None,
-                PcurveFit::SubrangeAware { tolerance } => {
-                    let [d0, d1] = edge.curve.domain()?;
-                    let span = (d1 - d0).max(1e-12);
-                    let is_subrange =
-                        (edge.t0 - d0).abs() > 1e-9 * span || (edge.t1 - d1).abs() > 1e-9 * span;
-                    is_subrange.then_some(tolerance)
-                }
-            };
-            coedge.pcurve = if let Some(tolerance) = subrange_tolerance {
+            let [d0, d1] = edge.curve.domain()?;
+            let span = (d1 - d0).max(1e-12);
+            let is_subrange =
+                (edge.t0 - d0).abs() > 1e-9 * span || (edge.t1 - d1).abs() > 1e-9 * span;
+            coedge.pcurve = if is_subrange {
                 build_pcurve_on_surface_range(
                     surface,
                     &edge.curve,
@@ -326,7 +305,7 @@ pub(crate) fn retrim_planar_face(
     let width = (u_max - u_min) + 2.0 * margin;
     let height = (v_max - v_min) + 2.0 * margin;
     let surface = make_plane(new_origin, plane.u_dir, plane.v_dir, width, height)?;
-    rebuild_loop_pcurves(face, edges, &surface, PcurveFit::WholeCurve, op)?;
+    rebuild_loop_pcurves(face, edges, &surface, (scale * 1e-7).max(1e-9), op)?;
     face.surface = surface;
     Ok(())
 }
@@ -354,7 +333,7 @@ pub(crate) fn retrim_face_in_solid<G>(
     face_pos: usize,
     edges: &HashMap<u64, EdgeRecord>,
     grow: G,
-    fit: PcurveFit,
+    tolerance: f64,
     op: &str,
 ) -> Result<(), String>
 where
@@ -368,9 +347,8 @@ where
         &mut solid.shells[shell].faces[face_pos],
         edges,
         &surface,
-        fit,
+        tolerance,
         op,
     )
 }
 
-// BREP private tests: 4cd17826e2eb38b8

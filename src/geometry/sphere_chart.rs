@@ -984,4 +984,3 @@ pub fn canonicalize_points(points: &mut [Vec3], relative_tolerance: f64) {
     }
 }
 
-// BREP private tests: 6b6f1c0e2ab4c7d1

@@ -140,7 +140,6 @@ mod seam;
 mod validate;
 #[path = "topology/primitives.rs"]
 mod primitives;
-// BREP private tests: 97ac8ba87759ec8b
 
 pub use seam::{
     analyze_doubly_periodic_seam_band, loop_seam_offsets, seam_band_uv_polygon, seam_band_uv_polygon_with,
@@ -149,4 +148,3 @@ pub(crate) use seam::doubly_periodic_has_only_collapsed_loops;
 pub(crate) use validate::adaptive_coedge_error;
 pub use primitives::{make_box_brep, make_cylinder_brep, make_pyramid_brep};
 
-// BREP private tests: 89aecfd8c93b10e3

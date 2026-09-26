@@ -241,4 +241,3 @@ pub fn write_obj(mesh: &Mesh, name: &str) -> Result<String, String> {
     Ok(lines.join("\n") + "\n")
 }
 
-// BREP private tests: bcf4c69420da6504

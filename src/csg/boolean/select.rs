@@ -168,6 +168,71 @@ fn boundary_coedge_key(
     ))
 }
 
+/// On against a COSURFACE PARTNER: a face of the other operand that the
+/// imprint read as the same surface as this fragment's source face, and whose
+/// trim holds the fragment's point.
+///
+/// The imprint exchanges boundary curves between such a pair instead of
+/// intersecting them, so every section on the overlap is built on their being
+/// one surface; point classification decides the same question again with its
+/// own size-derived band, and at the band's edge the two answers split. The
+/// revolve_pole union's side planes are the case: the wedge's plane stands
+/// 0 .. 3.4e-6 off the revolve's over their 6 x 8 overlap. The wedge's
+/// fragment there sits 2.0e-6 from the revolve's plane and was rescued On;
+/// the revolve's twin sits 2.425e-6 from the wedge's plane against a band of
+/// 2.33e-6 and read Out. A union (wedge first) then kept both copies, a
+/// revolve − wedge kept the revolve's, and both refused with one-use edges.
+///
+/// The point must project onto the partner within the assembler's weld, land
+/// inside its trim, and the two carriers' normals there must be parallel
+/// within the imprint pair classifier's bound. Escape hatch
+/// `BREP_COSURFACE_PAIR_ON=0`.
+fn cosurface_on(
+    fragment: &FaceFragmentRecord,
+    partners: &HashMap<u64, Vec<&FaceRecord>>,
+    tolerance: f64,
+) -> Result<Option<crate::PointClassification>, KernelRefusal> {
+    if std::env::var("BREP_COSURFACE_PAIR_ON").as_deref() == Ok("0") {
+        return Ok(None);
+    }
+    let Some(faces) = partners.get(&fragment.source_face_id) else {
+        return Ok(None);
+    };
+    let Ok(own) = face_normal(fragment) else {
+        return Ok(None);
+    };
+    let weld = assembler_weld(tolerance);
+    for partner in faces {
+        let Ok(projection) = project_point_to_surface(&partner.surface, fragment.test_point) else {
+            continue;
+        };
+        if projection.distance > weld {
+            continue;
+        }
+        let uv = Vec2 {
+            x: projection.u,
+            y: projection.v,
+        };
+        if parameter_point_in_face(partner, uv, 1e-9).or_refuse(KernelStage::Select, "parameter_point_in_face")?
+            != PolygonClass::Inside
+        {
+            continue;
+        }
+        let Ok(normal) = partner.surface.normal(projection.u, projection.v) else {
+            continue;
+        };
+        let normal = if partner.same_sense { normal } else { normal.scale(-1.0) };
+        if own.cross(normal).length() > PINCH_ANGULAR_TOLERANCE {
+            continue;
+        }
+        return Ok(Some(crate::PointClassification {
+            class: PointClass::On,
+            on_normal: Some(normal),
+        }));
+    }
+    Ok(None)
+}
+
 /// Keep/drop decisions for one operand's fragments (Golovanov §6.3:
 /// untouched faces join the result shell by edge adjacency, not per-face
 /// point classification).  Point classification runs only for fragments
@@ -185,7 +250,27 @@ fn side_keep_decisions(
     tolerance: f64,
     debug: bool,
     barrier_edges: &HashSet<(u8, u64)>,
+    cosurface_partners: &HashMap<u64, Vec<&FaceRecord>>,
+    coincident: &CoincidentPairs,
 ) -> Result<Vec<bool>, KernelRefusal> {
+    let classify_side = |fragment: &FaceFragmentRecord| -> Result<crate::PointClassification, KernelRefusal> {
+        let classification = classify_fragment(classifier, fragment, debug)?;
+        if classification.class == PointClass::On {
+            return Ok(classification);
+        }
+        match cosurface_on(fragment, cosurface_partners, tolerance)? {
+            Some(on) => {
+                if debug {
+                    eprintln!(
+                        "frag src_face={} {:?} -> On: its point lies in the trim of a face the imprint read as the same surface",
+                        fragment.source_face_id, classification.class
+                    );
+                }
+                Ok(on)
+            }
+            None => Ok(classification),
+        }
+    };
     let decide = |fragment: &FaceFragmentRecord,
                   classification: &crate::PointClassification|
      -> Result<(bool, bool), KernelRefusal> {
@@ -201,6 +286,27 @@ fn side_keep_decisions(
             );
         }
         let propagatable = classification.class != PointClass::On;
+        // A fragment On against a coincident copy of the other operand: the
+        // result keeps the copy its material lies behind (`coincident.rs`).
+        if classification.class == PointClass::On {
+            if let Some(partner) = coincident_partner(fragment, cosurface_partners, tolerance)? {
+                let key = if first_operand { (fragment.source_face_id, partner) } else { (partner, fragment.source_face_id) };
+                if let Some(pair) = coincident.get(&key) {
+                    let own = if first_operand { 0 } else { 1 };
+                    let keep = keeper(*pair, operation) == Some(own);
+                    if debug {
+                        eprintln!(
+                            "frag {} src_face={} On against coincident copy {partner}: {:?} keeps {:?}, keep={keep}",
+                            if first_operand { "A" } else { "B" },
+                            fragment.source_face_id,
+                            operation,
+                            keeper(*pair, operation),
+                        );
+                    }
+                    return Ok((keep, false));
+                }
+            }
+        }
         let keep = if first_operand {
             match classification.class {
                 PointClass::On => {
@@ -241,7 +347,7 @@ fn side_keep_decisions(
             .flat_map(|loop_record| &loop_record.coedges)
             .any(|coedge| !matches!(coedge.source, FragmentEdgeSource::Boundary { .. }));
         if touched || classifier.near_surface(fragment.test_point).or_refuse(KernelStage::Select, "near_surface")? {
-            let classification = classify_fragment(classifier, fragment, debug)?;
+            let classification = classify_side(fragment)?;
             let (value, source) = decide(fragment, &classification)?;
             keep[index] = Some(value);
             propagatable[index] = source;
@@ -293,7 +399,7 @@ fn side_keep_decisions(
     }
     for index in 0..fragments.len() {
         if on_adjacent[index] && keep[index].is_none() {
-            let classification = classify_fragment(classifier, &fragments[index], debug)?;
+            let classification = classify_side(&fragments[index])?;
             let (value, source) = decide(&fragments[index], &classification)?;
             keep[index] = Some(value);
             propagatable[index] = source;
@@ -328,7 +434,7 @@ fn side_keep_decisions(
                             let mut direct = Vec::with_capacity(fragments.len());
                             for fragment in fragments {
                                 let classification =
-                                    classify_fragment(classifier, fragment, debug)?;
+                                    classify_side(fragment)?;
                                 direct.push(decide(fragment, &classification)?.0);
                             }
                             return Ok(direct);
@@ -358,7 +464,7 @@ fn side_keep_decisions(
         if !progressed {
             match keep.iter().position(Option::is_none) {
                 Some(index) => {
-                    let classification = classify_fragment(classifier, &fragments[index], debug)?;
+                    let classification = classify_side(&fragments[index])?;
                     let (value, source) = decide(&fragments[index], &classification)?;
                     keep[index] = Some(value);
                     propagatable[index] = source;
@@ -381,9 +487,30 @@ pub(super) fn select_fragments(
     operation: BooleanOperation,
     tolerance: f64,
     barrier_edges: &HashSet<(u8, u64)>,
+    cosurface_pairs: &[(FaceKey, FaceKey)],
+    coincident: &CoincidentPairs,
 ) -> Result<Vec<FaceFragmentRecord>, KernelRefusal> {
     let debug = std::env::var("BREP_DEBUG_BOOL").is_ok();
     let mut selected = Vec::new();
+    // Each operand's face id -> the other pristine operand's faces the imprint
+    // read as the same surface.
+    fn face_of(solid: &BrepSolid, face_id: u64) -> Option<&FaceRecord> {
+        solid.shells.iter().flat_map(|shell| &shell.faces).find(|face| face.id == face_id)
+    }
+    let mut partners_of_a: HashMap<u64, Vec<&FaceRecord>> = HashMap::default();
+    let mut partners_of_b: HashMap<u64, Vec<&FaceRecord>> = HashMap::default();
+    for (first, second) in cosurface_pairs {
+        let (a_key, b_key) = if first.operand == 0 { (first, second) } else { (second, first) };
+        if a_key.operand != 0 || b_key.operand != 1 {
+            continue;
+        }
+        if let Some(face) = face_of(pristine_b, b_key.face_id) {
+            partners_of_a.entry(a_key.face_id).or_default().push(face);
+        }
+        if let Some(face) = face_of(pristine_a, a_key.face_id) {
+            partners_of_b.entry(b_key.face_id).or_default().push(face);
+        }
+    }
     let classifier_b = SolidClassifier::new(pristine_b, tolerance).or_refuse(KernelStage::Select, "new")?;
     let classifier_a = SolidClassifier::new(pristine_a, tolerance).or_refuse(KernelStage::Select, "new")?;
     let keep_a = side_keep_decisions(
@@ -394,6 +521,8 @@ pub(super) fn select_fragments(
         tolerance,
         debug,
         barrier_edges,
+        &partners_of_a,
+        coincident,
     )?;
     for (fragment, keep) in fragments_a.into_iter().zip(keep_a) {
         if keep {
@@ -408,6 +537,8 @@ pub(super) fn select_fragments(
         tolerance,
         debug,
         barrier_edges,
+        &partners_of_b,
+        coincident,
     )?;
     for (mut fragment, keep) in fragments_b.into_iter().zip(keep_b) {
         if !keep {

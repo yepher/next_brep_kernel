@@ -14,22 +14,25 @@ use super::*;
 /// to produce the tube plus planar end caps.
 ///
 /// Guards return a clear `Err` on an open/non-planar profile, a degenerate
-/// path tangent, or a loft failure. A self-intersecting result (path
-/// curvature radius smaller than the profile extent) is OUT OF SCOPE — the
-/// caller is responsible for keeping the tube from folding onto itself.
+/// path tangent, or a loft failure. A path that bends TIGHTER than the section
+/// reaches is refused by name before the loft (`ρκ ≥ 1`, §4c of
+/// [`sweep_sections_through_samples`]); it used to be out of scope and the
+/// caller's problem, and what the caller got instead was a wall that passed
+/// through itself.
 pub fn sweep_profile_along_path(
     profile: &[NurbsCurve],
     path: &NurbsCurve,
     name: Option<&str>,
 ) -> Result<BrepSolid, String> {
     // 32 stations is the original fixed sampling — golden parity pins the
-    // emitted geometry to it.  The helix variant raises the count with the
-    // turn count instead, hence the shared `_stations` core.
+    // emitted geometry to it — and it stays the count for every path whose
+    // tangent turns through at most a full turn. A path that turns further
+    // (a coil) gets the helix builder's density; see [`path_turning_stations`].
     sweep_profile_along_path_stations(
         profile,
         path,
         name,
-        32,
+        path_turning_stations(path),
         0.0,
         None,
         SectionPlacement::Transplant,
@@ -52,10 +55,10 @@ pub fn sweep_profile_along_path(
 /// holds that density up to 16 full turns (|twist| = 32π = 1024/16 quarter
 /// turns); a larger twist would silently alias under the cap, so it is
 /// REJECTED with an honest error instead.  Everything else the path sweep
-/// documents (profile validity, self-intersection being the caller's
-/// responsibility) applies unchanged; twisting about the profile's own
-/// centroid adds no new radial extent, so no extra collision guard exists
-/// to compute here.
+/// documents (profile validity, the tight-bend refusal) applies unchanged, and
+/// the tight-bend guard measures the TWISTED section's reach because it reads
+/// the axes the sections were actually placed on; twisting about the profile's
+/// own centroid adds no new radial extent of its own.
 pub fn sweep_profile_twisted(
     profile: &[NurbsCurve],
     path: &NurbsCurve,
@@ -79,7 +82,7 @@ pub fn sweep_profile_twisted(
         ));
     }
     let quarter_turns = (twist_angle.abs() / FRAC_PI_2).ceil() as usize;
-    let stations = (quarter_turns * 16).clamp(32, 1024);
+    let stations = (quarter_turns * 16).clamp(32, 1024).max(path_turning_stations(path));
     sweep_profile_along_path_stations(
         profile,
         path,
@@ -90,6 +93,34 @@ pub fn sweep_profile_twisted(
         SectionPlacement::Transplant,
     )
     .map_err(|error| format!("sweep_profile_twisted: {error}"))
+}
+
+/// The station budget of a single-curve path sweep, from how far the path's
+/// TANGENT turns: 8 stations per quarter turn of tangent — the 32 per turn
+/// [`sweep_profile_helix`] lofts a coil with — floored at the original 32 and
+/// capped at the loft's 1024.
+///
+/// A fixed 32 was a budget for a path that bends once. Along a coil it is
+/// FOUR stations a turn (an 8-turn helix edge, 2026-09-25), and a loft through
+/// sections a quarter turn apart does not follow the path between them: the
+/// wall cut its own corner and folded through itself, and the Tube and Path
+/// Sweep features refused the edge. The floor keeps every path that turns
+/// through at most a full turn on exactly the geometry it always had.
+///
+/// The turning is [`segment_turning`]'s — the chain sampler's own reading —
+/// independent of the station count it decides. A path it cannot read is
+/// reported by the sampler itself, in its own words, after the profile has been
+/// checked; here it only leaves the budget on the floor.
+fn path_turning_stations(path: &NurbsCurve) -> usize {
+    use std::f64::consts::FRAC_PI_2;
+    let turning = path
+        .domain()
+        .and_then(|domain| segment_turning(path, domain))
+        .unwrap_or(0.0);
+    // The slack keeps a path of EXACTLY a full turn (a circle) on the floor
+    // rather than one quarter over it from sampling round-off.
+    let quarter_turns = (turning / FRAC_PI_2 - 1e-3).ceil().max(0.0) as usize;
+    (quarter_turns * 8).clamp(32, 1024)
 }
 
 /// HOW a section is placed at each station — the two things "sweep a profile
@@ -121,7 +152,24 @@ pub fn sweep_profile_twisted(
 ///     (for a planar path the RMF's transport rotation IS that rotation), so
 ///     the profile is carried round the pivot and the end cap arrives at the
 ///     angle the start cap had to the tangent. A full-circle path degenerates
-///     to exactly a revolve of the profile about that axis.
+///     to exactly a revolve of the profile about that axis;
+///   - a HELIX makes `R_k` the SCREW about the helix's own axis — but only when
+///     the path says it is one ([`SweepPath::screw_axes`]), because the frame
+///     that realizes it is not the RMF. A helix is carried into itself by the
+///     screw, which spins the tangent frame at the helix's torsion; the RMF has
+///     no spin about the tangent by construction, so it rolls away from the
+///     screw by `∫τ ds` (169.75° over three turns of a radius-5, pitch-5 coil).
+///     A helix segment's stations are therefore framed off its axis
+///     (`screw_reference`), and every other segment keeps the RMF — which on a
+///     chain of lines and arcs in ANY planes is still exactly each arc's turn
+///     about its own centre, composed. The two hand over at a joint without a
+///     roll.
+///
+/// Why not one frame for every curve: the Frenet frame is the screw on a helix
+/// but spins where a spatial curve nearly straightens (a planar S-cubic lifted
+/// 1e-3 out of its plane carries a 180° roll through the inflection, which 32
+/// stations read as 0.4°), and one axis fitted to the whole run is the screw on
+/// a helix but rolls a two-arc spatial chain by up to 256° against its arcs.
 ///
 /// `R_k = F_k · F_0ᵀ` does NOT depend on which perpendicular `r_0` the RMF was
 /// seeded with: re-seeding rolls `F_0` and every `F_k` by the same angle about
@@ -164,7 +212,7 @@ pub fn sweep_profile_along_path_anchored(
         profile,
         path,
         name,
-        32,
+        path_turning_stations(path),
         0.0,
         Some(anchor),
         SectionPlacement::Transplant,
@@ -196,7 +244,7 @@ pub fn sweep_profile_twisted_anchored(
         ));
     }
     let quarter_turns = (twist_angle.abs() / FRAC_PI_2).ceil() as usize;
-    let stations = (quarter_turns * 16).clamp(32, 1024);
+    let stations = (quarter_turns * 16).clamp(32, 1024).max(path_turning_stations(path));
     sweep_profile_along_path_stations(
         profile,
         path,
@@ -215,8 +263,14 @@ pub fn sweep_profile_twisted_anchored(
 /// one signature (the feature layer picks all three per loop, so splitting them
 /// four ways here would only push the same match into the caller).
 ///
-/// `segment_names` name the chain's segments for the joint refusal; a short or
-/// empty slice degrades to `<unnamed>` rather than failing.
+/// `path` carries the chain AND its classification ([`SweepPath`]): the segment
+/// names for the joint refusal (a short or empty name list degrades to
+/// `<unnamed>` rather than failing), whether the run is CLOSED, the plane it lies
+/// in if it lies in one, and the continuity of every joint. The refusals below
+/// READ that classification rather than each re-deriving it — the corner gate no
+/// longer measures its own tangent break while sampling, and closure is a
+/// property of the path rather than something the sampler notices about its first
+/// and last station.
 ///
 /// `corner_advice` is appended to the cornered-joint refusal and is the CALLER's
 /// to write, because the builder has two callers with different answers: path
@@ -224,17 +278,22 @@ pub fn sweep_profile_twisted_anchored(
 /// sends them to its `translate` mode. A builder that named one feature would be
 /// telling half its users to switch to the feature they are already in.
 ///
-/// A ONE-segment chain delegates to the single-curve builders unchanged, so the
-/// geometry every existing path sweep emits is untouched by this entry point
+/// A ONE-segment OPEN chain delegates to the single-curve builders unchanged, so
+/// the geometry every existing path sweep emits is untouched by this entry point
 /// existing — the multi-segment sampler is reached only by a path that actually
-/// has a joint.
+/// has a joint. A one-segment CLOSED chain (a resident circular edge) does NOT
+/// delegate: the single-curve samplers cap both ends, which is exactly what a
+/// ring must not do.
 ///
-/// Joints must be tangent-continuous; see [`MAX_JOINT_TANGENT_BREAK`] for why a
-/// corner is refused here instead of rounded off, and where such a path belongs.
+/// A CORNER (a joint past [`MAX_JOINT_TANGENT_BREAK`]) selects the MITRE lane
+/// when every segment is straight — see `sweep_topology/miter.rs` for the
+/// construction and [`CornerPolicy`] for why this entry mitres while
+/// [`sweep_profile_along_chain_with_stations`] refuses. A CLOSED cornered
+/// polyline is a picture FRAME: its closing joint is a mitre like the rest and
+/// the result has no caps. A corner at a CURVED segment is refused by name.
 pub fn sweep_profile_along_chain(
     profile: &[NurbsCurve],
-    chain: &[NurbsCurve],
-    segment_names: &[String],
+    path: &SweepPath,
     twist_angle: f64,
     name: Option<&str>,
     anchor: Option<ProfileAnchor>,
@@ -243,14 +302,25 @@ pub fn sweep_profile_along_chain(
 ) -> Result<BrepSolid, String> {
     use std::f64::consts::{FRAC_PI_2, TAU};
 
-    if chain.is_empty() {
+    if path.is_empty() {
         return Err("sweepSolid: path chain is empty".into());
     }
+    // A bend TIGHTER than the section is the envelope lane's, not the loft's, and
+    // it is asked BEFORE the single-curve shortcut below — that shortcut lands in
+    // the same skinning builder, so taking it first would hide the one path shape
+    // this lane exists for (one circular arc) behind it.
+    let envelope_lane = super::envelope::recognize_swept_envelope(profile, path, placement_mode)?
+        .is_ok();
+
     // Single segment under `Transplant`: the existing builders, byte for byte.
     // `Rigid` has no single-curve wrapper to delegate to and falls through to the
     // chain sampler, which samples a 1-element chain over exactly the domain the
     // single-curve sampler would (no joints, the whole budget on one segment).
-    if let ([single], SectionPlacement::Transplant) = (chain, placement_mode) {
+    // A CLOSED single segment falls through too — the single-curve samplers end
+    // in a capped loft, and a ring has no caps.
+    if let ([single], SectionPlacement::Transplant, false, false) =
+        (path.curves.as_slice(), placement_mode, path.closed, envelope_lane)
+    {
         return match (anchor, twist_angle == 0.0) {
             (None, true) => sweep_profile_along_path(profile, single, name),
             (Some(anchor), true) => {
@@ -278,22 +348,30 @@ pub fn sweep_profile_along_chain(
             twist_angle.abs() / TAU
         ));
     }
+    // A CLOSED SPATIAL path lays its counter-twist down on top of the requested
+    // twist, which adds up to half a turn, so the density is set for the most the
+    // lap can roll.
     let stations = if twist_angle == 0.0 {
         32
     } else {
-        let quarter_turns = (twist_angle.abs() / FRAC_PI_2).ceil() as usize;
+        let counter = if path.closed && path.planar.is_none() {
+            std::f64::consts::PI
+        } else {
+            0.0
+        };
+        let quarter_turns = ((twist_angle.abs() + counter) / FRAC_PI_2).ceil() as usize;
         (quarter_turns * 16).clamp(32, 1024)
     };
     let _ = name;
     sweep_profile_along_chain_stations(
         profile,
-        chain,
-        segment_names,
+        path,
         stations,
         twist_angle,
         anchor,
         placement_mode,
         corner_advice,
+        CornerPolicy::Mitre,
     )
 }
 
@@ -306,20 +384,19 @@ pub fn sweep_profile_along_chain(
 /// and the tangent-continuity refusal apply unchanged.
 pub fn sweep_profile_along_chain_with_stations(
     profile: &[NurbsCurve],
-    chain: &[NurbsCurve],
-    segment_names: &[String],
+    path: &SweepPath,
     stations: usize,
     corner_advice: &str,
 ) -> Result<BrepSolid, String> {
     sweep_profile_along_chain_stations(
         profile,
-        chain,
-        segment_names,
+        path,
         stations.clamp(2, 1024),
         0.0,
         None,
         SectionPlacement::Transplant,
         corner_advice,
+        CornerPolicy::Refuse,
     )
 }
 
@@ -412,24 +489,104 @@ fn sweep_profile_along_path_stations(
     }
     let mut points = Vec::with_capacity(stations);
     let mut tangents = Vec::with_capacity(stations);
+    let mut curvatures = Vec::with_capacity(stations);
     for index in 0..stations {
         let t = t0 + (t1 - t0) * index as f64 / (stations - 1) as f64;
-        let derivatives = path.derivatives(t, 1)?;
+        let derivatives = path.derivatives_small(t, 2)?;
         let tangent = derivatives[1]
             .normalized()
             .map_err(|_| format!("sweepSolid: path tangent is degenerate at station {index}"))?;
         points.push(derivatives[0]);
         tangents.push(tangent);
+        curvatures.push(curvature_vector(derivatives[1], derivatives[2]));
     }
 
     sweep_sections_through_samples(
         profile,
         &points,
         &tangents,
+        &curvatures,
         twist_angle,
         placement,
         placement_mode,
+        RingFrame::Open,
+        None,
+        None,
     )
+}
+
+/// What a CHAIN builder does with a CORNER (a `G0` joint).
+///
+/// Two of this module's entry points sweep chains, and they answer the question
+/// differently — not because the geometry differs but because their callers'
+/// corner POLICIES do, and a builder that guessed would be overriding one of
+/// them:
+///   - [`sweep_profile_along_chain`] MITRES a polyline's corners, a closed
+///     polyline's closing joint included (`sweep_topology/miter.rs`). Its callers
+///     are the two sweep FEATURES, and a mitred corner is the shape they are
+///     asked for.
+///   - [`sweep_profile_along_chain_with_stations`] REFUSES every corner. Its
+///     callers build their own chains and have already decided what a corner
+///     means: the tube ROUNDS one into a tangent bend or joins it with a ball,
+///     and the wire harness routes tangent-continuous splines. A corner
+///     reaching either of them means their own construction did not come out,
+///     and mitring it instead would silently ship a shape neither feature
+///     offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CornerPolicy {
+    /// A polyline's corners are mitred, open or closed; anything else is refused.
+    Mitre,
+    /// Every corner is refused by name.
+    Refuse,
+}
+
+/// The SECTION a mitred sweep carries, placed in world, with its plane normal —
+/// the two things `sweep_topology/miter.rs` needs, and all it needs.
+///
+/// The placement modes are resolved HERE rather than in the mitre builder, on
+/// the same frame the skinning lane's station 0 uses (`û₀.perpendicular()`), so
+/// the two lanes place a section identically and a path that crosses the
+/// continuity gate does not also jump in space:
+///   - `Transplant` maps the profile's plane frame onto the path's first station
+///     (anchor origin onto the path, profile square to it), so the section's
+///     normal is the first tangent;
+///   - `Rigid` takes the profile WHERE IT IS, keeping the offset from the path
+///     and the angle to it that it was drawn with, so the section's normal is
+///     the profile's own.
+fn place_section(
+    profile: &[NurbsCurve],
+    placement: ProfileAnchor,
+    placement_mode: SectionPlacement,
+    start: Vec3,
+    tangent: Vec3,
+) -> Result<(Vec<NurbsCurve>, Vec3), String> {
+    if placement_mode == SectionPlacement::Rigid {
+        return Ok((profile.to_vec(), placement.normal));
+    }
+    let ProfileAnchor { origin, pu, pv, .. } = placement;
+    let r0 = tangent.perpendicular()?;
+    let s0 = tangent.cross(r0).normalized()?;
+    let mut placed = Vec::with_capacity(profile.len());
+    for curve in profile {
+        let control_points = curve
+            .control_points
+            .iter()
+            .map(|control| {
+                let point = control.point()?;
+                let local = point.sub(origin);
+                let world = start
+                    .add(r0.scale(local.dot(pu)))
+                    .add(s0.scale(local.dot(pv)));
+                Ok(Vec4::from_point(world, control.w))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        placed.push(NurbsCurve::new(
+            curve.degree,
+            curve.knots.clone(),
+            control_points,
+        )?);
+    }
+    Ok((placed, tangent))
 }
 
 /// The placement frame a sweep transplants its profile with: the caller's
@@ -457,33 +614,10 @@ fn resolve_placement(
     })
 }
 
-/// The largest tangent break, in radians, a chained path may have at a joint.
-///
-/// This is a REAL geometric boundary, not a tuning knob. The builder skins
-/// consecutive stations by lofting through them, so a corner between two
-/// stations is rendered as a smooth blend across the corner — the tube cuts it,
-/// and near a sharp one the section sweeps through itself. A path sweep can
-/// honestly build a G1 chain (line→fillet→line, spline pieces, an arc train)
-/// and cannot honestly build a cornered polyline. `Sweep` (SW) is the feature
-/// for a cornered path: it builds one prism per segment and unions them, which
-/// is exactly the construction that gives a corner a real mitre.
-///
-/// ~1.15° (0.02 rad). Loose enough to absorb the tangent disagreement of two
-/// curves a sketch chained on endpoint coincidence, tight enough that anything
-/// a user would call a corner is refused rather than silently rounded off.
-///
-/// This is INDEPENDENT of the chainer's join tolerance, and deliberately so.
-/// `common::chain_path_segments` joins on POSITION (`1e-5 * scale`); this gate
-/// measures DIRECTION. Two collinear segments meeting with a positional gap have
-/// a zero tangent break, and two segments meeting exactly at a point can still
-/// break 90°. So a run the chainer happily orders head-to-tail may still be
-/// refused here — which is not an inconsistency but the SW/SWP split itself: the
-/// chainer's job is to decide what order the picks form a run in, and this gate's
-/// job is to decide whether that run is one this builder can skin.
-const MAX_JOINT_TANGENT_BREAK: f64 = 0.02;
 
 /// Sweep a CLOSED PLANAR profile along a CHAIN of path curves, joined
-/// head-to-tail, as one continuous tube.
+/// head-to-tail, as one continuous tube — or, for a CLOSED path, as a capless
+/// ring.
 ///
 /// The chain is sampled as a single trajectory and handed to the shared core,
 /// so ONE rotation-minimizing frame is propagated across the whole path: a joint
@@ -496,21 +630,27 @@ const MAX_JOINT_TANGENT_BREAK: f64 = 0.02;
 /// per segment so a short fillet between two long lines still carries its
 /// curvature. The shared endpoint of two adjacent segments is sampled ONCE, not
 /// twice — a duplicated station would land in the RMF's coincident-step branch
-/// and waste a section on zero advance.
+/// and waste a section on zero advance. A CLOSED path drops one more station for
+/// the same reason: its last station IS its first.
 ///
-/// JOINTS must be tangent-continuous to within [`MAX_JOINT_TANGENT_BREAK`];
-/// a break beyond it is refused, naming the two segments and the angle.
+/// JOINTS decide the LANE. A break within [`MAX_JOINT_TANGENT_BREAK`] is skinned
+/// here; a break past it is a CORNER, which under [`CornerPolicy::Mitre`] hands an
+/// open all-straight run to the mitre builder (`sweep_topology/miter.rs`) and is
+/// otherwise refused by name, with the angle and the two segments. The
+/// classification carried on the path is what says so — this sampler no longer
+/// measures its own.
+#[allow(clippy::too_many_arguments)]
 fn sweep_profile_along_chain_stations(
     profile: &[NurbsCurve],
-    chain: &[NurbsCurve],
-    segment_names: &[String],
+    path: &SweepPath,
     stations: usize,
     twist_angle: f64,
     anchor: Option<ProfileAnchor>,
     placement_mode: SectionPlacement,
     corner_advice: &str,
+    corners: CornerPolicy,
 ) -> Result<BrepSolid, String> {
-    let tolerance = 1e-6;
+    let chain = path.curves.as_slice();
     if chain.is_empty() {
         return Err("sweepSolid: path chain is empty".into());
     }
@@ -520,11 +660,657 @@ fn sweep_profile_along_chain_stations(
     // Profile first, matching the single-curve sampler's order of complaint.
     let placement = resolve_placement(profile, anchor, placement_mode)?;
 
+    // --- The swept ENVELOPE, trimmed at its own self-intersection.
+    //
+    //     Past `ρκ = 1` the sections CROSS and the loft below skins a wall that
+    //     passes through itself. For a CIRCLE carried along one circular planar
+    //     arc the correct solid is a REVOLVE — the section disc truncated at the
+    //     axis, plus the reflection of the part that crossed it, each revolved
+    //     through the path's own turn (`sweep_topology/envelope.rs`) — and this
+    //     is where that lane is taken instead of the loft.
+    //
+    //     Anything else tight is left to the §4c refusal below, which now carries
+    //     WHICH half of the configuration this sweep missed. Nothing under
+    //     `ρκ = 1` reaches the lane at all: the recognition refuses a bend that
+    //     is not tighter than its section, so every shape that builds today keeps
+    //     the builder it has.
+    let envelope_gap =
+        match super::envelope::recognize_swept_envelope(profile, path, placement_mode)? {
+            Ok(plan) => {
+                let mut bodies = super::envelope::build_swept_envelope(&plan)?;
+                if bodies.len() == 1 {
+                    return Ok(bodies.remove(0));
+                }
+                return Err(format!(
+                    "{}: a section that crosses the path's axis (ρ·κ = {:.6}) sweeps TWO \
+                     bodies — the near lobe over the path's own azimuths and the far lobe half \
+                     a turn from them, meeting only along the axis — and this entry returns one \
+                     solid. {} were built; ask `sweep_envelope_bodies` for the pair",
+                    SWEEP_ENVELOPE_REFUSAL,
+                    plan.ratio(),
+                    bodies.len()
+                ));
+            }
+            Err(reason) => reason,
+        };
+
+    // --- A CORNER, read off the path's classification. Every joint was measured
+    //     once when the path was resolved, the CLOSING joint of a closed path
+    //     included — which is how a ring's seam gets the same gate as its
+    //     interior joints instead of being the one joint nobody checked.
+    //
+    //     A corner now selects a LANE rather than ending the build. A POLYLINE —
+    //     every segment straight, at least one corner — is MITRED: the section is
+    //     swept along each segment and the two sweeps are trimmed to the joint's
+    //     bisector plane, sharing one face loop there
+    //     (`sweep_topology/miter.rs`). A CLOSED one is a picture FRAME, whose
+    //     closing joint is mitred like the rest and which has no caps; the frame
+    //     lane's own refusals (a spatial loop, by its holonomy; a self-crossing
+    //     loop; overlapping mitres) live with the construction. What remains
+    //     refused HERE is a corner on a path that is not all straight — there is
+    //     no bisector plane for a curve to be trimmed to, and no lane that mixes
+    //     the two.
+    if let Some(corner) = path.corner() {
+        if corners == CornerPolicy::Mitre && path.cornered_polyline() {
+            // A twist is laid down in arc length over the stations, and a mitre has
+            // none. A CLOSED frame rolls it along the middle of each side instead,
+            // where a roll keeps the shared joint loops (`sweep_topology/miter.rs`),
+            // exactly as it rolls its own counter-twist. An OPEN cornered run does
+            // not have that construction and is refused.
+            if twist_angle != 0.0 && !path.closed {
+                return Err(
+                    "sweepSolid: a CORNERED path cannot carry a twist — its corners are mitred \
+                     from exact pieces that meet on the joint's bisector plane, and a twist laid \
+                     down along the path would roll the two sides of that plane apart, so they \
+                     would no longer share one loop there. Only a CLOSED frame rolls a twist along \
+                     the middle of its sides. Sweep the run without the twist; a \
+                     tangent-continuous (smooth) path is skinned through stations and carries one"
+                        .into(),
+                );
+            }
+            let (section, section_normal, _) =
+                mitre_section(profile, placement, placement_mode, path)?;
+            return super::miter::sweep_section_mitered(
+                &section,
+                section_normal,
+                path,
+                twist_angle,
+            );
+        }
+        // A path with BOTH a corner and a curved segment is in NEITHER lane, and
+        // this is the refusal that says so: the mitre lane needs every segment
+        // straight (one direction per side for the bisector plane to bisect) and
+        // the skinning lane needs every joint tangent-continuous (it interpolates
+        // stations, so it would round the corner off). A rounded rectangle with
+        // ONE corner left sharp is exactly that path — three G0 joints the mitre
+        // lane could carry and two G1 joints at an arc it cannot — and mitring
+        // the sharp corners while skinning the arc is a MIXED construction this
+        // builder does not have. Refused with both halves named rather than built
+        // as whichever lane happens to be asked first.
+        let curved = (0..path.len())
+            .find(|index| {
+                let curve = &path.curves[*index];
+                curve.degree != 1 || curve.control_points.len() != 2
+            })
+            .map(|index| format!(" — segment '{}' is CURVED", path.name(index)))
+            .unwrap_or_default();
+        // The MIXED-LANE sentence belongs only to a path that actually has a
+        // curved segment. Under [`CornerPolicy::Refuse`] an ALL-STRAIGHT cornered
+        // chain reaches this same refusal (the tube's and the wire harness's
+        // corners are refused whatever their segments are), and telling those
+        // callers that a straight cornered run is mitred would name a lane they
+        // deliberately do not have — their own `corner_advice` says what to do
+        // instead.
+        let mixed = if curved.is_empty() {
+            String::new()
+        } else {
+            " A path that MIXES the two — corners at some joints and curved segments elsewhere              — is in neither lane: every segment straight is mitred (open or closed), every              joint tangent-continuous is skinned, and nothing builds one construction for some              joints and the other for the rest."
+                .to_string()
+        };
+        return Err(format!(
+            "the path must be tangent-continuous: segments '{}' and '{}' meet at a {:.1}° \
+             corner{curved}. The profile is skinned between sampled stations along the path, so a \
+             corner would be ROUNDED OFF rather than mitred, and a mitre needs two STRAIGHT \
+             segments: it trims both sweeps to the plane that bisects their directions, and a \
+             curve has no single direction to bisect.{mixed} {corner_advice}",
+            path.name(corner.before),
+            path.name(corner.after),
+            corner.tangent_break.to_degrees()
+        ));
+    }
+
+    // --- A CLOSED path takes a REQUESTED twist only where it closes. After one lap
+    //     the section comes back rolled by the whole twist, so the twist must be a
+    //     rotational symmetry of the section about the path. The ring lane reads
+    //     that off the section and refuses by name a twist that does not close
+    //     ([`closing_twist`]).
+
+    // --- Sample the chain as ONE trajectory (budget, domains, stations).
+    let StationSamples {
+        points,
+        tangents,
+        curvatures,
+        segments,
+    } = chain_stations(path, stations)?;
+
+    // --- CLOSED: the ring needs a frame that comes back to itself. A PLANAR path
+    //     has one for free (see `ring_normal`); a SPATIAL one comes back rolled by
+    //     its own holonomy and is closed by the counter-twist policy
+    //     ([`RingFrame::Spatial`]).
+    let closure = ring_frame(path, &tangents)?;
+
+    sweep_sections_through_samples(
+        profile,
+        &points,
+        &tangents,
+        &curvatures,
+        twist_angle,
+        placement,
+        placement_mode,
+        closure,
+        Some(envelope_gap.as_str()),
+        Some((segments.as_slice(), path)),
+    )
+}
+
+/// How a station run CLOSES — which frame a ring's sections are placed on.
+///
+/// Three states, because "is this a ring" and "is its frame written down in
+/// closed form" are different questions and only a planar ring answers yes to
+/// both:
+///   - `Open`: the transported frame and two end caps;
+///   - `Planar(normal)`: a ring whose reference axis is the path plane's normal
+///     at every station, which returns to itself EXACTLY (see [`ring_normal`]);
+///   - `Spatial`: a ring on the TRANSPORTED frame, which returns rolled by the
+///     path's own holonomy and is closed by the counter-twist policy — see
+///     [`ring_closure_frames`].
+#[derive(Debug, Clone, Copy)]
+enum RingFrame {
+    Open,
+    Planar(Vec3),
+    Spatial,
+}
+
+impl RingFrame {
+    fn is_ring(self) -> bool {
+        !matches!(self, RingFrame::Open)
+    }
+}
+
+/// The ring frame a path's stations close on, read off its classification.
+fn ring_frame(path: &SweepPath, tangents: &[Vec3]) -> Result<RingFrame, String> {
+    Ok(match (path.closed, path.planar) {
+        (false, _) => RingFrame::Open,
+        (true, Some(normal)) => RingFrame::Planar(ring_normal(normal, tangents)?),
+        (true, None) => RingFrame::Spatial,
+    })
+}
+
+/// What a CLOSED sweep did to make its section meet itself after one lap — the
+/// applied twist the frame-closure policy REPORTS.
+///
+/// THE POLICY. Carried once round a closed path, the section frame comes back
+/// ROLLED about the start tangent by the path's HOLONOMY. That angle is not a
+/// defect of the sampling: the frame is parallel transport of the section's
+/// axes in the path's normal plane, which is parallel transport on the unit
+/// sphere along the path's TANGENT INDICATRIX, so by Gauss–Bonnet the roll is
+/// the solid angle that indicatrix encloses, modulo `2π`. A planar path's
+/// indicatrix runs along one great circle and encloses a hemisphere — `2π`,
+/// the identity — which is why a planar ring closes on its own; a spatial one
+/// generally does not. (A curve lying ON a sphere reads zero too: the radial
+/// direction is itself rotation-minimizing along any such curve. Its enclosed
+/// solid angle is not its holonomy; its indicatrix's is.)
+///
+/// The sweep closes the ring with the SMALLEST roll that does it: the
+/// counter-twist `−holonomy`, wrapped to `(−π, π]`.
+///   - SMOOTH lane: laid down LINEARLY IN ARC LENGTH over the stations, the wrap
+///     step from the last station back to station 0 included, so every span —
+///     the seam span too — rolls at the same rate and the closed loft sees no
+///     seam at all. A uniform rate is the distribution with the smallest peak
+///     rate and the smallest `∫(roll rate)² ds`.
+///   - CORNERED lane (`sweep_topology/miter.rs`): shared over the SEGMENTS in
+///     proportion to their length, each share laid down over its segment's
+///     untrimmed middle — a roll AT a mitre would pull the shared loop apart —
+///     and nothing at all when the untwisted lap already closes within the
+///     lane's own weld floor.
+///
+/// A REQUESTED twist rides on top of that counter-twist and is laid down the same
+/// way, so `applied_twist = requested_twist − holonomy` (or `requested_twist` alone
+/// where no counter-twist is needed). It closes only as a rotational symmetry of
+/// the section about the path, `2π·n/k` for a section with `k` of them, and is
+/// refused by name otherwise ([`crate::SWEEP_TWIST_CLOSURE_REFUSAL`]). A
+/// FRACTIONAL turn on a symmetric section lands each wall on a different section
+/// curve than it left: `curve_shift`.
+///
+/// `holonomy` is what the untwisted frame measures; `applied_twist` is what was
+/// laid down. All three angles are radians, right-handed about the path tangent.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SweepClosure {
+    /// The roll the UNTWISTED frame returns with after one lap, right-handed
+    /// about the start tangent, wrapped to `(−π, π]`. Zero for a planar path.
+    pub holonomy: f64,
+    /// The twist the caller asked for, snapped to the section symmetry it closes
+    /// on (it matched at round-off). Zero for an untwisted sweep.
+    pub requested_twist: f64,
+    /// The twist laid down over the lap: the requested twist plus the
+    /// counter-twist `−holonomy`, which is zero where the lane closes without one
+    /// (a planar path, or a frame whose untwisted lap already closes within the
+    /// weld floor).
+    pub applied_twist: f64,
+    /// How far along the section's curve list one lap carries each curve: the
+    /// wall leaving section curve `j` arrives on curve `(j + curve_shift) mod m`.
+    /// Zero for no twist and for a whole number of turns. The curves are counted
+    /// in the order the builder carries them, which on the MITRE lane is the
+    /// section's order after its winding is made counter-clockwise about the path.
+    pub curve_shift: usize,
+}
+
+/// The CLOSURE a sweep of `profile` along `path` applies — the frame-closure
+/// policy's report, exposed so a caller can read the twist a closed sweep laid
+/// down (see [`SweepClosure`]). `None` for an OPEN path, which has no lap to
+/// close.
+///
+/// Reads the very construction the sweep builds, not a second measurement of
+/// it: a cornered polyline asks the mitre lane's own frame plan (its placed
+/// section, its rings, its weld floor), and any other closed path asks the
+/// smooth lane's own stations and frames at `stations` — the budget the sweep
+/// was given (32 for [`sweep_profile_along_chain`] untwisted, the caller's for
+/// [`sweep_profile_along_chain_with_stations`]). Whatever the builder would
+/// refuse, this refuses with the same words, a requested `twist_angle` that does
+/// not close included.
+pub fn sweep_closure(
+    profile: &[NurbsCurve],
+    path: &SweepPath,
+    placement_mode: SectionPlacement,
+    stations: usize,
+    twist_angle: f64,
+) -> Result<Option<SweepClosure>, String> {
+    if !path.closed {
+        return Ok(None);
+    }
+    let placement = resolve_placement(profile, None, placement_mode)?;
+    if path.cornered_polyline() {
+        let (section, section_normal, _) = mitre_section(profile, placement, placement_mode, path)?;
+        return super::miter::mitred_frame_closure(&section, section_normal, path, twist_angle)
+            .map(Some);
+    }
+    let StationSamples {
+        points,
+        tangents,
+        segments,
+        ..
+    } = chain_stations(path, stations.clamp(2, 1024))?;
+    let screw = Some((segments.as_slice(), path)).filter(|_| placement_mode == SectionPlacement::Rigid);
+    let closure = ring_frame(path, &tangents)?;
+    let (section, _) = place_section(profile, placement, placement_mode, points[0], tangents[0])?;
+    let requested = ring_closing_twist(&section, &points, &tangents, twist_angle)?;
+    Ok(station_frames(&points, &tangents, closure, screw, requested)?.2)
+}
+
+/// The requested twist a RING closes on ([`closing_twist`]), read off the
+/// section as placed at station 0, about the path's first tangent, against the
+/// ring's own position floor: `1e-6` of the lap's chord length, the floor the
+/// mitred frame measures its own closure against.
+fn ring_closing_twist(
+    section: &[NurbsCurve],
+    points: &[Vec3],
+    tangents: &[Vec3],
+    twist_angle: f64,
+) -> Result<ClosingTwist, String> {
+    let lap: f64 = (0..points.len())
+        .map(|index| points[(index + 1) % points.len()].sub(points[index]).length())
+        .sum();
+    closing_twist(section, points[0], tangents[0], twist_angle, 1e-6 * lap)
+}
+
+/// The placed section a MITRED sweep carries and its plane normal, with the
+/// first segment's chord direction — shared by the builder and by
+/// [`sweep_closure`], so the instrument reads the section the frame is built
+/// from.
+fn mitre_section(
+    profile: &[NurbsCurve],
+    placement: ProfileAnchor,
+    placement_mode: SectionPlacement,
+    path: &SweepPath,
+) -> Result<(Vec<NurbsCurve>, Vec3, Vec3), String> {
+    let [t0, t1] = path.curves[0].domain()?;
+    let start = path.curves[0].evaluate(t0)?;
+    // The CHORD direction, which is both the first station's tangent (a
+    // straight segment's derivative is its chord) and the direction the
+    // mitre builder sweeps along, so the placed section is square to the
+    // same vector the construction uses.
+    let tangent = path.curves[0]
+        .evaluate(t1)?
+        .sub(start)
+        .normalized()
+        .map_err(|_| "sweepSolid: path segment 0 has zero length".to_string())?;
+    let (section, section_normal) =
+        place_section(profile, placement, placement_mode, start, tangent)?;
+    Ok((section, section_normal, tangent))
+}
+
+/// The station frames §3 places its sections on, extracted so the tight-bend
+/// INSTRUMENT ([`sweep_bend_profile`]) reads the frame the sweep will use — the
+/// section's reach into a bend depends on how the section is ROLLED about the
+/// path, so a second frame that merely agreed on a circle would be a different
+/// measurement on anything else.
+///
+/// `screw` is the chain's segment-of-station map and the path whose
+/// [`SweepPath::screw_axes`] it indexes, passed only by the `Rigid` placement.
+/// A station on a HELIX segment is framed off the helix's own axis instead of
+/// transported (see [`screw_reference`]); every other station takes the RMF step
+/// from its predecessor, so the two compose across a joint in either direction.
+///
+/// The third value is the ring's CLOSURE report: `None` for an open run, zero
+/// for a planar ring, and the measured holonomy with the counter-twist that
+/// closes it for a spatial one — whose axes are returned already twisted.
+///
+/// `requested` is a RING's requested twist, already known to close
+/// ([`closing_twist`]). It is laid down in the ring's frames over the whole lap,
+/// the wrap chord included, together with any counter-twist, so the seam span
+/// rolls at the rate every other span does. An OPEN run ignores it: its twist is
+/// laid down by the placement, over the stations it has.
+fn station_frames(
+    points: &[Vec3],
+    tangents: &[Vec3],
+    closure: RingFrame,
+    screw: Option<(&[usize], &SweepPath)>,
+    requested: ClosingTwist,
+) -> Result<(Vec<Vec3>, Vec<Vec3>, Option<SweepClosure>), String> {
+    match closure {
+        RingFrame::Open => {
+            let (r_axes, s_axes) = transported_frames(points, tangents, screw)?;
+            Ok((r_axes, s_axes, None))
+        }
+        RingFrame::Planar(normal) => {
+            let mut r_axes = Vec::with_capacity(points.len());
+            let mut s_axes = Vec::with_capacity(points.len());
+            for tangent in tangents {
+                // Project out any tangent component and re-normalize, so the frame is
+                // orthonormal even where the fitted plane and the sampled tangent
+                // disagree in the last bits.
+                let r = normal
+                    .sub(tangent.scale(normal.dot(*tangent)))
+                    .normalized()
+                    .map_err(|_| {
+                        "sweepSolid: the closed path's plane normal is parallel to its tangent"
+                            .to_string()
+                    })?;
+                s_axes.push(tangent.cross(r).normalized()?);
+                r_axes.push(r);
+            }
+            if requested.twist != 0.0 {
+                roll_over_the_lap(points, &mut r_axes, &mut s_axes, requested.twist)?;
+            }
+            Ok((
+                r_axes,
+                s_axes,
+                Some(SweepClosure {
+                    holonomy: 0.0,
+                    requested_twist: requested.twist,
+                    applied_twist: requested.twist,
+                    curve_shift: requested.shift,
+                }),
+            ))
+        }
+        RingFrame::Spatial => {
+            let (r_axes, s_axes, closure) =
+                ring_closure_frames(points, tangents, screw, requested)?;
+            Ok((r_axes, s_axes, Some(closure)))
+        }
+    }
+}
+
+/// The frames of a closed SPATIAL ring: the transported frame, counter-twisted
+/// by its own holonomy so the section meets itself (see [`SweepClosure`]).
+///
+/// MEASURED, not assumed. The run is transported ONE STEP FURTHER than an open
+/// run goes — from the last station back to station 0, by the very rule every
+/// other step takes (the RMF, or a helix segment's screw frame under `Rigid`) —
+/// and the returned axis is compared with station 0's: the signed angle between
+/// them, right-handed about the start tangent, is the holonomy `h`.
+///
+/// Then station `k`, at chord-length `s_k` round a lap of chord length `L`
+/// (the wrap chord included), is rolled about its tangent by `φ_k = −h·s_k/L`.
+/// Rolling about the tangent commutes with the transport step (each step is a
+/// rotation carrying one tangent onto the next, and it carries a roll about the
+/// first onto the same roll about the second), so the frame transported from
+/// the last twisted station across the wrap arrives rolled by
+/// `h − h·s_{n−1}/L`, and station 0 sits `−h·(L − s_{n−1})/L` further on — the
+/// same rate as every other span. The ring closes with no seam to skin.
+///
+/// No new station law: the closed lane already floors its budget at 16 stations
+/// per quarter turn of the path's TURNING, and a closed curve turns at least
+/// `2π` (Fenchel), so a lap carries at least 64 stations. The largest roll this
+/// lays down is `π`, under 3° a station — finer than the 16 per quarter turn a
+/// requested twist gets.
+///
+/// A REQUESTED twist `T` that closes ([`closing_twist`]) rides on the same rate:
+/// each station rolls by `(T − h)·s_k/L`, so the section comes back from the lap
+/// rolled by `T` alone, onto itself. [`sweep_profile_along_chain`] sizes the
+/// station budget for `|T| + π`.
+fn ring_closure_frames(
+    points: &[Vec3],
+    tangents: &[Vec3],
+    screw: Option<(&[usize], &SweepPath)>,
+    requested: ClosingTwist,
+) -> Result<(Vec<Vec3>, Vec<Vec3>, SweepClosure), String> {
+    let stations = points.len();
+    if stations < 2 {
+        return Err("sweepSolid: need at least 2 stations".into());
+    }
+    // The lap with its wrap: station 0 again, arriving as the LAST segment's end.
+    let mut lap_points = points.to_vec();
+    lap_points.push(points[0]);
+    let mut lap_tangents = tangents.to_vec();
+    lap_tangents.push(tangents[0]);
+    let lap_segments: Option<Vec<usize>> = screw.map(|(segments, _)| {
+        let mut extended = segments.to_vec();
+        extended.push(segments[stations - 1]);
+        extended
+    });
+    let lap_screw = match (&lap_segments, screw) {
+        (Some(segments), Some((_, path))) => Some((segments.as_slice(), path)),
+        _ => None,
+    };
+    let (mut r_axes, mut s_axes) = transported_frames(&lap_points, &lap_tangents, lap_screw)?;
+    let returned = r_axes.pop().expect("a lap has a wrap station");
+    s_axes.pop();
+    let holonomy = returned.dot(s_axes[0]).atan2(returned.dot(r_axes[0]));
+
+    let applied = if requested.twist == 0.0 {
+        -holonomy
+    } else {
+        requested.twist - holonomy
+    };
+    roll_over_the_lap(points, &mut r_axes, &mut s_axes, applied)?;
+    Ok((
+        r_axes,
+        s_axes,
+        SweepClosure {
+            holonomy,
+            requested_twist: requested.twist,
+            applied_twist: applied,
+            curve_shift: requested.shift,
+        },
+    ))
+}
+
+/// Roll a ring's station frames about their tangents by `roll` over the lap,
+/// linearly in chord length with the WRAP chord included: station `k` at `s_k`
+/// of a lap of length `L` rolls by `roll·s_k/L`.
+fn roll_over_the_lap(
+    points: &[Vec3],
+    r_axes: &mut [Vec3],
+    s_axes: &mut [Vec3],
+    roll: f64,
+) -> Result<(), String> {
+    let stations = points.len();
+    let mut travelled = Vec::with_capacity(stations);
+    let mut length = 0.0;
+    for index in 0..stations {
+        travelled.push(length);
+        length += points[(index + 1) % stations].sub(points[index]).length();
+    }
+    if length <= 0.0 {
+        return Err("sweepSolid: the closed path has zero length".into());
+    }
+    for station in 0..stations {
+        let phi = roll * travelled[station] / length;
+        let (sin_phi, cos_phi) = phi.sin_cos();
+        let (r, s) = (r_axes[station], s_axes[station]);
+        r_axes[station] = r.scale(cos_phi).add(s.scale(sin_phi));
+        s_axes[station] = s.scale(cos_phi).sub(r.scale(sin_phi));
+    }
+    Ok(())
+}
+
+/// The TRANSPORTED frames of a station run: seeded on an arbitrary perpendicular
+/// to the first tangent and carried station to station — by the RMF, or by a
+/// helix segment's screw frame under `Rigid` (see [`station_frames`]).
+fn transported_frames(
+    points: &[Vec3],
+    tangents: &[Vec3],
+    screw: Option<(&[usize], &SweepPath)>,
+) -> Result<(Vec<Vec3>, Vec<Vec3>), String> {
+    let stations = points.len();
+    let mut r_axes = Vec::with_capacity(stations);
+    let mut s_axes = Vec::with_capacity(stations);
+    {
+        let r0 = tangents[0].perpendicular()?; // any unit vector ⟂ T0
+        s_axes.push(tangents[0].cross(r0).normalized()?);
+        r_axes.push(r0);
+        // The helix segment the running roll was fixed for, and that roll.
+        let mut roll: Option<(usize, f64)> = None;
+        for index in 0..stations - 1 {
+            let t_next = tangents[index + 1];
+            let helix = screw.and_then(|(segments, path)| {
+                let segment = segments[index + 1];
+                path.screw_axes[segment].map(|axis| (segment, axis, path))
+            });
+            let r_next = match helix {
+                None => rmf_step(
+                    r_axes[index],
+                    tangents[index],
+                    t_next,
+                    points[index + 1].sub(points[index]),
+                )
+                .ok_or_else(|| format!("sweepSolid: frame degenerated at station {index}"))?,
+                Some((segment, axis, path)) => {
+                    // The roll is fixed ONCE per helix segment, at the station it
+                    // departs from — station 0, or the joint the previous segment
+                    // arrived at — so the incoming frame continues without a snap.
+                    let phi = match roll {
+                        Some((fixed, phi)) if fixed == segment => phi,
+                        _ => {
+                            let tangent = tangents[index];
+                            let reference =
+                                screw_reference(axis, tangent, path.name(segment), index)?;
+                            let r = r_axes[index];
+                            let phi = tangent.dot(reference.cross(r)).atan2(reference.dot(r));
+                            roll = Some((segment, phi));
+                            phi
+                        }
+                    };
+                    let reference = screw_reference(axis, t_next, path.name(segment), index + 1)?;
+                    let (sin_phi, cos_phi) = phi.sin_cos();
+                    reference
+                        .scale(cos_phi)
+                        .add(t_next.cross(reference).scale(sin_phi))
+                }
+            };
+            s_axes.push(t_next.cross(r_next).normalized()?);
+            r_axes.push(r_next);
+        }
+    }
+    Ok((r_axes, s_axes))
+}
+
+/// A HELIX station's reference axis: the screw axis with its tangent component
+/// removed, `normalize(W − (W·T)T)`.
+///
+/// Why this and not the transported frame: a helix is carried into itself by
+/// ONE rigid motion — the screw about its axis — and that motion fixes both the
+/// axis and the tangent's angle to it, so the axis' projection onto the normal
+/// plane is the same body-fixed direction at every station. A frame built on it
+/// IS the screw, so `R_k = F_k·F_0ᵀ` carries the profile about the coil's axis
+/// and up its pitch. A rotation-minimizing frame has no spin about the tangent,
+/// while the screw's frame spins at the helix's torsion `τ`, so the RMF rolls
+/// away from it by `∫τ ds` — the rotation the user saw. On a TAPERED helix the
+/// tangent's angle to the axis drifts with the radius, and this frame keeps the
+/// section square to the axis all the same, which is what a tapered coil is.
+///
+/// Undefined only where the path runs ALONG its own axis, which a helix of
+/// positive radius never does; refused by name there rather than guessed.
+fn screw_reference(axis: Vec3, tangent: Vec3, segment: &str, station: usize) -> Result<Vec3, String> {
+    axis.sub(tangent.scale(axis.dot(tangent)))
+        .normalized()
+        .map_err(|_| {
+            format!(
+                "sweepSolid: path segment '{segment}' runs along its own helix axis at station \
+                 {station}, so the screw motion that carries the section has no direction \
+                 about the path there"
+            )
+        })
+}
+
+/// The stations a path is sampled at, and what each one carries: the point, the
+/// unit tangent, and the CURVATURE VECTOR `κ·N̂` — the path's own bend there,
+/// measured from the curve rather than differenced off the station polyline,
+/// because it is the number the tight-bend refusal quotes.
+pub(crate) struct StationSamples {
+    pub(crate) points: Vec<Vec3>,
+    pub(crate) tangents: Vec<Vec3>,
+    /// `κ·N̂` per station: its length is the curvature and its direction points
+    /// at the centre of the osculating circle. Zero on a straight piece.
+    pub(crate) curvatures: Vec<Vec3>,
+    /// The path SEGMENT each station belongs to. A joint station is emitted by
+    /// the segment ARRIVING at it, so it carries that segment's index.
+    pub(crate) segments: Vec<usize>,
+}
+
+/// The CURVATURE VECTOR of a curve from its first two derivatives:
+///
+/// ```text
+///     κ·N̂ = (r̈ − (r̈·T̂)T̂) / |ṙ|²,      T̂ = ṙ/|ṙ|
+/// ```
+///
+/// the component of the second derivative perpendicular to the tangent over the
+/// squared speed — the reparameterization-invariant form, so a non-uniformly
+/// parameterized path reads its own geometric bend rather than its
+/// parameterization's. A degree-1 piece has a zero second derivative
+/// (`derivatives` pads past the degree), so a straight segment reads exactly
+/// zero and needs no special case.
+pub(crate) fn curvature_vector(first: Vec3, second: Vec3) -> Vec3 {
+    let speed_squared = first.dot(first);
+    if speed_squared <= 0.0 {
+        return Vec3::default();
+    }
+    let tangent = first.scale(1.0 / speed_squared.sqrt());
+    second
+        .sub(tangent.scale(second.dot(tangent)))
+        .scale(1.0 / speed_squared)
+}
+
+/// Sample a CHAIN as ONE trajectory: the per-segment arc-length estimate, the
+/// station budget it implies, and the stations themselves.
+///
+/// Extracted from the chain sweep so the tight-bend INSTRUMENT
+/// ([`sweep_bend_profile`]) measures the very stations the sweep lofts through,
+/// rather than a second sampling that agrees with it today.
+fn chain_stations(path: &SweepPath, stations: usize) -> Result<StationSamples, String> {
+    let tolerance = 1e-6;
+    let chain = path.curves.as_slice();
     // --- Per-segment arc-length estimate, and the domain each one is sampled
     //     over. A degenerate domain is refused here rather than producing a
     //     silently collapsed station block.
+    //
+    //     Each segment's TURNING — the total angle its tangent sweeps — is measured
+    //     too, because that, not its length, is what decides how many stations it
+    //     needs (see the floor below).
     let mut domains = Vec::with_capacity(chain.len());
     let mut lengths = Vec::with_capacity(chain.len());
+    let mut turning = Vec::with_capacity(chain.len());
     for (index, curve) in chain.iter().enumerate() {
         let [t0, t1] = curve.domain()?;
         if (t1 - t0).abs() <= tolerance {
@@ -541,6 +1327,9 @@ fn sweep_profile_along_chain_stations(
         }
         domains.push([t0, t1]);
         lengths.push(length);
+        turning.push(segment_turning(curve, [t0, t1]).map_err(|error| {
+            format!("sweepSolid: path tangent is degenerate on segment {index}: {error}")
+        })?);
     }
     let total_length: f64 = lengths.iter().sum();
     if total_length <= tolerance {
@@ -550,17 +1339,75 @@ fn sweep_profile_along_chain_stations(
     // --- Station budget per segment: proportional to arc length, floored at 2
     //     (a segment needs its two ends), and the remainder handed to the
     //     longest segment so the totals land exactly on `stations`.
+    //
+    //     The floor is raised to the segment's own TURNING, at 16
+    //     stations per quarter turn — the density the twisted builder already
+    //     uses, and the one that puts the cubic v-interpolant's own error around
+    //     1e-7 relative (it falls as the fourth power of the angular spacing,
+    //     `Δθ⁴/384`, which is ~2.4e-7 at 16 per quarter turn).
+    //
+    //     WHY THE CLOSED LANE NEEDS IT AND THE OPEN LANE DOES NOT, stated as the
+    //     measurement that forced it: a rounded rectangle's four quarter arcs are
+    //     SHORT next to its four straight runs, so a length-proportional share of
+    //     32 hands each arc the 2-station floor — its two ends and nothing in
+    //     between — and the interpolant cuts the corner. Measured on a 30 x 18
+    //     path with r = 4: the ring came out 6.2 % under `A · perimeter`, a
+    //     watertight, validating, WRONG solid. The floor takes the same case to
+    //     1e-5.
+    //
+    //     An OPEN path is under-sampled the same way and now takes the same floor.
+    //     It did not until 2026-09-25, and a coil showed what that cost: an 8-turn
+    //     helix got 32 stations, four a turn, and the loft between sections a
+    //     quarter turn apart folded its own wall — a `Rigid` sweep along the coil,
+    //     or a coil with a straight lead, was refused outright. (A curvature-JUMP
+    //     law at G1 joints is still this plan's remaining item 2; the floor is
+    //     about how far a segment turns, not how its curvature changes.)
+    //
+    //     Once the floors lift the turning segments past their share, the SHARES
+    //     are taken of the lifted total, not of the `stations` asked for: the
+    //     segments that do not turn are sampled at the density the turning ones
+    //     were raised to. Measured on the coil above with a tangent straight lead:
+    //     the floor gave the coil ~500 stations and the lead its share of 32 — its
+    //     two ends — and the interpolant, stiff from the coil, bowed through the
+    //     lead: 2.7e-5 off Pappus on a lead of 10, 5.0e-4 on a lead of 100, and
+    //     1.5e-7 / 2.1e-7 at the density the coil was given.
+    let floors: Vec<usize> = turning
+        .iter()
+        .map(|turn| ((turn / std::f64::consts::FRAC_PI_2) * 16.0).ceil() as usize)
+        .collect();
+    let floored_length: f64 = lengths
+        .iter()
+        .zip(&floors)
+        .filter(|(_, floor)| **floor > 2)
+        .map(|(length, _)| length)
+        .sum();
+    let floor_total: usize = floors.iter().sum();
+    //     A CLOSED path is not lifted — its shares stay those of the `stations`
+    //     asked for (its floors can still move where a segment's turning is
+    //     re-read densely, see `segment_turning`): its loft
+    //     runs every skin through as many laps as its section curves take to
+    //     cycle, so a lifted total multiplies against the cap there, and the
+    //     closed lane's measured residuals are pinned at its own budget.
+    let lifted = if !path.closed && floored_length > tolerance {
+        let straight = floor_total as f64 * (total_length - floored_length) / floored_length;
+        ((floor_total as f64 + straight).ceil() as usize).min(1024)
+    } else {
+        0
+    };
+    let stations = stations.max(lifted);
     let mut budget: Vec<usize> = lengths
         .iter()
-        .map(|length| {
+        .zip(&floors)
+        .map(|(length, floor)| {
             let share = (stations as f64 * length / total_length).round() as usize;
-            share.max(2)
+            share.max(*floor).max(2)
         })
         .collect();
     // Each interior joint shares one station between its two segments, so the
-    // emitted total is sum(budget) - (segments - 1).
-    let joints = chain.len() - 1;
-    let emitted: usize = budget.iter().sum::<usize>() - joints;
+    // emitted total is sum(budget) - (segments - 1). A CLOSED path drops its very
+    // last station too — it is the first one — so it emits one fewer again.
+    let shared = chain.len() - 1 + usize::from(path.closed);
+    let emitted: usize = budget.iter().sum::<usize>() - shared;
     // The 2-per-segment floor means a chain of n segments emits at least n+1
     // stations, so a long enough chain cannot be held under the loft's station
     // cap by any distribution. The loft's interpolation solve is O(stations³)
@@ -585,69 +1432,357 @@ fn sweep_profile_along_chain_stations(
         budget[longest] += stations - emitted;
     }
 
-    // --- Sample the chain as ONE trajectory, checking tangent continuity at
-    //     every joint as it is crossed.
+    // --- Sample the chain as ONE trajectory.
     let mut points: Vec<Vec3> = Vec::new();
     let mut tangents: Vec<Vec3> = Vec::new();
+    let mut curvatures: Vec<Vec3> = Vec::new();
+    let mut segments: Vec<usize> = Vec::new();
     for (index, curve) in chain.iter().enumerate() {
         let [t0, t1] = domains[index];
         let count = budget[index];
-
-        // The JOINT check runs at this segment's START parameter, which is the
-        // point the previous segment ended on — comparing the tangent the path
-        // arrives with against the one it departs with. Sampling the next
-        // station instead would fold the segment's own curvature into the
-        // measured break and let a genuine corner through on a curved segment.
-        if index > 0 {
-            let departing = curve.derivatives(t0, 1)?[1].normalized().map_err(|_| {
-                format!("sweepSolid: path tangent is degenerate at the start of segment {index}")
-            })?;
-            let arriving = *tangents
-                .last()
-                .expect("a previous segment emitted stations");
-            // Both unit, so the dot is the cosine of the break.
-            let break_angle = arriving.dot(departing).clamp(-1.0, 1.0).acos();
-            if break_angle > MAX_JOINT_TANGENT_BREAK {
-                let previous_name = segment_names
-                    .get(index - 1)
-                    .map(String::as_str)
-                    .unwrap_or("<unnamed>");
-                let name = segment_names
-                    .get(index)
-                    .map(String::as_str)
-                    .unwrap_or("<unnamed>");
-                return Err(format!(
-                    "the path must be tangent-continuous: segments '{previous_name}' and \
-                     '{name}' meet at a {:.1}° corner. The profile is skinned between sampled \
-                     stations along the path, so a corner would be ROUNDED OFF rather than \
-                     mitred. {corner_advice}",
-                    break_angle.to_degrees()
-                ));
+        // Skip the first sample of every segment after the first: that station
+        // is the joint, already emitted as the previous segment's last. On a
+        // CLOSED path the LAST segment's last sample is skipped too — it is
+        // station 0, and a ring that emitted it twice would interpolate a
+        // zero-length span across its own seam.
+        let first = usize::from(index > 0);
+        if first == 1 {
+            // THE JOINT reads the TIGHTER of the two pieces that meet there. A
+            // G1 joint is tangent-continuous, not curvature-continuous — a line
+            // running into a cubic hands over at κ = 0 and the cubic starts at
+            // its own spike — and the station is emitted once, by the piece that
+            // ARRIVES. Left as that, a path whose tightest bend sits at the
+            // START of a curved piece would quote the straight piece's κ = 0 and
+            // the bend would go unnamed; on the wire harness's own span the two
+            // ends are mirror images and only ONE of them was being read.
+            let derivatives = curve.derivatives_small(t0, 2)?;
+            let arriving = curvature_vector(derivatives[1], derivatives[2]);
+            if let Some(departing) = curvatures.last_mut() {
+                if arriving.length() > departing.length() {
+                    *departing = arriving;
+                }
             }
         }
-
-        // Skip the first sample of every segment after the first: that station
-        // is the joint, already emitted as the previous segment's last.
-        let first = usize::from(index > 0);
-        for sample in first..count {
+        let last = count - usize::from(path.closed && index + 1 == chain.len());
+        for sample in first..last {
             let t = t0 + (t1 - t0) * sample as f64 / (count - 1) as f64;
-            let derivatives = curve.derivatives(t, 1)?;
+            let derivatives = curve.derivatives_small(t, 2)?;
             let tangent = derivatives[1].normalized().map_err(|_| {
                 format!("sweepSolid: path tangent is degenerate on segment {index}")
             })?;
             points.push(derivatives[0]);
             tangents.push(tangent);
+            curvatures.push(curvature_vector(derivatives[1], derivatives[2]));
+            segments.push(index);
         }
     }
+    // A CLOSED path's seam is a joint like any other, and station 0 is the only
+    // one whose two sides are sampled at opposite ends of the loop: the last
+    // segment's end is station 0, and it was dropped rather than emitted.
+    if path.closed {
+        if let (Some(curve), Some(domain)) = (chain.last(), domains.last()) {
+            let derivatives = curve.derivatives_small(domain[1], 2)?;
+            let arriving = curvature_vector(derivatives[1], derivatives[2]);
+            if let Some(departing) = curvatures.first_mut() {
+                if arriving.length() > departing.length() {
+                    *departing = arriving;
+                }
+            }
+        }
+    }
+    Ok(StationSamples {
+        points,
+        tangents,
+        curvatures,
+        segments,
+    })
+}
 
-    sweep_sections_through_samples(
-        profile,
-        &points,
-        &tangents,
-        twist_angle,
-        placement,
-        placement_mode,
-    )
+/// The ring frame's fixed reference axis: the path plane's own normal, oriented
+/// once and reused at every station.
+///
+/// A planar path's rotation-minimizing frame IS the planar frame — the transport
+/// has no component about the tangent, so the axis perpendicular to the plane is
+/// carried unchanged the whole way round and comes back to itself EXACTLY. That
+/// is what makes a closed planar sweep need no twist policy: the holonomy is
+/// zero by construction, not by cancellation. Taking the plane normal as the
+/// reference axis says so in the construction rather than hoping a
+/// station-by-station transport returns to where it started.
+///
+/// The guard is the one case a fixed axis cannot serve: a tangent parallel to the
+/// normal, which a planar path cannot have and a mis-fitted plane could.
+fn ring_normal(normal: Vec3, tangents: &[Vec3]) -> Result<Vec3, String> {
+    for (index, tangent) in tangents.iter().enumerate() {
+        if tangent.cross(normal).length() < 0.5 {
+            return Err(format!(
+                "sweepSolid: the closed path's own plane normal is within 30° of its tangent \
+                 at station {index}, so the path does not lie in that plane after all"
+            ));
+        }
+    }
+    normal.normalized().map_err(|_| {
+        "sweepSolid: the closed path's plane normal is degenerate".to_string()
+    })
+}
+
+/// The total TURNING of one path segment: the angle its unit tangent sweeps over
+/// its own domain, summed over 16 uniform steps — or, where a step turns more
+/// than [`TURNING_ALIAS_STEP`], over 16 steps per knot span.
+///
+/// Not the same question as its length, and the one a station budget has to
+/// answer: a straight segment of any length is carried exactly by two stations,
+/// while a quarter arc of any radius needs enough stations that the cubic
+/// interpolant through them does not cut the corner. 16 samples is the density
+/// every other estimate in this builder uses — and it ALIASES a segment that
+/// turns more than a few times: on an 8-turn coil each step is half a turn, and
+/// the angle between two tangents cannot read more than π however far the curve
+/// turned between them. A step that large is the sign, so only then is the
+/// segment re-read densely; everything that reads calmly at 16 keeps exactly the
+/// reading, and so exactly the floor, it always had (a half circle reads a hair
+/// over π there, and a floor of 33 — the budget the closed lane is pinned at).
+fn segment_turning(curve: &NurbsCurve, domain: [f64; 2]) -> Result<f64, String> {
+    let (total, widest) = turning_at(curve, domain, 16)?;
+    if widest <= TURNING_ALIAS_STEP {
+        return Ok(total);
+    }
+    let spans = curve.knots.windows(2).filter(|pair| pair[1] > pair[0]).count();
+    Ok(turning_at(curve, domain, (spans * 16).clamp(64, 8192))?.0)
+}
+
+/// The widest tangent step [`segment_turning`] trusts at 16 samples: π/8, twice
+/// the step of a quarter arc read at that density.
+const TURNING_ALIAS_STEP: f64 = std::f64::consts::PI / 8.0;
+
+/// `(total turning, widest single step)` over `steps` uniform steps.
+fn turning_at(curve: &NurbsCurve, domain: [f64; 2], steps: usize) -> Result<(f64, f64), String> {
+    let [t0, t1] = domain;
+    let mut total = 0.0;
+    let mut widest: f64 = 0.0;
+    // A stationary sample — a cusp in the parameterization, which an involute
+    // flank's Hermite fit carries by construction — still has a direction of
+    // travel, and the turning is a question about directions.
+    let mut previous = curve.unit_tangent(t0, t0, t1)?;
+    for sample in 1..=steps {
+        let tangent = curve.unit_tangent(t0 + (t1 - t0) * sample as f64 / steps as f64, t0, t1)?;
+        let step = previous.dot(tangent).clamp(-1.0, 1.0).acos();
+        total += step;
+        widest = widest.max(step);
+        previous = tangent;
+    }
+    Ok((total, widest))
+}
+
+/// ONE double-reflection step (Wang et al. 2008) of a rotation-minimizing frame:
+/// carry the reference axis `r` from a station with tangent `t` to the next with
+/// tangent `t_next` across the step vector `step`, then re-orthogonalize against
+/// the new tangent to shed floating drift. `None` when the result degenerates.
+///
+/// Extracted so the frame the sections are placed on and the frame the holonomy
+/// is measured with are the SAME transport rather than two copies of it.
+fn rmf_step(r: Vec3, t: Vec3, t_next: Vec3, step: Vec3) -> Option<Vec3> {
+    let c1 = step.dot(step);
+    let candidate = if c1 <= 1e-18 {
+        // Coincident stations: carry the reference axis forward unchanged.
+        r
+    } else {
+        // First reflection across the plane bisecting the step vector.
+        let reflected_r = r.sub(step.scale(2.0 / c1 * step.dot(r)));
+        let reflected_t = t.sub(step.scale(2.0 / c1 * step.dot(t)));
+        // Second reflection across the plane bisecting the tangents.
+        let v2 = t_next.sub(reflected_t);
+        let c2 = v2.dot(v2);
+        if c2 <= 1e-18 {
+            reflected_r
+        } else {
+            reflected_r.sub(v2.scale(2.0 / c2 * v2.dot(reflected_r)))
+        }
+    };
+    candidate
+        .sub(t_next.scale(candidate.dot(t_next)))
+        .normalized()
+        .ok()
+}
+
+// ===========================================================================
+// The TIGHT BEND: a section carried through a bend tighter than its own reach
+// ===========================================================================
+
+/// How many points each profile curve contributes to the section's REACH.
+///
+/// The reach has to be a WITNESS — a point of the section that really does turn
+/// back — so it is read off the curve itself and never off the control hull:
+/// `make_arc` places a half-circle's middle controls at `r√2`, so a hull bound
+/// would refuse a round section 41 % early. Sampling under-reads instead, which
+/// is the safe direction: at 64 samples per curve a circle's support is short by
+/// `r(1 − cos(π/128))` = 3.0e-4·r, so the guard can only ever refuse LATE, and a
+/// bend that slips past it still meets the fold acceptance at the loft's exit.
+const BEND_SECTION_SAMPLES: usize = 64;
+
+/// One station's tight-bend reading: what the path does there and how far the
+/// section reaches into it.
+///
+/// The quantity that decides the sweep is [`BendStation::ratio`] — `reach·κ`,
+/// the same `ρκ` the fillet's canal surface folds at. A section point offset `d`
+/// towards the centre of the osculating circle advances `(1 − d·κ)` per unit of
+/// path, so at `d·κ = 1` it stops and past it it goes BACKWARDS: the swept
+/// envelope has turned back through itself and the solid is the envelope trimmed
+/// at that self-intersection, not the loft through the crossing sections.
+#[derive(Debug, Clone, Copy)]
+pub struct BendStation {
+    /// The station's index in the sweep's own station list.
+    pub station: usize,
+    /// Where it is on the path.
+    pub point: Vec3,
+    /// The path's curvature `κ` there (zero on a straight piece).
+    pub curvature: f64,
+    /// The path's radius of curvature `ρ = 1/κ`, `f64::INFINITY` where straight.
+    pub radius: f64,
+    /// How far the placed section reaches towards the centre of the bend —
+    /// its support in the curvature-normal direction. Negative when the whole
+    /// section sits on the OUTSIDE of the bend, zero where the path is straight.
+    pub reach: f64,
+    /// `reach·κ`. `< 1` builds; `≥ 1` folds.
+    pub ratio: f64,
+}
+
+/// The profile's sample points in the placement frame's own 2D coordinates
+/// `(a, b) = ((x − origin)·pu, (x − origin)·pv)`.
+///
+/// Sampled ONCE: `Transplant` places the same 2D shape at every station
+/// (`world = station + rᵢ·a + sᵢ·b`), so a station's reach is a pair of dot
+/// products against the precomputed cloud rather than a re-evaluation of the
+/// placed curves.
+fn section_offsets(
+    profile: &[NurbsCurve],
+    placement: &ProfileAnchor,
+) -> Result<Vec<(f64, f64)>, String> {
+    let ProfileAnchor { origin, pu, pv, .. } = *placement;
+    let mut offsets = Vec::with_capacity(profile.len() * BEND_SECTION_SAMPLES);
+    for curve in profile {
+        let [start, end] = curve.domain()?;
+        for sample in 0..BEND_SECTION_SAMPLES {
+            let t = start + (end - start) * sample as f64 / BEND_SECTION_SAMPLES as f64;
+            let local = curve.evaluate(t)?.sub(origin);
+            offsets.push((local.dot(pu), local.dot(pv)));
+        }
+    }
+    Ok(offsets)
+}
+
+/// The `ρκ` profile: one [`BendStation`] per station, in station order.
+///
+/// `axes` are the frames the sections are PLACED on (twist included), because
+/// the reach is the section's support in the curvature-normal direction and a
+/// non-round section rolled about the path presents a different support there.
+fn bend_stations(
+    points: &[Vec3],
+    curvatures: &[Vec3],
+    axes: &[(Vec3, Vec3)],
+    offsets: &[(f64, f64)],
+) -> Vec<BendStation> {
+    (0..points.len())
+        .map(|station| {
+            let curvature = curvatures[station].length();
+            if curvature <= 0.0 {
+                return BendStation {
+                    station,
+                    point: points[station],
+                    curvature: 0.0,
+                    radius: f64::INFINITY,
+                    reach: 0.0,
+                    ratio: 0.0,
+                };
+            }
+            // The curvature vector is perpendicular to the tangent by
+            // construction, so its components on (r, s) are the whole of it.
+            let normal = curvatures[station].scale(1.0 / curvature);
+            let (r_axis, s_axis) = axes[station];
+            let (nu, nv) = (normal.dot(r_axis), normal.dot(s_axis));
+            let reach = offsets
+                .iter()
+                .map(|(a, b)| a * nu + b * nv)
+                .fold(f64::NEG_INFINITY, f64::max);
+            BendStation {
+                station,
+                point: points[station],
+                curvature,
+                radius: 1.0 / curvature,
+                reach,
+                ratio: reach * curvature,
+            }
+        })
+        .collect()
+}
+
+/// The `ρκ` profile a TRANSPLANT sweep of `profile` along `path` would carry at
+/// `stations` stations — the instrument behind the refusal below, exposed so a
+/// caller (or a probe) can measure a path BEFORE asking for the solid.
+///
+/// Reads the very stations the sweep lofts through: the same budget, the same
+/// sampling, the same rotation-minimizing frame. Untwisted, which is the lane
+/// every caller of [`sweep_profile_along_chain_with_stations`] is in.
+pub fn sweep_bend_profile(
+    profile: &[NurbsCurve],
+    path: &SweepPath,
+    stations: usize,
+) -> Result<Vec<BendStation>, String> {
+    let placement = resolve_placement(profile, None, SectionPlacement::Transplant)?;
+    let StationSamples {
+        points,
+        tangents,
+        curvatures,
+        ..
+    } = chain_stations(path, stations.clamp(2, 1024))?;
+    let closure = ring_frame(path, &tangents)?;
+    let untwisted = ClosingTwist {
+        twist: 0.0,
+        shift: 0,
+    };
+    let (r_axes, s_axes, _) = station_frames(&points, &tangents, closure, None, untwisted)?;
+    let axes: Vec<(Vec3, Vec3)> = r_axes.into_iter().zip(s_axes).collect();
+    let offsets = section_offsets(profile, &placement)?;
+    Ok(bend_stations(&points, &curvatures, &axes, &offsets))
+}
+
+/// The prefix every tight-bend refusal starts with, so a caller can CLASSIFY one
+/// (the wire harness reports it as a bundle status) without matching free text.
+pub const SWEEP_TIGHT_BEND_REFUSAL: &str = "sweepSolid: the path bends TIGHTER than the section";
+
+/// The refusal for a path that bends tighter than the section reaches, or `None`
+/// when every station builds.
+///
+/// Quotes the WORST station rather than the first one scanned — the tightest
+/// bend is the one the user has to ease, and a path can cross the bar in several
+/// places (both ends of one Hermite span, typically).
+fn tight_bend_refusal(profile: &[BendStation], stations: usize) -> Option<String> {
+    let folded = profile.iter().filter(|station| station.ratio >= 1.0).count();
+    if folded == 0 {
+        return None;
+    }
+    let worst = profile
+        .iter()
+        .max_by(|a, b| a.ratio.total_cmp(&b.ratio))
+        .expect("a folded station exists");
+    Some(format!(
+        "{SWEEP_TIGHT_BEND_REFUSAL} at station {} of {stations} ({:.4}, {:.4}, {:.4}): the path's \
+         radius of curvature there is {:.6} and the section reaches {:.6} into the bend, so \
+         ρ·κ = {:.3} ≥ 1 ({folded} of {stations} stations do). A section carried through a bend \
+         tighter than its own reach sweeps an envelope that passes through ITSELF — the solid \
+         there is that envelope trimmed at its own self-intersection, which this lane does not \
+         build: it skins the section between stations, and past ρ·κ = 1 the sections CROSS and \
+         the wall folds. Ease the bend to a radius above {:.6}, or narrow the section until it \
+         reaches no further than {:.6} (a round section of diameter {:.6})",
+        worst.station,
+        worst.point.x,
+        worst.point.y,
+        worst.point.z,
+        worst.radius,
+        worst.reach,
+        worst.ratio,
+        worst.reach,
+        worst.radius,
+        2.0 * worst.radius,
+    ))
 }
 
 /// The part of the sweep that does not care HOW the stations were sampled:
@@ -665,13 +1800,32 @@ fn sweep_profile_along_chain_stations(
 /// The RMF is propagated over the station sequence as a whole, so a chain's
 /// frame carries across a joint exactly as it carries across any other pair of
 /// adjacent stations — there is no per-segment restart to reconcile.
+///
+/// `closure` turns the run into a RING: anything but [`RingFrame::Open`] says the
+/// stations come back round to station 0 (which is therefore NOT repeated at the
+/// end). `Planar(normal)` says the path lies in the plane of that normal, so the
+/// reference axis is fixed rather than transported — a planar frame, whose
+/// holonomy round the loop is zero by construction. `Spatial` transports the
+/// frame and closes it with the counter-twist policy ([`SweepClosure`]). Either
+/// way the sections skin through a CLOSED loft: one face per section curve, no
+/// end caps, `V − E + F = 0`. `Open` is the open run: transported frame, two end
+/// caps, and the refusal below for a trajectory that closes anyway.
+///
+/// `chain` is the station-to-segment map and the classified path, from the chain
+/// sampler; the single-curve sampler has none. Only `Rigid` reads it, to frame a
+/// HELIX segment's stations off its screw axis ([`screw_reference`]).
+#[allow(clippy::too_many_arguments)]
 fn sweep_sections_through_samples(
     profile: &[NurbsCurve],
     points: &[Vec3],
     tangents: &[Vec3],
+    curvatures: &[Vec3],
     twist_angle: f64,
     placement: ProfileAnchor,
     placement_mode: SectionPlacement,
+    closure: RingFrame,
+    envelope_gap: Option<&str>,
+    chain: Option<(&[usize], &SweepPath)>,
 ) -> Result<BrepSolid, String> {
     let tolerance = 1e-6;
     let stations = points.len();
@@ -686,8 +1840,11 @@ fn sweep_sections_through_samples(
     //         uniformly in space even on a non-uniformly parameterized path.
     //         Only computed when a twist is actually requested — the
     //         `twist_angle == 0.0` path must stay bit-identical to the
-    //         pre-twist builder.
-    let twist_fractions: Option<Vec<f64>> = if twist_angle != 0.0 {
+    //         pre-twist builder — and only on an OPEN run. These fractions stop at
+    //         the last station, so a RING laid down by them would roll its wrap
+    //         span at a different rate from every other; a ring rolls its twist
+    //         in its frames instead, over the whole lap (§3).
+    let twist_fractions: Option<Vec<f64>> = if twist_angle != 0.0 && !closure.is_ring() {
         let mut cumulative = vec![0.0; stations];
         let mut total = 0.0;
         for index in 1..stations {
@@ -705,67 +1862,84 @@ fn sweep_sections_through_samples(
         None
     };
 
-    // --- 3. Rotation-minimizing frames via the double-reflection method.
-    let mut r_axes = Vec::with_capacity(stations);
-    let mut s_axes = Vec::with_capacity(stations);
-    let r0 = tangents[0].perpendicular()?; // any unit vector ⟂ T0
-    s_axes.push(tangents[0].cross(r0).normalized()?);
-    r_axes.push(r0);
-    for index in 0..stations - 1 {
-        let t_next = tangents[index + 1];
-        let v1 = points[index + 1].sub(points[index]);
-        let c1 = v1.dot(v1);
-        let r_candidate = if c1 <= 1e-18 {
-            // Coincident stations: carry the reference axis forward unchanged.
-            r_axes[index]
-        } else {
-            // First reflection across the plane bisecting the step vector.
-            let reflected_r = r_axes[index].sub(v1.scale(2.0 / c1 * v1.dot(r_axes[index])));
-            let reflected_t = tangents[index].sub(v1.scale(2.0 / c1 * v1.dot(tangents[index])));
-            // Second reflection across the plane bisecting the tangents.
-            let v2 = t_next.sub(reflected_t);
-            let c2 = v2.dot(v2);
-            if c2 <= 1e-18 {
-                reflected_r
-            } else {
-                reflected_r.sub(v2.scale(2.0 / c2 * v2.dot(reflected_r)))
-            }
-        };
-        // Re-orthogonalize against the new tangent to shed floating drift.
-        let r_next = r_candidate
-            .sub(t_next.scale(r_candidate.dot(t_next)))
-            .normalized()
-            .map_err(|_| format!("sweepSolid: frame degenerated at station {index}"))?;
-        s_axes.push(t_next.cross(r_next).normalized()?);
-        r_axes.push(r_next);
-    }
-
-    // --- 3b. A CLOSED trajectory cannot be capped: the first and last sections
-    //         land on top of each other, and the loft's own complaint about that
-    //         ("end sections coincide") says nothing about the path. Name it here
-    //         instead, with the two things that do work. The check is on the
-    //         PATH's first and last station POINTS, which is enough: a path that
-    //         comes back to where it started puts the two caps in the same place
-    //         whatever direction it arrives from — coincident when it also
-    //         arrives pointing the same way, interpenetrating when it does not,
-    //         and neither is a solid worth building.
+    // --- 3. The station frames.
     //
-    //         The scale is the path's own travel, so this is a proportion, not a
-    //         length: ends within a thousandth of the distance travelled are the
-    //         same place for capping purposes. On a circular arc that band is the
-    //         last ~0.36° before closure, so a 359° sweep still builds.
-    {
+    //   OPEN: rotation-minimizing frames via the double-reflection method, seeded
+    //   on an arbitrary perpendicular to T0 — arbitrary because `Rigid` cancels
+    //   the seed out (`R_k = F_k·F_0ᵀ`) and `Transplant` has always taken whatever
+    //   roll `perpendicular()` returned.
+    //
+    //   RING: the plane normal is the reference axis AT EVERY STATION. A planar
+    //   path's RMF is that frame already — the transport has no component about
+    //   the tangent — so this is not a different frame from the open lane's, it is
+    //   the same frame written down in closed form instead of accumulated. Which
+    //   matters for exactly one reason: written down, it returns to itself at the
+    //   seam EXACTLY, so the ring's last section meets its first with no residual
+    //   roll to skin away.
+    //
+    //   SPATIAL RING: the open lane's transported frame, carried one step further
+    //   round the wrap to MEASURE the roll it returns with (the holonomy), and
+    //   counter-twisted by that roll linearly in arc length so the lap's last span
+    //   rolls at the same rate as every other and the ring meets itself
+    //   (`ring_closure_frames`).
+    //
+    //   A REQUESTED twist on a RING is laid down in those frames too, over the
+    //   whole lap with the wrap, on top of the counter-twist — but only a twist
+    //   that closes: after the lap the section comes back rolled by it, so it must
+    //   carry the section onto itself ([`closing_twist`], refused by name
+    //   otherwise). A fractional turn on a symmetric section closes onto a
+    //   DIFFERENT curve than it left, `shift` along, and the loft below is told.
+    //
+    //   RIGID on a HELIX segment: the helix's own screw frame (see
+    //   `screw_reference`), which the RMF rolls away from by the helix's
+    //   integrated torsion. `Transplant` keeps the RMF everywhere — it squares
+    //   the section to the path and centres it there, and its callers (SWP, the
+    //   tube, the harness) are not this contract.
+    let screw = chain.filter(|_| placement_mode == SectionPlacement::Rigid);
+    let requested = if closure.is_ring() && twist_angle != 0.0 {
+        let (section, _) = place_section(profile, placement, placement_mode, points[0], tangents[0])?;
+        ring_closing_twist(&section, points, tangents, twist_angle)?
+    } else {
+        ClosingTwist {
+            twist: 0.0,
+            shift: 0,
+        }
+    };
+    let (r_axes, s_axes, _) = station_frames(points, tangents, closure, screw, requested)?;
+
+    // --- 3b. An OPEN trajectory that comes back to where it started cannot be
+    //         capped: the first and last sections land on top of each other, and
+    //         the loft's own complaint about that ("end sections coincide") says
+    //         nothing about the path. Name it here instead, with the two things
+    //         that do work. The check is on the PATH's first and last station
+    //         POINTS, which is enough: a path that comes back to where it started
+    //         puts the two caps in the same place whatever direction it arrives
+    //         from — coincident when it also arrives pointing the same way,
+    //         interpenetrating when it does not, and neither is a solid worth
+    //         building.
+    //
+    //         TWO CLOSURE NOTIONS COEXIST, and deliberately. A path whose ends
+    //         meet within the chainer's join band is CLASSIFIED closed and swept
+    //         as a ring above — that is the shape a user drew as a loop. This band
+    //         is a thousandth of the distance TRAVELLED, a hundred times looser,
+    //         and it catches the run that is nearly a loop without being one: a
+    //         359.7° arc whose caps would interpenetrate rather than coincide. The
+    //         first is a shape with a construction; the second is an accident, and
+    //         it is still refused. On a circular arc the band is the last ~0.36°
+    //         before closure, so a 359° sweep still builds.
+    if !closure.is_ring() {
         let travel: f64 = points
             .windows(2)
             .map(|pair| pair[1].sub(pair[0]).length())
             .sum();
-        let closure = points[stations - 1].sub(points[0]).length();
-        if travel > tolerance && closure <= 1e-3 * travel {
+        let gap = points[stations - 1].sub(points[0]).length();
+        if travel > tolerance && gap <= 1e-3 * travel {
             return Err(format!(
-                "sweepSolid: the path returns to where it started ({closure:.3e} apart after \
+                "sweepSolid: the path returns to where it started ({gap:.3e} apart after \
                  travelling {travel:.3e}), so the sweep's two end caps would land on top of each \
                  other. A closed path swept this way IS a revolution — build it with Revolve \
-                 about the same axis, or sweep the run in two halves and union them"
+                 about the same axis, or close the path exactly so it sweeps as a capless ring, \
+                 or sweep the run in two halves and union them"
             ));
         }
     }
@@ -796,6 +1970,9 @@ fn sweep_sections_through_samples(
     let mut station_points: Vec<Vec<Vec3>> = Vec::with_capacity(if rigid { stations } else { 0 });
     let mut section_normals: Vec<Vec3> = Vec::with_capacity(if rigid { stations } else { 0 });
     let mut anchor_track: Vec<Vec3> = Vec::with_capacity(if rigid { stations } else { 0 });
+    // The axes the section is actually PLACED on, twist included — what the
+    // tight-bend guard below measures the section's reach in.
+    let mut placed_axes: Vec<(Vec3, Vec3)> = Vec::with_capacity(stations);
     for station in 0..stations {
         let station_origin = points[station];
         // Rotate the RMF axes about the tangent by the station's twist angle
@@ -814,6 +1991,7 @@ fn sweep_sections_through_samples(
             }
             None => (r_axes[station], s_axes[station]),
         };
+        placed_axes.push((ri, si));
         let tk = tangents[station];
         let place = |x: Vec3| -> Vec3 {
             if rigid {
@@ -887,15 +2065,36 @@ fn sweep_sections_through_samples(
     // its extremes over the section lie on the control points. Checking the hull
     // therefore bounds the advance over the curves AND over the region they
     // enclose — this is a proof, not a sampling.
+    //
+    // ON A RING the guard walks one step FURTHER: the wrap from the last station
+    // back to station 0 is a step the sections take like any other, and it is the
+    // one step an open run does not have. A ring whose wrap step folded while
+    // every interior step advanced would otherwise pass. On a ring whose twist
+    // lands each curve `shift` along, the wrap step's control points arrive on
+    // that curve's: the flat control-point list of station 0, turned left by the
+    // points of the `shift` curves before it (curves `j` and `j + shift` carry the
+    // same number, which is what makes the turn a relabelling).
+    let step_count = if closure.is_ring() {
+        stations
+    } else {
+        stations - 1
+    };
+    let next_station = |station: usize| (station + 1) % stations;
     if rigid {
+        let landing_offset: usize = profile[..requested.shift]
+            .iter()
+            .map(|curve| curve.control_points.len())
+            .sum();
         let mut most_positive = 0.0f64;
         let mut most_negative = 0.0f64;
         let mut longest_step = 0.0f64;
-        for station in 0..stations - 1 {
+        for station in 0..step_count {
             let normal = section_normals[station];
+            let arriving = &station_points[next_station(station)];
+            let turn = if next_station(station) == 0 { landing_offset } else { 0 };
             for (before, after) in station_points[station]
                 .iter()
-                .zip(&station_points[station + 1])
+                .zip(arriving[turn..].iter().chain(&arriving[..turn]))
             {
                 let step = after.sub(*before);
                 longest_step = longest_step.max(step.length());
@@ -930,8 +2129,8 @@ fn sweep_sections_through_samples(
         // profile and vector is. A station whose origin barely moves is skipped —
         // an origin sitting on the turn axis means the profile straddles it, and
         // the fold-back guard above has already spoken.
-        for station in 0..stations - 1 {
-            let step = anchor_track[station + 1].sub(anchor_track[station]);
+        for station in 0..step_count {
+            let step = anchor_track[next_station(station)].sub(anchor_track[station]);
             let length = step.length();
             if length <= noise {
                 continue;
@@ -946,9 +2145,70 @@ fn sweep_sections_through_samples(
         }
     }
 
-    // --- 5. Loft through the swept sections (side walls + planar end caps).
-    loft_profile_brep(&sections)
-        .map_err(|error| format!("sweepSolid: loft through swept sections failed: {error}"))
+    // --- 4c. TRANSPLANT: refuse a path that bends TIGHTER than the section
+    //         reaches, before the loft rather than after it.
+    //
+    // A section square to the path, offset `d` towards the centre of the
+    // osculating circle, advances `(1 − d·κ)` per unit of path: at `d·κ = 1` it
+    // stands still and past it it RETREATS, so consecutive sections cross and
+    // the wall the loft skins through them passes through itself. That is the
+    // same `ρκ > 1` the fillet's canal surface folds at, and the same defect the
+    // soundness acceptance catches at the loft's exit — but caught THERE it can
+    // only name a face and two parameters, where here it can name the station,
+    // the bend and the section that does not fit through it.
+    //
+    // RIGID is not measured here: it does not keep the section square to the
+    // path, so `ρκ` is not its criterion, and §4b above is its guard.
+    //
+    // The reach is a WITNESS and the curvature is the PATH's own, so this refuses
+    // only where a real section point really does turn back. What it does not see
+    // is a bend that peaks BETWEEN two stations — the loft interpolates those,
+    // and the acceptance at the exit remains the backstop.
+    if !rigid && std::env::var("BREP_SWEEP_BEND_GUARD").as_deref() != Ok("0") {
+        let offsets = section_offsets(profile, &placement)?;
+        let profile_stations = bend_stations(points, curvatures, &placed_axes, &offsets);
+        if let Some(refusal) = tight_bend_refusal(&profile_stations, stations) {
+            // The ENVELOPE lane builds this shape exactly for ONE configuration
+            // (a circle on one circular planar arc), and a caller that lands here
+            // has missed it. `envelope_gap` is that lane's own measurement of
+            // WHICH half was missed, carried down from the entry that has the
+            // path to measure — so the refusal names the boundary of what is
+            // built rather than only the bend that is refused.
+            return Err(match envelope_gap {
+                Some(gap) if !gap.is_empty() => format!(
+                    "{refusal}. The swept envelope trimmed at its own self-intersection is built \
+                     for a CIRCLE carried along one circular planar arc, and this sweep is not \
+                     that: {gap}"
+                ),
+                _ => refusal,
+            });
+        }
+    }
+
+    // --- 5. Loft through the swept sections.
+    //
+    //   OPEN: side walls plus two planar end caps.
+    //
+    //   RING: the CLOSED loft — the sections form a cycle, the last flowing back
+    //   into the first through the same C² cyclic interpolation every interior
+    //   span gets, so the seam is not a weld. One face per section curve and NO
+    //   CAPS, which is the whole point: a ring has no ends to cap, and capping it
+    //   would be two faces inside the material. The topology it emits is
+    //   `c` corner vertices, `c` corner rings, `c` seam edges and `c` faces, so
+    //   `V − E + F = c − 2c + c = 0` — the Euler characteristic of a torus, which
+    //   is what a section carried once round a loop encloses.
+    //   A RING whose requested twist lands each curve `shift` along skins each
+    //   wall from its own curve into that one (`loft_profile_brep_closed_shifted`),
+    //   so there is still one wall per section curve.
+    match closure {
+        RingFrame::Planar(_) | RingFrame::Spatial => {
+            crate::loft_profile_brep_closed_shifted(&sections, requested.shift).map_err(|error| {
+                format!("sweepSolid: closed loft through swept sections failed: {error}")
+            })
+        }
+        RingFrame::Open => loft_profile_brep(&sections)
+            .map_err(|error| format!("sweepSolid: loft through swept sections failed: {error}")),
+    }
 }
 
 /// Helical sweep (§5.7): sweep a CLOSED PLANAR profile loop along a helix of

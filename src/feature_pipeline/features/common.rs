@@ -61,22 +61,17 @@ pub fn stamp_face_role(face_name: &str, role: &str, op_type: &str) {
 }
 
 /// Stamp the whole sweep-family role convention on a BUILT solid's named faces:
-/// `start_name`/`end_name` → `start_cap`/`STARTCAP` + `end_cap`/`ENDCAP`, any
-/// other name ending in `wall_suffix` → `sidewall`/`SIDEWALL`. Walking the
-/// actual faces (not the intended name list) means an absent cap (full revolve)
-/// or a skipped axis wall never leaves a phantom record in the store.
-pub fn stamp_sweep_roles(solid: &BrepSolid, wall_suffix: &str, start_name: &str, end_name: &str) {
-    stamp_sweep_roles_multi(
-        solid,
-        wall_suffix,
-        std::slice::from_ref(&start_name.to_string()),
-        std::slice::from_ref(&end_name.to_string()),
-    );
-}
-
-/// [`stamp_sweep_roles`] for a profile with SEVERAL loops: each region names its
-/// own caps (`{cap_base}:L{loopId}_START`), so the role pass takes the whole
-/// list rather than one name per end.
+/// a name in `start_names`/`end_names` → `start_cap`/`STARTCAP` +
+/// `end_cap`/`ENDCAP`, any other name ending in `wall_suffix` →
+/// `sidewall`/`SIDEWALL`. Walking the actual faces (not the intended name list)
+/// means an absent cap (full revolve) or a skipped axis wall never leaves a
+/// phantom record in the store.
+///
+/// The lists are per-loop: each region of a multi-loop profile names its own
+/// caps (`{cap_base}:L{loopId}_START`), so the role pass takes the whole list
+/// rather than one name per end. A single-loop profile passes a one-element
+/// slice — there was a `stamp_sweep_roles` wrapper for that, and every caller
+/// went through this function instead, so it is gone.
 pub fn stamp_sweep_roles_multi(
     solid: &BrepSolid,
     wall_suffix: &str,
@@ -678,7 +673,8 @@ pub fn finalize_solid_grouped(
 // Dressup edge/face selection — shared by fillet.rs (F) and chamfer.rs (CH)
 // ===========================================================================
 //
-// Fillet and chamfer share selection resolution and direction validation.
+// Fillet and chamfer share selection resolution; chamfer alone validates its
+// `direction`.
 // Each feature owns its numeric parameters, kernel call, and abort policy.
 
 /// One solid and sampled edge points for a fillet or chamfer operation.
@@ -889,7 +885,8 @@ pub fn blend_face_name(id: &str, edge_name: &str) -> String {
     format!("{}:{}", blend_face_base(id), edge_name)
 }
 
-/// Reject directions that depended on the removed mesh blend pipeline.
+/// Reject chamfer directions that depended on the removed mesh blend pipeline.
+/// Fillet has no `direction` param: its blend side is always classified per edge.
 pub fn require_blend_direction(ctx: &FeatureContext, operation: &str) -> Result<(), String> {
     let direction = ctx
         .param("direction")
@@ -1245,6 +1242,10 @@ pub fn resolve_path(ctx: &FeatureContext, name: &str) -> Result<Vec<NurbsCurve>,
 pub struct PathSegment {
     pub name: String,
     pub curve: NurbsCurve,
+    /// The segment's SCREW AXIS direction when its publisher knows it is a helix
+    /// ([`SceneMap::resolve_path_segment_axes`]). Reversing the segment leaves it
+    /// valid: a frame referenced to an axis does not depend on the axis' sign.
+    pub axis: Option<Vec3>,
 }
 
 /// Resolve a `path` `reference_selection` — one name or MANY — to a single
@@ -1266,6 +1267,33 @@ pub struct PathSegment {
 /// the same set of edges always yields the same chain. Any segment that reaches
 /// neither end is a disconnected or branching selection, and is reported BY NAME
 /// rather than silently dropped.
+/// Resolve a `path` `reference_selection` to the sweep's own PATH TYPE: the
+/// ordered chain [`resolve_path_chain`] produces, CLASSIFIED once
+/// ([`crate::SweepPath`]) — open or closed, the plane it lies in if it lies in
+/// one, and the continuity of every joint including a closed path's closing one.
+///
+/// Every sweep refusal that used to answer one of those questions for itself now
+/// reads this: the builder's corner gate, the closed-path lane, and `SW`'s own
+/// `translate` fold-back rule, which could previously only report a closed path
+/// as the consequence it happened to notice (a segment that must reverse).
+/// Resolution, order and orientation are unchanged — this classifies the chain
+/// the resolver produced, it does not re-resolve or re-order it.
+pub fn resolve_sweep_path(
+    ctx: &FeatureContext,
+    names: &[String],
+) -> Result<crate::SweepPath, String> {
+    let segments = resolve_path_chain(ctx, names)?;
+    let mut curves = Vec::with_capacity(segments.len());
+    let mut segment_names = Vec::with_capacity(segments.len());
+    let mut axes = Vec::with_capacity(segments.len());
+    for segment in segments {
+        curves.push(segment.curve);
+        segment_names.push(segment.name);
+        axes.push(segment.axis);
+    }
+    crate::SweepPath::new(curves, segment_names)?.with_screw_axes(axes)
+}
+
 pub fn resolve_path_chain(
     ctx: &FeatureContext,
     names: &[String],
@@ -1275,6 +1303,7 @@ pub fn resolve_path_chain(
     for reference in names {
         let curves = resolve_path(ctx, reference)?;
         let published = ctx.scene.resolve_path_segment_names(reference);
+        let published_axes = ctx.scene.resolve_path_segment_axes(reference);
         let single = curves.len() == 1;
         for (index, curve) in curves.into_iter().enumerate() {
             let name = published
@@ -1287,8 +1316,11 @@ pub fn resolve_path_chain(
                         format!("{reference}[{index}]")
                     }
                 });
+            let axis = published_axes
+                .and_then(|axes| axes.get(index).copied().flatten())
+                .map(|axis| axis.direction);
             if seen.insert(name.clone()) {
-                segments.push(PathSegment { name, curve });
+                segments.push(PathSegment { name, curve, axis });
             }
         }
     }
@@ -2019,7 +2051,6 @@ pub fn union_solids_keeping(
     Ok(current)
 }
 
-// BREP private tests: 6df63fd1e9a86a54
 
 /// Transform controls shared by primitive solid schemas.
 pub(super) fn primitive_transform_schema() -> serde_json::Value {
@@ -2069,4 +2100,3 @@ pub(super) fn optional_boolean_schema() -> serde_json::Value {
 }
 
 
-// BREP private tests: be6260a67d7d26af

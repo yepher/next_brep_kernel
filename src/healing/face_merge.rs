@@ -130,7 +130,23 @@ fn coplanar_with_same_outward_normal(
         return Ok(false);
     }
     let (second_u, second_v) = surface_domains(&second.surface)?;
-    let plane_tolerance = (tolerance * 100.0).max(1e-6) * (1.0 + first_origin.length());
+    // The merged face is emitted carrying `first`'s plane, so every point of
+    // `second` has to lie ON that plane, not merely near it.  The band is the
+    // caller's coplanarity tolerance, floored where a caller asks for less
+    // than its own fitting noise and CAPPED at the assembler weld: past that
+    // the assembler holds a point and this plane apart, so the merged face is
+    // one nothing exact downstream can consume — the STEP importer's phase
+    // 1.75 ear-clips precisely such a face back into planar triangles.
+    //
+    // The cap replaces a `* (1.0 + first_origin.length())` factor that
+    // charged the band by how far the plane's origin sits from the WORLD
+    // origin — where the part happens to have been modelled, not a property
+    // of its geometry.  On a 190-unit part 50 units out it opened a 1.9e-7
+    // request to a 9.7e-4 band, wide enough to merge adjacent facets of a
+    // tessellated curve into one "plane" whose own corners sat 5.4e-4 off it.
+    let plane_tolerance = (tolerance * 100.0)
+        .max(1e-6)
+        .min(crate::tolerance::assembler_weld(tolerance));
     for u in second_u {
         for v in second_v {
             if second
@@ -701,6 +717,149 @@ fn traversal_vertices(edge: &EdgeRecord, coedge: &CoedgeRecord) -> (u64, u64) {
     }
 }
 
+/// The parameter space every leftover coedge's pcurve lives in, when the merged
+/// faces share ONE carrier. Only then can a merge read a loop's parameter-space
+/// continuity; a reprojecting lane walks before its pcurves share a space.
+struct SharedParameterSpace<'a> {
+    surface: &'a NurbsSurface,
+    /// The radius that made two fitted endpoints one vertex.
+    weld: f64,
+}
+
+impl SharedParameterSpace<'_> {
+    fn coincide(&self, first: Vec3, second: Vec3) -> bool {
+        let band = crate::classification::surface_uv_band(self.surface, first.x, first.y, self.weld);
+        (first.x - second.x).abs() <= band && (first.y - second.y).abs() <= band
+    }
+}
+
+/// A coedge's pcurve at its start, middle and end. The pcurve runs in the
+/// coedge's own direction, so its domain start is where the traversal starts.
+fn pcurve_stations(coedge: &CoedgeRecord) -> Option<[Vec3; 3]> {
+    let [t0, t1] = coedge.pcurve.domain().ok()?;
+    Some([
+        coedge.pcurve.evaluate(t0).ok()?,
+        coedge.pcurve.evaluate((t0 + t1) / 2.0).ok()?,
+        coedge.pcurve.evaluate(t1).ok()?,
+    ])
+}
+
+/// SLIT DISSOLUTION. An edge whose two leftover uses run along the SAME
+/// parameter-space segment, one each way, separates nothing: its ring on the
+/// other side was the shared edge the merge just cancelled (a flanged hole's
+/// annulus, slit to the ring it bridged to). Kept, the walk can only return
+/// along it and close a loop of zero area. Two uses a PERIOD apart are a seam
+/// the region wraps across, and stay.
+fn dissolve_slits(
+    remaining: &mut Vec<CoedgeRecord>,
+    edges: &HashMap<u64, &EdgeRecord>,
+    space: &SharedParameterSpace,
+) {
+    let mut uses = HashMap::<u64, Vec<usize>>::default();
+    for (index, coedge) in remaining.iter().enumerate() {
+        uses.entry(coedge.edge_id).or_default().push(index);
+    }
+    let slits = uses
+        .iter()
+        .filter(|(edge_id, indices)| {
+            if indices.len() != 2 || edges[*edge_id].degenerate {
+                return false;
+            }
+            let (first, second) = (&remaining[indices[0]], &remaining[indices[1]]);
+            if first.forward == second.forward {
+                return false;
+            }
+            let (Some(first), Some(second)) = (pcurve_stations(first), pcurve_stations(second)) else {
+                return false;
+            };
+            space.coincide(first[0], second[2])
+                && space.coincide(first[1], second[1])
+                && space.coincide(first[2], second[0])
+        })
+        .map(|(edge_id, _)| *edge_id)
+        .collect::<HashSet<_>>();
+    remaining.retain(|coedge| !slits.contains(&coedge.edge_id));
+}
+
+/// Stitch a merged face's leftover coedges into loops, or `None` when the
+/// stitching is not determined.
+///
+/// A loop can pass one VERTEX twice — a bridge's foot on the ring it joins —
+/// so reaching the start vertex does not by itself close the loop, and a vertex
+/// with several unused coedges leaving it does not name the next one. There the
+/// walk follows the loop's PARAMETER-SPACE continuity when the coedges share a
+/// carrier (`space`): the successor starts where the current pcurve ends, and a
+/// seam's two images of one vertex a period apart are two different places.
+/// Without a shared space, or with no single successor, the merge is refused
+/// and the faces stay as they were assembled.
+fn walk_cycles(
+    mut remaining: Vec<CoedgeRecord>,
+    edges: &HashMap<u64, &EdgeRecord>,
+    space: Option<&SharedParameterSpace>,
+) -> Option<Vec<LoopRecord>> {
+    let maximum_cycle_length = remaining.len();
+    let mut loops = Vec::new();
+    while !remaining.is_empty() {
+        let first = remaining.remove(0);
+        let (start, mut end) = traversal_vertices(edges[&first.edge_id], &first);
+        let mut cycle = vec![first];
+        loop {
+            let leaving = remaining
+                .iter()
+                .enumerate()
+                .filter_map(|(index, coedge)| {
+                    (traversal_vertices(edges[&coedge.edge_id], coedge).0 == end).then_some(index)
+                })
+                .collect::<Vec<_>>();
+            let closes = end == start;
+            let successor = match (leaving.as_slice(), closes) {
+                ([], true) => None,
+                ([only], false) => Some(*only),
+                ([], false) => return None,
+                _ => {
+                    let space = space?;
+                    let here = pcurve_stations(cycle.last()?)?[2];
+                    let closing = closes && space.coincide(here, pcurve_stations(&cycle[0])?[0]);
+                    let mut continuing = Vec::new();
+                    for index in leaving {
+                        if space.coincide(here, pcurve_stations(&remaining[index])?[0]) {
+                            continuing.push(index);
+                        }
+                    }
+                    match (continuing.as_slice(), closing) {
+                        ([], true) => None,
+                        ([only], false) => Some(*only),
+                        _ => return None,
+                    }
+                }
+            };
+            let Some(index) = successor else {
+                break;
+            };
+            let next = remaining.remove(index);
+            end = traversal_vertices(edges[&next.edge_id], &next).1;
+            cycle.push(next);
+            if cycle.len() > maximum_cycle_length {
+                return None;
+            }
+        }
+        // A cycle that traverses every one of its edges both ways encloses
+        // nothing, however its parameter-space image reads.
+        let mut counts = HashMap::<u64, usize>::default();
+        for coedge in &cycle {
+            *counts.entry(coedge.edge_id).or_default() += 1;
+        }
+        if counts.values().all(|count| *count == 2) {
+            return None;
+        }
+        loops.push(LoopRecord {
+            id: loops.len() as u64 + 1,
+            coedges: cycle,
+        });
+    }
+    Some(loops)
+}
+
 /// Whether two faces ride ONE carrier — the same geometric surface, oriented
 /// the same way out of the material — by any of the four readings this module
 /// merges on: bit-identical patches, coplanar planes with the same outward
@@ -789,7 +948,6 @@ fn try_merge_pair(
     {
         return Ok(None);
     }
-    let maximum_cycle_length = older_coedges.len() + newer_coedges.len();
     let mut remaining = older_coedges
         .into_iter()
         .filter(|coedge| {
@@ -802,39 +960,23 @@ fn try_merge_pair(
         }))
         .cloned()
         .collect::<Vec<_>>();
-    let mut loops = Vec::new();
-    while !remaining.is_empty() {
-        let first = remaining.remove(0);
-        let (start, mut end) = traversal_vertices(edges[&first.edge_id], &first);
-        let mut cycle = vec![first];
-        while end != start {
-            let matches = remaining
-                .iter()
-                .enumerate()
-                .filter_map(|(index, coedge)| {
-                    (traversal_vertices(edges[&coedge.edge_id], coedge).0 == end).then_some(index)
-                })
-                .collect::<Vec<_>>();
-            if matches.len() != 1 {
-                return Ok(None);
-            }
-            let next = remaining.remove(matches[0]);
-            end = traversal_vertices(edges[&next.edge_id], &next).1;
-            cycle.push(next);
-            if cycle.len() > maximum_cycle_length {
-                return Ok(None);
-            }
-        }
-        if !cycle
+    let space = same_carrier.then(|| SharedParameterSpace {
+        surface: &older.surface,
+        weld: crate::tolerance::assembler_weld(tolerance),
+    });
+    if let Some(space) = &space {
+        dissolve_slits(&mut remaining, edges, space);
+    }
+    let Some(mut loops) = walk_cycles(remaining, edges, space.as_ref()) else {
+        return Ok(None);
+    };
+    if loops.iter().any(|loop_record| {
+        loop_record
+            .coedges
             .iter()
-            .any(|coedge| !edges[&coedge.edge_id].degenerate)
-        {
-            return Ok(None);
-        }
-        loops.push(LoopRecord {
-            id: loops.len() as u64 + 1,
-            coedges: cycle,
-        });
+            .all(|coedge| edges[&coedge.edge_id].degenerate)
+    }) {
+        return Ok(None);
     }
     if loops.is_empty() {
         return Ok(None);
@@ -1195,6 +1337,7 @@ fn try_merge_pair(
 fn try_merge_connected_group(
     faces: &[FaceRecord],
     edges: &HashMap<u64, &EdgeRecord>,
+    tolerance: f64,
     same_carrier_area_tolerance_ratio: f64,
     keep_unmerged: &[String],
 ) -> Result<Option<(Vec<usize>, FaceRecord)>, KernelRefusal> {
@@ -1269,48 +1412,19 @@ fn try_merge_connected_group(
                     .then_some(*edge_id)
             })
             .collect::<HashSet<_>>();
-        let mut remaining = uses_by_edge
+        let remaining = uses_by_edge
             .into_iter()
             .filter(|(edge_id, _)| !internal.contains(edge_id))
             .flat_map(|(_, uses)| uses)
             .collect::<Vec<_>>();
-        let maximum_cycle_length = remaining.len();
-        let mut loops = Vec::new();
-        let mut failed = false;
-        while !remaining.is_empty() {
-            let first = remaining.remove(0);
-            let (start, mut end) = traversal_vertices(edges[&first.edge_id], &first);
-            let mut cycle = vec![first];
-            while end != start {
-                let matches = remaining
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, coedge)| {
-                        (traversal_vertices(edges[&coedge.edge_id], coedge).0 == end)
-                            .then_some(index)
-                    })
-                    .collect::<Vec<_>>();
-                if matches.len() != 1 {
-                    failed = true;
-                    break;
-                }
-                let next = remaining.remove(matches[0]);
-                end = traversal_vertices(edges[&next.edge_id], &next).1;
-                cycle.push(next);
-                if cycle.len() > maximum_cycle_length {
-                    failed = true;
-                    break;
-                }
-            }
-            if failed {
-                break;
-            }
-            loops.push(LoopRecord {
-                id: loops.len() as u64 + 1,
-                coedges: cycle,
-            });
-        }
-        if failed || loops.is_empty() {
+        let space = SharedParameterSpace {
+            surface: &faces[seed].surface,
+            weld: crate::tolerance::assembler_weld(tolerance),
+        };
+        let Some(mut loops) = walk_cycles(remaining, edges, Some(&space)) else {
+            continue;
+        };
+        if loops.is_empty() {
             continue;
         }
         loops.sort_by(|first, second| {
@@ -1371,6 +1485,133 @@ fn face_is_pinned(face: &FaceRecord, keep_unmerged: &[String]) -> bool {
     }
 }
 
+/// Pairwise merge driver for one shell.
+///
+/// `try_merge_pair` returns `None` for any two faces that share no
+/// non-degenerate edge, so the only candidates are edge-adjacent pairs; they
+/// are kept in a set ordered by the faces' original positions and evaluated
+/// smallest first. Faces stay in their original slots (a merged face keeps
+/// the lower slot, the absorbed face's slot is emptied), so that order never
+/// shifts. A rejected pair is dropped for good: `try_merge_pair` is a pure
+/// function of the two face records and the constant edge map, and a pair is
+/// re-queued only when one of its faces changes. Hence each accepted merge is
+/// the lexicographically first accepting pair over all faces — the same pair
+/// the former full rescan found — and the result is the same face set, in
+/// the same order, reached without re-examining every pair per merge.
+struct PairMerger<'a> {
+    slots: Vec<Option<FaceRecord>>,
+    pinned: Vec<bool>,
+    edges: &'a HashMap<u64, &'a EdgeRecord>,
+    /// Non-degenerate edge id → slots of the faces using it.
+    uses: HashMap<u64, Vec<usize>>,
+    /// Edge-adjacent pairs `(lower slot, higher slot)` not yet rejected.
+    candidates: std::collections::BTreeSet<(usize, usize)>,
+}
+
+impl<'a> PairMerger<'a> {
+    fn new(
+        faces: Vec<FaceRecord>,
+        edges: &'a HashMap<u64, &'a EdgeRecord>,
+        keep_unmerged: &[String],
+    ) -> Self {
+        let pinned = faces
+            .iter()
+            .map(|face| face_is_pinned(face, keep_unmerged))
+            .collect::<Vec<_>>();
+        let mut merger = Self {
+            slots: faces.into_iter().map(Some).collect(),
+            pinned,
+            edges,
+            uses: HashMap::default(),
+            candidates: std::collections::BTreeSet::new(),
+        };
+        for slot in 0..merger.slots.len() {
+            merger.index_slot(slot);
+        }
+        merger
+    }
+
+    fn slot_edge_ids(&self, slot: usize) -> Vec<u64> {
+        let Some(face) = &self.slots[slot] else {
+            return Vec::new();
+        };
+        let mut ids = face
+            .loops
+            .iter()
+            .flat_map(|loop_record| &loop_record.coedges)
+            .map(|coedge| coedge.edge_id)
+            .filter(|edge_id| !self.edges[edge_id].degenerate)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Register `slot`'s edges and queue it against every face already
+    /// using one of them.
+    fn index_slot(&mut self, slot: usize) {
+        for edge_id in self.slot_edge_ids(slot) {
+            let users = self.uses.entry(edge_id).or_default();
+            for &other in users.iter() {
+                if other != slot && !self.pinned[other] && !self.pinned[slot] {
+                    self.candidates.insert((other.min(slot), other.max(slot)));
+                }
+            }
+            users.push(slot);
+        }
+    }
+
+    fn unindex_slot(&mut self, slot: usize) {
+        for edge_id in self.slot_edge_ids(slot) {
+            if let Some(users) = self.uses.get_mut(&edge_id) {
+                users.retain(|user| *user != slot);
+            }
+        }
+        self.candidates
+            .retain(|(lower, higher)| *lower != slot && *higher != slot);
+    }
+
+    /// Perform up to `budget` merges; returns how many were made.
+    fn run(
+        &mut self,
+        budget: usize,
+        tolerance: f64,
+        same_carrier_area_tolerance_ratio: f64,
+    ) -> Result<usize, KernelRefusal> {
+        let mut merged_count = 0;
+        while merged_count < budget {
+            let Some(&(lower, higher)) = self.candidates.iter().next() else {
+                break;
+            };
+            self.candidates.remove(&(lower, higher));
+            let (Some(older), Some(newer)) = (&self.slots[lower], &self.slots[higher]) else {
+                continue;
+            };
+            let Some(merged) = try_merge_pair(
+                older,
+                newer,
+                self.edges,
+                tolerance,
+                same_carrier_area_tolerance_ratio,
+            )?
+            else {
+                continue;
+            };
+            self.unindex_slot(higher);
+            self.unindex_slot(lower);
+            self.slots[higher] = None;
+            self.slots[lower] = Some(merged);
+            self.index_slot(lower);
+            merged_count += 1;
+        }
+        Ok(merged_count)
+    }
+
+    fn into_faces(self) -> Vec<FaceRecord> {
+        self.slots.into_iter().flatten().collect()
+    }
+}
+
 /// Merge adjacent fragments that retain the exact same carrier surface.
 ///
 /// Every shared edge is cancelled in opposite directions and the remaining
@@ -1383,17 +1624,20 @@ fn merge_same_surface_faces_impl(
     keep_unmerged: &[String],
 ) -> Result<BrepSolid, KernelRefusal> {
     let mut result = solid.clone();
+    // `result.edges` is not touched until the retain below, so the id map is
+    // built once; every candidate pair sees the same edge records.
+    let edges = result
+        .edges
+        .iter()
+        .map(|edge| (edge.id, edge))
+        .collect::<HashMap<_, _>>();
     for shell in &mut result.shells {
         loop {
-            let edges = result
-                .edges
-                .iter()
-                .map(|edge| (edge.id, edge))
-                .collect::<HashMap<_, _>>();
             if !validate {
                 if let Some((indices, merged)) = try_merge_connected_group(
                     &shell.faces,
                     &edges,
+                    tolerance,
                     same_carrier_area_tolerance_ratio,
                     keep_unmerged,
                 )? {
@@ -1405,34 +1649,92 @@ fn merge_same_surface_faces_impl(
                     continue;
                 }
             }
-            let mut accepted = None;
-            'pairs: for first in 0..shell.faces.len() {
-                if face_is_pinned(&shell.faces[first], keep_unmerged) {
-                    continue;
-                }
-                for second in first + 1..shell.faces.len() {
-                    if face_is_pinned(&shell.faces[second], keep_unmerged) {
-                        continue;
-                    }
-                    if let Some(merged) = try_merge_pair(
-                        &shell.faces[first],
-                        &shell.faces[second],
-                        &edges,
-                        tolerance,
-                        same_carrier_area_tolerance_ratio,
-                    )? {
-                        accepted = Some((first, second, merged));
-                        break 'pairs;
-                    }
-                }
-            }
-            let Some((first, second, merged)) = accepted else {
+            // The validating lane has no group phase, so it drains every pair
+            // merge in one pass; the open lane merges one pair, then offers
+            // the changed shell to the group phase again, exactly as before.
+            let budget = if validate { usize::MAX } else { 1 };
+            let mut merger = PairMerger::new(
+                std::mem::take(&mut shell.faces),
+                &edges,
+                keep_unmerged,
+            );
+            let merged = merger.run(budget, tolerance, same_carrier_area_tolerance_ratio);
+            shell.faces = merger.into_faces();
+            if merged? == 0 || validate {
                 break;
-            };
-            shell.faces[first] = merged;
-            shell.faces.remove(second);
+            }
         }
     }
+    finish_merge(solid, result, validate)
+}
+
+/// Merge each face in `absorbed` into an edge-adjacent face outside `absorbed`
+/// that rides the same carrier — the pair [`merge_same_surface_faces`] would
+/// merge, at the same `tolerance` — and nothing else.
+///
+/// The absorbing face keeps its id, its name and its slot in the shell, and
+/// its carrier is the frame the merged face is built on; a face in `absorbed`
+/// that shares a carrier with no such neighbour is left as it was. Two faces
+/// outside `absorbed` are never merged with each other, however cosurface: the
+/// caller is naming whose material a face is, not normalizing the solid, so a
+/// coplanar pair the document kept apart stays apart. The result passes the
+/// validating merge's Euler and `validate()` checks or the call refuses.
+pub(crate) fn absorb_faces_into_carriers(
+    solid: &BrepSolid,
+    tolerance: f64,
+    absorbed: &HashSet<u64>,
+) -> Result<BrepSolid, KernelRefusal> {
+    let mut result = solid.clone();
+    let edges = result
+        .edges
+        .iter()
+        .map(|edge| (edge.id, edge))
+        .collect::<HashMap<_, _>>();
+    let edge_ids = |face: &FaceRecord| -> HashSet<u64> {
+        face.loops
+            .iter()
+            .flat_map(|loop_record| &loop_record.coedges)
+            .map(|coedge| coedge.edge_id)
+            .filter(|edge_id| !edges[edge_id].degenerate)
+            .collect()
+    };
+    for shell in &mut result.shells {
+        'merge: loop {
+            for inner in 0..shell.faces.len() {
+                if !absorbed.contains(&shell.faces[inner].id) {
+                    continue;
+                }
+                let inner_edges = edge_ids(&shell.faces[inner]);
+                for outer in 0..shell.faces.len() {
+                    if outer == inner
+                        || absorbed.contains(&shell.faces[outer].id)
+                        || edge_ids(&shell.faces[outer]).is_disjoint(&inner_edges)
+                    {
+                        continue;
+                    }
+                    let Some(merged) =
+                        try_merge_pair(&shell.faces[outer], &shell.faces[inner], &edges, tolerance, 1e-7)?
+                    else {
+                        continue;
+                    };
+                    shell.faces[outer] = merged;
+                    shell.faces.remove(inner);
+                    continue 'merge;
+                }
+            }
+            break;
+        }
+    }
+    finish_merge(solid, result, true)
+}
+
+/// The tail every merge shares: drop the edges and vertices no face uses any
+/// more and, on the validating lane, recount the genus and validate.
+fn finish_merge(
+    solid: &BrepSolid,
+    mut result: BrepSolid,
+    validate: bool,
+) -> Result<BrepSolid, KernelRefusal> {
     let used_edges = result
         .shells
         .iter()
@@ -1483,12 +1785,7 @@ fn merge_same_surface_faces_impl(
         .iter()
         .map(|shell| shell.faces.len() as i64)
         .sum::<i64>();
-    let hole_count = result
-        .shells
-        .iter()
-        .flat_map(|shell| &shell.faces)
-        .map(|face| face.loops.len().saturating_sub(1) as i64)
-        .sum::<i64>();
+    let hole_count = result.bounding_hole_count();
     let edge_count = result.edges.iter().filter(|edge| !edge.degenerate).count() as i64;
     // Count only LIVE vertices (referenced by a non-degenerate edge): the
     // merge removes edges and faces, orphaning vertices that then must not
@@ -1579,4 +1876,3 @@ pub(crate) fn merge_same_surface_faces_open(
     merge_same_surface_faces_impl(solid, tolerance, false, 5e-3, &[])
 }
 
-// BREP private tests: cebf6e4d7f8e005f

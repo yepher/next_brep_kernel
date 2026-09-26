@@ -97,8 +97,25 @@ pub(super) fn coedge_to_vertex(coedge: &CoedgeRecord, edges: &HashMap<u64, EdgeR
 /// Golovanov §6.12 — delete a transition face and heal the hole by extending
 /// and re-intersecting its immediate neighbours. See the module docs for the
 /// covered vs deferred cases. Returns a fresh solid that is guaranteed to
-/// `validate()`, or a clear `Err` describing why the heal was refused.
+/// `validate()` AND to be sound, or a clear `Err` describing why the heal was
+/// refused.
+///
+/// `validate()` is an incidence test and cannot see a body passing through
+/// itself, which a re-intersected rim is exactly the kind of thing to produce:
+/// a fold or a crossing changes the AREA where it does not change the volume,
+/// so no closed-form oracle downstream notices. [`crate::accept_sound`] is
+/// that floor, and it runs on the way out of the public entry only — the
+/// set driver's chain calls [`delete_face_and_heal_impl`] so a ten-face
+/// selection pays for one scan and not ten.
 pub fn delete_face_and_heal(solid: &BrepSolid, face_id: u64) -> Result<BrepSolid, String> {
+    crate::accept_sound(delete_face_and_heal_impl(solid, face_id)?, "deleteFace")
+}
+
+/// The heal itself, without the soundness floor: see [`delete_face_and_heal`].
+pub(super) fn delete_face_and_heal_impl(
+    solid: &BrepSolid,
+    face_id: u64,
+) -> Result<BrepSolid, String> {
     let mut solid = solid.clone();
     let scale = solid_model_scale(&solid);
     let tolerance = (scale * 1e-7).max(1e-9);
@@ -227,6 +244,9 @@ pub fn delete_face_and_heal(solid: &BrepSolid, face_id: u64) -> Result<BrepSolid
     }
     let f_reach = f_reach * 3.0 + tolerance;
 
+    if let Some(directory) = census_directory() {
+        record_planar_open_heal(&directory, &solid, face_id);
+    }
     let plan = plan_heal(&neighbour_planes, f_center, f_reach)?;
 
     // --- New recovered corners (triple points) and the new sharp edge ------
@@ -294,6 +314,8 @@ pub fn delete_face_and_heal(solid: &BrepSolid, face_id: u64) -> Result<BrepSolid
         .collect();
 
     // Relocate every non-transition edge that ends on a collapsed corner.
+    let unmoved = solid.edges.clone();
+    let mut moved: HashSet<u64> = HashSet::default();
     for edge in &mut solid.edges {
         if boundary_edge_ids.contains(&edge.id) {
             continue;
@@ -303,15 +325,23 @@ pub fn delete_face_and_heal(solid: &BrepSolid, face_id: u64) -> Result<BrepSolid
         if start_target.is_none() && end_target.is_none() {
             continue;
         }
-        if edge.curve.degree != 1 || edge.curve.control_points.len() != 2 {
+        moved.insert(edge.id);
+        if edge.curve.straight_segment(tolerance).is_none() {
             return Err(
                 "delete_face_and_heal: a side edge meeting the transition face is \
                         not a straight line (deferred: curved neighbour edges)"
                     .into(),
             );
         }
-        let mut start_point = edge.curve.control_points[0].point()?;
-        let mut end_point = edge.curve.control_points[1].point()?;
+        // The edge's OWN ends, at `t0`/`t1`. `straight_segment` answers "is this
+        // a line" with the first and last control points — the WHOLE curve's ends
+        // — and a side edge is often a subrange of its line: a cap's top edge
+        // already trimmed back by another blend on its far end. Taking the curve's
+        // ends there moved that far end back out to the old sharp corner, so
+        // deleting one of two chamfers rebuilt the cap edge right through the
+        // other one.
+        let mut start_point = edge.curve.evaluate(edge.t0)?;
+        let mut end_point = edge.curve.evaluate(edge.t1)?;
         if let Some(target) = start_target {
             edge.start_vertex_id = target;
             start_point = new_vertex_points[&target];
@@ -331,6 +361,17 @@ pub fn delete_face_and_heal(solid: &BrepSolid, face_id: u64) -> Result<BrepSolid
         edge.t0 = 0.0;
         edge.t1 = 1.0;
     }
+    // One plane per neighbour, read by the gate and by the re-trim below alike.
+    let retrimmed: HashMap<u64, Plane> =
+        neighbour_ids.iter().copied().zip(neighbour_planes.iter().copied()).collect();
+    moved_edges_lie_on_their_faces(
+        &unmoved,
+        &solid,
+        &moved,
+        &retrimmed,
+        (scale * 1e-6).max(1e-7),
+        "delete_face_and_heal",
+    )?;
 
     // Index the (now relocated) edges for loop rewrites and pcurve rebuilds.
     let mut edges_by_id: HashMap<u64, EdgeRecord> = solid
@@ -431,13 +472,13 @@ pub fn delete_face_and_heal(solid: &BrepSolid, face_id: u64) -> Result<BrepSolid
         .iter()
         .map(|edge| (edge.id, edge.clone()))
         .collect();
-    for (index, &neighbour_id) in neighbour_ids.iter().enumerate() {
-        let plane = neighbour_planes[index];
+    for neighbour_id in neighbour_ids {
+        let plane = &retrimmed[&neighbour_id];
         let (ns, nf) = find_face(&solid, neighbour_id)
             .ok_or_else(|| format!("delete_face_and_heal: missing neighbour {neighbour_id}"))?;
         retrim_planar_face(
             &mut solid.shells[ns].faces[nf],
-            &plane,
+            plane,
             &final_edges,
             scale,
             "delete_face_and_heal",
@@ -482,4 +523,3 @@ pub fn resolve_face_by_point(solid: &BrepSolid, point: Vec3) -> Result<u64, Stri
     }
 }
 
-// BREP private tests: 5ec8877de1dffe85

@@ -238,11 +238,13 @@ pub fn pose_port(record: &PortRecord, transform: &AffineTransform) -> PortRecord
     }
 }
 
-/// Attach a part's ports to a placed component: each port's id AND label are
-/// wrapped `{component}:{…}` (two instances of one part must not read alike in
-/// the harness panel) and its record is posed by the component transform. The
-/// record lists the ids so [`update_component_transform`] moves them with the
-/// members; the posed records are returned for the feature to publish.
+/// Attach a part's connection points to a placed component: each point's
+/// ADDRESS is wrapped `{component}:{address}` and its record is posed by the
+/// component transform. The record's `port_name` / `point_name` / `purpose`
+/// stay PART-LOCAL — the occurrence chain lives in the address, so pin `VCC` of
+/// port `J1` reads the same however deep it is placed. The record lists the
+/// addresses so [`update_component_transform`] moves them with the members; the
+/// posed records are returned for the feature to publish.
 pub fn attach_component_ports(
     record: &mut ComponentRecord,
     ports: &BTreeMap<String, PortRecord>,
@@ -250,8 +252,7 @@ pub fn attach_component_ports(
     let mut posed = Vec::with_capacity(ports.len());
     for (local_id, port) in ports {
         let id = namespaced(&record.id, local_id);
-        let mut port = pose_port(port, &record.transform);
-        port.label = namespaced(&record.id, &port.label);
+        let port = pose_port(port, &record.transform);
         record.ports.push(id.clone());
         posed.push((id, port));
     }
@@ -319,7 +320,7 @@ pub fn update_component_transform(
             continue;
         };
         let posed = pose_port(port, &delta);
-        crate::feature_pipeline::features::port::place_scene_port(scene, &port_id, posed)?;
+        crate::feature_pipeline::ports::place_scene_port(scene, &port_id, posed)?;
     }
     Ok(())
 }
@@ -355,8 +356,9 @@ pub fn reject_component_references<'a>(
 /// SKETCH (plane attach + edge projection), DATUM/PLANE (a datum derived from
 /// component geometry), ACOMP itself (the component's own feature, wired by
 /// the parts-library lane), and the two wire-harness construction features —
-/// PORT (its `directionRef` is a connector face on a placed component: the
-/// harness workbench's whole point) and SPLINE (its anchors attach to ports).
+/// WAYPOINT (its `directionRef` is a face on a placed component: the harness
+/// workbench's whole point) and SPLINE (its anchors attach to connection
+/// points).
 /// Assembly constraints are not history features, so they never reach this
 /// fence. The exemption is type-level, which is safe because none of the
 /// exempt types carries a `boolean` param or operand-solid references —
@@ -383,7 +385,8 @@ pub fn enforce_reference_fence(
             | "PLANE"
             | "ACOMP"
             | "ASSEMBLY COMPONENT"
-            | "PORT"
+            | "WP"
+            | "WAYPOINT"
             | "SP"
             | "SPLINE"
     ) {
@@ -496,4 +499,3 @@ impl SceneMap {
     }
 }
 
-// BREP private tests: 31356d3bcc31b5e3

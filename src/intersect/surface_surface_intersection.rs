@@ -28,6 +28,48 @@ const TRANSVERSE_START_CROSS: f64 = 1e-2;
 /// it with the same number the seeds were accepted by.
 pub(crate) const TRANSVERSE_SEED_CROSS: f64 = TRANSVERSE_START_CROSS;
 
+/// How much CURVE a trace must be able to reach, as a multiple of the
+/// carriers' shared extent, whatever step ceiling the caller asked for.
+///
+/// `maximum_steps` bounds corrector CALLS; multiplied by the ceiling in force
+/// it bounds the ARC a trace can reach, and that product is the only thing
+/// that decides whether an ordinary section is reachable at all.  At the
+/// marcher's own ceiling (`diagonal / 15`) the default budget reaches 266
+/// extents — no bound in practice.  A caller that asks for a FINER ceiling is
+/// asking for RESOLUTION, and its request silently shortened the reach in the
+/// same proportion: `offset_shell`'s `0.0005 · scale` leaves 2.0 extents, less
+/// than one turn of an ordinary closed section on a part that size, so a
+/// perfectly marched circle died at 4000 steps (2026-09-13: the apex-cone
+/// carrier against its base plane — 42.714 of curve against a 28.844 reach,
+/// every step at the cap, the §4.12 curvature budget permitting 113× more).
+///
+/// That is the 2026-08-06 rule one level up: what a marcher can reach must be
+/// a fixed fraction of the MODEL, never a function of the step the caller
+/// asked for.  So the ceiling is honoured as resolution and the step COUNT is
+/// derived from it — the trace takes however many steps this much curve needs.
+/// Nothing that completes today changes by a single step: the derived count
+/// only ever exceeds the caller's own, and only on the fine-ceiling lane.
+///
+/// It is a FLOOR on the reach, not a bound on how long a section may be — the
+/// default lane keeps its 266 extents.  Sized for the fine-ceiling lane alone,
+/// where the longest section measured over the kernel's 37 631 traces is 1.76
+/// extents (the 2026-09-13 census; 4.43 is the most any capped ceiling reached
+/// before this and 0.13 the least).
+const MARCH_REACH_EXTENTS: f64 = 4.0;
+
+/// Corrector calls a trace may spend: the caller's own budget, or however many
+/// [`MARCH_REACH_EXTENTS`] of curve need at `maximum_step`, whichever is more.
+fn step_budget(maximum_steps: usize, maximum_step: f64, diagonal: f64) -> usize {
+    if !(maximum_step > 0.0) || !diagonal.is_finite() {
+        return maximum_steps;
+    }
+    let needed = (MARCH_REACH_EXTENTS * diagonal / maximum_step).ceil();
+    if !needed.is_finite() || needed <= maximum_steps as f64 {
+        return maximum_steps;
+    }
+    needed as usize
+}
+
 #[derive(Clone, Copy)]
 struct Bounds {
     minimum: Vec3,
@@ -520,6 +562,27 @@ fn normal_turn_step(
     best
 }
 
+/// The switches a trace reads, taken from the environment once per
+/// intersection call rather than once per trace.
+#[derive(Clone, Copy)]
+struct TraceSwitches {
+    /// `BREP_SSI_FIRST_STEP_BUDGET=0` lets the first step skip the §4.12
+    /// ceiling, as every trace did before 2026-09-15.
+    first_step_ceiling: bool,
+    /// `BREP_DEBUG_SSI_TRACE=1`: every start and every accepted station.
+    debug: bool,
+}
+
+impl TraceSwitches {
+    fn from_env() -> Self {
+        Self {
+            first_step_ceiling: std::env::var("BREP_SSI_FIRST_STEP_BUDGET").as_deref() != Ok("0"),
+            debug: std::env::var_os("BREP_DEBUG_SSI_TRACE").is_some(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn trace(
     first: SurfaceInfo<'_>,
     second: SurfaceInfo<'_>,
@@ -530,6 +593,7 @@ fn trace(
     minimum_step: f64,
     maximum_step: f64,
     maximum_steps: usize,
+    switches: TraceSwitches,
 ) -> Result<Trace, String> {
     let mut points = vec![start];
     let mut current = start;
@@ -540,7 +604,22 @@ fn trace(
         });
     };
     tangent = tangent.scale(direction);
+    // The FIRST step is held to the same §4.12 normal-turn ceiling as every
+    // later one. The ceiling used to be applied only after a step was accepted,
+    // so step zero was `diagonal / 100` whatever the curvature — and a step
+    // that lands on a trim-window boundary ends the branch before the turn
+    // check below ever reads it. On the rescue pair
+    // (`boolean_fuzz_corpus/23_section_pcurve_fold_t222`, cone × a 90° pin-wall
+    // window) that one step was the whole 0.69 and 0.77 of section, turning the
+    // tangent 0.97 rad where the ceiling allows 1.0e-2 of advance: two
+    // stations, a four-point fit, and trims 3.0e-2 and 3.8e-2 apart. Escape
+    // hatch: BREP_SSI_FIRST_STEP_BUDGET=0.
     let mut step_size = initial_step.min(maximum_step);
+    if switches.first_step_ceiling {
+        if let Some(budget) = normal_turn_step(first, second, start, tangent, 0.1) {
+            step_size = step_size.min(budget).clamp(minimum_step, maximum_step);
+        }
+    }
     let mut terminated = false;
     for _ in 0..maximum_steps {
         let mut accepted = None;
@@ -561,6 +640,25 @@ fn trace(
             break;
         };
         points.push(candidate);
+        if switches.debug {
+            // One line per accepted station: the tangent's turn across the
+            // step, the normal-turn ceiling where it started, the step asked
+            // for and the distance actually covered.
+            let turn = tangent_at(first, second, candidate)
+                .ok()
+                .flatten()
+                .map(|next| vector_angle(tangent, if next.dot(tangent) < 0.0 { next.scale(-1.0) } else { next }))
+                .unwrap_or(f64::NAN);
+            let budget = normal_turn_step(first, second, current, tangent, 0.1).unwrap_or(f64::NAN);
+            let at = candidate.point;
+            eprintln!(
+                "SSI-TRACE dir {direction} step {step_size:.4e} jump {:.4e} turn {turn:.4} ceiling {budget:.4e} boundary {boundary} p ({:.6},{:.6},{:.6})",
+                at.sub(current.point).length(),
+                at.x,
+                at.y,
+                at.z
+            );
+        }
         if boundary {
             terminated = true;
             break;
@@ -702,6 +800,7 @@ pub fn intersect_surfaces(
     let initial_step = diagonal / 100.0;
     let minimum_step = (options.tolerance * 100.0).max(diagonal * 1e-6);
     let maximum_step = (diagonal / 15.0).min(options.maximum_step.unwrap_or(f64::INFINITY));
+    let maximum_steps = step_budget(options.maximum_steps, maximum_step, diagonal);
     let mut starts = if options.seed_only {
         Vec::new()
     } else {
@@ -740,6 +839,7 @@ pub fn intersect_surfaces(
         starts.push(refined);
     }
 
+    let switches = TraceSwitches::from_env();
     let mut curves: Vec<SurfaceIntersectionCurve> = Vec::new();
     for start in starts {
         let claimed = curves.iter().any(|curve| {
@@ -747,6 +847,13 @@ pub fn intersect_surfaces(
                 point_segment_distance(start.point, segment[0], segment[1]) <= initial_step * 1.5
             })
         });
+        if switches.debug {
+            let at = start.point;
+            eprintln!(
+                "SSI-START claimed {claimed} p ({:.6},{:.6},{:.6}) initial {initial_step:.4e} minimum {minimum_step:.4e} maximum {maximum_step:.4e}",
+                at.x, at.y, at.z
+            );
+        }
         if claimed {
             continue;
         }
@@ -759,7 +866,8 @@ pub fn intersect_surfaces(
             initial_step,
             minimum_step,
             maximum_step,
-            options.maximum_steps,
+            maximum_steps,
+            switches,
         )?;
         let (all, closed) = if forward.closed {
             (forward.points, true)
@@ -773,7 +881,8 @@ pub fn intersect_surfaces(
                 initial_step,
                 minimum_step,
                 maximum_step,
-                options.maximum_steps,
+                maximum_steps,
+                switches,
             )?;
             let mut all: Vec<_> = backward.points.into_iter().skip(1).rev().collect();
             all.extend(forward.points);
@@ -839,6 +948,7 @@ pub fn intersect_surfaces_supplemental(
     let initial_step = diagonal / 100.0;
     let minimum_step = (options.tolerance * 100.0).max(diagonal * 1e-6);
     let maximum_step = (diagonal / 15.0).min(options.maximum_step.unwrap_or(f64::INFINITY));
+    let maximum_steps = step_budget(options.maximum_steps, maximum_step, diagonal);
 
     // Denser self-seed (≥2× density pushes the ≤24 grid toward its cap so a
     // thin transverse overlap the classifier stepped over still gets a start),
@@ -882,6 +992,7 @@ pub fn intersect_surfaces_supplemental(
         }
     });
 
+    let switches = TraceSwitches::from_env();
     let mut curves: Vec<SurfaceIntersectionCurve> = Vec::new();
     for start in starts {
         let claimed = curves.iter().any(|curve| {
@@ -904,7 +1015,8 @@ pub fn intersect_surfaces_supplemental(
             initial_step,
             minimum_step,
             maximum_step,
-            options.maximum_steps,
+            maximum_steps,
+            switches,
         ) else {
             continue;
         };
@@ -920,7 +1032,8 @@ pub fn intersect_surfaces_supplemental(
                 initial_step,
                 minimum_step,
                 maximum_step,
-                options.maximum_steps,
+                maximum_steps,
+                switches,
             ) else {
                 continue;
             };
@@ -956,4 +1069,3 @@ pub fn intersect_surfaces_supplemental(
     Ok(curves)
 }
 
-// BREP private tests: 4d85736d7666e221

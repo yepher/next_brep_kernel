@@ -78,8 +78,9 @@ pub(super) fn blend_open_edge_impl(
     }
     let compute = |overshoot_fraction: f64| -> Result<(FittedRows, Vec<EndSurgery>, bool), String> {
         // The open-edge surgery locates its ends by support crossings, not by
-        // the marched vertex stations, so the snapped indices are unused here.
-        let (stations, _) = march_open_stations(
+        // the marched vertex stations; the snapped indices only break the fit
+        // where the carriers' extension starts (`fit_open_rows`).
+        let (stations, vertex_indices) = march_open_stations(
             edge,
             &first_mate,
             &second_mate,
@@ -87,7 +88,13 @@ pub(super) fn blend_open_edge_impl(
             overshoot_fraction,
         )?;
         let parameters = station_parameters(&stations);
-        let rows = fit_open_rows(&stations, &parameters, chamfer)?;
+        let rows = fit_open_rows(
+            &stations,
+            &parameters,
+            chamfer,
+            Some(vertex_indices),
+            extrusion_direction(edge, &first_mate, &second_mate),
+        )?;
         let mut ends = Vec::with_capacity(2);
         let mut in_range = true;
         for (vertex, at_start) in [(edge.start_vertex_id, true), (edge.end_vertex_id, false)] {
@@ -204,7 +211,7 @@ pub(super) fn blend_open_edge_impl(
     crossings.note(start_end.escalated || finish_end.escalated);
     let mut result = solid.clone();
     let mut take_id = fresh_id_source(solid);
-    build_open_surgery(
+    let sewn = build_open_surgery(
         solid,
         &mut result,
         &mut take_id,
@@ -216,6 +223,7 @@ pub(super) fn blend_open_edge_impl(
         name,
     )?;
     prune_orphan_vertices(&mut result);
+    check_snap_closure(solid, &result, sewn.snap)?;
     crossings.gate(result)
 }
 
@@ -279,8 +287,17 @@ pub(in crate::blend) fn build_open_surgery(
     let [start_end, finish_end] = ends;
 
     // Trim the support rows to the crossing window.
+    // A POLE end stops EXACTLY on the row's own end (the march puts the
+    // pole's station there and overshoots no further), so there is nothing to
+    // split off on that side.  Only equality: a stop PAST the row's end — a
+    // free end's crossing the rows never reached — still fails the split and
+    // refuses, rather than building a rail out to wherever the rows stop.
     let trim_row = |row: &NurbsCurve, a: f64, b: f64| -> Result<NurbsCurve, String> {
-        let (_, tail) = row.split(a)?;
+        let [low, high] = row.domain()?;
+        let tail = if a == low { row.clone() } else { row.split(a)?.1 };
+        if b == high {
+            return Ok(tail);
+        }
         let (middle, _) = tail.split(b)?;
         Ok(middle)
     };
@@ -303,23 +320,83 @@ pub(in crate::blend) fn build_open_surgery(
             finish_end.cs_parameter()
         )
     };
-    let cr = trim_row(&rows.cr, start_end.cr_parameter(), finish_end.cr_parameter())
-        .map_err(describe_trim)?;
-    let cr_pcurve = trim_row(
+    // A rail whose two stops are one point within `consumed_band` has no strip
+    // to trim: the blend takes that mate down to a single point along this
+    // edge.  That is a FULL-WIDTH corner — the shared face of a miter whose
+    // radius is the side face's width, every face of a star at full width, the
+    // middle edge of a channel whose two corner setbacks meet.  No rail edge is
+    // built; the mate loses the blended edge instead of having it replaced, and
+    // the rail's two rim vertices are one vertex, which the orchestrator
+    // identifies (`SewnStripe::identified`) once every stripe is in.  A stripe
+    // free at BOTH ends has no corner to collapse onto, so it refuses.
+    let band = consumed_band(solid);
+    let collapses = |row: &NurbsCurve, a: f64, b: f64| -> Result<bool, String> {
+        let from = row.evaluate(a)?;
+        Ok(row.evaluate(b)?.sub(from).length() <= band
+            && row.evaluate(0.5 * (a + b))?.sub(from).length() <= band)
+    };
+    let cr_collapsed = collapses(&rows.cr, start_end.cr_parameter(), finish_end.cr_parameter())?;
+    let cs_collapsed = collapses(&rows.cs, start_end.cs_parameter(), finish_end.cs_parameter())?;
+    if cr_collapsed || cs_collapsed {
+        let unsupported = if start_end.free().is_some() && finish_end.free().is_some() {
+            Some("neither end is a corner")
+        } else if first.face.id == second.face.id {
+            Some("both rails lie on one face")
+        } else if matches!(start_end, EndPlan::Cap(_)) || matches!(finish_end, EndPlan::Cap(_)) {
+            Some("a capped end has no corner to share the point with")
+        } else {
+            None
+        };
+        if let Some(reason) = unsupported {
+            return Err(format!(
+                "{RAIL_COLLAPSE_UNSUPPORTED} edge {}'s rail shrinks to a point and {reason}",
+                edge.id
+            ));
+        }
+    }
+    let trim_rail = |collapsed: bool,
+                     row: &NurbsCurve,
+                     pcurve: &NurbsCurve,
+                     a: f64,
+                     b: f64|
+     -> Result<Option<(NurbsCurve, NurbsCurve)>, String> {
+        if collapsed {
+            return Ok(None);
+        }
+        Ok(Some((trim_row(row, a, b).map_err(describe_trim)?, trim_row(pcurve, a, b)?)))
+    };
+    let cr_rail = trim_rail(
+        cr_collapsed,
+        &rows.cr,
         &rows.cr_pcurve,
         start_end.cr_parameter(),
         finish_end.cr_parameter(),
     )?;
-    let cs = trim_row(&rows.cs, start_end.cs_parameter(), finish_end.cs_parameter())
-        .map_err(describe_trim)?;
-    let cs_pcurve = trim_row(
+    let cs_rail = trim_rail(
+        cs_collapsed,
+        &rows.cs,
         &rows.cs_pcurve,
         start_end.cs_parameter(),
         finish_end.cs_parameter(),
     )?;
-
-    let cr_domain = cr.domain()?;
-    let cs_domain = cs.domain()?;
+    // A collapsed rail's domain is its two stops, which are one point.
+    let cr_domain = match &cr_rail {
+        Some((cr, _)) => cr.domain()?,
+        None => [start_end.cr_parameter(), finish_end.cr_parameter()],
+    };
+    let cs_domain = match &cs_rail {
+        Some((cs, _)) => cs.domain()?,
+        None => [start_end.cs_parameter(), finish_end.cs_parameter()],
+    };
+    // A rail's end points, read off the trimmed rail or, collapsed, the row.
+    let cr_at = |parameter: f64| match &cr_rail {
+        Some((cr, _)) => cr.evaluate(parameter),
+        None => rows.cr.evaluate(parameter),
+    };
+    let cs_at = |parameter: f64| match &cs_rail {
+        Some((cs, _)) => cs.evaluate(parameter),
+        None => rows.cs.evaluate(parameter),
+    };
     let old_start = edge.start_vertex_id;
     let old_finish = edge.end_vertex_id;
 
@@ -330,6 +407,9 @@ pub(in crate::blend) fn build_open_surgery(
     // deleted (its role is taken over by the new transverse curve on the
     // prior blend face).  An interior crossing is the pristine case — a fresh
     // vertex with the boundary trimmed to it.
+    //
+    // Consumed means within `consumed_band` — the slack `check_support_extent`
+    // refuses past, so a rail between the two is not possible.
     let classify =
         |boundary_id: u64, boundary_param: f64, corner: u64| -> Result<RimResolution, String> {
             let boundary = result
@@ -339,13 +419,13 @@ pub(in crate::blend) fn build_open_surgery(
                 .ok_or("blend: end boundary edge missing during surgery")?;
             let span = (boundary.t1 - boundary.t0).abs().max(1e-12);
             let far_vertex = if boundary.start_vertex_id == corner {
-                Some((boundary.end_vertex_id, boundary.t1))
+                Some((boundary.end_vertex_id, boundary.t1, boundary.t0))
             } else if boundary.end_vertex_id == corner {
-                Some((boundary.start_vertex_id, boundary.t0))
+                Some((boundary.start_vertex_id, boundary.t0, boundary.t1))
             } else {
                 None
             };
-            if let Some((far_id, _far_t)) = far_vertex {
+            if let Some((far_id, far_t, near_t)) = far_vertex {
                 // A consumed boundary is a COINCIDENCE — a prior fillet's rim
                 // vertex is exactly where this rail crosses — and the operands
                 // were healed before the march, so it holds to solver
@@ -362,17 +442,10 @@ pub(in crate::blend) fn build_open_surgery(
                     .find(|candidate| candidate.id == far_id)
                     .map(|candidate| candidate.point)
                     .ok_or("blend: consumed boundary far vertex missing")?;
-                let near_point = result
-                    .vertices
-                    .iter()
-                    .find(|candidate| candidate.id == corner)
-                    .map(|candidate| candidate.point)
-                    .ok_or("blend: boundary corner vertex missing")?;
                 let crossing = boundary.curve.evaluate_extended(boundary_param)?;
-                let extent = far_point.sub(near_point).length();
-                let consumed_band = (1e-6 * (1.0 + extent)).max(1e-7);
                 let _ = span;
-                if crossing.sub(far_point).length() <= consumed_band {
+                let past_far = crossing.sub(far_point).length();
+                if past_far <= band {
                     // Sanity: the reused vertex must exist.
                     if !result
                         .vertices
@@ -382,6 +455,25 @@ pub(in crate::blend) fn build_open_surgery(
                         return Err("blend: consumed boundary far vertex missing".into());
                     }
                     return Ok(RimResolution::Consumed(far_id));
+                }
+                // A crossing BEYOND the far vertex is a rail that runs off
+                // its face: the blend is wider than the face by more than the
+                // band a snap may close, and trimming the boundary there would
+                // extend it into air.  `check_support_extent` refuses this
+                // before the march on every face the exact tool understands;
+                // this is the refusal for the rest.  It is not the whole
+                // answer: a crossing the solve CLAMPS to the far vertex reads
+                // as consumed here, and `detect_row_coincidence` is what sees
+                // that row leave the face.  Measured on the census: it fires on
+                // a wall wider than its closed chain's arc (0.5 past) and on the
+                // r = 10.001 pinch past an earlier round (2e-3 past), both of
+                // which refused later in the surgery before.
+                if (boundary_param - far_t) * (far_t - near_t) > 0.0 {
+                    return Err(format!(
+                        "{BLEND_WIDER_THAN_FACE} its rail crosses edge {boundary_id} {past_far:.3e} \
+                         past that edge's far vertex, and a rail within {band:.3e} of it is the \
+                         most this surgery snaps onto the edge"
+                    ));
                 }
             }
             Ok(RimResolution::Fresh)
@@ -439,8 +531,8 @@ pub(in crate::blend) fn build_open_surgery(
     // coincident with, so the detection only runs on stripes that are free at
     // both ends.  (Fail-safe: not detecting a coincidence keeps the pristine
     // path, which is what a corner stop wants anyway.)
-    let (sew_first, sew_second) = match (start_end.free(), finish_end.free()) {
-        (Some(start_free), Some(finish_free)) => (
+    let (sew_first, sew_second) = match (start_end.free(), finish_end.free(), &cr_rail, &cs_rail) {
+        (Some(start_free), Some(finish_free), Some((cr, _)), Some((cs, _))) => (
             detect_row_coincidence(
                 solid,
                 first,
@@ -451,8 +543,9 @@ pub(in crate::blend) fn build_open_surgery(
                 start_first.existing().unwrap_or(0),
                 finish_first.is_consumed(),
                 finish_first.existing().unwrap_or(0),
-                &cr,
+                cr,
                 blend_cr_forward,
+                band,
             )?,
             detect_row_coincidence(
                 solid,
@@ -464,8 +557,9 @@ pub(in crate::blend) fn build_open_surgery(
                 start_second.existing().unwrap_or(0),
                 finish_second.is_consumed(),
                 finish_second.existing().unwrap_or(0),
-                &cs,
+                cs,
                 !blend_cr_forward,
+                band,
             )?,
         ),
         _ => (None, None),
@@ -492,17 +586,42 @@ pub(in crate::blend) fn build_open_surgery(
             }
         }
     };
-    let w1a = resolve(&start_first, cr.evaluate(cr_domain[0]))?;
-    let w1b = resolve(&finish_first, cr.evaluate(cr_domain[1]))?;
-    let w2a = resolve(&start_second, cs.evaluate(cs_domain[0]))?;
-    let w2b = resolve(&finish_second, cs.evaluate(cs_domain[1]))?;
+    let w1a = resolve(&start_first, cr_at(cr_domain[0]))?;
+    let w1b = resolve(&finish_first, cr_at(cr_domain[1]))?;
+    let w2a = resolve(&start_second, cs_at(cs_domain[0]))?;
+    let w2b = resolve(&finish_second, cs_at(cs_domain[1]))?;
+    // How far the consumed rims and sewn rows moved a rail onto what already
+    // existed — what `check_snap_closure` measures the body against.
+    let mut snap = [&sew_first, &sew_second]
+        .into_iter()
+        .flatten()
+        .fold(0.0f64, |worst, sew| worst.max(sew.deviation));
+    for (rim, vertex, row_end) in [
+        (&start_first, w1a, cr_at(cr_domain[0])?),
+        (&finish_first, w1b, cr_at(cr_domain[1])?),
+        (&start_second, w2a, cs_at(cs_domain[0])?),
+        (&finish_second, w2b, cs_at(cs_domain[1])?),
+    ] {
+        if !rim.is_consumed() {
+            continue;
+        }
+        let point = result
+            .vertices
+            .iter()
+            .find(|candidate| candidate.id == vertex)
+            .ok_or("blend: consumed rim vertex missing")?
+            .point;
+        snap = snap.max(row_end.sub(point).length());
+    }
 
     // Support edges: a sewn side reuses the EXISTING coincident edge (no
     // fresh edge — OCCT's `SetExistingEdge` move); a pristine side gets the
     // fitted row as a fresh edge.
-    let cr_edge_id = match &sew_first {
-        Some(sew) => sew.edge_id,
-        None => {
+    // A collapsed side builds no edge at all.
+    let cr_edge_id = match (&sew_first, &cr_rail) {
+        (Some(sew), _) => Some(sew.edge_id),
+        (None, None) => None,
+        (None, Some((cr, _))) => {
             let id = take_id();
             result.edges.push(EdgeRecord {
                 id,
@@ -514,12 +633,13 @@ pub(in crate::blend) fn build_open_surgery(
                 degenerate: false,
                 name: None,
             });
-            id
+            Some(id)
         }
     };
-    let cs_edge_id = match &sew_second {
-        Some(sew) => sew.edge_id,
-        None => {
+    let cs_edge_id = match (&sew_second, &cs_rail) {
+        (Some(sew), _) => Some(sew.edge_id),
+        (None, None) => None,
+        (None, Some((cs, _))) => {
             let id = take_id();
             result.edges.push(EdgeRecord {
                 id,
@@ -531,7 +651,7 @@ pub(in crate::blend) fn build_open_surgery(
                 degenerate: false,
                 name: None,
             });
-            id
+            Some(id)
         }
     };
     // The edge closing each end of the blend face: the §6.9 transverse curve
@@ -567,10 +687,12 @@ pub(in crate::blend) fn build_open_surgery(
     // Replace the blended edge in each PRISTINE mate's loop — the blend
     // face's loop direction is forced by manifold pairing with F1's use of
     // the blended edge (`first_use_forward`, captured above).  A sewn mate is
-    // dropped whole below; nothing to splice.
-    for (mate, new_edge_id, pcurve_forward, sewn) in [
-        (first, cr_edge_id, &cr_pcurve, sew_first.is_some()),
-        (second, cs_edge_id, &cs_pcurve, sew_second.is_some()),
+    // dropped whole below; nothing to splice.  A COLLAPSED side has no rail to
+    // put there: the mate simply loses the blended edge, and its loop closes
+    // through the rim vertices the orchestrator identifies.
+    for (mate, rail, sewn) in [
+        (first, cr_edge_id.zip(cr_rail.as_ref()), sew_first.is_some()),
+        (second, cs_edge_id.zip(cs_rail.as_ref()), sew_second.is_some()),
     ] {
         if sewn {
             continue;
@@ -587,6 +709,10 @@ pub(in crate::blend) fn build_open_surgery(
             .iter()
             .position(|coedge| coedge.edge_id == edge.id)
             .ok_or("blend: edge coedge lost during surgery")?;
+        let Some((new_edge_id, (_, pcurve_forward))) = rail else {
+            loop_record.coedges.remove(position);
+            continue;
+        };
         let old_forward = loop_record.coedges[position].forward;
         loop_record.coedges[position] = CoedgeRecord {
             id: loop_record.coedges[position].id,
@@ -612,6 +738,8 @@ pub(in crate::blend) fn build_open_surgery(
             (first, cr_edge_id, &cap.first_leg, if at_start { w1a } else { w1b }),
             (second, cs_edge_id, &cap.second_leg, if at_start { w2a } else { w2b }),
         ] {
+            // Refused above: a capped end never meets a collapsed rail.
+            let rail_edge_id = rail_edge_id.ok_or("blend: a capped end lost its rail")?;
             let face = result
                 .shells
                 .iter_mut()
@@ -841,10 +969,22 @@ pub(in crate::blend) fn build_open_surgery(
         )?;
     }
 
-    // Blend face: cr fwd -> TB -> cs rev -> TA rev in (t, z) space.
-    let mid_u = (cr_domain[0] + cr_domain[1]) * 0.5;
+    // Blend face: cr fwd -> TB -> cs rev -> TA rev in (t, z) space.  Both rows
+    // share one parameterisation, so a collapsed cr reads its sense across the
+    // strip the cs rail still spans (a stripe with BOTH rails collapsed has no
+    // area; the orchestrator drops it with the edges that bound it).
+    let (mid_u, station_uv) = match (&cr_rail, &cs_rail) {
+        (Some((_, cr_pcurve)), _) => {
+            let mid_u = (cr_domain[0] + cr_domain[1]) * 0.5;
+            (mid_u, cr_pcurve.evaluate(mid_u)?)
+        }
+        (None, Some(_)) => {
+            let mid_u = (cs_domain[0] + cs_domain[1]) * 0.5;
+            (mid_u, rows.cr_pcurve.evaluate(mid_u)?)
+        }
+        (None, None) => (cr_domain[0], rows.cr_pcurve.evaluate(cr_domain[0])?),
+    };
     let blend_normal = raw_normal(&rows.surface, mid_u, 0.0)?;
-    let station_uv = cr_pcurve.evaluate(mid_u)?;
     let n1 = raw_normal(&first.face.surface, station_uv.x, station_uv.y)?;
     let out1 = if first.face.same_sense {
         n1
@@ -927,51 +1067,63 @@ pub(in crate::blend) fn build_open_surgery(
     };
     let start_slot = end_slot(&start_end, transverse_a_id, !blend_cr_forward)?;
     let finish_slot = end_slot(&finish_end, transverse_b_id, blend_cr_forward)?;
+    // A collapsed rail has no coedge: the end slots on either side of it meet
+    // at its one rim point.
     let coedges = if blend_cr_forward {
-        let mut coedges = vec![CoedgeRecord {
-            id: take_id(),
-            edge_id: cr_edge_id,
-            forward: cr_forward,
-            pcurve: crate::sweep_topology::parameter_line(
-                cr_domain[0],
-                0.0,
-                cr_domain[1],
-                0.0,
-            )?,
-        }];
+        let mut coedges = Vec::new();
+        if let Some(cr_edge_id) = cr_edge_id {
+            coedges.push(CoedgeRecord {
+                id: take_id(),
+                edge_id: cr_edge_id,
+                forward: cr_forward,
+                pcurve: crate::sweep_topology::parameter_line(
+                    cr_domain[0],
+                    0.0,
+                    cr_domain[1],
+                    0.0,
+                )?,
+            });
+        }
         coedges.extend(finish_slot);
-        coedges.push(CoedgeRecord {
-            id: take_id(),
-            edge_id: cs_edge_id,
-            forward: cs_forward,
-            pcurve: cs_blend_pcurve_reversed(&cs_domain)?,
-        });
+        if let Some(cs_edge_id) = cs_edge_id {
+            coedges.push(CoedgeRecord {
+                id: take_id(),
+                edge_id: cs_edge_id,
+                forward: cs_forward,
+                pcurve: cs_blend_pcurve_reversed(&cs_domain)?,
+            });
+        }
         coedges.extend(start_slot);
         coedges
     } else {
-        let mut coedges = vec![CoedgeRecord {
-            id: take_id(),
-            edge_id: cr_edge_id,
-            forward: cr_forward,
-            pcurve: crate::sweep_topology::parameter_line(
-                cr_domain[1],
-                0.0,
-                cr_domain[0],
-                0.0,
-            )?,
-        }];
+        let mut coedges = Vec::new();
+        if let Some(cr_edge_id) = cr_edge_id {
+            coedges.push(CoedgeRecord {
+                id: take_id(),
+                edge_id: cr_edge_id,
+                forward: cr_forward,
+                pcurve: crate::sweep_topology::parameter_line(
+                    cr_domain[1],
+                    0.0,
+                    cr_domain[0],
+                    0.0,
+                )?,
+            });
+        }
         coedges.extend(start_slot);
-        coedges.push(CoedgeRecord {
-            id: take_id(),
-            edge_id: cs_edge_id,
-            forward: cs_forward,
-            pcurve: crate::sweep_topology::parameter_line(
-                cs_domain[0],
-                1.0,
-                cs_domain[1],
-                1.0,
-            )?,
-        });
+        if let Some(cs_edge_id) = cs_edge_id {
+            coedges.push(CoedgeRecord {
+                id: take_id(),
+                edge_id: cs_edge_id,
+                forward: cs_forward,
+                pcurve: crate::sweep_topology::parameter_line(
+                    cs_domain[0],
+                    1.0,
+                    cs_domain[1],
+                    1.0,
+                )?,
+            });
+        }
         coedges.extend(finish_slot);
         coedges
     };
@@ -1013,10 +1165,20 @@ pub(in crate::blend) fn build_open_surgery(
     result
         .edges
         .retain(|candidate| !consumed_edges.contains(&candidate.id));
+    // Each collapsed rail's two rims are one vertex.
+    let mut identified = Vec::new();
+    for (collapsed, from, to) in [(cr_collapsed, w1a, w1b), (cs_collapsed, w2a, w2b)] {
+        if collapsed && from != to {
+            identified.push((from, to));
+        }
+    }
     Ok(SewnStripe {
         cr_edge_id,
         cs_edge_id,
         blend_face_id,
+        consumed: [sew_first.is_some(), sew_second.is_some()],
+        snap,
+        identified,
     })
 }
 
@@ -1072,4 +1234,3 @@ fn cs_blend_pcurve_reversed(cs_domain: &[f64; 2]) -> Result<NurbsCurve, String> 
     crate::sweep_topology::parameter_line(cs_domain[1], 1.0, cs_domain[0], 1.0)
 }
 
-// BREP private tests: 9cca6ef52feb16d7

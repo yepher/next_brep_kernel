@@ -59,25 +59,9 @@ pub(super) fn fit_rim_circle(edge: &EdgeRecord, tolerance: f64) -> Result<Option
     }))
 }
 
-/// Weld an offset rim that is NOT coplanar with any opening cap into a ruled
-/// (conical-frustum) opening-wall band.
+/// Whether a coedge runs along its edge, read from geometry.
 ///
-/// `weld_coplanar_orphan_rims` handles the perpendicular-wall case where the
-/// offset rim lands in the plane of a flat opening cap.  When the retained
-/// side face is oblique (a truncated cone), the offset rim leaves that plane:
-/// it is a smaller coaxial circle sitting BELOW the opening.  The offset
-/// pipeline then mis-builds the opening wall as a flat disk that caps the
-/// opening (bounded only by the source rim) and leaves the offset rim dangling
-/// one-use.  The correct opening wall is the ruled band between the source rim
-/// (radius R on the opening plane) and the offset rim (radius r below it) — an
-/// exact conical frustum through the two coaxial circles.
-///
-/// Rebuild that mis-built flat cap in place: swap its plane for the frustum
-/// surface through both rims and add the offset rim as its inner loop, so both
-/// rims become two-use and the shell closes watertight.  Reuses the existing
-/// `boundary_pcurve` fitter; nothing else in the assembly is disturbed.
-///
-/// The `forward` flag for a coedge is derived from geometry, not assumed: a
+/// The `forward` flag for a coedge is derived, not assumed: a
 /// coedge whose `pcurve` (mapped through the surface) traces its edge's 3D
 /// curve in the SAME direction is `forward = true`, otherwise `false`. When a
 /// pcurve's direction is pinned by loop connectivity (a full-circle rim isoline
@@ -160,500 +144,17 @@ pub(super) fn surface_is_planar(surface: &crate::NurbsSurface, tolerance: f64) -
     Ok(planar_surface_frame(surface, tolerance)?.is_some())
 }
 
-/// The mis-built opening cap a ruled weld may rebuild: a geometrically planar
-/// face whose single loop consists of exactly ONE closed non-degenerate rim
-/// plus only face-local plumbing (seam edges used twice by this loop and
-/// degenerate pole placeholders). A plane-carried disk has just the rim; a
-/// revolve-carried disk arrives as [rim, seam, pole, seam].
-fn cap_face_rim(
-    face: &FaceRecord,
-    edges_by_id: &HashMap<u64, &EdgeRecord>,
-    global_use_counts: &HashMap<u64, usize>,
-) -> Option<u64> {
-    if face.loops.len() != 1 {
-        return None;
-    }
-    let mut local_counts = HashMap::<u64, usize>::default();
-    for coedge in &face.loops[0].coedges {
-        *local_counts.entry(coedge.edge_id).or_default() += 1;
-    }
-    let mut rim = None;
-    for (&edge_id, &local) in &local_counts {
-        let edge = edges_by_id.get(&edge_id)?;
-        let global = global_use_counts.get(&edge_id).copied().unwrap_or(0);
-        if edge.degenerate {
-            // Pole placeholder: fine as long as it is entirely this face's.
-            if global != local {
-                return None;
-            }
-            continue;
-        }
-        if local == 2 {
-            // Seam: both uses must be this loop's, or a rebuild orphans it.
-            if global != 2 {
-                return None;
-            }
-            continue;
-        }
-        if local == 1 && edge.start_vertex_id == edge.end_vertex_id {
-            if rim.is_some() {
-                return None;
-            }
-            rim = Some(edge_id);
-            continue;
-        }
-        return None;
-    }
-    rim
-}
-
-pub(super) fn weld_ruled_offset_rims(solid: &mut BrepSolid, tolerance: f64) -> Result<usize, String> {
-    let use_counts = crate::topology::edge_use_counts(solid);
-    let orphan_ids = solid
-        .edges
-        .iter()
-        .filter(|edge| {
-            use_counts.get(&edge.id).copied().unwrap_or(0) == 1
-                && edge.start_vertex_id == edge.end_vertex_id
-        })
-        .map(|edge| edge.id)
-        .collect::<Vec<_>>();
-    let mut welded = 0usize;
-    let mut shell_unions: Vec<(usize, usize)> = Vec::new();
-    for edge_id in orphan_ids {
-        // A previous cap rebuild may have purged this candidate (a pole
-        // placeholder that was face-local plumbing of a rebuilt disk).
-        let Some(offset_edge) = solid.edges.iter().find(|edge| edge.id == edge_id).cloned() else {
-            continue;
-        };
-        let Some(offset_circle) = fit_rim_circle(&offset_edge, tolerance)? else {
-            continue;
-        };
-        // The single existing use fixes the manifold direction: the band must
-        // trace the shared offset rim the opposite way.
-        let owner_shell = solid
-            .shells
-            .iter()
-            .enumerate()
-            .find_map(|(shell_index, shell)| {
-                shell
-                    .faces
-                    .iter()
-                    .flat_map(|face| &face.loops)
-                    .flat_map(|loop_record| &loop_record.coedges)
-                    .find(|coedge| coedge.edge_id == edge_id)
-                    .map(|_| shell_index)
-            })
-            .ok_or_else(|| "offset_shell: ruled rim has no use".to_string())?;
-        // Locate the mis-built flat opening cap: a geometrically planar face
-        // whose single loop is one closed circle (the source rim, plus only
-        // face-local seam/pole plumbing) coaxial with — but not coplanar
-        // with — the offset rim. Several coaxial planar caps can qualify
-        // (e.g. the cavity floor); the opening cap is the CLOSEST one along
-        // the axis — the offset wall's thin rim, not the far floor.
-        let current_use_counts = crate::topology::edge_use_counts(solid);
-        let edges_by_id = solid
-            .edges
-            .iter()
-            .map(|edge| (edge.id, edge))
-            .collect::<HashMap<_, _>>();
-        let mut mate: Option<(usize, usize, EdgeRecord, RimCircle, f64)> = None;
-        for (shell_index, shell) in solid.shells.iter().enumerate() {
-            for (face_index, face) in shell.faces.iter().enumerate() {
-                if !surface_is_planar(&face.surface, tolerance).unwrap_or(false) {
-                    os_debug!("RULED mate reject face {}: not planar", face.id);
-                    continue;
-                }
-                let Some(source_edge_id) = cap_face_rim(face, &edges_by_id, &current_use_counts)
-                else {
-                    os_debug!("RULED mate reject face {}: no single cap rim", face.id);
-                    continue;
-                };
-                if source_edge_id == edge_id {
-                    continue;
-                }
-                let Some(source_edge) = solid
-                    .edges
-                    .iter()
-                    .find(|edge| {
-                        edge.id == source_edge_id && edge.start_vertex_id == edge.end_vertex_id
-                    })
-                    .cloned()
-                else {
-                    continue;
-                };
-                let Some(source_circle) = fit_rim_circle(&source_edge, tolerance)? else {
-                    continue;
-                };
-                if offset_circle.axis.dot(source_circle.axis).abs() < 0.999 {
-                    continue;
-                }
-                let between = source_circle.center.sub(offset_circle.center);
-                let axial = between.dot(offset_circle.axis);
-                // Coaxial: centre offset is purely along the shared axis.
-                if between.sub(offset_circle.axis.scale(axial)).length() > tolerance.max(1e-4) {
-                    continue;
-                }
-                // Non-coplanar: an in-plane rim is the coplanar-weld case.
-                if axial.abs() <= tolerance.max(1e-4) {
-                    continue;
-                }
-                if mate
-                    .as_ref()
-                    .is_none_or(|(_, _, _, _, best)| axial.abs() < *best)
-                {
-                    mate = Some((
-                        shell_index,
-                        face_index,
-                        source_edge,
-                        source_circle,
-                        axial.abs(),
-                    ));
-                }
-            }
-        }
-        let Some((cap_shell, cap_face, source_edge, source_circle, _)) = mate else {
-            os_debug!("RULED skip: no mate cap for orphan {edge_id}");
-            continue;
-        };
-        os_debug!(
-            "RULED mate found: cap face shell {cap_shell} idx {cap_face}, source edge {}",
-            source_edge.id
-        );
-        // The source rim must be a genuine circle NURBS: the band reuses its
-        // rotational parametrization so the analytic isoline pcurves are exact.
-        if source_edge.curve.degree < 2 {
-            os_debug!(
-                "RULED skip: source rim degree {} < 2",
-                source_edge.curve.degree
-            );
-            continue;
-        }
-        let owner_surface = solid.shells[owner_shell]
-            .faces
-            .iter()
-            .find(|face| {
-                face.loops
-                    .iter()
-                    .flat_map(|loop_record| &loop_record.coedges)
-                    .any(|coedge| coedge.edge_id == edge_id)
-            })
-            .map(|face| face.surface.clone())
-            .ok_or_else(|| "offset_shell: ruled rim lost its owner".to_string())?;
-        // Pin the owner's isoline pcurve to its loop neighbors. A full circle
-        // admits either u-direction, but choosing the wrong one can collapse
-        // the trim polygon and halve the volume integral.
-        let (prev_end, next_start) = crate::topology::coedge_neighbor_endpoints(
-            solid.shells[owner_shell].faces.iter().flat_map(|face| &face.loops),
-            edge_id,
-        )
-        .ok_or_else(|| "offset_shell: ruled rim lost its owner loop".to_string())?;
-        // Both endpoints sit on the rim's v-isoline; a straight parameter-space
-        // line between them IS that isoline traced in the loop's direction.
-        if (prev_end.y - next_start.y).abs() > tolerance.max(1e-4) {
-            os_debug!("RULED skip: owner rim neighbours not on a common isoline");
-            continue;
-        }
-        let owner_pcurve = crate::make_line(
-            Vec3::new(prev_end.x, prev_end.y, 0.0),
-            Vec3::new(next_start.x, next_start.y, 0.0),
-        )?;
-        // Verify the isoline actually traces the re-analyticized rim circle.
-        let mut worst = 0.0f64;
-        for sample in 0..=32 {
-            let fraction = sample as f64 / 32.0;
-            let uv = owner_pcurve.evaluate(fraction)?;
-            let on_surface = owner_surface.evaluate(uv.x, uv.y)?;
-            let radial = on_surface.sub(offset_circle.center);
-            let axial = radial.dot(offset_circle.axis);
-            let planar = radial.sub(offset_circle.axis.scale(axial)).length();
-            worst = worst.max(axial.abs().max((planar - offset_circle.radius).abs()));
-        }
-        if worst > tolerance.max(1e-3) {
-            os_debug!("RULED skip: neighbour-pinned owner pcurve off rim by {worst}");
-            continue;
-        }
-        // Re-analyticize the degenerate offset rim. PREFERRED: the owner
-        // surface's own v-isoline at the pinned rim height — exact both on the
-        // owner (it IS the surface's boundary curve) and in parametrization
-        // (the offset carrier copies the source face's rotational knots), so
-        // the band it spans is the exact normal-ruled frustum. The fitted-
-        // polyline circle is only a similarity witness: its sampled radius
-        // carries the polyline's chord sag (~1e-4 relative), which is exactly
-        // the wall-volume error the exact isoline removes. FALLBACK: the
-        // source control net scaled radially to the fitted circle, for owners
-        // whose u-structure does not match the source rim's.
-        let scaled_offset_curve = || -> Result<crate::NurbsCurve, String> {
-            let radius_ratio = offset_circle.radius / source_circle.radius;
-            let offset_controls = source_edge
-                .curve
-                .control_points
-                .iter()
-                .map(|control| {
-                    let point = control.point()?;
-                    let placed = offset_circle
-                        .center
-                        .add(point.sub(source_circle.center).scale(radius_ratio));
-                    Ok(crate::Vec4::from_point(placed, control.w))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            crate::NurbsCurve::new(
-                source_edge.curve.degree,
-                source_edge.curve.knots.clone(),
-                offset_controls,
-            )
-        };
-        let iso_offset_curve = owner_surface.iso_curve_v(prev_end.y).ok().filter(|iso| {
-            iso.degree == source_edge.curve.degree
-                && iso.knots.len() == source_edge.curve.knots.len()
-                && iso
-                    .knots
-                    .iter()
-                    .zip(&source_edge.curve.knots)
-                    .all(|(a, b)| (a - b).abs() <= 1e-9)
-                && iso.control_points.len() == source_edge.curve.control_points.len()
-        });
-        let offset_curve = match iso_offset_curve {
-            Some(iso) => {
-                // The band zips source and offset controls index by index, so
-                // the isoline must run angularly in step with the source rim
-                // (same start, same direction) — otherwise the ruled surface
-                // would twist. Verify against the similarity image.
-                let reference = scaled_offset_curve()?;
-                let mut aligned = true;
-                for sample in 0..=8 {
-                    let fraction = sample as f64 / 8.0;
-                    if iso
-                        .evaluate(fraction)?
-                        .sub(reference.evaluate(fraction)?)
-                        .length()
-                        > tolerance.max(1e-3) * 4.0
-                    {
-                        aligned = false;
-                        break;
-                    }
-                }
-                if aligned {
-                    iso
-                } else {
-                    os_debug!(
-                        "RULED: owner isoline out of step with source rim; using scaled fallback"
-                    );
-                    reference
-                }
-            }
-            None => scaled_offset_curve()?,
-        };
-        // Verify the reconstructed rim actually lies on its owner face so the
-        // re-analyticized curve stays consistent with the offset wall.
-        if !edge_on_surface(
-            &EdgeRecord {
-                curve: offset_curve.clone(),
-                t0: 0.0,
-                t1: 1.0,
-                ..offset_edge.clone()
-            },
-            &owner_surface,
-            tolerance,
-        )? {
-            os_debug!("RULED skip: re-analyticized rim not on owner surface");
-            continue;
-        }
-        // Build the frustum band as the ruled tensor between the two circles so
-        // v=0 is the source rim and v=1 the offset rim, both exact isolines.
-        let band_controls = source_edge
-            .curve
-            .control_points
-            .iter()
-            .zip(&offset_curve.control_points)
-            .map(|(source_control, offset_control)| vec![*source_control, *offset_control])
-            .collect::<Vec<_>>();
-        let band = crate::NurbsSurface::new(
-            source_edge.curve.degree,
-            1,
-            source_edge.curve.knots.clone(),
-            vec![0.0, 0.0, 1.0, 1.0],
-            band_controls,
-        )?;
-        let [band_u0, band_u1] = band.domain_u()?;
-        let seam = band.iso_curve_u(band_u0)?;
-        // Build the band as a fixed, internally-coherent rectangle (source rim
-        // walked +u at v=0, offset rim walked -u at v=1, seam up then down),
-        // exactly like make_cone_brep's side face. The source and offset skins
-        // were assembled as independent components whose global normal senses
-        // are not yet reconciled; a re-run of orient_open_solid_faces after all
-        // rims are two-use makes the joined manifold coherent, and a final
-        // signed-volume check restores outward normals.
-        let ccw = true;
-        let next_loop_id = solid.shells[cap_shell].faces[cap_face]
-            .loops
-            .iter()
-            .map(|loop_record| loop_record.id)
-            .max()
-            .unwrap_or(0)
-            + 1;
-        let mut next_coedge_id = solid
-            .shells
-            .iter()
-            .flat_map(|shell| &shell.faces)
-            .flat_map(|face| &face.loops)
-            .flat_map(|loop_record| &loop_record.coedges)
-            .map(|coedge| coedge.id)
-            .max()
-            .unwrap_or(0)
-            + 1;
-        let seam_edge_id = solid.edges.iter().map(|edge| edge.id).max().unwrap_or(0) + 1;
-        // Straight parameter-space isolines mirroring make_cone_brep's side
-        // face rectangle: v=0 source rim, u=u1 seam up, v=1 offset rim, u=u0
-        // seam down. The CW variant is the mirror image.
-        let line = |u0: f64, v0: f64, u1: f64, v1: f64| -> Result<crate::NurbsCurve, String> {
-            crate::make_line(Vec3::new(u0, v0, 0.0), Vec3::new(u1, v1, 0.0))
-        };
-        let (source_pcurve, seam_up_pcurve, offset_pcurve, seam_down_pcurve) = if ccw {
-            (
-                line(band_u0, 0.0, band_u1, 0.0)?,
-                line(band_u1, 0.0, band_u1, 1.0)?,
-                line(band_u1, 1.0, band_u0, 1.0)?,
-                line(band_u0, 1.0, band_u0, 0.0)?,
-            )
-        } else {
-            (
-                line(band_u1, 0.0, band_u0, 0.0)?,
-                line(band_u0, 0.0, band_u0, 1.0)?,
-                line(band_u0, 1.0, band_u1, 1.0)?,
-                line(band_u1, 1.0, band_u1, 0.0)?,
-            )
-        };
-        // Seam edge joins the two rims' seam vertices along the u0 generatrix;
-        // both rectangles walk it up (forward) then down (backward).
-        let seam_start_vertex = source_edge.start_vertex_id;
-        let seam_end_vertex = offset_edge.start_vertex_id;
-        // The rim coedges' `forward` follows the 3D walk their (fixed-direction)
-        // band isolines produce, so each stays consistent with its edge curve.
-        let source_curve_forward = isoline_forward(&source_pcurve, &band, &source_edge.curve)?;
-        let offset_curve_forward = isoline_forward(&offset_pcurve, &band, &offset_curve)?;
-        let mut coedges = Vec::new();
-        let mut push_coedge = |edge_id: u64, forward: bool, pcurve: crate::NurbsCurve| {
-            coedges.push(CoedgeRecord {
-                id: next_coedge_id,
-                edge_id,
-                forward,
-                pcurve,
-            });
-            next_coedge_id += 1;
-        };
-        if debug_enabled() {
-            for (label, pcurve) in [("source", &source_pcurve), ("offset", &offset_pcurve)] {
-                let spin = (|| -> Result<f64, String> {
-                    let [d0, d1] = pcurve.domain()?;
-                    let a = pcurve.evaluate(d0 + (d1 - d0) * 0.45)?;
-                    let b = pcurve.evaluate(d0 + (d1 - d0) * 0.55)?;
-                    Ok(band.evaluate(a.x, a.y)?.cross(band.evaluate(b.x, b.y)?).z)
-                })()
-                .unwrap_or(f64::NAN);
-                os_debug!("RULED band {label} pcurve spin {:+.3e}", spin);
-            }
-            os_debug!(
-                "RULED source_forward={source_curve_forward} offset_forward={offset_curve_forward}"
-            );
-        }
-        if ccw {
-            push_coedge(source_edge.id, source_curve_forward, source_pcurve);
-            push_coedge(seam_edge_id, true, seam_up_pcurve);
-            push_coedge(edge_id, offset_curve_forward, offset_pcurve);
-            push_coedge(seam_edge_id, false, seam_down_pcurve);
-        } else {
-            push_coedge(seam_edge_id, true, seam_up_pcurve);
-            push_coedge(edge_id, offset_curve_forward, offset_pcurve);
-            push_coedge(seam_edge_id, false, seam_down_pcurve);
-            push_coedge(source_edge.id, source_curve_forward, source_pcurve);
-        }
-        // Commit: rebuild the flat cap as the frustum band, re-analyticize the
-        // offset rim, refit the owner pcurve, and register the seam edge.
-        let face = &mut solid.shells[cap_shell].faces[cap_face];
-        face.surface = band.clone();
-        // The cap's face-local plumbing (a revolve-carried disk's seam and
-        // pole placeholder) dies with the old loop; purge the records so the
-        // Euler bookkeeping does not count edges no face references anymore.
-        let retired_edge_ids = face
-            .loops
-            .iter()
-            .flat_map(|loop_record| &loop_record.coedges)
-            .map(|coedge| coedge.edge_id)
-            .filter(|retired| *retired != source_edge.id && *retired != edge_id)
-            .collect::<HashSet<_>>();
-        face.loops = vec![LoopRecord {
-            id: next_loop_id,
-            coedges,
-        }];
-        if parameter_space_area(face)? < 0.0 {
-            face.same_sense = !face.same_sense;
-        }
-        solid
-            .edges
-            .retain(|record| !retired_edge_ids.contains(&record.id));
-        // The neighbour-pinned owner pcurve traces the re-analyticized rim in
-        // the loop's direction; its `forward` must follow that same 3D walk.
-        // Rewrite ONLY the pre-existing owner use: when the cap lives in the
-        // same shell as the owner (multi-opening shells are already one
-        // connected component here), an unfiltered sweep would clobber the
-        // band's own freshly built rim coedge with a pcurve that lives in the
-        // OWNER surface's parameter space.
-        let owner_forward = isoline_forward(&owner_pcurve, &owner_surface, &offset_curve)?;
-        for (face_index, face) in solid.shells[owner_shell].faces.iter_mut().enumerate() {
-            if owner_shell == cap_shell && face_index == cap_face {
-                continue;
-            }
-            for coedge in face
-                .loops
-                .iter_mut()
-                .flat_map(|loop_record| &mut loop_record.coedges)
-                .filter(|coedge| coedge.edge_id == edge_id)
-            {
-                coedge.pcurve = owner_pcurve.clone();
-                coedge.forward = owner_forward;
-            }
-        }
-        if let Some(record) = solid.edges.iter_mut().find(|record| record.id == edge_id) {
-            record.curve = offset_curve.clone();
-            record.degenerate = false;
-        }
-        solid.edges.push(EdgeRecord {
-            id: seam_edge_id,
-            curve: seam,
-            t0: 0.0,
-            t1: 1.0,
-            start_vertex_id: seam_start_vertex,
-            end_vertex_id: seam_end_vertex,
-            degenerate: false,
-            name: None,
-        });
-        if owner_shell != cap_shell {
-            shell_unions.push((owner_shell, cap_shell));
-        }
-        welded += 1;
-    }
-    merge_connected_shells(solid, shell_unions);
-    if welded > 0 {
-        // The bands are built with a fixed internal winding; now that every rim
-        // is two-use, make the shared-edge coedge directions coherent so the
-        // finalize validation accepts the joined manifold. Normal-convention
-        // coherence (same_sense) is repaired on the finalized solid.
-        orient_open_solid_faces(solid)?;
-    }
-    Ok(welded)
-}
-
 /// Weld PAIRS of coaxial, coplanar orphan rims into a NEW planar annulus face.
 ///
 /// A through-hole shelled at both of its openings leaves the retained hole
 /// wall and its offset image each ending on a dangling rim in every opening
-/// plane. Neither single-rim strategy applies there: no wall fragment covers
+/// plane. The single-rim strategy does not apply there: no wall fragment covers
 /// the hole's surroundings (the wall carriers only produce the opening's
 /// border frame), so there is no containing planar face to hole
-/// (`weld_coplanar_orphan_rims`) and no mis-built cap to rebuild
-/// (`weld_ruled_offset_rims`). The missing geometry is exactly the flat
-/// annulus between the two rims — the through-hole wall's exposed thickness.
+/// (`weld_coplanar_orphan_rims`). The missing geometry is exactly the flat
+/// annulus between the two rims — the through-hole wall's exposed thickness,
+/// which lies IN the opening plane, as every closure here does since the ruled
+/// cork was retired on 2026-09-17.
 ///
 /// Pairing: two one-use closed rims qualify when they are circles on a common
 /// axis, lie in a common plane (an out-of-plane mate would need a twisted
@@ -1087,4 +588,571 @@ pub(super) fn claim_bore_end_rings(
         claimed += 1;
     }
     Ok(claimed)
+}
+
+/// One opening rim as the assembled solid carries it: the source rim edge (used
+/// by its source face and by the mis-built opening cap) and its IMAGE on the
+/// offset carrier (used once, by the offset skin), with the uv curve both were
+/// built from.
+struct RimBandPair {
+    rim: u64,
+    image: u64,
+    cap_face: u64,
+    carrier: usize,
+    pcurve: crate::NurbsCurve,
+}
+
+/// What [`weld_free_form_rim_bands`] measured about the bands it built.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct RimBandResiduals {
+    /// Worst distance from a band corner to the vertex its edges meet at.
+    pub endpoint: f64,
+    /// Worst `max_t ‖C_3d(t) − S_band(p(t))‖` over the band's four edges.
+    pub edge_to_carrier: f64,
+    /// The bar both were held to: twice the intersection-fit contract, since
+    /// each band rail and the edge it meets were each fitted to that contract
+    /// against the same locus.
+    pub bar: f64,
+}
+
+/// What [`weld_free_form_rim_bands`] did: how many bands it built, or — when it
+/// found an opening cap it could not replace — why. What the bands measured is
+/// gated inside the weld and traced through `BREP_OS_DEBUG`; the fixtures
+/// re-measure the delivered solid rather than trusting a number passed out.
+#[derive(Clone, Debug, Default)]
+pub(super) struct RimBandOutcome {
+    pub welded: usize,
+    /// Set only when the lane RECOGNIZED its configuration — an opening kept
+    /// whole as a cap bounded by source rims, with offset edges dangling — and
+    /// could not close it. The shell still fails where it failed before; this
+    /// is the name its refusal carries.
+    pub decline: Option<String>,
+}
+
+impl RimBandOutcome {
+    /// A decline is only named when an opening cap bounded by nothing but
+    /// source rims is there to be replaced; otherwise the dangling edges are
+    /// some other lane's, and this one says nothing.
+    fn declined(reason: String, solid: &BrepSolid, face_images: &[OffsetShellFaceImageRecord]) -> Self {
+        let use_counts = crate::topology::edge_use_counts(solid);
+        let role = |face_id: u64| face_images.get(face_id.saturating_sub(1) as usize).map(|image| image.role);
+        let faces = solid.shells.iter().flat_map(|shell| &shell.faces).collect::<Vec<_>>();
+        let whole_cap = faces.iter().any(|face| {
+            matches!(role(face.id), Some(OffsetFaceRole::Wall))
+                && face.loops.len() == 1
+                && face.loops[0].coedges.iter().all(|coedge| {
+                    use_counts.get(&coedge.edge_id).copied().unwrap_or(0) == 2
+                        && faces.iter().any(|other| {
+                            other.id != face.id
+                                && matches!(role(other.id), Some(OffsetFaceRole::Source))
+                                && other
+                                    .loops
+                                    .iter()
+                                    .flat_map(|loop_record| &loop_record.coedges)
+                                    .any(|use_| use_.edge_id == coedge.edge_id)
+                        })
+                })
+        });
+        os_debug!("RIMBAND decline (named: {whole_cap}): {reason}");
+        Self {
+            decline: whole_cap.then_some(reason),
+            ..Self::default()
+        }
+    }
+}
+
+/// Where two edge curves coincide geometrically: `Some(reversed)`.
+fn same_edge_geometry(first: &EdgeRecord, second: &EdgeRecord, tolerance: f64) -> Result<Option<bool>, String> {
+    let ends = |edge: &EdgeRecord| -> Result<[Vec3; 3], String> {
+        Ok([
+            edge.curve.evaluate(edge.t0)?,
+            edge.curve.evaluate((edge.t0 + edge.t1) * 0.5)?,
+            edge.curve.evaluate(edge.t1)?,
+        ])
+    };
+    let [a0, am, a1] = ends(first)?;
+    let [b0, bm, b1] = ends(second)?;
+    if am.sub(bm).length() > tolerance {
+        return Ok(None);
+    }
+    if a0.sub(b0).length() <= tolerance && a1.sub(b1).length() <= tolerance {
+        return Ok(Some(false));
+    }
+    if a0.sub(b1).length() <= tolerance && a1.sub(b0).length() <= tolerance {
+        return Ok(Some(true));
+    }
+    Ok(None)
+}
+
+/// Close an opening whose offset rim image falls SHORT of the opening, for any
+/// rim a pcurve can name: a free-form (NURBS) rim, or a non-iso one.
+///
+/// The configuration the retired coaxial-circle weld closed for circles: a
+/// retained face leaning over its opening offsets to a skin that ends at the
+/// image of the rim, strictly inside the source, so no imprint against the
+/// opening cuts it. The pipeline then keeps the opening face whole as a cap
+/// bounded by the source rim, and the image chain dangles one-use. The wall
+/// that closes it is the NORMAL-RULED band from each rim point to its offset
+/// image — the same wall the frustum weld builds, and the convention
+/// `frustum_open_both_ends_shells_watertight_with_exact_wall_volume` asserts.
+///
+/// Each band is built from the uv curve the rim and its image were both made
+/// from. The source face's surface and the offset carrier are first put on one
+/// basis (exact: the carrier's refined net is a refinement of the source's),
+/// then the curve's images on both are fitted over ONE parameter set, so the
+/// two rails share degree, knots and weights and the ruled tensor between them
+/// reproduces the segment `(1 − t)·rim(s) + t·image(s)` at every `s`. Adjacent
+/// bands share the straight ruling at the rim vertex between them.
+///
+/// Measured, not assumed: every band corner against its vertex and every band
+/// edge against the band surface along its pcurve, each held to twice the
+/// intersection-fit contract. A cap this lane recognizes but cannot close is
+/// refused by name: a rim corner where two retained faces meet SHARPLY leaves
+/// two images that do not meet, and closing that needs a miter this lane does
+/// not build.
+pub(super) fn weld_free_form_rim_bands(
+    solid: &mut BrepSolid,
+    face_images: &mut Vec<OffsetShellFaceImageRecord>,
+    carriers: &[Carrier],
+    source: &BrepSolid,
+    tolerance: f64,
+) -> Result<RimBandOutcome, String> {
+    let mut residuals = RimBandResiduals::default();
+    let use_counts = crate::topology::edge_use_counts(solid);
+    let one_use = solid
+        .edges
+        .iter()
+        .filter(|edge| !edge.degenerate && use_counts.get(&edge.id).copied().unwrap_or(0) == 1)
+        .cloned()
+        .collect::<Vec<_>>();
+    if one_use.is_empty() {
+        return Ok(RimBandOutcome::default());
+    }
+    let role_of = |face_id: u64| {
+        face_images
+            .get(face_id.saturating_sub(1) as usize)
+            .map(|image| image.role)
+    };
+    let faces_using = |solid: &BrepSolid, edge_id: u64| -> Vec<u64> {
+        solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .filter(|face| {
+                face.loops
+                    .iter()
+                    .flat_map(|loop_record| &loop_record.coedges)
+                    .any(|coedge| coedge.edge_id == edge_id)
+            })
+            .map(|face| face.id)
+            .collect()
+    };
+    let source_face = |face_id: u64| {
+        source
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .find(|face| face.id == face_id)
+    };
+
+    // Pair every dangling image with the carrier coedge it came from, and that
+    // coedge's uv curve with the source rim it traces on the source face.
+    let mut pairs: Vec<RimBandPair> = Vec::new();
+    for image in &one_use {
+        let mut found = None;
+        'carriers: for (index, carrier) in carriers.iter().enumerate() {
+            if !matches!(carrier.kind, OffsetFaceRole::Offset) {
+                continue;
+            }
+            let carrier_face = &carrier.solid.shells[0].faces[0];
+            for coedge in carrier_face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+                let Some(carrier_edge) = carrier.solid.edges.iter().find(|edge| edge.id == coedge.edge_id) else {
+                    continue;
+                };
+                if carrier_edge.degenerate || same_edge_geometry(image, carrier_edge, tolerance)?.is_none() {
+                    continue;
+                }
+                found = Some((index, coedge.pcurve.clone()));
+                break 'carriers;
+            }
+        }
+        let Some((carrier_index, pcurve)) = found else {
+            // The image is a PIECE of a carrier's rim image, and what cut it
+            // short is the name of the refusal. An end ON the opening surface
+            // means the offset crossed the opening there — the rim's image is
+            // inside the source along part of the rim and outside along the
+            // rest, which is the MIXED rim. Anything else is the miter two
+            // retained faces' offsets cut into each other's images.
+            let point = image.curve.evaluate((image.t0 + image.t1) * 0.5)?;
+            let on_opening = [image.t0, image.t1]
+                .into_iter()
+                .map(|parameter| {
+                    let end = image.curve.evaluate(parameter)?;
+                    let mut nearest = f64::INFINITY;
+                    for carrier in carriers.iter().filter(|carrier| matches!(carrier.kind, OffsetFaceRole::Wall)) {
+                        let opening = &carrier.solid.shells[0].faces[0];
+                        nearest = nearest.min(project_point_to_surface(&opening.surface, end)?.distance);
+                    }
+                    Ok(nearest)
+                })
+                .collect::<Result<Vec<_>, String>>()?
+                .into_iter()
+                .fold(f64::INFINITY, f64::min);
+            let reason = if on_opening <= tolerance {
+                format!(
+                    "the rim's offset image lies INSIDE the source along part of the rim and outside \
+                     along the rest: the dangling piece near ({:.3},{:.3},{:.3}) ends {on_opening:.3e} \
+                     from the opening surface, where the image crosses it. The wall there is the \
+                     opening where the image is outside and the ruled band where it is inside, joined \
+                     at the crossing — a MIXED rim, which this lane does not build",
+                    point.x, point.y, point.z
+                )
+            } else {
+                format!(
+                    "the dangling offset edge near ({:.3},{:.3},{:.3}) is not a whole rim image of an \
+                     offset carrier, and its ends are {on_opening:.3e} from any opening — a SHARP rim \
+                     corner, where two retained faces' offsets meet in a miter and cut each other's rim \
+                     images short, needs a miter this rim band lane does not build",
+                    point.x, point.y, point.z
+                )
+            };
+            return Ok(RimBandOutcome::declined(reason, solid, face_images));
+        };
+        let Some(face) = source_face(carriers[carrier_index].source_face_id) else {
+            return Ok(RimBandOutcome::default());
+        };
+        let [q0, q1] = pcurve.domain()?;
+        let at = |q: f64| -> Result<Vec3, String> {
+            let uv = pcurve.evaluate(q)?;
+            face.surface.evaluate(uv.x, uv.y)
+        };
+        let (start, middle, end) = (at(q0)?, at((q0 + q1) * 0.5)?, at(q1)?);
+        let mut rim = None;
+        for edge in &solid.edges {
+            if edge.degenerate || use_counts.get(&edge.id).copied().unwrap_or(0) != 2 {
+                continue;
+            }
+            let (a, b) = (edge.curve.evaluate(edge.t0)?, edge.curve.evaluate(edge.t1)?);
+            let ends_match = (a.sub(start).length() <= tolerance && b.sub(end).length() <= tolerance)
+                || (a.sub(end).length() <= tolerance && b.sub(start).length() <= tolerance);
+            if ends_match && crate::project_point_to_curve(&edge.curve, middle)?.distance <= tolerance {
+                rim = Some(edge.id);
+                break;
+            }
+        }
+        let Some(rim) = rim else {
+            os_debug!("RIMBAND skip: image {} has no two-use source rim", image.id);
+            return Ok(RimBandOutcome::default());
+        };
+        let users = faces_using(solid, rim);
+        let caps = users
+            .iter()
+            .copied()
+            .filter(|face_id| matches!(role_of(*face_id), Some(OffsetFaceRole::Wall)))
+            .collect::<Vec<_>>();
+        let sources = users
+            .iter()
+            .filter(|face_id| matches!(role_of(**face_id), Some(OffsetFaceRole::Source)))
+            .count();
+        if caps.len() != 1 || sources != 1 {
+            os_debug!("RIMBAND skip: rim {rim} is not between a source face and one cap");
+            return Ok(RimBandOutcome::default());
+        }
+        pairs.push(RimBandPair {
+            rim,
+            image: image.id,
+            cap_face: caps[0],
+            carrier: carrier_index,
+            pcurve,
+        });
+    }
+
+    // Every cap must be bounded by paired rims and nothing else.
+    let cap_ids = pairs.iter().map(|pair| pair.cap_face).collect::<HashSet<_>>();
+    for cap_id in &cap_ids {
+        let cap = solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .find(|face| face.id == *cap_id)
+            .ok_or_else(|| "offset_shell: rim band cap vanished".to_string())?;
+        if cap.loops.len() != 1
+            || !cap.loops[0]
+                .coedges
+                .iter()
+                .all(|coedge| pairs.iter().any(|pair| pair.rim == coedge.edge_id))
+        {
+            os_debug!("RIMBAND skip: cap {cap_id} is not bounded by paired rims alone");
+            return Ok(RimBandOutcome::default());
+        }
+    }
+
+    let vertex_point = |solid: &BrepSolid, id: u64| -> Result<Vec3, String> {
+        solid
+            .vertices
+            .iter()
+            .find(|vertex| vertex.id == id)
+            .map(|vertex| vertex.point)
+            .ok_or_else(|| format!("offset_shell: rim band vertex {id} missing"))
+    };
+    let edge_record = |solid: &BrepSolid, id: u64| -> Result<EdgeRecord, String> {
+        solid
+            .edges
+            .iter()
+            .find(|edge| edge.id == id)
+            .cloned()
+            .ok_or_else(|| format!("offset_shell: rim band edge {id} missing"))
+    };
+
+    // A rim vertex's images from its two faces must be ONE vertex of the chain.
+    for pair in &pairs {
+        let rim = edge_record(solid, pair.rim)?;
+        for vertex in [rim.start_vertex_id, rim.end_vertex_id] {
+            let point = vertex_point(solid, vertex)?;
+            let neighbours = pairs
+                .iter()
+                .filter(|other| {
+                    solid.edges.iter().any(|edge| {
+                        edge.id == other.rim && (edge.start_vertex_id == vertex || edge.end_vertex_id == vertex)
+                    })
+                })
+                .map(|other| other.image)
+                .collect::<Vec<_>>();
+            let image_vertices = neighbours
+                .iter()
+                .map(|image| {
+                    let edge = edge_record(solid, *image)?;
+                    let near = |id: u64| vertex_point(solid, id).map(|p| p.sub(point).length());
+                    Ok(if near(edge.start_vertex_id)? <= near(edge.end_vertex_id)? {
+                        edge.start_vertex_id
+                    } else {
+                        edge.end_vertex_id
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            if image_vertices.len() == 2 && image_vertices[0] != image_vertices[1] {
+                let gap = vertex_point(solid, image_vertices[0])?
+                    .sub(vertex_point(solid, image_vertices[1])?)
+                    .length();
+                return Ok(RimBandOutcome::declined(format!(
+                    "the opening rim turns a SHARP corner at ({:.3},{:.3},{:.3}), where the offset \
+                     images of its two retained faces do not meet (gap {gap:.3e}); a ruled rim band \
+                     cannot close it without a miter, which is not built",
+                    point.x, point.y, point.z
+                ), solid, face_images));
+            }
+        }
+    }
+
+    let scale = crate::solid_model_scale(source);
+    let fit_tolerance = crate::KernelTolerances::for_scale(scale, 1e-7).intersection_fit;
+    residuals.bar = 2.0 * fit_tolerance;
+    let band_measure = crate::offset_construction_band(scale);
+    let mut next_edge_id = solid.edges.iter().map(|edge| edge.id).max().unwrap_or(0) + 1;
+    let mut next_coedge_id = solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .flat_map(|face| &face.loops)
+        .flat_map(|loop_record| &loop_record.coedges)
+        .map(|coedge| coedge.id)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let mut rulings: HashMap<(u64, u64), u64> = HashMap::default();
+    let mut new_edges: Vec<EdgeRecord> = Vec::new();
+    let mut bands: Vec<(u64, FaceRecord)> = Vec::new();
+    for pair in &pairs {
+        let face = source_face(carriers[pair.carrier].source_face_id)
+            .ok_or_else(|| "offset_shell: rim band source face vanished".to_string())?;
+        let carrier_surface = &carriers[pair.carrier].solid.shells[0].faces[0].surface;
+        let (rim_sheet, image_sheet) =
+            crate::offset::unify_offset_sheet_bases(&face.surface, carrier_surface)?;
+        let (rail, image_rail) = crate::image_curve::image_curve_pair(
+            &rim_sheet,
+            &image_sheet,
+            &pair.pcurve,
+            fit_tolerance,
+            "offsetShell rim band",
+        )?;
+        let shared = rail.curve.degree == image_rail.curve.degree
+            && rail.curve.knots.len() == image_rail.curve.knots.len()
+            && rail.curve.knots.iter().zip(&image_rail.curve.knots).all(|(a, b)| (a - b).abs() <= 1e-12)
+            && rail
+                .curve
+                .control_points
+                .iter()
+                .zip(&image_rail.curve.control_points)
+                .all(|(a, b)| (a.w - b.w).abs() <= 1e-9)
+            && (rail.t0 - image_rail.t0).abs() <= 1e-12
+            && (rail.t1 - image_rail.t1).abs() <= 1e-12;
+        if !shared {
+            return Err("offset_shell: a rim band's two rails do not share a basis".into());
+        }
+        let band = crate::NurbsSurface::new(
+            rail.curve.degree,
+            1,
+            rail.curve.knots.clone(),
+            vec![0.0, 0.0, 1.0, 1.0],
+            rail.curve
+                .control_points
+                .iter()
+                .zip(&image_rail.curve.control_points)
+                .map(|(a, b)| vec![*a, *b])
+                .collect(),
+        )?;
+        let (s_a, s_b) = (rail.t0, rail.t1);
+        let rim = edge_record(solid, pair.rim)?;
+        let image = edge_record(solid, pair.image)?;
+        let nearest = |solid: &BrepSolid, edge: &EdgeRecord, point: Vec3| -> Result<u64, String> {
+            let start = vertex_point(solid, edge.start_vertex_id)?.sub(point).length();
+            let end = vertex_point(solid, edge.end_vertex_id)?.sub(point).length();
+            Ok(if start <= end { edge.start_vertex_id } else { edge.end_vertex_id })
+        };
+        let rim_a = nearest(solid, &rim, band.evaluate(s_a, 0.0)?)?;
+        let rim_b = nearest(solid, &rim, band.evaluate(s_b, 0.0)?)?;
+        let image_a = nearest(solid, &image, band.evaluate(s_a, 1.0)?)?;
+        let image_b = nearest(solid, &image, band.evaluate(s_b, 1.0)?)?;
+        if rim_a == rim_b || image_a == image_b {
+            return Err("offset_shell: a closed rim needs a seam this rim band does not build".into());
+        }
+        for (s, t, vertex) in [(s_a, 0.0, rim_a), (s_b, 0.0, rim_b), (s_a, 1.0, image_a), (s_b, 1.0, image_b)] {
+            residuals.endpoint = residuals
+                .endpoint
+                .max(band.evaluate(s, t)?.sub(vertex_point(solid, vertex)?).length());
+        }
+        let mut ruling = |from: u64, to: u64| -> Result<u64, String> {
+            if let Some(id) = rulings.get(&(from, to)) {
+                return Ok(*id);
+            }
+            let id = next_edge_id;
+            next_edge_id += 1;
+            new_edges.push(EdgeRecord {
+                id,
+                curve: crate::make_line(vertex_point(solid, from)?, vertex_point(solid, to)?)?,
+                t0: 0.0,
+                t1: 1.0,
+                start_vertex_id: from,
+                end_vertex_id: to,
+                degenerate: false,
+                name: None,
+            });
+            rulings.insert((from, to), id);
+            Ok(id)
+        };
+        let ruling_b = ruling(rim_b, image_b)?;
+        let ruling_a = ruling(rim_a, image_a)?;
+        let line = |u0: f64, v0: f64, u1: f64, v1: f64| {
+            crate::make_line(Vec3::new(u0, v0, 0.0), Vec3::new(u1, v1, 0.0))
+        };
+        let starts_at = |edge: &EdgeRecord, point: Vec3| -> Result<bool, String> {
+            Ok(edge.curve.evaluate(edge.t0)?.sub(point).length()
+                <= edge.curve.evaluate(edge.t1)?.sub(point).length())
+        };
+        let rim_forward = starts_at(&rim, band.evaluate(s_a, 0.0)?)?;
+        let image_forward = starts_at(&image, band.evaluate(s_b, 1.0)?)?;
+        let mut coedge = |edge_id: u64, forward: bool, pcurve: crate::NurbsCurve| {
+            let record = CoedgeRecord {
+                id: next_coedge_id,
+                edge_id,
+                forward,
+                pcurve,
+            };
+            next_coedge_id += 1;
+            record
+        };
+        let coedges = vec![
+            coedge(rim.id, rim_forward, line(s_a, 0.0, s_b, 0.0)?),
+            coedge(ruling_b, true, line(s_b, 0.0, s_b, 1.0)?),
+            coedge(image.id, image_forward, line(s_b, 1.0, s_a, 1.0)?),
+            coedge(ruling_a, false, line(s_a, 1.0, s_a, 0.0)?),
+        ];
+        let mut band_face = FaceRecord {
+            id: 0,
+            surface: band,
+            same_sense: true,
+            loops: vec![LoopRecord { id: 1, coedges }],
+            name: None,
+        };
+        if parameter_space_area(&band_face)? < 0.0 {
+            band_face.same_sense = false;
+        }
+        bands.push((pair.cap_face, band_face));
+    }
+
+    // Measure every band edge against the band along its pcurve.
+    let all_edges = solid.edges.iter().chain(new_edges.iter()).map(|edge| (edge.id, edge)).collect::<HashMap<_, _>>();
+    for (_, band) in &bands {
+        for coedge in &band.loops[0].coedges {
+            let edge = all_edges[&coedge.edge_id];
+            let measured = crate::measure_edge_against_pcurve_image(
+                &band.surface,
+                &coedge.pcurve,
+                edge,
+                coedge.forward,
+                band_measure,
+            )?;
+            residuals.edge_to_carrier = residuals.edge_to_carrier.max(measured.deviation());
+        }
+    }
+    os_debug!(
+        "RIMBAND {} band(s): endpoint {:.3e}, edge-to-carrier {:.3e}, bar {:.3e}",
+        bands.len(),
+        residuals.endpoint,
+        residuals.edge_to_carrier,
+        residuals.bar
+    );
+    if residuals.endpoint > residuals.bar || residuals.edge_to_carrier > residuals.bar {
+        return Err(format!(
+            "offset_shell: a ruled rim band misses its edges (endpoint {:.3e}, edge-to-band {:.3e}) \
+             past twice the intersection-fit contract {:.3e}",
+            residuals.endpoint, residuals.edge_to_carrier, residuals.bar
+        ));
+    }
+
+    // Commit: each cap gives way to its bands, in the cap's shell, and the shells
+    // the rims and images belong to join it.
+    let shell_of = |solid: &BrepSolid, face_id: u64| {
+        solid
+            .shells
+            .iter()
+            .position(|shell| shell.faces.iter().any(|face| face.id == face_id))
+    };
+    let mut unions = Vec::new();
+    for pair in &pairs {
+        let cap_shell = shell_of(solid, pair.cap_face).ok_or_else(|| "offset_shell: cap shell missing".to_string())?;
+        for edge_id in [pair.rim, pair.image] {
+            for face_id in faces_using(solid, edge_id) {
+                if let Some(shell) = shell_of(solid, face_id) {
+                    if shell != cap_shell {
+                        unions.push((cap_shell, shell));
+                    }
+                }
+            }
+        }
+    }
+    let welded = bands.len();
+    for (cap_id, mut band) in bands {
+        let cap_shell = shell_of(solid, cap_id).ok_or_else(|| "offset_shell: cap shell missing".to_string())?;
+        let cap_source = face_images
+            .get(cap_id.saturating_sub(1) as usize)
+            .map(|image| image.source_face_id)
+            .ok_or_else(|| "offset_shell: cap provenance missing".to_string())?;
+        band.id = face_images.len() as u64 + 1;
+        face_images.push(OffsetShellFaceImageRecord {
+            role: OffsetFaceRole::Wall,
+            source_face_id: cap_source,
+        });
+        solid.shells[cap_shell].faces.push(band);
+    }
+    for shell in &mut solid.shells {
+        shell.faces.retain(|face| !cap_ids.contains(&face.id));
+    }
+    solid.edges.extend(new_edges);
+    merge_connected_shells(solid, unions);
+    orient_open_solid_faces(solid)?;
+    Ok(RimBandOutcome {
+        welded,
+        decline: None,
+    })
 }

@@ -185,10 +185,10 @@ pub fn assembly_pose_updates_json() -> String {
 /// write-back, spec §6 step 4).
 #[wasm_bindgen]
 pub fn assembly_apply_document_json(document_json: &str) -> Result<String, JsValue> {
-    apply_document(document_json).map_err(|error| JsValue::from_str(&error))
+    assembly_apply_document_impl(document_json).map_err(|error| JsValue::from_str(&error))
 }
 
-fn apply_document(document_json: &str) -> Result<String, String> {
+pub fn assembly_apply_document_impl(document_json: &str) -> Result<String, String> {
     let mut document: serde_json::Value = serde_json::from_str(document_json)
         .map_err(|error| format!("assembly document fold: bad document: {error}"))?;
     with_session(|session| {
@@ -356,10 +356,10 @@ pub fn assembly_add_constraint_json(
     constraint_type: &str,
     params_json: &str,
 ) -> Result<String, JsValue> {
-    add_constraint(constraint_type, params_json).map_err(|error| JsValue::from_str(&error))
+    assembly_add_constraint_impl(constraint_type, params_json).map_err(|error| JsValue::from_str(&error))
 }
 
-fn add_constraint(constraint_type: &str, params_json: &str) -> Result<String, String> {
+pub fn assembly_add_constraint_impl(constraint_type: &str, params_json: &str) -> Result<String, String> {
     let def = constraints::constraint_type(constraint_type)
         .ok_or_else(|| format!("Unknown constraint type: {constraint_type}"))?;
     let mut params: serde_json::Value = serde_json::from_str(params_json)
@@ -396,10 +396,10 @@ fn add_constraint(constraint_type: &str, params_json: &str) -> Result<String, St
 /// returns the solve report.
 #[wasm_bindgen]
 pub fn assembly_update_constraint_json(id: &str, params_json: &str) -> Result<String, JsValue> {
-    update_constraint(id, params_json).map_err(|error| JsValue::from_str(&error))
+    assembly_update_constraint_impl(id, params_json).map_err(|error| JsValue::from_str(&error))
 }
 
-fn update_constraint(id: &str, params_json: &str) -> Result<String, String> {
+pub fn assembly_update_constraint_impl(id: &str, params_json: &str) -> Result<String, String> {
     let mut params: serde_json::Value = serde_json::from_str(params_json)
         .map_err(|error| format!("constraint params: {error}"))?;
     if !params.is_object() {
@@ -421,10 +421,10 @@ fn update_constraint(id: &str, params_json: &str) -> Result<String, String> {
 /// Delete a constraint. Auto-solves; returns the solve report.
 #[wasm_bindgen]
 pub fn assembly_remove_constraint_json(id: &str) -> Result<String, JsValue> {
-    remove_constraint(id).map_err(|error| JsValue::from_str(&error))
+    assembly_remove_constraint_impl(id).map_err(|error| JsValue::from_str(&error))
 }
 
-fn remove_constraint(id: &str) -> Result<String, String> {
+pub fn assembly_remove_constraint_impl(id: &str) -> Result<String, String> {
     with_session(|session| {
         let index = find_index(session, id)?;
         session.state.constraints.remove(index);
@@ -435,10 +435,10 @@ fn remove_constraint(id: &str) -> Result<String, String> {
 /// Enable/disable a constraint. Auto-solves; returns the solve report.
 #[wasm_bindgen]
 pub fn assembly_set_constraint_enabled_json(id: &str, enabled: bool) -> Result<String, JsValue> {
-    set_enabled(id, enabled).map_err(|error| JsValue::from_str(&error))
+    assembly_set_constraint_enabled_impl(id, enabled).map_err(|error| JsValue::from_str(&error))
 }
 
-fn set_enabled(id: &str, enabled: bool) -> Result<String, String> {
+pub fn assembly_set_constraint_enabled_impl(id: &str, enabled: bool) -> Result<String, String> {
     with_session(|session| {
         find_entry(session, id)?.enabled = enabled;
         Ok(solve_session(session).to_string())
@@ -448,20 +448,23 @@ fn set_enabled(id: &str, enabled: bool) -> Result<String, String> {
 /// Persist a constraint row's dialog expansion state (view state — no solve).
 #[wasm_bindgen]
 pub fn assembly_set_constraint_open_json(id: &str, open: bool) -> Result<(), JsValue> {
+    assembly_set_constraint_open_impl(id, open).map_err(|error| JsValue::from_str(&error))
+}
+
+pub fn assembly_set_constraint_open_impl(id: &str, open: bool) -> Result<(), String> {
     with_session(|session| {
         find_entry(session, id)?.open = open;
         Ok(())
     })
-    .map_err(|error| JsValue::from_str(&error))
 }
 
 /// Reorder a constraint to `index` (clamped). Auto-solves; returns the report.
 #[wasm_bindgen]
 pub fn assembly_move_constraint_json(id: &str, index: usize) -> Result<String, JsValue> {
-    move_constraint(id, index).map_err(|error| JsValue::from_str(&error))
+    assembly_move_constraint_impl(id, index).map_err(|error| JsValue::from_str(&error))
 }
 
-fn move_constraint(id: &str, index: usize) -> Result<String, String> {
+pub fn assembly_move_constraint_impl(id: &str, index: usize) -> Result<String, String> {
     with_session(|session| {
         let from = find_index(session, id)?;
         let entry = session.state.constraints.remove(from);
@@ -539,8 +542,11 @@ fn infer_apply(options_json: &str) -> Result<serde_json::Value, String> {
 /// Manual solve (the panel's Solve button). Returns the solve report.
 #[wasm_bindgen]
 pub fn assembly_run_solve_json() -> Result<String, JsValue> {
+    assembly_run_solve_impl().map_err(|error| JsValue::from_str(&error))
+}
+
+pub fn assembly_run_solve_impl() -> Result<String, String> {
     with_session(|session| Ok(solve_session(session).to_string()))
-        .map_err(|error| JsValue::from_str(&error))
 }
 
 fn find_index(session: &Session, id: &str) -> Result<usize, String> {

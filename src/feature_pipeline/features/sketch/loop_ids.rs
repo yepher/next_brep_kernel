@@ -146,7 +146,6 @@ fn next_free(claims: &[Claim], taken: &[u64]) -> u64 {
     highest.saturating_add(1)
 }
 
-// BREP private tests: 836b0104a3a028ba
 
 // ===========================================================================
 // Write-back — the editor side
@@ -320,4 +319,3 @@ fn numeric(value: &serde_json::Value) -> Option<u64> {
     }
 }
 
-// BREP private tests: ef961a0422cc988b

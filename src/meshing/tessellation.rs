@@ -194,4 +194,3 @@ pub fn tessellate_brep(solid: &BrepSolid, options: TessellationOptions) -> Resul
     Ok(mesh)
 }
 
-// BREP private tests: 52762cc01b7c9570

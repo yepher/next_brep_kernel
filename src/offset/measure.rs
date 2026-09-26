@@ -225,4 +225,3 @@ pub fn vertex_endpoint_gap(vertex_point: Vec3, curve_end: Vec3) -> f64 {
     curve_end.sub(vertex_point).length()
 }
 
-// BREP private tests: c329615ce4176843

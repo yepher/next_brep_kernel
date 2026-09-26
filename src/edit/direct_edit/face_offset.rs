@@ -1,5 +1,11 @@
 use super::*;
 
+#[path = "face_offset_plan.rs"]
+mod plan;
+use plan::RebuildPlan;
+#[path = "face_offset_tangent.rs"]
+mod tangent;
+
 // ---------------------------------------------------------------------------
 // Push a CURVED analytic face (cylinder / cone) by OFFSETTING its carrier.
 //
@@ -100,6 +106,9 @@ pub fn offset_ruled_face(
     if !distance.is_finite() {
         return Err("offset_ruled_face: distance must be finite".into());
     }
+    if let Some(directory) = census_directory() {
+        record_push_census(&directory, solid, face_id, distance);
+    }
     let scale = solid_model_scale(solid);
     let tolerance = (scale * 1e-7).max(1e-9);
     let plane_tolerance = (scale * 1e-6).max(1e-7);
@@ -169,6 +178,11 @@ pub fn offset_ruled_face(
     // far endpoint (its unmoved rim vertex) is not relocated by any rim.
     let vertex_pos: HashMap<u64, Vec3> =
         solid.vertices.iter().map(|v| (v.id, v.point)).collect();
+    // The mouth's TANGENT vertices, where the rim touches a floor that a third
+    // face pinches to a point (a bore inscribed in a hex pocket). Read off
+    // topology before the rim pass, so a non-planar floor refuses by name.
+    let tangents =
+        tangent::tangent_vertices(solid, face_id, &faces_of_edge, &edge_by_id, plane_tolerance)?;
 
     // OPEN rim arcs (a multi-loop pushed face: a window / slot cut through the
     // wall). Collected here and trimmed in a second pass, once every corner
@@ -446,39 +460,55 @@ pub fn offset_ruled_face(
     }
 
     // Second pass: trim each open rim's conic to the arc BETWEEN its two solved
-    // corners — the one that contains the old edge, picked by the old midpoint's
-    // parameter — and orient it start-vertex → end-vertex.
+    // endpoints — the one that CONTAINS the old edge, picked by the old
+    // midpoint's parameter — and orient it start-vertex → end-vertex.
+    //
+    // Both endpoints are parameters on the same conic (a seam end is solved on
+    // the seam meridian, see `RimEnd::Seam`), so there is one rule for every
+    // arc: the wanted piece is `[low, high]` when the midpoint lies in it, and
+    // the COMPLEMENT — the piece that runs the other way round, across the
+    // conic's period boundary — when it does not. The complement used to be an
+    // unconditional refusal; it is an ordinary arc whenever one of its two
+    // halves is empty, which is exactly the case of an endpoint that landed ON
+    // the period boundary. The reporter's gear bore has two of them: its top
+    // rim is split at the carrier's own seam azimuth, so the vertex there
+    // solves to parameter 0 while the arc it starts is `[0.9946, 1]`.
     for rim in &open_rims {
         let [d0, d1] = rim.conic.domain()?;
         let middle = project_point_to_curve(&rim.conic, rim.old_mid)?.u;
-        let (from, to) = match (rim.start, rim.end) {
-            (RimEnd::Corner(a), RimEnd::Corner(b)) => {
-                let (low, high) = if a <= b { (a, b) } else { (b, a) };
-                if middle < low || middle > high {
-                    return Err(
-                        "offset_ruled_face: a multi-loop rim arc wraps the pushed carrier's \
-                         periodic seam — deferred (refusing)"
-                            .into(),
-                    );
-                }
-                (low, high)
-            }
-            (RimEnd::Seam, RimEnd::Corner(corner)) | (RimEnd::Corner(corner), RimEnd::Seam) => {
-                if middle < corner {
-                    (d0, corner)
-                } else {
-                    (corner, d1)
-                }
-            }
-            (RimEnd::Seam, RimEnd::Seam) => {
-                return Err(
-                    "offset_ruled_face: a multi-loop rim arc ends on the seam at BOTH ends — \
-                     refusing"
-                        .into(),
-                )
-            }
-        };
-        let mut trimmed = subcurve(&rim.conic, from, to)?;
+        let (a, b) = (rim.start.parameter(), rim.end.parameter());
+        let (low, high) = if a <= b { (a, b) } else { (b, a) };
+        if std::env::var("BREP_PUSH_HOLE_DEBUG").is_ok() {
+            let describe = |end: RimEnd| match end {
+                RimEnd::Corner(u) => format!("Corner({u:.9})"),
+                RimEnd::Seam(u) => format!("Seam({u:.9})"),
+            };
+            let at = |vid: u64| {
+                new_vertex
+                    .get(&vid)
+                    .map(|p: &Vec3| format!("({:.5},{:.5},{:.5})", p.x, p.y, p.z))
+                    .unwrap_or_else(|| "-".to_string())
+            };
+            eprintln!(
+                "OPENRIM edge {} domain=[{d0},{d1}] start={} end={} middle={middle:.9} \
+                 v{}{} -> v{}{}",
+                rim.edge_id,
+                describe(rim.start),
+                describe(rim.end),
+                rim.start_vertex_id,
+                at(rim.start_vertex_id),
+                rim.end_vertex_id,
+                at(rim.end_vertex_id),
+            );
+        }
+        if let (RimEnd::Seam(_), RimEnd::Seam(_)) = (rim.start, rim.end) {
+            return Err(
+                "offset_ruled_face: a multi-loop rim arc ends on the seam at BOTH ends — \
+                 refusing"
+                    .into(),
+            );
+        }
+        let mut trimmed = rim_arc_between(&rim.conic, low, high, middle, tolerance)?;
         let start_point = *new_vertex.get(&rim.start_vertex_id).ok_or_else(|| {
             "offset_ruled_face: a multi-loop rim corner was not relocated — refusing".to_string()
         })?;
@@ -492,6 +522,24 @@ pub fn offset_ruled_face(
         }
         new_curve.insert(rim.edge_id, trimmed);
     }
+
+    // A tangent vertex cannot follow the rim — its flat stays — so it is split:
+    // the plan gets the new rim vertex, and a bridge edge or a merged floor.
+    // With no tangent vertex the plan stays geometry-only.
+    let mut plan = RebuildPlan::default();
+    tangent::plan_tangent_vertices(
+        solid,
+        face_id,
+        &tangents,
+        &faces_of_edge,
+        &edge_by_id,
+        &vertex_pos,
+        &s_prime,
+        plane_tolerance,
+        &mut new_vertex,
+        &mut cap_faces,
+        &mut plan,
+    )?;
 
     let pos = |vid: u64| -> Vec3 {
         new_vertex
@@ -642,7 +690,7 @@ pub fn offset_ruled_face(
             {
                 continue;
             }
-            if edge.curve.degree != 1 || edge.curve.control_points.len() != 2 {
+            if edge.curve.straight_segment(tolerance).is_none() {
                 return Err(
                     "offset_ruled_face: the push moved the end of a CURVED edge that is not a \
                      rebuilt rim — refusing"
@@ -653,11 +701,24 @@ pub fn offset_ruled_face(
             let end = pos(edge.end_vertex_id);
             for neighbour in faces_of_edge.get(&edge.id).cloned().unwrap_or_default() {
                 if !cap_faces.contains(&neighbour) {
-                    return Err(
-                        "offset_ruled_face: a relocated corner borders a face this push does not \
-                         re-trim — refusing"
-                            .into(),
-                    );
+                    // Name the vertex, the edge and the face. This is the
+                    // refusal a rim corner PINNED by a third, fixed face gives
+                    // — the reporter's gear bore is inscribed in a hex pocket,
+                    // so each of its six tangent corners also ends the bottom
+                    // edge of a hex flat, and moving the rim off those flats is
+                    // a topology change (the six floor faces merge) that push
+                    // face does not perform. Without the ids the message says
+                    // nothing about which corner is stuck.
+                    let stuck = [edge.start_vertex_id, edge.end_vertex_id]
+                        .into_iter()
+                        .find(|vertex| new_vertex.contains_key(vertex))
+                        .unwrap_or(edge.start_vertex_id);
+                    return Err(format!(
+                        "offset_ruled_face: the push relocates rim corner vertex {stuck}, which \
+                         also ends edge {} of face {neighbour} — a face this push does not \
+                         re-trim, so the rim would tear away from it (refusing)",
+                        edge.id
+                    ));
                 }
                 let (nshell, nface) = find_face(solid, neighbour).ok_or_else(|| {
                     format!("offset_ruled_face: missing neighbour {neighbour}")
@@ -684,37 +745,18 @@ pub fn offset_ruled_face(
         }
     }
 
-    // Every edge this push touched, by curve or by trim range — the selective
-    // re-fit's work list.
-    let changed_edges: HashSet<u64> = new_curve
-        .keys()
-        .chain(new_range.keys())
-        .copied()
-        .collect();
-
-    // --- Apply to a fresh clone (the input is never mutated) ---------------
-    let mut result = solid.clone();
-    for edge in &mut result.edges {
-        if let Some(curve) = new_curve.get(&edge.id) {
-            // A trimmed rim arc carries its PARENT conic's parameter range
-            // (`NurbsCurve::split` preserves knot values), so the edge range
-            // comes from the curve. Every whole-curve rebuild — the closed rims,
-            // the seam lines — still lands on [0, 1] exactly as before.
-            let [d0, d1] = curve.domain()?;
-            edge.curve = curve.clone();
-            edge.t0 = d0;
-            edge.t1 = d1;
-        } else if let Some((t0, t1)) = new_range.get(&edge.id) {
-            // A curved neighbour's own edge: same curve, new trim.
-            edge.t0 = *t0;
-            edge.t1 = *t1;
-        }
-    }
-    for vertex in &mut result.vertices {
-        if let Some(point) = new_vertex.get(&vertex.id) {
-            vertex.point = *point;
-        }
-    }
+    // --- Apply the plan to a fresh clone (the input is never mutated) -------
+    //
+    // Everything above is the classification step; what it decided is the plan.
+    plan.curves = new_curve;
+    plan.ranges = new_range;
+    plan.moved = new_vertex;
+    let (mut result, applied) = plan.apply(solid)?;
+    // Every edge this push touched, by curve, by trim range or by being added —
+    // the selective re-fit's work list.
+    let changed_edges = plan.changed_edges(&applied);
+    let (pshell, pface) = find_face(&result, face_id)
+        .ok_or_else(|| format!("offset_ruled_face: missing face {face_id}"))?;
     // The pushed face rides the offset carrier. S′ shares the source's parameter
     // domain + seam azimuth (same make_revolution frame/span), so the face's
     // existing (u, v) pcurves stay valid when every rim stayed at its axial
@@ -777,11 +819,24 @@ pub fn offset_ruled_face(
         // still reads as a gross deviation (measured 5.96 and 12.0 on the slot
         // fixture, against a 0.394 limit).
         //
-        // The SEAM edges are deliberately left alone: each is rebuilt as a
-        // straight chord over the same axial range, so fraction ↦ height is
-        // unchanged and their exact (u, v) — including the two coedges sitting
-        // on OPPOSITE sides of the periodic seam — survives untouched.
+        // The SEAM edges keep their u — and with it the two coedges sitting on
+        // OPPOSITE sides of the periodic seam — but their v is REFRESHED, which
+        // is where this used to be wrong.
+        //
+        // The claim that stood here was that a seam is "rebuilt as a straight
+        // chord over the same axial range, so fraction ↦ height is unchanged".
+        // That is true of a cap PERPENDICULAR to the axis and false of an
+        // OBLIQUE one: a tilted plane meets the generatrix at azimuth `u` at an
+        // axial station that depends on the RADIUS, so changing the radius by
+        // `d` slides the seam's endpoint along the axis by `d·tan θ`, where `θ`
+        // is the angle between the axis and the cap's normal. Measured on a
+        // radius-3 bore drilled at 30° and pushed by 0.5: the seam's pcurve sat
+        // `2.887e-1` off its own edge — exactly `0.5·tan 30°` — and
+        // `validate()`'s scale-derived pcurve limit passed it, so the only
+        // symptom was the body's volume, `1.9e-7` relative against its closed
+        // form where the axis-aligned control reads `1.6e-13`.
         let rebuilt: HashSet<u64> = rim_edges.iter().copied().collect();
+        let seams: HashSet<u64> = seam_edges.iter().copied().collect();
         let surface = result.shells[pshell].faces[pface].surface.clone();
         let [u_start, u_end] = surface.domain_u()?;
         let u_period = u_end - u_start;
@@ -798,6 +853,20 @@ pub fn offset_ruled_face(
                     pcurve = pcurve.reversed()?;
                 }
                 coedge.pcurve = reanchor_pcurve_u(&pcurve, &coedge.pcurve, u_period)?;
+            }
+        }
+        // The seam pass, in the same loop shape but keeping u: a generatrix's
+        // azimuth does not change under a radial offset, only the station its
+        // ends sit at.
+        for loop_record in &mut result.shells[pshell].faces[pface].loops {
+            for coedge in &mut loop_record.coedges {
+                if !seams.contains(&coedge.edge_id) {
+                    continue;
+                }
+                let edge = final_edges
+                    .get(&coedge.edge_id)
+                    .ok_or_else(|| format!("offset_ruled_face: missing edge {}", coedge.edge_id))?;
+                coedge.pcurve = reseat_seam_pcurve(&surface, &coedge.pcurve, edge, coedge.forward)?;
             }
         }
     }
@@ -891,7 +960,64 @@ pub fn offset_ruled_face(
     Ok(result)
 }
 
-/// Where an OPEN rim arc's endpoint sits on the rebuilt conic.
+/// Put a SEAM meridian's pcurve back on its own (rebuilt) chord without moving
+/// it off the periodic seam: the u coordinates are carried over verbatim from
+/// the pcurve being replaced — they are what put the two coedges of a seam on
+/// OPPOSITE sides of the period — and only v is re-solved.
+///
+/// `v` is solved exactly rather than fitted. A ruled revolution is affine in
+/// `v` along a fixed `u`, so the station of a point on that generatrix is its
+/// projection onto the segment the v-domain spans, and two surface evaluations
+/// give the whole map.
+fn reseat_seam_pcurve(
+    surface: &NurbsSurface,
+    pcurve: &NurbsCurve,
+    edge: &EdgeRecord,
+    forward: bool,
+) -> Result<NurbsCurve, String> {
+    let [q0, q1] = pcurve.domain()?;
+    let (head, tail) = (pcurve.evaluate(q0)?, pcurve.evaluate(q1)?);
+    let [v0, v1] = surface.domain_v()?;
+    let station = |u: f64, target: Vec3| -> Result<f64, String> {
+        let base = surface.evaluate(u, v0)?;
+        let top = surface.evaluate(u, v1)?;
+        let direction = top.sub(base);
+        let length_squared = direction.length_squared();
+        if length_squared <= 0.0 {
+            return Err(
+                "offset_ruled_face: the pushed carrier's generatrix has zero length — refusing"
+                    .into(),
+            );
+        }
+        Ok(v0 + (v1 - v0) * (target.sub(base).dot(direction) / length_squared))
+    };
+    let (at_head, at_tail) = if forward {
+        (edge.curve.evaluate(edge.t0)?, edge.curve.evaluate(edge.t1)?)
+    } else {
+        (edge.curve.evaluate(edge.t1)?, edge.curve.evaluate(edge.t0)?)
+    };
+    let reseated = crate::make_line(
+        Vec3::new(head.x, station(head.x, at_head)?, 0.0),
+        Vec3::new(tail.x, station(tail.x, at_tail)?, 0.0),
+    )?;
+    // Checked, not asserted: the reseated pcurve must land on the chord it
+    // carries, at both ends and in the middle.
+    let [r0, r1] = reseated.domain()?;
+    for (parameter, target) in [(r0, at_head), (r1, at_tail)] {
+        let uv = reseated.evaluate(parameter)?;
+        let drift = surface.evaluate(uv.x, uv.y)?.sub(target).length();
+        if drift > 1e-6 * (1.0 + target.length()) {
+            return Err(format!(
+                "offset_ruled_face: the reseated seam pcurve misses its own chord by \
+                 {drift:.3e} — refusing"
+            ));
+        }
+    }
+    Ok(reseated)
+}
+
+/// Where an OPEN rim arc's endpoint sits on the rebuilt conic — in every case
+/// a PARAMETER on that conic, solved from geometry.
 #[derive(Clone, Copy)]
 enum RimEnd {
     /// A genuine corner: the TRIPLE point `offset carrier ∩ this rim's
@@ -899,10 +1025,27 @@ enum RimEnd {
     /// parameter that lands on it.
     Corner(f64),
     /// The pushed carrier's periodic SEAM split this rim in two, so the
-    /// endpoint rides the offset carrier's seam meridian — which is exactly
-    /// parameter 0 (== 1) of the conic, because `S'` is revolved about the
-    /// SAME frame and seam azimuth as the source carrier.
-    Seam,
+    /// endpoint rides the offset carrier's seam MERIDIAN — the parameter at
+    /// which the conic crosses that meridian's axial half-plane.
+    ///
+    /// It is NOT parameter 0 of the conic. `S'` is revolved about the same
+    /// frame as the source carrier, so parameter 0 sits at `frame.x_axis`'s
+    /// azimuth — and a face's topological seam edge need not be there. An
+    /// imported cylinder can carry its seam edge anywhere on the carrier: the
+    /// reporter's gear bore (`IMPORT3D1_Face_29`) has its seam edge at
+    /// u = 0.5, a full 180° from `frame.x_axis`, and reading it as parameter 0
+    /// relocated both seam vertices to the wrong meridian and trimmed each
+    /// abutting arc from `[0, corner]` instead of `[0.5, corner]`.
+    Seam(f64),
+}
+
+impl RimEnd {
+    /// The conic parameter this endpoint lands on.
+    fn parameter(self) -> f64 {
+        match self {
+            RimEnd::Corner(parameter) | RimEnd::Seam(parameter) => parameter,
+        }
+    }
 }
 
 /// One open rim arc, held between the two passes of the rebuild.
@@ -924,7 +1067,9 @@ struct OpenRim {
 ///
 /// Two cases, and nothing else is admitted:
 /// * the adjacent edge is the pushed face's own SEAM — the endpoint rides the
-///   offset carrier's seam meridian;
+///   offset carrier's seam meridian, i.e. it is where this rim's conic crosses
+///   that meridian's axial half-plane ([`seam_axial_plane`], the same closed
+///   form the single-neighbour-hole lane pins its corners with);
 /// * the adjacent edge's fixed neighbour `N'` is a PLANE — the endpoint is the
 ///   triple point `S' ∩ N ∩ N'`, i.e. where this rim's conic (already the
 ///   `S' ∩ N` curve) crosses `N'`. The crossing nearest the old vertex is the
@@ -945,8 +1090,29 @@ fn resolve_open_rim_end(
 ) -> Result<(RimEnd, Vec3), String> {
     let incident = faces_of_edge.get(&adjacent.id).cloned().unwrap_or_default();
     if incident.iter().all(|f| *f == face_id) {
-        let [d0, _] = conic.domain()?;
-        return Ok((RimEnd::Seam, conic.evaluate(d0)?));
+        let (pshell, pface) = find_face(solid, face_id)
+            .ok_or_else(|| format!("offset_ruled_face: missing pushed face {face_id}"))?;
+        let meridian = seam_axial_plane(&solid.shells[pshell].faces[pface].surface, adjacent)
+            .ok_or_else(|| {
+                format!(
+                    "offset_ruled_face: the pushed face's seam (edge {}) is not a meridian of \
+                     its carrier — refusing",
+                    adjacent.id
+                )
+            })?;
+        // The meridian's plane is a WHOLE axial plane, so it also carries the
+        // opposite azimuth; the seam vertex being replaced picks the right one.
+        // The two are a diameter apart and the new one is |r − r'| from the old,
+        // which is smaller than r + r' for any push the carrier survives.
+        let parameter = conic_crossing_nearest(conic, &meridian, old_point, plane_tolerance)?
+            .ok_or_else(|| {
+                format!(
+                    "offset_ruled_face: the rebuilt rim never crosses the pushed face's own seam \
+                     meridian (edge {}) — refusing",
+                    adjacent.id
+                )
+            })?;
+        return Ok((RimEnd::Seam(parameter), conic.evaluate(parameter)?));
     }
     let other = *incident
         .iter()
@@ -963,6 +1129,16 @@ fn resolve_open_rim_end(
         let projection = project_point_to_curve(conic, old_point)?;
         return Ok((RimEnd::Corner(projection.u), conic.evaluate(projection.u)?));
     }
+    census_push("corner_crossings", || {
+        let [d0, d1] = conic.domain().unwrap_or([f64::NAN, f64::NAN]);
+        let height = |t: f64| conic.evaluate(t).map(|p| p.sub(plane.origin).dot(plane.normal)).unwrap_or(f64::NAN);
+        serde_json::json!({
+            "h_start": height(d0),
+            "h_end": height(d1),
+            "roots": plane_crossing_params(conic, &plane).map(|roots| roots.iter().map(|t| (t - d0) / (d1 - d0)).collect::<Vec<_>>()).unwrap_or_default(),
+            "closed": conic.evaluate(d0).and_then(|a| conic.evaluate(d1).map(|b| a.sub(b).length())).unwrap_or(f64::NAN) <= plane_tolerance,
+        })
+    });
     let mut best: Option<(f64, f64)> = None;
     for parameter in plane_crossing_params(conic, &plane)? {
         let distance = conic.evaluate(parameter)?.sub(old_point).length();
@@ -1046,6 +1222,57 @@ fn plane_crossing_params(curve: &NurbsCurve, plane: &Plane) -> Result<Vec<f64>, 
     Ok(roots)
 }
 
+/// The parameter at which `curve` crosses `plane` NEAREST `reference`, or
+/// `None` when it never crosses it.
+///
+/// Written for the seam endpoint of an open rim, where the plane is an axial
+/// half-plane's whole plane and the crossing wanted is the one replacing a
+/// known old point. Two things [`plane_crossing_params`] alone does not give:
+///
+/// * **the domain ENDS count.** A closed conic whose parameter origin already
+///   sits on the plane — the canonical case, where the carrier's seam azimuth
+///   IS `frame.x_axis` — has a root exactly at `d0` (== `d1`). The sampled
+///   sweep only reports it when the signed distance there is *bit*-zero, and
+///   a bisected near-endpoint root is a few ulp off the exact end. So both
+///   ends are offered first, and a root that duplicates an offered end is
+///   dropped: the canonical case then returns `d0` exactly, and
+///   `conic.evaluate(d0)` stays the point this function has always returned.
+/// * **a pick.** An axial plane cuts a conic about the same axis twice, at
+///   opposite azimuths; only the old point can say which is the seam's.
+fn conic_crossing_nearest(
+    curve: &NurbsCurve,
+    plane: &Plane,
+    reference: Vec3,
+    plane_tolerance: f64,
+) -> Result<Option<f64>, String> {
+    let [d0, d1] = curve.domain()?;
+    let span = (d1 - d0).max(1e-12);
+    let mut candidates: Vec<f64> = Vec::new();
+    let mut ends = [false, false];
+    for (slot, end) in [d0, d1].into_iter().enumerate() {
+        if curve.evaluate(end)?.sub(plane.origin).dot(plane.normal).abs() <= plane_tolerance {
+            ends[slot] = true;
+            candidates.push(end);
+        }
+    }
+    for root in plane_crossing_params(curve, plane)? {
+        if (ends[0] && (root - d0).abs() <= 1e-6 * span)
+            || (ends[1] && (root - d1).abs() <= 1e-6 * span)
+        {
+            continue;
+        }
+        candidates.push(root);
+    }
+    let mut best: Option<(f64, f64)> = None;
+    for parameter in candidates {
+        let distance = curve.evaluate(parameter)?.sub(reference).length();
+        if best.map(|(known, _)| distance < known).unwrap_or(true) {
+            best = Some((distance, parameter));
+        }
+    }
+    Ok(best.map(|(_, parameter)| parameter))
+}
+
 /// The piece of `curve` over `[from, to]`. `NurbsCurve::split` keeps the parent
 /// parameterization, so the result's own domain IS `[from, to]` — which is what
 /// the edge's `t0`/`t1` are then set from.
@@ -1063,6 +1290,57 @@ fn subcurve(curve: &NurbsCurve, from: f64, to: f64) -> Result<NurbsCurve, String
         trimmed = trimmed.split(from)?.1;
     }
     Ok(trimmed)
+}
+
+/// The arc of `conic` between the parameters `low <= high` that CONTAINS
+/// `middle` — the old edge's own midpoint, which is what says which of the two
+/// complementary arcs the edge being replaced actually was.
+///
+/// `[low, high]` when the midpoint lies in it. Otherwise the edge is the
+/// COMPLEMENT, the arc that runs the other way round across the conic's period
+/// boundary, and that is an ordinary sub-arc exactly when one of its two halves
+/// — `[d0, low]` and `[high, d1]` — is empty, i.e. when an endpoint landed ON
+/// the boundary. It does, whenever a rim was split at the pushed carrier's own
+/// seam azimuth: the reporter's gear bore (`IMPORT3D1_Face_29`) carries such a
+/// split, and its two arcs there are `[0.9946, 1]` (endpoint at 0) and
+/// `[0, 0.5]` (endpoint at 1). Both used to be refused as "wraps the pushed
+/// carrier's periodic seam" although neither needs anything joined.
+///
+/// The genuinely two-piece complement stays a refusal: joining two rational
+/// NURBS pieces across the boundary is a curve rebuild this lane does not do,
+/// and no corpus document asks for one.
+fn rim_arc_between(
+    conic: &NurbsCurve,
+    low: f64,
+    high: f64,
+    middle: f64,
+    tolerance: f64,
+) -> Result<NurbsCurve, String> {
+    let [d0, d1] = conic.domain()?;
+    if middle >= low && middle <= high {
+        return subcurve(conic, low, high);
+    }
+    // The two halves of the complement can only be ONE arc if the conic closes.
+    if conic.evaluate(d0)?.sub(conic.evaluate(d1)?).length() > tolerance {
+        return Err(
+            "offset_ruled_face: a multi-loop rim arc runs outside its OPEN conic's domain — \
+             refusing"
+                .into(),
+        );
+    }
+    let span = (d1 - d0).max(1e-12);
+    let head_is_empty = low - d0 <= 1e-9 * span;
+    let tail_is_empty = d1 - high <= 1e-9 * span;
+    match (head_is_empty, tail_is_empty) {
+        (true, false) => subcurve(conic, high, d1),
+        (false, true) => subcurve(conic, d0, low),
+        _ => Err(
+            "offset_ruled_face: a multi-loop rim arc crosses the rebuilt conic's period \
+             boundary with material on BOTH sides, so it is two pieces to join — deferred \
+             (refusing)"
+                .into(),
+        ),
+    }
 }
 
 /// Orient a rebuilt CLOSED rim the way the edge it replaces ran.
@@ -1194,7 +1472,7 @@ pub(super) fn retrim_offset_ruled_face(
         face_pos,
         final_edges,
         |solid, points| extend_ruled_neighbour_over(solid, face_id, points, tolerance),
-        PcurveFit::SubrangeAware { tolerance },
+        tolerance,
         "offset_ruled_face",
     )
 }
@@ -1249,7 +1527,12 @@ fn seam_axial_plane(surface: &NurbsSurface, seam: &EdgeRecord) -> Option<Plane> 
 ///   triple point and belongs to `resolve_open_rim_end`;
 /// * that neighbour is neither planar nor coaxial-ruled — the two lanes with
 ///   their own exact rebuilds, which must keep them (bit-identity);
-/// * every edge is OPEN (a closed edge is the single-rim lane's business);
+/// * every edge is OPEN (a closed edge is the single-rim lane's business) —
+///   except a loop that is ONE closed edge whose vertex is PINNED to the
+///   neighbour's seam. That vertex is a corner, not the bookkeeping split the
+///   single-rim lane places at the march's domain start (which lands it off the
+///   seam: 2.923 on the crossing-pipe tee), and it is exactly the two-arc
+///   window this lane already rebuilt, stored as the one edge it is;
 /// * every corner vertex has valence two across the WHOLE solid, so relocating
 ///   it cannot strand a third face's boundary. This is what rules out the hole
 ///   that straddles the pushed carrier's periodic seam: its arcs are stitched
@@ -1277,9 +1560,9 @@ fn single_neighbour_hole(
         let edge = *edge_by_id
             .get(&coedge.edge_id)
             .ok_or_else(|| format!("offset_ruled_face: missing edge {}", coedge.edge_id))?;
-        if edge.start_vertex_id == edge.end_vertex_id {
+        if edge.start_vertex_id == edge.end_vertex_id && loop_record.coedges.len() != 1 {
             if debug { eprintln!("HOLE reject: edge {} is closed", edge.id); }
-            return Ok(None); // a closed rim: the single-rim lane owns it.
+            return Ok(None); // a closed rim among others: not one window.
         }
         let incident = faces_of_edge.get(&edge.id).cloned().unwrap_or_default();
         let others: Vec<u64> = incident.into_iter().filter(|f| *f != face_id).collect();
@@ -1302,7 +1585,13 @@ fn single_neighbour_hole(
     let Some(neighbour) = neighbour else {
         return Ok(None);
     };
-    if edge_ids.len() < 2 {
+    // A lone CLOSED edge qualifies only once its vertex is shown to be pinned
+    // (below); an OPEN lone edge never closes a window.
+    let lone_closed = edge_ids.len() == 1
+        && edge_by_id
+            .get(&edge_ids[0])
+            .is_some_and(|edge| edge.start_vertex_id == edge.end_vertex_id);
+    if edge_ids.len() < 2 && !lone_closed {
         if debug { eprintln!("HOLE reject: only {} edges", edge_ids.len()); }
         return Ok(None);
     }
@@ -1358,6 +1647,11 @@ fn single_neighbour_hole(
                 }
             }
         }
+    }
+    if lone_closed && pinned.is_empty() {
+        // A free closed rim: its vertex is bookkeeping, the single-rim lane's.
+        if debug { eprintln!("HOLE reject: lone closed edge {} is not pinned", edge_ids[0]); }
+        return Ok(None);
     }
     if debug {
         eprintln!("HOLE accept: neighbour {neighbour} edges {edge_ids:?} pinned {pinned:?}");
@@ -1485,6 +1779,24 @@ fn rebuild_single_neighbour_hole(
                         .map(|point| point.sub(old).length())
                         .fold(0.0f64, f64::max)
                         .max(tolerance * 100.0);
+                    // A strict sign change, not `curve_plane_crossing_or_end_near`:
+                    // `arc_of_section` cuts only a CLOSED traced section, and a
+                    // closed curve does not stop on the seam plane — it passes
+                    // through it, and where its parameter origin lies on the
+                    // plane its two ends carry the same round-off, so the first
+                    // or the last sampled interval brackets that crossing either
+                    // way. Measured on every pinned corner in the lib, suite and
+                    // case populations: the strict and the end-accepting crossing
+                    // are the same point.
+                    census_push("seam_crossings", || {
+                        crossing_note(
+                            &section.curve,
+                            &plane,
+                            curve_plane_crossing_near(&section.curve, &plane, old, reach),
+                            curve_plane_crossing_or_end_near(&section.curve, &plane, old, reach, tolerance),
+                            section.closed,
+                        )
+                    });
                     curve_plane_crossing_near(&section.curve, &plane, old, reach)
                         .map(|(_, point)| point)
                         .ok_or_else(|| {
@@ -1506,7 +1818,19 @@ fn rebuild_single_neighbour_hole(
             .ok_or_else(|| format!("offset_ruled_face: missing edge {edge_id}"))?;
         let from = new_vertex[&edge.start_vertex_id];
         let to = new_vertex[&edge.end_vertex_id];
-        let through = edge.curve.evaluate(0.5 * (edge.t0 + edge.t1))?;
+        // A closed edge asks `arc_of_section` for the whole section, whose
+        // direction is read off a point the old edge reaches early: a quarter
+        // of the way round by ARC LENGTH, and an open arc's midpoint the same
+        // way. A fraction of the edge's PARAMETER range is that point only for a
+        // uniform speed law; the crossing-pipe tee's window re-weighted by a
+        // Möbius substitution put its quarter-parameter point past the half
+        // turn, cut the section the wrong way round, and refused as "a rebuilt
+        // rim traverses the carrier's periodic parameter differently".
+        let through = if edge.start_vertex_id == edge.end_vertex_id {
+            arc_length_stations(edge, 5, true)?[1]
+        } else {
+            arc_length_stations(edge, 3, true)?[1]
+        };
         let arc = arc_of_section(section, from, to, through, tolerance)
             .map_err(|error| format!("offset_ruled_face: {error}"))?;
         new_curve.insert(edge.id, arc);
@@ -1564,7 +1888,7 @@ fn refit_changed_pcurves(
             let edge = final_edges
                 .get(&coedge.edge_id)
                 .ok_or_else(|| format!("offset_ruled_face: missing edge {}", coedge.edge_id))?;
-            // Same subrange rule as `PcurveFit::SubrangeAware`, so a rim that is
+            // Same subrange rule as `offset_retrim::rebuild_loop_pcurves`, so a rim that is
             // a strict piece of a full-domain curve keeps the range-aware fit it
             // has always had.
             let [d0, d1] = edge.curve.domain()?;
@@ -1608,4 +1932,3 @@ fn nearest_curve(curves: &[NurbsCurve], reference: Vec3) -> Result<NurbsCurve, S
         .ok_or_else(|| "offset_ruled_face: empty intersection".into())
 }
 
-// BREP private tests: 37e0c543416098c0

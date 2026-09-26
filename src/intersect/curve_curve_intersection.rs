@@ -257,4 +257,3 @@ pub fn intersect_curves(
     Ok(results)
 }
 
-// BREP private tests: 53828ae9ea2f3766

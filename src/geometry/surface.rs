@@ -5,11 +5,27 @@ use crate::curve::{
 use crate::{KnotVector, NurbsCurve, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
 
+#[path = "surface/extension.rs"]
+mod extension;
+pub use extension::{
+    ExtendRefusal, SurfaceSide, WeightSite, MAXIMUM_FOLD_ANGLE, MAXIMUM_GROWTH_RATIO,
+};
+
 const EPS: f64 = 1e-12;
 /// A generatrix control point that is neither ON the axis of revolution nor
 /// this fraction of the generatrix's own radial extent clear of it is a fuzzy
 /// pole, and `make_revolution` refuses it (see the comment at the check).
 const NEAR_AXIS_RELATIVE_TOLERANCE: f64 = 1e-4;
+
+/// The widest tensor block [`NurbsSurface::deriv1_tensor_each`] will evaluate,
+/// per direction. The mass integrator reads a RATIONAL patch's cell at up to
+/// this many stations; `props::mass_properties::rule::MAX_ORDER` is DEFINED as
+/// this constant rather than repeating its value, because the block's arrays
+/// here and the station arrays there must agree and a drift between them is a
+/// hard failure, not a slow path (the callers propagate the refusal below
+/// rather than falling back). 8 was the fixed rule's own width; the arrays are
+/// stack-resident either way.
+pub(crate) const TENSOR_MAX_BLOCK: usize = 24;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NurbsSurface {
@@ -44,6 +60,11 @@ pub struct NurbsSurface {
     /// 33 indices of evaluated surface points at fixed per-surface params.
     #[serde(skip, default)]
     pub(crate) projection_ring_grid: std::cell::OnceCell<Vec<Vec3>>,
+    /// Cached convex-hull enclosure of every projection lattice cell
+    /// (`projection.rs`'s global stage), built on the first query the local
+    /// answer does not already settle. `None` when the net cannot be refined.
+    #[serde(skip, default)]
+    pub(crate) projection_cells: std::cell::OnceCell<Option<crate::projection::ProjectionCells>>,
 }
 
 impl NurbsSurface {
@@ -66,6 +87,7 @@ impl NurbsSurface {
             projection_grid: std::cell::OnceCell::new(),
             projection_dense_grid: std::cell::OnceCell::new(),
             projection_ring_grid: std::cell::OnceCell::new(),
+            projection_cells: std::cell::OnceCell::new(),
         };
         surface.ensure_valid()?;
         Ok(surface)
@@ -156,6 +178,57 @@ impl NurbsSurface {
         self.analytic
             .get_or_init(|| crate::analytic_surface::recognize(self))
             .as_ref()
+    }
+
+    /// The names of this surface's caches that hold a value, in declaration
+    /// order. For the boolean's operand-state instrument
+    /// (`BREP_DEBUG_OPERAND_STATE`), which reads which caches arrive warm.
+    pub(crate) fn warm_caches(&self) -> Vec<&'static str> {
+        let mut warm = Vec::new();
+        let cells = [
+            ("analytic", self.analytic.get().is_some()),
+            ("validated", self.validated.get()),
+            ("closed", self.closed_directions.get().is_some()),
+            ("grid", self.projection_grid.get().is_some()),
+            ("dense", self.projection_dense_grid.get().is_some()),
+            ("ring", self.projection_ring_grid.get().is_some()),
+            ("cells", self.projection_cells.get().is_some()),
+        ];
+        for (name, held) in cells {
+            if held {
+                warm.push(name);
+            }
+        }
+        warm
+    }
+
+    /// Empties the named caches (`warm_caches`' names; `all` for every one),
+    /// or, with `from`, sets each to `from`'s value. For the operand-state
+    /// instrument only: a cache that decides an answer is a defect, and this
+    /// is how the bisect finds it.
+    pub(crate) fn exchange_caches(&mut self, names: &[&str], from: Option<&Self>) {
+        let wants = |name: &str| names.iter().any(|&n| n == name || n == "all");
+        if wants("analytic") {
+            self.analytic = from.map(|f| f.analytic.clone()).unwrap_or_default();
+        }
+        if wants("validated") {
+            self.validated = std::cell::Cell::new(from.is_some_and(|f| f.validated.get()));
+        }
+        if wants("closed") {
+            self.closed_directions = from.map(|f| f.closed_directions.clone()).unwrap_or_default();
+        }
+        if wants("grid") {
+            self.projection_grid = from.map(|f| f.projection_grid.clone()).unwrap_or_default();
+        }
+        if wants("dense") {
+            self.projection_dense_grid = from.map(|f| f.projection_dense_grid.clone()).unwrap_or_default();
+        }
+        if wants("ring") {
+            self.projection_ring_grid = from.map(|f| f.projection_ring_grid.clone()).unwrap_or_default();
+        }
+        if wants("cells") {
+            self.projection_cells = from.map(|f| f.projection_cells.clone()).unwrap_or_default();
+        }
     }
 
     fn knot_vectors(&self) -> Result<(KnotVector, KnotVector), String> {
@@ -542,6 +615,135 @@ impl NurbsSurface {
         Ok(result)
     }
 
+    /// Whether [`Self::deriv1_tensor_each`] can drive this patch: the stack
+    /// basis tables only reach `MAX_STACK_DEGREE`, and a higher-degree patch
+    /// must be evaluated station by station through [`Self::deriv1`].
+    #[inline]
+    pub(crate) fn deriv1_tensor_supported(&self) -> bool {
+        self.degree_u <= MAX_STACK_DEGREE && self.degree_v <= MAX_STACK_DEGREE
+    }
+
+    /// `(S, S_u, S_v)` at every station of the TENSOR BLOCK `us x vs`, handed
+    /// to `f` as `(u index, v index, S, S_u, S_v)` with `us` outer and `vs`
+    /// inner.
+    ///
+    /// Bit-identical to calling [`Self::deriv1`] at each pair, and that is the
+    /// whole point of it: the block's `us.len() + vs.len()` spans and basis
+    /// rows are evaluated ONCE each instead of once per station, which is
+    /// where a fixed tensor-Gauss cell spends most of its time (the basis
+    /// recurrence carries a division per knot per derivative order, and an
+    /// 8x8 cell asks for the same 8 u rows and 8 v rows sixty-four times).
+    /// Nothing else changes: `knot_clamp` / `knot_find_span` /
+    /// `basis_derivatives_into` see the same arguments and so return the same
+    /// floats, the control-point sum runs in the same row-outer/column-inner
+    /// order from the same zero `Vec4`, and the rational de-homogenization is
+    /// [`Self::derivatives_small`]'s recurrence written out for
+    /// `derivative_count == 1`.
+    ///
+    /// Two steps of that recurrence are elided because they are exact no-ops
+    /// at this order: `binomial(1, 1)` is exactly `1.0`, and the mixed term it
+    /// scales is the zero vector, whose subtraction leaves every component
+    /// (including a negative zero) bit-unchanged.
+    pub(crate) fn deriv1_tensor_each<F>(
+        &self,
+        us: &[f64],
+        vs: &[f64],
+        mut f: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(usize, usize, Vec3, Vec3, Vec3) -> Result<(), String>,
+    {
+        self.ensure_valid()?;
+        // Width and rationale: `TENSOR_MAX_BLOCK` at the top of this module.
+        const MAX_BLOCK: usize = TENSOR_MAX_BLOCK;
+        if !self.deriv1_tensor_supported() || us.len() > MAX_BLOCK || vs.len() > MAX_BLOCK {
+            return Err("NurbsSurface: tensor block outside the stack evaluator".into());
+        }
+        let du = 1usize.min(self.degree_u);
+        let dv = 1usize.min(self.degree_v);
+        let mut span_u = [0usize; MAX_BLOCK];
+        let mut span_v = [0usize; MAX_BLOCK];
+        let mut basis_u = [[[0.0f64; MAX_STACK_ORDER]; 2]; MAX_BLOCK];
+        let mut basis_v = [[[0.0f64; MAX_STACK_ORDER]; 2]; MAX_BLOCK];
+        for (index, &value) in us.iter().enumerate() {
+            let value = knot_clamp(&self.knots_u, self.degree_u, value);
+            span_u[index] = knot_find_span(&self.knots_u, self.degree_u, value);
+            basis_derivatives_into(
+                &self.knots_u,
+                self.degree_u,
+                span_u[index],
+                value,
+                du,
+                &mut basis_u[index][..=du],
+            );
+        }
+        for (index, &value) in vs.iter().enumerate() {
+            let value = knot_clamp(&self.knots_v, self.degree_v, value);
+            span_v[index] = knot_find_span(&self.knots_v, self.degree_v, value);
+            basis_derivatives_into(
+                &self.knots_v,
+                self.degree_v,
+                span_v[index],
+                value,
+                dv,
+                &mut basis_v[index][..=dv],
+            );
+        }
+        let zero = Vec4 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            w: 0.0,
+        };
+        for i in 0..us.len() {
+            let rows = &self.control_points[span_u[i] - self.degree_u..];
+            for j in 0..vs.len() {
+                let column = span_v[j] - self.degree_v;
+                // The (k, l) homogeneous grid `derivatives_small` builds for
+                // `derivative_count == 1`: (0,0) always, (0,1) when dv >= 1,
+                // (1,0) when du >= 1.
+                let sum = |k: usize, l: usize| {
+                    let mut point = zero;
+                    for row_index in 0..=self.degree_u {
+                        let row = &rows[row_index];
+                        for column_index in 0..=self.degree_v {
+                            point = point.add(
+                                row[column + column_index]
+                                    .scale(basis_u[i][k][row_index] * basis_v[j][l][column_index]),
+                            );
+                        }
+                    }
+                    point
+                };
+                let h00 = sum(0, 0);
+                let h01 = if dv >= 1 { sum(0, 1) } else { zero };
+                let h10 = if du >= 1 { sum(1, 0) } else { zero };
+                let weight = h00.w;
+                if weight.abs() <= EPS {
+                    return Err("NurbsSurface: zero evaluated weight".into());
+                }
+                let inverse = 1.0 / weight;
+                let point = Vec3::new(h00.x, h00.y, h00.z).scale(inverse);
+                let partial_v = if dv >= 1 {
+                    Vec3::new(h01.x, h01.y, h01.z)
+                        .sub(point.scale(h01.w))
+                        .scale(inverse)
+                } else {
+                    Vec3::default()
+                };
+                let partial_u = if du >= 1 {
+                    Vec3::new(h10.x, h10.y, h10.z)
+                        .sub(point.scale(h10.w))
+                        .scale(inverse)
+                } else {
+                    Vec3::default()
+                };
+                f(i, j, point, partial_u, partial_v)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Point and first partials `(S, S_u, S_v)` with zero heap allocation.
     /// Bit-identical to `derivatives(u, v, 1)` at `[0][0] / [1][0] / [0][1]`.
     #[inline]
@@ -600,6 +802,105 @@ impl NurbsSurface {
         let su = base[1][0].add(base[1][1].scale(dv_out));
         let sv = base[0][1].add(base[1][1].scale(du_out));
         Ok((s, su, sv))
+    }
+
+    /// One first partial at `(u, v)` (clamped into the domain), `S_u` when
+    /// `along_u`, else `S_v`, evaluated from the DIFFERENCES of the control net
+    /// rather than from the basis derivatives.
+    ///
+    /// [`Self::derivatives`] forms `S_u = (A_u − W_u·S) / W` from `A_u = Σ N′ᵢ·Hᵢ`,
+    /// a sum of terms the size of the control points whose exact total may be
+    /// zero. Its rounding is therefore ABSOLUTE, a few ulps of the point, and
+    /// where the partial itself vanishes (an isoline on which the
+    /// parameterization is stationary, as on an extrusion of a cubic with
+    /// coincident end poles) the DIRECTION of what is left is that rounding:
+    /// measured 2.7e-15 of `x` on a partial of 7.7e-5 along `y`, a normal tilted
+    /// by 3.5e-11.
+    ///
+    /// The hodograph `A_u = Σ N_{i+1,p−1}·p·(H_{i+1} − H_i)/(ξ_{i+p+1} − ξ_{i+1})`
+    /// (The NURBS Book eq. 3.4, per row) carries the same partial with rounding
+    /// that scales with its own terms: coincident control points difference to
+    /// an exact zero, and every other difference is weighted by a basis function
+    /// that vanishes with the partial. The rational part subtracts
+    /// `W_u·S` with `W_u` taken from the weight differences, which is an exact
+    /// zero wherever neighbouring weights are equal.
+    ///
+    /// Not bit-identical to `derivatives`, so it is read only where the bare
+    /// partial has lost its direction (`offset/point.rs`). Refuses above the
+    /// stack basis tables' degree.
+    pub(crate) fn partial_by_differences(
+        &self,
+        along_u: bool,
+        u: f64,
+        v: f64,
+    ) -> Result<Vec3, String> {
+        self.ensure_valid()?;
+        if self.degree_u > MAX_STACK_DEGREE || self.degree_v > MAX_STACK_DEGREE {
+            return Err("NurbsSurface: partial by differences exceeds the stack degree".into());
+        }
+        let (pu, pv) = (self.degree_u, self.degree_v);
+        let u = knot_clamp(&self.knots_u, pu, u);
+        let v = knot_clamp(&self.knots_v, pv, v);
+        let span_u = knot_find_span(&self.knots_u, pu, u);
+        let span_v = knot_find_span(&self.knots_v, pv, v);
+        let mut full_u = [0.0f64; MAX_STACK_ORDER];
+        let mut full_v = [0.0f64; MAX_STACK_ORDER];
+        basis_functions_into(&self.knots_u, pu, span_u, u, &mut full_u);
+        basis_functions_into(&self.knots_v, pv, span_v, v, &mut full_v);
+        let zero = Vec4 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            w: 0.0,
+        };
+        let control = |i: usize, j: usize| self.control_points[span_u - pu + i][span_v - pv + j];
+        let mut point = zero;
+        for i in 0..=pu {
+            for j in 0..=pv {
+                point = point.add(control(i, j).scale(full_u[i] * full_v[j]));
+            }
+        }
+        if point.w.abs() <= EPS {
+            return Err("NurbsSurface: zero evaluated weight".into());
+        }
+        let source = Vec3::new(point.x, point.y, point.z).scale(1.0 / point.w);
+        let (knots, degree, span, parameter) = if along_u {
+            (&self.knots_u, pu, span_u, u)
+        } else {
+            (&self.knots_v, pv, span_v, v)
+        };
+        if degree == 0 {
+            return Ok(Vec3::default());
+        }
+        let mut lowered = [0.0f64; MAX_STACK_ORDER];
+        basis_functions_into(knots, degree - 1, span, parameter, &mut lowered);
+        // The hodograph's homogeneous value, Σ over the (degree) differences of
+        // the basis span times the other direction's full basis.
+        let mut hodograph = zero;
+        for r in 0..degree {
+            // Difference r joins control indices (span − degree + r) and
+            // (span − degree + r + 1); its lowered basis is N_{span−degree+r+1, degree−1}.
+            let index = span - degree + r;
+            let width = knots[index + degree + 1] - knots[index + 1];
+            if width.abs() <= EPS {
+                continue;
+            }
+            let factor = lowered[r] * degree as f64 / width;
+            if along_u {
+                for j in 0..=pv {
+                    let difference = control(r + 1, j).add(control(r, j).scale(-1.0));
+                    hodograph = hodograph.add(difference.scale(factor * full_v[j]));
+                }
+            } else {
+                for i in 0..=pu {
+                    let difference = control(i, r + 1).add(control(i, r).scale(-1.0));
+                    hodograph = hodograph.add(difference.scale(factor * full_u[i]));
+                }
+            }
+        }
+        Ok(Vec3::new(hodograph.x, hodograph.y, hodograph.z)
+            .sub(source.scale(hodograph.w))
+            .scale(1.0 / point.w))
     }
 
     pub fn normal(&self, u: f64, v: f64) -> Result<Vec3, String> {
@@ -1056,9 +1357,7 @@ fn binomial(n: usize, k: usize) -> f64 {
     })
 }
 
-// BREP private tests: ecf255325b772bff
 
-// BREP private tests: 6c04b017586ca0d0
 
 /// Diagnostic "carrier preview" patch (§3.15 applied to display): re-express
 /// the surface over an INFLATED domain so an inspector can show where the
@@ -1182,4 +1481,3 @@ fn normalized(parameters: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-// BREP private tests: 6cb24462fcd160ba

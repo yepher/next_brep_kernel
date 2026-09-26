@@ -218,7 +218,6 @@ pub(in crate::watertight_tessellation) fn polygon_is_simple(polygon: &[FaceVerte
             }
             let c = polygon[j].uv;
             let d = polygon[(j + 1) % n].uv;
-            // BREP private tests: cc89aeb46add6a3b
             if segments_properly_cross(a, b, c, d, epsilon) {
                 return false;
             }

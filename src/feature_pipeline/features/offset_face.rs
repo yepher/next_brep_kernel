@@ -68,7 +68,7 @@ pub fn schema() -> serde_json::Value {
     "type": "O.F",
     "shortName": "O.F",
     "longName": "Offset Face",
-    "displayBuilder": true,
+    "displayBuilder": false,
     "inputParamsSchema": {
         "id": {
             "type": "string",
@@ -94,4 +94,3 @@ pub fn schema() -> serde_json::Value {
 })
 }
 
-// BREP private tests: 0f00e1a69fd3c166

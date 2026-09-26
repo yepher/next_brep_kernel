@@ -21,4 +21,3 @@ pub(crate) fn mat4_mul(a: &Mat4, b: &Mat4) -> Mat4 {
     out
 }
 
-// BREP private tests: 31738417e5ee3dde

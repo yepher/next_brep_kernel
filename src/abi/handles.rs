@@ -236,10 +236,12 @@ pub fn free_solid(handle: u32) {
     });
 }
 
-/// A clone of a resident solid, for native tooling that needs the topology
-/// itself (the case-replay diagnostics, probes): the feature pipeline's results
-/// only ever hand out handles. Native only — topology never crosses the wasm
-/// boundary. Short borrow; the clone is the caller's.
+/// A clone of a resident solid, for Rust callers that need the topology itself:
+/// the case-replay diagnostics and probes, and the history runner answering a
+/// drawing sheet's topology request (native thread or browser worker alike),
+/// which serializes the clone back to the main side. The feature pipeline's
+/// results only ever hand out handles, and this is no `#[wasm_bindgen]` export:
+/// JavaScript never calls it. Short borrow; the clone is the caller's.
 pub fn registered_solid_clone(handle: u32) -> Result<BrepSolid, String> {
     with_registered_solid_str(handle, |solid| Ok(solid.clone()))
 }
@@ -311,6 +313,7 @@ pub fn tessellate_handle(handle: u32, chord_tolerance: f64) -> Result<WasmMeshBu
 #[wasm_bindgen]
 pub fn mass_properties_handle(handle: u32) -> Result<String, JsValue> {
     with_registered_solid(handle, |solid| {
+        let _caller = crate::mass_caller("abi.mass_properties");
         let properties = solid_mass_properties(solid).map_err(javascript_error)?;
         serde_json::to_string(&properties).map_err(|error| javascript_error(error.to_string()))
     })

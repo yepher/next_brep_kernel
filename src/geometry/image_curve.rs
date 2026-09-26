@@ -494,4 +494,3 @@ pub fn image_curve_pair(
     Ok((first_image, second_image))
 }
 
-// BREP private tests: 2d2c706c699b9ed2

@@ -91,4 +91,3 @@ pub(crate) fn coedge_neighbor_endpoints<'a>(
     ))
 }
 
-// BREP private tests: 340d2dc5aba88c5a

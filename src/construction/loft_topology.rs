@@ -10,14 +10,12 @@ mod basic;
 mod guided;
 #[path = "loft_topology/closed.rs"]
 mod closed;
-// BREP private tests: fe4de28da8f21108
-// BREP private tests: b53b1db70d85dddc
-// BREP private tests: 9955026f9a85e303
 
 pub use basic::{loft_profile_brep, loft_profile_brep_tangent};
 use basic::closed_points;
 
 pub use closed::loft_profile_brep_closed;
+pub(crate) use closed::loft_profile_brep_closed_shifted;
 
 pub use guided::{loft_profile_brep_guided, loft_profile_brep_guided_frame};
 

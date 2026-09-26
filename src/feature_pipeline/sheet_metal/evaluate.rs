@@ -31,7 +31,6 @@
 //! which the boolean cannot classify).
 
 use super::tree::{Bend, Edge, Flat, HoleBend, HoleBendKind, SheetTree};
-// BREP private tests: 9e39edd0859b977c
 use crate::{
     boolean_operation, extrude_profile_brep, make_arc, make_line, revolve_profile_brep_named,
     transform_brep, AffineTransform, BooleanOperation, BooleanOptions, BrepSolid, Vec3,
@@ -42,7 +41,6 @@ mod plate;
 mod bend;
 mod collar;
 mod walk;
-// BREP private tests: b788aaf048652c3f
 
 pub use walk::{evaluate, folded_flat_placements, FlatPlacement, WedgeStrip};
 pub(crate) use collar::circle_of_loop;

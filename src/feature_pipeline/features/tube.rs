@@ -579,8 +579,12 @@ fn node_is_bend(
 /// joined at BEND nodes.
 ///
 /// A CLOSED run — every node in the component a bend, so the walk comes back to
-/// where it started — cannot be swept: the two end caps would land on top of
-/// each other, and `sweep_profile_along_chain` says so rather than building it.
+/// where it started — is not swept HERE. The builder does now sweep a closed
+/// PLANAR path, as a capless ring, but a tube's closed run is a different
+/// question: its cycle is a network of joints, the ring lane needs the whole loop
+/// tangent-continuous and planar, and a tube's corners are neither in general. So
+/// the cycle is opened the way it always was, and the two beads below are the
+/// price. Making a planar, all-bends cycle one ring instead is open work.
 ///
 /// It takes TWO breaks to open a cycle, not one. Demoting a single node still
 /// leaves a chain that starts and ends at that same node — the path is closed
@@ -833,11 +837,16 @@ fn chain_pieces(
 ) -> Result<Vec<BrepSolid>, String> {
     use std::f64::consts::{PI, TAU};
     let mut pieces = Vec::with_capacity(path.len());
-    for curve in path {
+    for (index, curve) in path.iter().enumerate() {
         let [t0, t1] = curve.domain()?;
         let start = curve.evaluate(t0)?;
         let end = curve.evaluate(t1)?;
-        let tangent = curve.derivatives(t0, 1)?[1].normalized()?;
+        // Read as the one-sided limit where the derivative vanishes: a
+        // stationary END is still a direction of travel, and the straight-or-
+        // bent test below compares directions, not derivatives.
+        let tangent = curve
+            .unit_tangent(t0, t0, t1)
+            .map_err(|error| format!("tube: path piece {index}: {error}"))?;
         // The section normal to the path at its start: any radial direction
         // perpendicular to the tangent will do, and the arc's own plane fixes
         // the rest.
@@ -848,7 +857,9 @@ fn chain_pieces(
             make_arc(start, radial, binormal, radius, PI, TAU)?,
         ];
         // Straight or curved? A line's end tangent equals its start tangent.
-        let end_tangent = curve.derivatives(t1, 1)?[1].normalized()?;
+        let end_tangent = curve
+            .unit_tangent(t1, t0, t1)
+            .map_err(|error| format!("tube: path piece {index}: {error}"))?;
         if end_tangent.sub(tangent).length() <= 1e-9 {
             pieces.push(extrude_profile_brep(&section, tangent, end.sub(start).length())?);
             continue;
@@ -1054,10 +1065,14 @@ fn named_chain(
     let piece_names: Vec<String> = (0..path.len())
         .map(|piece| format!("{name}{suffix}_Seg{local} piece {piece}"))
         .collect();
+    // Classified where the chain is assembled. A bend run is built to be open and
+    // tangent-continuous (the straight pieces meet their torus sectors at exact
+    // tangent points); the classification is what the corner refusal reads when a
+    // too-small bend radius leaves one that is not.
+    let classified = crate::SweepPath::from_curves(path, &piece_names)?;
     let mut swept = sweep_profile_along_chain_with_stations(
         &profile,
-        path,
-        &piece_names,
+        &classified,
         stations,
         "raise the tube's bend radius so the corner is rounded, or set it to 0 to \
          join the segments with a ball instead",
@@ -1169,10 +1184,7 @@ fn named_chain(
 /// joint, which reads exact overall. The loop's total inherits it because a
 /// face's volume contribution is `⅓∫p·n dA`, weighted by distance from the
 /// origin, and a closed loop has no free end caps whose opposite-signed
-/// contributions offset it. This is the same effect
-/// `kernel-tube-joint-seam-2026-09-09.md` measured on this very face (−2.31e-6
-/// before the seam frame, +4.10e-7 after) — a documented property of integrating
-/// a trimmed spherical patch, not something k = 1 introduced.
+/// contributions offset it.
 ///
 /// The shape itself is sound where it matters: `solid_connectivity` reports one
 /// shell, one component, no pinch vertices, and `solid_self_intersections`
@@ -1438,7 +1450,8 @@ fn named_cylinder(
 }
 
 /// One named CURVED segment: a circle of the tube radius swept along the edge by
-/// the path sweep's own builder, at its own 32-station default — so a tube and a
+/// the path sweep's own builder, at its own station budget (32, raised along a
+/// path that turns further than a full turn, such as a helix) — so a tube and a
 /// Path Sweep of the same circle along the same edge are the same solid.
 ///
 /// The circle is authored as two half arcs about the ORIGIN in XY. Where it sits
@@ -1798,4 +1811,3 @@ pub fn schema() -> serde_json::Value {
 })
 }
 
-// BREP private tests: 909355568a9c512b

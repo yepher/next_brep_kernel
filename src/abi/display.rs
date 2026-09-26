@@ -344,6 +344,29 @@ pub fn mass_properties_handle_native(
     })
 }
 
+/// Surface area and volume of a resident solid — the native sibling of
+/// [`mass_properties_handle_native`] for a caller that reads NOTHING but
+/// those two numbers (`examples/case_replay.rs` records volume and area per
+/// solid and discards the rest). The full entry runs a second station sweep
+/// over every trimmed face for the nine moment integrands, which costs as
+/// much again as the area/volume sweep: on `anotherBooleanFail`'s imported
+/// 32-face body 2.6 s against 1.3 s, and 5.3 s of that case's 12.9 s replay
+/// went to moments nobody read. The two numbers come out of the same
+/// `solid_mass_properties` call the full entry starts with, so they are
+/// bit-identical to its `volume` and `surface_area`; the full entry's
+/// refusal of a non-positive volume is kept so a caller switching over sees
+/// the same `Err` on the same solids. Reads the solid in one registry borrow.
+pub fn mass_measures_handle_native(handle: u32) -> Result<MassProperties, String> {
+    with_registered_solid_str(handle, |solid| {
+        let _caller = crate::mass_caller("abi.mass_measures");
+        let properties = solid_mass_properties(solid)?;
+        if properties.volume.abs() <= 1e-30 {
+            return Err("solid_mass_properties_full: non-positive volume".into());
+        }
+        Ok(properties)
+    })
+}
+
 /// Topology validation issues of a resident solid as `(severity, message)`
 /// pairs — the native sibling of the JSON validators, for in-process
 /// qualification tooling (`examples/case_replay.rs`). An empty Vec means the
@@ -376,7 +399,13 @@ pub fn validate_handle_native(handle: u32) -> Result<Vec<(String, String)>, Stri
 /// last digit while gaining or losing edges — `inbox-20260909-tube-joint-edge-splits`
 /// carried "7 faces / 17 edges / 11 vertices" in prose for a month with every
 /// local assertion in its suite passing — so the totals are recorded and
-/// diffed, not stated. Reads the solid in one registry borrow.
+/// diffed.
+///
+/// Since 2026-09-20 they can also be STATED. The two checks answer different
+/// questions and both are kept — a diff against the baseline says "did this
+/// change", a claim says "was it ever right" — and it is the NON-degenerate
+/// count that a claim may state, for the reason above. Reads the solid in one
+/// registry borrow.
 pub fn topology_counts_native(handle: u32) -> Result<(usize, usize, usize, usize), String> {
     with_registered_solid_str(handle, |solid| {
         Ok((
@@ -395,6 +424,35 @@ pub fn topology_counts_native(handle: u32) -> Result<(usize, usize, usize, usize
 /// diagnostic. Reads the solid in one registry borrow.
 pub fn connectivity_handle_native(handle: u32) -> Result<crate::ConnectivityReport, String> {
     with_registered_solid_str(handle, |solid| Ok(crate::solid_connectivity(solid)))
+}
+
+/// Closedness and Euler parity of a resident solid — the THIRD check
+/// `validate()` does not make on its own. Its Euler comparison reduces, on a
+/// freshly derived solid, to exactly "is the characteristic even", and it is
+/// switched off on any solid carrying a degenerate edge; this asks the question
+/// directly and on every solid. Pure counting, one registry borrow.
+pub fn euler_handle_native(handle: u32) -> Result<crate::EulerReport, String> {
+    with_registered_solid_str(handle, |solid| Ok(crate::solid_euler(solid)))
+}
+
+/// Face-loop self-crossing of a resident solid — the check no OTHER detector
+/// here can make. `validate()` is silent (the incidence is perfect), the
+/// face-versus-face scan has no pair to confirm (both triangles are on one
+/// face), connectivity and Euler parity count the same cells either way; the
+/// face's AREA is the only other tell. Pure parameter-space work on the trims
+/// the face already carries — no tessellation — so it is cheap enough to be a
+/// default. Reads the solid in one registry borrow.
+pub fn loop_crossings_handle_native(handle: u32) -> Result<crate::LoopCrossingReport, String> {
+    with_registered_solid_str(handle, |solid| Ok(crate::loop_self_crossings(solid)))
+}
+
+/// The vector-area closure of a resident solid: does each closed shell's
+/// TRIMS enclose the zero vector area a closed shell owes, and if not, which
+/// faces own the residual. One pass over the trims and the edge curves — no
+/// tessellation, no projection — so unlike the crossing scan it is cheap
+/// enough for a default gate. Reads the solid in one registry borrow.
+pub fn vector_area_handle_native(handle: u32) -> Result<crate::VectorAreaReport, String> {
+    with_registered_solid_str(handle, |solid| Ok(crate::shell_vector_areas(solid)))
 }
 
 /// Face-versus-face self-intersection of a resident solid — the OTHER check
@@ -517,6 +575,7 @@ pub fn export_step_named_handles(
     unit: &str,
     timestamp: &str,
     pmi: Option<&crate::StepPmi<'_>>,
+    colors: Option<&crate::StepColors>,
 ) -> Result<crate::StepExportReport, String> {
     if named.is_empty() {
         return Err("export_step_named_handles: no solids to export".into());
@@ -530,7 +589,7 @@ pub fn export_step_named_handles(
         .iter()
         .map(|(solid_name, solid)| (solid_name.clone(), solid))
         .collect();
-    crate::export_step_report_named(&borrowed, name, unit, timestamp, pmi)
+    crate::export_step_report_named(&borrowed, name, unit, timestamp, pmi, colors)
 }
 
 /// STRUCTURED export: the resident scene PLUS the document's assembly model, as
@@ -550,6 +609,7 @@ pub fn export_step_assembly_handles(
     unit: &str,
     timestamp: &str,
     pmi: Option<&crate::StepPmi<'_>>,
+    colors: Option<&crate::StepColors>,
 ) -> Result<crate::StepExportReport, String> {
     if named.is_empty() {
         return Err("export_step_assembly_handles: no solids to export".into());
@@ -560,7 +620,7 @@ pub fn export_step_assembly_handles(
         solids.push((solid_name.clone(), solid));
     }
     let assembly = crate::assembly_export_tree(document_name, solids, components)?;
-    crate::export_step_assembly_report(&assembly, unit, timestamp, pmi)
+    crate::export_step_assembly_report(&assembly, unit, timestamp, pmi, colors)
 }
 
 /// Native: export the CURRENT resident solids (by handle) to an IGES 5.3

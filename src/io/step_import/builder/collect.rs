@@ -91,7 +91,8 @@ impl<'a> SolidBuilder<'a> {
             same_sense,
             start_ref == end_ref,
         )?;
-        let curve = heal_imported_edge_endpoints(&curve, p_start, p_end)?;
+        let written = curve;
+        let curve = heal_imported_edge_endpoints(&written, p_start, p_end)?;
         let [t0, t1] = curve.domain()?;
         // A zero-length edge on one vertex is a POLE loop (e.g. a countersink
         // cone apex written as a real EDGE_CURVE instead of a VERTEX_LOOP —
@@ -123,6 +124,19 @@ impl<'a> SolidBuilder<'a> {
             name: None,
         });
         self.edge_of_ref.insert(edge_ref, id);
+        self.curve_ref_of_edge.insert(id, curve_ref);
+        if self.readings.is_some() {
+            self.capture_written(id, Some(curve_ref), &written)?;
+            let [w0, w1] = written.domain()?;
+            let edge = self.edge_record(id);
+            let moved = written.evaluate(w0)?.sub(edge.curve.evaluate(t0)?).length()
+                + written.evaluate(w1)?.sub(edge.curve.evaluate(t1)?).length();
+            if moved > 0.0 {
+                self.capture_stage(id, || {
+                    format!("endpoints healed onto the vertices ({moved:.3e})")
+                });
+            }
+        }
         Ok(id)
     }
 
@@ -174,7 +188,7 @@ impl<'a> SolidBuilder<'a> {
     /// edge's direction; the neighbouring face, walking it the other way, reuses
     /// the same edge with `forward = false` — giving each edge exactly two
     /// opposite-sense coedges (the manifold shell the validator requires).
-    fn faceted_edge(&mut self, a: u64, b: u64) -> Result<(u64, bool), String> {
+    pub(super) fn faceted_edge(&mut self, a: u64, b: u64) -> Result<(u64, bool), String> {
         let key = (a.min(b), a.max(b));
         if let Some(&edge_id) = self.edge_of_vertex_pair.get(&key) {
             let forward = self.edge_record(edge_id).start_vertex_id == a;
@@ -196,6 +210,8 @@ impl<'a> SolidBuilder<'a> {
             name: None,
         });
         self.edge_of_vertex_pair.insert(key, id);
+        let line = self.edge_record(id).curve.clone();
+        self.capture_written(id, None, &line)?;
         Ok((id, true))
     }
 
@@ -397,7 +413,9 @@ impl<'a> SolidBuilder<'a> {
         };
 
         Ok(PendingFace {
+            face_ref,
             surface,
+            surface_ref,
             same_sense: face_same_sense,
             bounds,
         })
@@ -451,7 +469,9 @@ impl<'a> SolidBuilder<'a> {
     /// and the (existing) aligned stitch path applies uniformly.
     pub(super) fn finish_face(&mut self, pending: PendingFace) -> Result<FaceRecord, String> {
         let PendingFace {
+            face_ref,
             surface,
+            surface_ref,
             same_sense,
             mut bounds,
         } = pending;
@@ -463,11 +483,12 @@ impl<'a> SolidBuilder<'a> {
 
         let mut loops = Vec::with_capacity(bounds.len());
         for (specs, _) in bounds {
-            let loop_record = self.build_loop(&surface, &specs)?;
+            let loop_record = self.build_loop(&surface, surface_ref, &specs)?;
             loops.push(loop_record);
         }
 
         let id = self.fresh();
+        self.capture_face(id, face_ref, surface_ref);
         let mut face = FaceRecord {
             id,
             surface,
@@ -514,4 +535,3 @@ impl<'a> SolidBuilder<'a> {
     }
 }
 
-// BREP private tests: 858ceab3e20d3086

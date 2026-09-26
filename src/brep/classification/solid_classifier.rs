@@ -50,7 +50,12 @@ fn face_normal(face: &FaceRecord, u: f64, v: f64) -> Result<Vec3, String> {
 /// span so a pole or collapsed direction cannot widen the band into the
 /// whole face.
 fn face_uv_tolerance(face: &FaceRecord, u: f64, v: f64, spatial: f64) -> f64 {
-    let Ok(derivatives) = face.surface.derivatives(u, v, 1) else {
+    surface_uv_band(&face.surface, u, v, spatial)
+}
+
+/// [`face_uv_tolerance`] for a bare carrier.
+pub(crate) fn surface_uv_band(surface: &crate::NurbsSurface, u: f64, v: f64, spatial: f64) -> f64 {
+    let Ok(derivatives) = surface.derivatives(u, v, 1) else {
         return spatial;
     };
     let band = crate::tolerance::surface_uv_tolerance(
@@ -58,7 +63,7 @@ fn face_uv_tolerance(face: &FaceRecord, u: f64, v: f64, spatial: f64) -> f64 {
         derivatives[1][0].length(),
         derivatives[0][1].length(),
     );
-    let cap = match (face.surface.domain_u(), face.surface.domain_v()) {
+    let cap = match (surface.domain_u(), surface.domain_v()) {
         (Ok([u0, u1]), Ok([v0, v1])) => ((u1 - u0).min(v1 - v0) * 0.05).max(1e-12),
         _ => f64::INFINITY,
     };
@@ -78,6 +83,88 @@ pub struct PointClassification {
     pub class: PointClass,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_normal: Option<Vec3>,
+}
+
+/// Per-thread counters for the classifier, printed by
+/// [`classify_profile_report`] when `BREP_PROFILE` is set: how many point
+/// queries ran, how many face projections and trim tests the On band cost,
+/// how many rays were cast and how many face intersections and trim tests
+/// they cost, and the wall time of each part. When the switch is off every
+/// counter is one thread-local flag test.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct ClassifyProfile {
+    pub enabled: bool,
+    pub classify_calls: u64,
+    pub band_candidates: u64,
+    pub band_project_ms: f64,
+    pub band_trim_tests: u64,
+    pub band_trim_ms: f64,
+    pub rays: u64,
+    pub ray_faces: u64,
+    pub ray_csi_ms: f64,
+    pub ray_trim_tests: u64,
+    pub ray_trim_ms: f64,
+    pub coincident_calls: u64,
+    pub coincident_ms: f64,
+    pub classifier_builds: u64,
+    pub classifier_build_ms: f64,
+}
+
+thread_local! {
+    static CLASSIFY_PROFILE: std::cell::Cell<ClassifyProfile> =
+        const { std::cell::Cell::new(ClassifyProfile {
+            enabled: false, classify_calls: 0, band_candidates: 0, band_project_ms: 0.0,
+            band_trim_tests: 0, band_trim_ms: 0.0, rays: 0, ray_faces: 0, ray_csi_ms: 0.0,
+            ray_trim_tests: 0, ray_trim_ms: 0.0, coincident_calls: 0, coincident_ms: 0.0,
+            classifier_builds: 0, classifier_build_ms: 0.0,
+        }) };
+}
+
+fn classify_profile(update: impl FnOnce(&mut ClassifyProfile)) {
+    CLASSIFY_PROFILE.with(|cell| {
+        let mut profile = cell.get();
+        if profile.enabled {
+            update(&mut profile);
+            cell.set(profile);
+        }
+    });
+}
+
+fn classify_profile_started() -> Option<web_time::Instant> {
+    CLASSIFY_PROFILE
+        .with(|cell| cell.get().enabled)
+        .then(web_time::Instant::now)
+}
+
+fn classify_elapsed_ms(started: Option<web_time::Instant>) -> f64 {
+    started.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1_000.0)
+}
+
+/// Arm the classifier counters (reset to zero) when `BREP_PROFILE` is set.
+pub(crate) fn classify_profile_begin() {
+    let enabled = std::env::var("BREP_PROFILE").is_ok();
+    CLASSIFY_PROFILE.with(|cell| {
+        cell.set(ClassifyProfile {
+            enabled,
+            ..ClassifyProfile::default()
+        })
+    });
+}
+
+/// Print the counters gathered since [`classify_profile_begin`] under
+/// `label` and disarm them. Silent when profiling is off.
+pub(crate) fn classify_profile_report(label: &str) {
+    let p = CLASSIFY_PROFILE.with(|cell| cell.get());
+    if !p.enabled {
+        return;
+    }
+    eprintln!(
+        "classify.profile {label} calls={} builds={} build_ms={:.2} band: candidates={} project_ms={:.2} trim_tests={} trim_ms={:.2} rays={} ray_faces={} csi_ms={:.2} ray_trim_tests={} ray_trim_ms={:.2} coincident: calls={} ms={:.2}",
+        p.classify_calls, p.classifier_builds, p.classifier_build_ms, p.band_candidates,
+        p.band_project_ms, p.band_trim_tests, p.band_trim_ms, p.rays, p.ray_faces,
+        p.ray_csi_ms, p.ray_trim_tests, p.ray_trim_ms, p.coincident_calls, p.coincident_ms,
+    );
+    CLASSIFY_PROFILE.with(|cell| cell.set(ClassifyProfile::default()));
 }
 
 /// Point-in-solid classification with per-solid precomputation: face
@@ -131,6 +218,7 @@ fn clip_segment_to_aabb(
 
 impl<'a> SolidClassifier<'a> {
     pub fn new(solid: &'a BrepSolid, tolerance: f64) -> Result<Self, String> {
+        let build_started = classify_profile_started();
         let faces: Vec<&FaceRecord> = solid.shells.iter().flat_map(|shell| &shell.faces).collect();
         let face_boxes = faces
             .iter()
@@ -141,6 +229,10 @@ impl<'a> SolidClassifier<'a> {
             bounds.include(*face_box);
         }
         let bvh = Bvh::build(&face_boxes);
+        classify_profile(|p| {
+            p.classifier_builds += 1;
+            p.classifier_build_ms += classify_elapsed_ms(build_started);
+        });
         Ok(Self {
             faces,
             face_boxes,
@@ -196,6 +288,7 @@ impl<'a> SolidClassifier<'a> {
     }
 
     pub fn classify(&self, point: Vec3) -> Result<PointClassification, String> {
+        classify_profile(|p| p.classify_calls += 1);
         let tolerance = self.tolerance;
         if !self.bounds.expanded(tolerance).contains(point) {
             return Ok(PointClassification {
@@ -218,19 +311,30 @@ impl<'a> SolidClassifier<'a> {
         let mut boundary_normals: Vec<Vec3> = Vec::new();
         for &index in &candidates {
             let face = self.faces[index];
+            let project_started = classify_profile_started();
             let projection = project_point_to_surface(&face.surface, point)?;
+            classify_profile(|p| {
+                p.band_candidates += 1;
+                p.band_project_ms += classify_elapsed_ms(project_started);
+            });
             if projection.distance > on_tolerance {
                 continue;
             }
             let uv_tolerance = face_uv_tolerance(face, projection.u, projection.v, on_tolerance);
-            match parameter_point_in_face(
+            let trim_started = classify_profile_started();
+            let trim = parameter_point_in_face(
                 face,
                 Vec2 {
                     x: projection.u,
                     y: projection.v,
                 },
                 uv_tolerance,
-            )? {
+            )?;
+            classify_profile(|p| {
+                p.band_trim_tests += 1;
+                p.band_trim_ms += classify_elapsed_ms(trim_started);
+            });
+            match trim {
                 PolygonClass::Inside => {
                     interior_normals.push(face_normal(face, projection.u, projection.v)?)
                 }
@@ -283,6 +387,7 @@ impl<'a> SolidClassifier<'a> {
         let require_agreement = std::env::var("BREP_CLASSIFY_RAY_AGREE").as_deref() != Ok("0");
         let mut verdicts: Vec<PointClass> = Vec::new();
         'directions: for direction in directions {
+            classify_profile(|p| p.rays += 1);
             let direction = direction.normalized()?;
             let ray_end = point.add(direction.scale(ray_length));
             candidates.clear();
@@ -319,8 +424,15 @@ impl<'a> SolidClassifier<'a> {
                     point.add(direction.scale(span_start)),
                     point.add(direction.scale(span_end)),
                 )?;
-                for intersection in intersect_curve_surface(&sub_ray, &face.surface, tolerance)? {
+                let csi_started = classify_profile_started();
+                let intersections = intersect_curve_surface(&sub_ray, &face.surface, tolerance)?;
+                classify_profile(|p| {
+                    p.ray_faces += 1;
+                    p.ray_csi_ms += classify_elapsed_ms(csi_started);
+                });
+                for intersection in intersections {
                     if intersection.point.sub(point).length() <= tolerance * 10.0 {
+                        let trim_started = classify_profile_started();
                         let trim = parameter_point_in_face(
                             face,
                             Vec2 {
@@ -329,6 +441,10 @@ impl<'a> SolidClassifier<'a> {
                             },
                             face_uv_tolerance(face, intersection.u, intersection.v, on_tolerance),
                         )?;
+                        classify_profile(|p| {
+                            p.ray_trim_tests += 1;
+                            p.ray_trim_ms += classify_elapsed_ms(trim_started);
+                        });
                         if trim != PolygonClass::Outside {
                             return Ok(PointClassification {
                                 class: PointClass::On,
@@ -340,6 +456,7 @@ impl<'a> SolidClassifier<'a> {
                     if intersection.tangential {
                         continue 'directions;
                     }
+                    let trim_started = classify_profile_started();
                     let trim_class = parameter_point_in_face(
                         face,
                         Vec2 {
@@ -348,6 +465,10 @@ impl<'a> SolidClassifier<'a> {
                         },
                         face_uv_tolerance(face, intersection.u, intersection.v, on_tolerance),
                     )?;
+                    classify_profile(|p| {
+                        p.ray_trim_tests += 1;
+                        p.ray_trim_ms += classify_elapsed_ms(trim_started);
+                    });
                     if std::env::var("BREP_DEBUG_CLASSIFY").is_ok() {
                         eprintln!(
                             "classify ray dir=({:.3},{:.3},{:.3}) face={} hit=({:.4},{:.4},{:.4}) t3d={:.4} uv=({:.6},{:.6}) trim={:?}",
@@ -412,6 +533,16 @@ impl<'a> SolidClassifier<'a> {
     /// ignored) so it fires only on a genuine surface overlap, never on mere
     /// proximity to an edge.
     pub fn coincident_on_normal(&self, point: Vec3) -> Result<Option<Vec3>, String> {
+        let started = classify_profile_started();
+        let result = self.coincident_on_normal_inner(point);
+        classify_profile(|p| {
+            p.coincident_calls += 1;
+            p.coincident_ms += classify_elapsed_ms(started);
+        });
+        result
+    }
+
+    fn coincident_on_normal_inner(&self, point: Vec3) -> Result<Option<Vec3>, String> {
         let band = (self.tolerance * 10.0).max(self.bounds.diagonal() * 1e-7);
         if !self.bounds.expanded(band).contains(point) {
             return Ok(None);
@@ -456,5 +587,8 @@ pub fn classify_point(
     solid: &BrepSolid,
     tolerance: f64,
 ) -> Result<PointClassification, String> {
-    SolidClassifier::new(solid, tolerance)?.classify(point)
+    classify_profile_begin();
+    let result = SolidClassifier::new(solid, tolerance)?.classify(point);
+    classify_profile_report("classify_point");
+    result
 }

@@ -69,8 +69,12 @@ fn find_conjugate<'a>(
                 continue;
             }
         };
-        let derivatives = candidate.curve.derivatives(join_t, 1)?;
-        let tangent = derivatives[1].normalized()?;
+        // At the vertex, where an involute flank's Hermite fit is stationary:
+        // read the one-sided limit from inside the candidate edge.
+        let tangent = candidate
+            .curve
+            .unit_tangent(join_t, candidate.t0, candidate.t1)
+            .map_err(|error| format!("blend chain: edge {}: {error}", candidate.id))?;
         let chain_tangent = if forward {
             tangent
         } else {
@@ -188,7 +192,13 @@ pub(super) fn collect_smooth_chain(solid: &BrepSolid, seed_edge_id: u64) -> Resu
         } else {
             segment.edge.t0
         };
-        let tangent = segment.edge.curve.derivatives(t, 1)?[1].normalized()?;
+        // At a vertex, which is exactly where an involute flank's Hermite fit
+        // is stationary: read the one-sided limit from inside the edge.
+        let tangent = segment
+            .edge
+            .curve
+            .unit_tangent(t, segment.edge.t0, segment.edge.t1)
+            .map_err(|error| format!("blend chain: edge {}: {error}", segment.edge.id))?;
         Ok(if segment.forward {
             tangent
         } else {

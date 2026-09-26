@@ -323,19 +323,66 @@ impl BrepSolid {
             .count() as i64;
         let edge_count = self.edges.iter().filter(|edge| !edge.degenerate).count() as i64;
         let face_count = face_ids.len() as i64;
-        let hole_count: i64 = self
-            .shells
-            .iter()
-            .flat_map(|shell| &shell.faces)
-            .map(|face| face.loops.len().saturating_sub(1) as i64)
-            .sum();
+        let hole_count = self.bounding_hole_count();
         let shell_count = self.shells.len() as i64;
         let actual = vertex_count - edge_count + face_count - hole_count;
         let expected = 2 * (shell_count - self.genus);
-        // The reduced V-E+F formula does not model parameter-space pole
-        // collapses reliably. Degenerate edges are validated separately by
-        // incidence, so reserve this Euler check for ordinary cell complexes.
-        if actual != expected && !self.edges.iter().any(|edge| edge.degenerate) {
+        // What this comparison actually tests, and it is not the genus.
+        //
+        // On a freshly derived solid the producer set `genus = S - chi/2` in
+        // INTEGER division, so `expected = 2*(S - genus) = 2*trunc(chi/2)` and
+        // `actual == expected` holds EXACTLY when the characteristic is even.
+        // Measured over 1042 imported bodies, the rows that mismatch and the
+        // rows with an odd characteristic are the same rows, both ways. After a
+        // mutation that adjusts `genus` by hand -- `closed_heal`'s `genus -= 1`,
+        // `delete_faces`' `genus += shift / 2` -- it becomes a drift check on
+        // that adjustment. It is never an independent measurement of the genus:
+        // `genus = S - chi/2` IS the definition, so any recomputation from the
+        // same complex re-runs this arithmetic.
+        //
+        // The PRECONDITION, which this check did not used to state.
+        //
+        // `chi = 2(S - G)` is a fact about CLOSED orientable surfaces. On an
+        // open shell -- one still being assembled, or a sheet -- the
+        // characteristic is unconstrained (a disk is 1) and comparing it to
+        // anything is meaningless. Until 2026-09-11 the comparison ran on open
+        // shells too and was merely hidden, on some of them, by a skip for
+        // degenerate edges: three offset-shell cases turn out to reach it with
+        // an open shell and an EVEN characteristic, so the skip was covering
+        // for a missing precondition rather than for a pole-collapse problem.
+        //
+        // The degenerate-edge skip that used to stand here is GONE, and what it
+        // was hiding was not what its comment claimed.
+        //
+        // It read "the reduced V-E+F formula does not model parameter-space
+        // pole collapses reliably". Removing it reddened three offset-shell
+        // tests with an EVEN characteristic and a recorded genus that
+        // contradicted it -- so not a parity problem, and reproducible with the
+        // pre-2026-09-11 hole rule, so not a consequence of that work either.
+        // The cause was `finalize.rs` forcing `genus = 0` whenever a body's only
+        // single-use edges are degenerate, which is true of any body carrying an
+        // ordinary pole edge. A shelled solid with a spherical cavity wall was
+        // therefore recorded genus 0 while its own count said 3, and an
+        // independent watertight MESH count of the same shell confirmed the
+        // three handles (chi = -4 at three chord tolerances, closed, no boundary
+        // or non-manifold edges). The handles are real -- shelling on an ANNULAR
+        // opening joins outer and inner skins along two rim curves -- so only the
+        // recorded number was wrong. With `finalize` recording what it counts,
+        // this skip has nothing left to hide and the check runs on every solid.
+        //
+        // `closed` is the precondition the formula genuinely needs: chi =
+        // 2(S - G) is a fact about CLOSED orientable surfaces, and an open
+        // shell's characteristic is unconstrained (a disk is 1). It is stated so
+        // this check and `soundness::solid_euler` agree about the domain they
+        // apply to -- the disagreement between them, one having the precondition
+        // and the other not, is what made a green case gate look like coverage
+        // it was not.
+        let closed = self
+            .edges
+            .iter()
+            .filter(|edge| !edge.degenerate)
+            .all(|edge| edge_uses.get(&edge.id).map(Vec::len) == Some(2));
+        if closed && actual != expected {
             // OCC-style models carry COINCIDENT PARALLEL edges: two
             // ref-distinct edges riding one geometric locus between the same
             // vertices (a wall split exactly where an adjoining ring meets
@@ -359,6 +406,45 @@ impl BrepSolid {
             wire_warnings,
             max_pcurve_error,
         }
+    }
+
+    /// `H` in the reduced-complex Euler count `V - E + F - H`: per face, the
+    /// loops that actually bound area, less its outer one.
+    ///
+    /// A boundary collapsed to a single point — STEP's `VERTEX_LOOP`, which
+    /// this kernel models as a single-use degenerate edge carrying a pcurve —
+    /// encloses no area, so it is not a hole. The reduced complex already
+    /// leaves that edge out of `E` and its vertex out of `V`; leaving its loop
+    /// out of `H` is the same rule applied to the same collapsed cell.
+    ///
+    /// Counting it as a hole subtracts a spurious 1 per puncture. An ODD number
+    /// of punctures then makes the characteristic odd, which no closed
+    /// orientable surface has; an even number keeps it even and quietly inflates
+    /// the derived genus by half of them.
+    pub(crate) fn bounding_hole_count(&self) -> i64 {
+        let degenerate: HashSet<u64> = self
+            .edges
+            .iter()
+            .filter(|edge| edge.degenerate)
+            .map(|edge| edge.id)
+            .collect();
+        self.shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .map(|face| {
+                face.loops
+                    .iter()
+                    .filter(|record| {
+                        !record.coedges.is_empty()
+                            && !record
+                                .coedges
+                                .iter()
+                                .all(|coedge| degenerate.contains(&coedge.edge_id))
+                    })
+                    .count()
+                    .saturating_sub(1) as i64
+            })
+            .sum()
     }
 
     /// Count disjoint pairs of non-degenerate edges that ride ONE geometric

@@ -7,6 +7,7 @@ impl<'a> SolidBuilder<'a> {
     pub(super) fn build_loop(
         &mut self,
         surface: &NurbsSurface,
+        surface_ref: usize,
         specs: &[(u64, bool)],
     ) -> Result<LoopRecord, String> {
         let [u0, u1] = surface.domain_u()?;
@@ -14,13 +15,7 @@ impl<'a> SolidBuilder<'a> {
         let (closed_u, closed_v) = surface.closed_directions()?;
         let u_span = u1 - u0;
         let v_span = v1 - v0;
-        let scale = surface_scale(surface)?;
-        // The fit target must stay INSIDE the validator's pcurve band, whose
-        // floor is ABSOLUTE (4e-3): a purely scale-proportional target lets
-        // the fitter stop above the validation limit on large (BIM-sized)
-        // parts even though the locus is exactly representable.
-        let pcurve_tol = (1e-6 * (1.0 + scale))
-            .min(0.5 * crate::KernelTolerances::for_scale(scale, 1e-7).pcurve_consistency);
+        let pcurve_tol = loop_pcurve_tolerance(surface)?;
 
         // Which edges appear twice in this loop → seam pair candidates.
         let mut occurrence: HashMap<u64, usize> = HashMap::default();
@@ -109,15 +104,24 @@ impl<'a> SolidBuilder<'a> {
                 });
                 continue;
             }
+            // The vendor's own statement of this edge's locus in THIS face's
+            // parameter space, when the file supplies one and it verifies.
+            // Falls through to the projection fit otherwise, which is what the
+            // importer did for every coedge before this lane existed.
+            let supplied =
+                self.supplied_loop_pcurve(surface, surface_ref, *edge_id, *forward, pcurve_tol)?;
             let edge = self.edge_record(*edge_id);
-            let mut pcurve = build_pcurve_on_surface_range(
-                surface,
-                &edge.curve,
-                edge.t0,
-                edge.t1,
-                *forward,
-                pcurve_tol,
-            )?;
+            let mut pcurve = match supplied {
+                Some(pcurve) => pcurve,
+                None => build_pcurve_on_surface_range(
+                    surface,
+                    &edge.curve,
+                    edge.t0,
+                    edge.t1,
+                    *forward,
+                    pcurve_tol,
+                )?,
+            };
             if edge.degenerate {
                 // Projection at a surface singularity has many equally valid
                 // UV answers and sampling a point-curve can jump between them.
@@ -775,4 +779,3 @@ impl<'a> SolidBuilder<'a> {
     }
 }
 
-// BREP private tests: d86d7435b0b54926

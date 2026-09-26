@@ -805,10 +805,13 @@ pub fn offset_sphere_face(
     Ok(result)
 }
 
-/// `retrim_planar_face` rebuilds every pcurve with [`PcurveFit::WholeCurve`],
-/// which maps an edge's WHOLE curve onto the fresh carrier. That is right for a
-/// full-domain edge and WRONG for an edge that is a strict SUBRANGE of its own
-/// curve: `validate()` samples a pcurve over its whole domain against the edge
+/// `retrim_planar_face` USED TO rebuild every pcurve over the edge's WHOLE
+/// curve, which is right for a full-domain edge and WRONG for an edge that is a
+/// strict SUBRANGE of its own curve. It is subrange-aware itself since
+/// 2026-09-16, when the same defect surfaced a third time in
+/// `delete_face_and_heal`, which had no such pass; this one is kept because it
+/// is what produces this caller's final pcurves at its own tolerance, and
+/// removing it is a separate change. The history, for why it exists: `validate()` samples a pcurve over its whole domain against the edge
 /// over `[t0, t1]`, so the pcurve of a partially-trimmed edge reads as a
 /// deviation the size of the trimmed-off overhang. `move_faces` has always
 /// paired its planar re-trim with this pass (`face_move.rs`, the
@@ -878,4 +881,3 @@ fn patch_meridian_pcurve(
     )
 }
 
-// BREP private tests: cd14f87aca569a9a

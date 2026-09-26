@@ -215,10 +215,14 @@ pub(super) fn build_loop(
         };
         if !complete || run.len() < 1usize.max(chain.count / 2) {
             if !chain_closed {
-                let (carrier_pcurve, carrier_curve) = match &chain.source {
-                    ChainSource::Boundary { coedge, curve } => (&coedge.pcurve, curve),
-                    ChainSource::Cut { pcurve, curve, .. } => (pcurve, curve),
+                let (carrier_pcurve, carrier_curve, lift) = match &chain.source {
+                    ChainSource::Boundary { coedge, curve } => (&coedge.pcurve, curve, Vec2 { x: 0.0, y: 0.0 }),
+                    ChainSource::Cut { pcurve, curve, lift, .. } => (pcurve, curve, *lift),
                 };
+                // Back onto the pcurve's own period: the arrangement may have
+                // lifted the chain a whole period into the face's band.
+                let run_start = run_start.sub(lift);
+                let run_end = run_end.sub(lift);
                 let start_projection = project_point_to_curve(
                     carrier_pcurve,
                     Vec3::new(run_start.x, run_start.y, 0.0),
@@ -242,6 +246,20 @@ pub(super) fn build_loop(
                 };
                 let start_tolerance = (epsilon * 20.0).max(chord_tolerance(run_start) * 1.01);
                 let end_tolerance = (epsilon * 20.0).max(chord_tolerance(run_end) * 1.01);
+                if std::env::var("BREP_DEBUG_FRAG").is_ok() {
+                    eprintln!(
+                        "partial run: chain {chain_id} count={} run={} complete={complete} span={parameter_span:.6e} \
+                         start(d={:.6e} tol={:.6e} f={:.9}) end(d={:.6e} tol={:.6e} f={:.9})",
+                        chain.count,
+                        run.len(),
+                        start_projection.distance,
+                        start_tolerance,
+                        start_fraction,
+                        end_projection.distance,
+                        end_tolerance,
+                        end_fraction,
+                    );
+                }
                 if parameter_span > 1e-12
                     && start_projection.distance <= start_tolerance
                     && end_projection.distance <= end_tolerance

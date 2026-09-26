@@ -1,4 +1,5 @@
 use super::*;
+use super::mass_profile;
 
 /// Integrate all `kinds` over the trimmed parameter region in ONE pass over
 /// a conforming cell decomposition (Golovanov §8.10): knot-span grid cells,
@@ -56,6 +57,7 @@ pub(super) fn integrate_trimmed_multi_with(
         // reads them exactly, with no proxy region and no chord.
         if allow_winding {
             if let Some(values) = winding::winding_band_integral(face, kinds)? {
+                mass_profile(|p| p.route_winding += 1);
                 return Ok(values);
             }
         }
@@ -65,6 +67,7 @@ pub(super) fn integrate_trimmed_multi_with(
         // band as one in-domain polygon so the winding integrator fills it.
         if closed_u && closed_v {
             if let Some(polygons) = doubly_periodic_seam_band_polygons(face, domain)? {
+                mass_profile(|p| p.route_seam_band += 1);
                 return integrate_trimmed_polys(face, kinds, &polygons, false, domain);
             }
         }
@@ -82,6 +85,7 @@ pub(super) fn integrate_trimmed_multi_with(
                         || point[1] < v0 - 1e-9
                         || point[1] > v1 + 1e-9
                 });
+                mass_profile(|p| p.route_cap += 1);
                 return integrate_trimmed_polys(face, kinds, &polygons, extended, domain);
             }
             if let Some(polygons) = singly_periodic_wall_polygons(face, closed_u, closed_v, domain)?
@@ -92,25 +96,41 @@ pub(super) fn integrate_trimmed_multi_with(
                         || point[1] < v0 - 1e-9
                         || point[1] > v1 + 1e-9
                 });
+                mass_profile(|p| p.route_wall += 1);
                 return integrate_trimmed_polys(face, kinds, &polygons, extended, domain);
             }
         }
+        let polygons_started = super::profile::profile_started();
         let (unwrapped, hopped) =
             trim_polygons_unwrapped(face, closed_u, closed_v, u1 - u0, v1 - v0)?;
+        mass_profile(|p| p.polygons_ms += super::profile::elapsed_ms(polygons_started));
         if hopped {
             let raw = trim_polygons_tagged(face)?;
             let raw_area =
                 integrate_trimmed_polys(face, &[Integrand::Area], &raw, false, domain)?[0];
-            let unwrapped_area =
-                integrate_trimmed_polys(face, &[Integrand::Area], &unwrapped, true, domain)?[0];
+            // The unwrapped pass carries the requested kinds AND the area probe
+            // in one sweep: every slot of `integrate_trimmed_polys` accumulates
+            // on its own (the cells, the clipping, the correction and the
+            // orientation never read a kind), so the area slot here is the
+            // number a standalone `[Area]` pass returns, bit for bit, and the
+            // kinds are the numbers a second pass over the same polygons would
+            // return. Two passes per hopped face were 0.6 s of
+            // `anotherBooleanFail` across its five integrator calls.
+            let mut probed: Vec<Integrand> = kinds.to_vec();
+            probed.push(Integrand::Area);
+            let unwrapped_values =
+                integrate_trimmed_polys(face, &probed, &unwrapped, true, domain)?;
+            let unwrapped_area = unwrapped_values[kinds.len()];
             // Fall back to raw ONLY when the unwrap collapsed to a sliver (a torn
             // covering-plane polygon); a substantial unwrapped region is trusted
             // even when it is SMALLER than raw (the seam-straddling-hole case).
             let unwrap_degenerate = unwrapped_area.abs() < 1e-3 * raw_area.abs();
             return if unwrap_degenerate {
+                mass_profile(|p| p.route_hopped_raw += 1);
                 integrate_trimmed_polys(face, kinds, &raw, false, domain)
             } else {
-                integrate_trimmed_polys(face, kinds, &unwrapped, true, domain)
+                mass_profile(|p| p.route_hopped_unwrapped += 1);
+                Ok(unwrapped_values[..kinds.len()].to_vec())
             };
         }
         // No seam hop between coedges, but a single edge that straddles the
@@ -122,9 +142,15 @@ pub(super) fn integrate_trimmed_multi_with(
             (closed_u && (point[0] < u0 - 1e-9 || point[0] > u1 + 1e-9))
                 || (closed_v && (point[1] < v0 - 1e-9 || point[1] > v1 + 1e-9))
         });
+        mass_profile(|p| if straddles { p.route_straddle += 1 } else { p.route_periodic_raw += 1 });
         return integrate_trimmed_polys(face, kinds, &unwrapped, straddles, domain);
     }
+    let polygons_started = super::profile::profile_started();
     let raw = trim_polygons_tagged(face)?;
+    mass_profile(|p| {
+        p.route_raw += 1;
+        p.polygons_ms += super::profile::elapsed_ms(polygons_started);
+    });
     integrate_trimmed_polys(face, kinds, &raw, false, domain)
 }
 
@@ -207,6 +233,16 @@ pub(super) fn integrate_trimmed_polys(
     };
 
     let sign = if face.same_sense { 1.0 } else { -1.0 };
+    // One weight reading per knot cell for the whole walk: the quadtree asks
+    // the same cell for panels at four depths.
+    let mut rules = rule::SurfaceRules::new(&face.surface)?;
+    // A fully covered cell's 8x8 tensor Gauss block asks the surface for the
+    // same eight u rows and eight v rows sixty-four times; `deriv1_tensor_each`
+    // evaluates each once and hands back bit-identical stations. The
+    // covering-plane path keeps the per-station `deriv1_extended` (its wrap is
+    // a per-station decision), and so does a patch above the stack-basis
+    // degree.
+    let tensor_block = !extended && face.surface.deriv1_tensor_supported() && tensor_blocks_on();
     let mut totals = vec![0.0f64; kinds.len()];
     let station = |u: f64, v: f64, weight: f64, totals: &mut [f64]| -> Result<(), String> {
         // On the unwrapped grid a station can sit one or more periods past the
@@ -231,28 +267,51 @@ pub(super) fn integrate_trimmed_polys(
     // children clip the parent's fragments — re-clipping the full trim
     // polygon at every leaf was the dominant cost, not the quadrature.
     const MAX_DEPTH: usize = 4;
+    mass_profile(|p| p.polygon_chords += polygons.iter().map(|poly| poly.points.len() as u64).sum::<u64>());
+    let base_clip_started = super::profile::profile_started();
     let mut stack: Vec<([f64; 4], usize, Vec<Vec<[f64; 2]>>)> = Vec::new();
+    // Two working vectors for every Sutherland–Hodgman pass in this call; only
+    // a surviving fragment is handed to the stack as its own allocation.
+    let mut clip_scratch: Vec<[f64; 2]> = Vec::new();
+    let mut clip_result: Vec<[f64; 2]> = Vec::new();
     for upair in u_breaks.windows(2) {
         for vpair in v_breaks.windows(2) {
             let cell = [upair[0], upair[1], vpair[0], vpair[1]];
-            let clipped: Vec<Vec<[f64; 2]>> = polygons
-                .iter()
-                .zip(&loop_boxes)
-                .filter(|(_, bounds)| {
-                    // A loop wholly outside the cell clips to nothing —
-                    // unless it ENCLOSES the cell, which the bbox test
-                    // keeps (an enclosing loop's bbox covers the cell).
-                    bounds[0] <= cell[1]
-                        && bounds[1] >= cell[0]
-                        && bounds[2] <= cell[3]
-                        && bounds[3] >= cell[2]
-                })
-                .map(|(polygon, _)| clip_polygon_to_cell(&polygon.points, cell))
-                .filter(|clipped| clipped.len() >= 3)
-                .collect();
+            let mut clipped: Vec<Vec<[f64; 2]>> = Vec::new();
+            for (polygon, bounds) in polygons.iter().zip(&loop_boxes) {
+                // A loop wholly outside the cell clips to nothing —
+                // unless it ENCLOSES the cell, which the bbox test
+                // keeps (an enclosing loop's bbox covers the cell).
+                if !(bounds[0] <= cell[1]
+                    && bounds[1] >= cell[0]
+                    && bounds[2] <= cell[3]
+                    && bounds[3] >= cell[2])
+                {
+                    continue;
+                }
+                clip_polygon_to_cell_into(
+                    &polygon.points,
+                    cell,
+                    &mut clip_scratch,
+                    &mut clip_result,
+                );
+                if clip_result.len() >= 3 {
+                    // Copy the fragment out rather than donating the buffer:
+                    // the ping-pong vectors carry the WHOLE trim loop's
+                    // capacity (thousands of chords on a big face) and handing
+                    // that to a four-vertex fragment made every later cell
+                    // re-grow it from nothing.
+                    clipped.push(clip_result.clone());
+                }
+            }
             stack.push((cell, 0, clipped));
         }
     }
+    mass_profile(|p| {
+        p.base_cells += stack.len() as u64;
+        p.base_clip_ms += super::profile::elapsed_ms(base_clip_started);
+    });
+    let cells_started = super::profile::profile_started();
     while let Some((cell, depth, clipped)) = stack.pop() {
         let cell_area = (cell[1] - cell[0]) * (cell[3] - cell[2]);
         if cell_area <= 0.0 {
@@ -273,23 +332,64 @@ pub(super) fn integrate_trimmed_polys(
             if winding.abs() <= 0.5 {
                 continue;
             }
-            let half_u = (cell[1] - cell[0]) * 0.5;
-            let middle_u = (cell[1] + cell[0]) * 0.5;
-            let half_v = (cell[3] - cell[2]) * 0.5;
-            let middle_v = (cell[3] + cell[2]) * 0.5;
-            for i in 0..GAUSS_X.len() {
-                for j in 0..GAUSS_X.len() {
-                    station(
-                        middle_u + half_u * GAUSS_X[i],
-                        middle_v + half_v * GAUSS_X[j],
-                        winding * orientation * GAUSS_W[i] * GAUSS_W[j] * half_u * half_v,
-                        &mut totals,
-                    )?;
+            mass_profile(|p| p.full_cells += 1);
+            let full_started = super::profile::profile_started();
+            if tensor_block {
+                // The cell's own tensor blocks: the same stations, order and
+                // weights as the one-block rule on a polynomial carrier, and
+                // the panels and orders a RATIONAL one's weights ask for
+                // (`rule`). Either way the u spans/basis rows and v
+                // spans/basis rows of a block are evaluated once for it
+                // instead of once per station.
+                let stations = integrate_cell_scaled(
+                    face,
+                    cell,
+                    winding * orientation,
+                    kinds,
+                    &mut totals,
+                    &mut rules,
+                )?;
+                mass_profile(|p| p.full_stations += stations as u64);
+            } else {
+                // The covering-plane path keeps its per-station wrap, so it
+                // reads the cell through `station` — at the same panels and
+                // orders.
+                let half_u = (cell[1] - cell[0]) * 0.5;
+                let middle_u = (cell[1] + cell[0]) * 0.5;
+                let half_v = (cell[3] - cell[2]) * 0.5;
+                let middle_v = (cell[3] + cell[2]) * 0.5;
+                let (u_panels, v_panels) = rules.panels(&face.surface, cell)?;
+                let one_block = u_panels.len() == 1 && v_panels.len() == 1 && u_panels[0].order == GAUSS_COUNT && v_panels[0].order == GAUSS_COUNT;
+                if one_block {
+                    for i in 0..GAUSS_X.len() {
+                        for j in 0..GAUSS_X.len() {
+                            station(
+                                middle_u + half_u * GAUSS_X[i],
+                                middle_v + half_v * GAUSS_X[j],
+                                winding * orientation * GAUSS_W[i] * GAUSS_W[j] * half_u * half_v,
+                                &mut totals,
+                            )?;
+                        }
+                    }
+                    mass_profile(|p| p.full_stations += (GAUSS_X.len() * GAUSS_X.len()) as u64);
+                } else {
+                    for u_panel in &u_panels {
+                        for v_panel in &v_panels {
+                            for (u, u_weight) in u_panel.stations() {
+                                for (v, v_weight) in v_panel.stations() {
+                                    station(u, v, winding * orientation * u_weight * v_weight, &mut totals)?;
+                                }
+                            }
+                            mass_profile(|p| p.full_stations += (u_panel.order * v_panel.order) as u64);
+                        }
+                    }
                 }
             }
+            mass_profile(|p| p.full_ms += super::profile::elapsed_ms(full_started));
             continue;
         }
         if depth < MAX_DEPTH {
+            let child_started = super::profile::profile_started();
             let middle_u = (cell[0] + cell[1]) * 0.5;
             let middle_v = (cell[2] + cell[3]) * 0.5;
             for child in [
@@ -298,17 +398,28 @@ pub(super) fn integrate_trimmed_polys(
                 [cell[0], middle_u, middle_v, cell[3]],
                 [middle_u, cell[1], middle_v, cell[3]],
             ] {
-                let child_clipped: Vec<Vec<[f64; 2]>> = clipped
-                    .iter()
-                    .map(|polygon| clip_polygon_to_cell(polygon, child))
-                    .filter(|polygon| polygon.len() >= 3)
-                    .collect();
+                let mut child_clipped: Vec<Vec<[f64; 2]>> = Vec::new();
+                for polygon in &clipped {
+                    clip_polygon_to_cell_into(
+                        polygon,
+                        child,
+                        &mut clip_scratch,
+                        &mut clip_result,
+                    );
+                    if clip_result.len() >= 3 {
+                        child_clipped.push(clip_result.clone());
+                    }
+                }
                 stack.push((child, depth + 1, child_clipped));
             }
+            mass_profile(|p| p.child_clip_ms += super::profile::elapsed_ms(child_started));
             continue;
         }
+        mass_profile(|p| p.leaf_cells += 1);
+        let leaf_started = super::profile::profile_started();
         for polygon in &clipped {
             for index in 1..polygon.len() - 1 {
+                mass_profile(|p| p.tri_stations += TRIANGLE_CUBATURE.len() as u64);
                 let a = polygon[0];
                 let b = polygon[index];
                 let c = polygon[index + 1];
@@ -327,8 +438,12 @@ pub(super) fn integrate_trimmed_polys(
                 }
             }
         }
+        mass_profile(|p| p.leaf_ms += super::profile::elapsed_ms(leaf_started));
     }
+    mass_profile(|p| p.cells_ms += super::profile::elapsed_ms(cells_started));
+    let corr_started = super::profile::profile_started();
     curved_boundary_correction(face, polygons, extended, domain, orientation, &station, &mut totals)?;
+    mass_profile(|p| p.corr_ms += super::profile::elapsed_ms(corr_started));
     Ok(totals)
 }
 
@@ -375,24 +490,34 @@ fn curved_boundary_correction(
             let chord = [p1[0] - p0[0], p1[1] - p0[1]];
             let curve = &face.loops[arc.loop_index].coedges[arc.coedge_index].pcurve;
             let span = arc.t1 - arc.t0;
-            for i in 0..GAUSS_X.len() {
-                let s = 0.5 * (GAUSS_X[i] + 1.0);
-                let weight_s = 0.5 * GAUSS_W[i];
-                let (point, tangent) = curve.deriv1(arc.t0 + s * span)?;
-                let on_arc = [point.x + arc.offset[0], point.y + arc.offset[1]];
-                let on_chord = [p0[0] + s * chord[0], p0[1] + s * chord[1]];
-                let deviation = [on_arc[0] - on_chord[0], on_arc[1] - on_chord[1]];
-                let deviation_s = [tangent.x * span - chord[0], tangent.y * span - chord[1]];
-                for j in 0..ACROSS_X.len() {
-                    let lambda = ACROSS_X[j];
-                    let q_s = [chord[0] + lambda * deviation_s[0], chord[1] + lambda * deviation_s[1]];
-                    let jacobian = q_s[0] * deviation[1] - q_s[1] * deviation[0];
-                    let u = on_chord[0] + lambda * deviation[0];
-                    let v = on_chord[1] + lambda * deviation[1];
-                    if !extended && (u < u0 - eps_u || u > u1 + eps_u || v < v0 - eps_v || v > v1 + eps_v) {
-                        continue;
+            mass_profile(|p| p.corr_chords += 1);
+            // The sliver is walked in the chord's own parameter s ∈ [0, 1];
+            // the arc behind it is this pcurve over [t0, t1], so the panels
+            // and orders are ITS weights', mapped back to s.
+            let panels = rule::curve_panels(curve, arc.t0, arc.t1)?;
+            for panel in &panels {
+                let (nodes, weights) = panel.nodes();
+                let (lo, hi) = ((panel.lo - arc.t0) / span, (panel.hi - arc.t0) / span);
+                mass_profile(|p| p.corr_stations += (nodes.len() * ACROSS_X.len()) as u64);
+                for i in 0..nodes.len() {
+                    let s = lo + (hi - lo) * 0.5 * (nodes[i] + 1.0);
+                    let weight_s = 0.5 * weights[i] * (hi - lo);
+                    let (point, tangent) = curve.deriv1(arc.t0 + s * span)?;
+                    let on_arc = [point.x + arc.offset[0], point.y + arc.offset[1]];
+                    let on_chord = [p0[0] + s * chord[0], p0[1] + s * chord[1]];
+                    let deviation = [on_arc[0] - on_chord[0], on_arc[1] - on_chord[1]];
+                    let deviation_s = [tangent.x * span - chord[0], tangent.y * span - chord[1]];
+                    for j in 0..ACROSS_X.len() {
+                        let lambda = ACROSS_X[j];
+                        let q_s = [chord[0] + lambda * deviation_s[0], chord[1] + lambda * deviation_s[1]];
+                        let jacobian = q_s[0] * deviation[1] - q_s[1] * deviation[0];
+                        let u = on_chord[0] + lambda * deviation[0];
+                        let v = on_chord[1] + lambda * deviation[1];
+                        if !extended && (u < u0 - eps_u || u > u1 + eps_u || v < v0 - eps_v || v > v1 + eps_v) {
+                            continue;
+                        }
+                        station(u, v, -orientation * weight_s * ACROSS_W[j] * jacobian, totals)?;
                     }
-                    station(u, v, -orientation * weight_s * ACROSS_W[j] * jacobian, totals)?;
                 }
             }
         }
