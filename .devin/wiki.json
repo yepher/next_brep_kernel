@@ -1,0 +1,286 @@
+{
+  "repo_notes": [
+    {
+      "content": "This wiki is the crate's user manual (README.md links to it). Write for two readers: (1) an application developer calling the public API from Rust or WASM, and (2) a contributor who has to change a geometric algorithm. Every page should say which public functions/types are the entry points (as re-exported from src/lib.rs), what the operation guarantees, and how it fails.\n\nRepository facts:\n- This repo is a published-crate mirror of BREP_kernel, synced from a larger monorepo by tools/bin/sync-crate.sh. Tests, test data and the design documents that comments cite (e.g. per-entity-tolerances.md, step-assembly-import.md, fillet-stripe-network.md, synchronous-modeling.md) are NOT in this repo. Do not invent their contents; describe the code as it is. BREP_app, BREP_render and the umbrella BREP crate mentioned in README.md are also not here.\n- src/lib.rs uses #[path = \"...\"] to mount files from topical directories (geometry/, brep/, csg/, blending/, offset/, ...) as flat modules. The public API is whatever lib.rs re-exports. Items marked #[doc(hidden)] are diagnostic hooks, not API.\n- build.rs sets BREP_KERNEL_SOURCE_HASH (a hash of src/**/*.rs), which the parts library uses to invalidate cached geometry.\n- Cargo features: `parallel` (rayon) and `wasm-threads` (parallel + wasm-bindgen-rayon).\n\nVocabulary that recurs across the codebase and should be explained where it first appears and used consistently:\n- carrier: the underlying (untrimmed) surface a face lies on; a face is a carrier plus trimming loops.\n- analytic carrier: a NURBS surface recognized as plane/cylinder/cone/sphere/torus/revolution, enabling closed-form projection and intersection.\n- pcurve: an edge's curve in a face's (u,v) parameter space.\n- lane: one of several alternative strategies an operation may take for a given input (e.g. a containment lane, a fillet application lane). Pages should list the lanes and what selects each.\n- refusal: a deliberate, typed failure. Many refusals have exported string-prefix constants (e.g. SWEEP_TIGHT_BEND_REFUSAL) so callers can classify them without matching free text. The kernel prefers refusing to returning an unsound solid.\n- report / ledger / *_reported: variants that return diagnostics alongside the result (e.g. fillet_edges_reported, gordon_surface_reported, PolylineFitReport, PcurveFitLedger).\n- census: diagnostic functions that enumerate cases a lane met, used to measure coverage.\n- *_SWITCH constants: named toggles for alternative classification behaviour.\n- validate() vs soundness: validate() is an incidence/topology check only; brep/soundness.rs and healing/accept.rs check self-intersection, connectivity, Euler and closure, and decide repair-or-refuse.\n\nStyle: prefer diagrams of data flow and pipelines (Mermaid) over prose. Show short Rust usage snippets built from real re-exported names. Cite file paths for every claim."
+    }
+  ],
+  "pages": [
+    {
+      "title": "Overview",
+      "purpose": "What BREP_kernel is (exact NURBS B-rep CAD kernel in Rust for native and WASM), what it can and cannot do, and a map of the wiki grouped by layer: geometry -> topology -> operations -> feature pipeline -> exchange/output. Include one architecture diagram showing those layers and which src/ directories implement each."
+    },
+    {
+      "title": "Crate Layout, Build and WASM ABI",
+      "parent": "Overview",
+      "purpose": "How to depend on and build the crate: Cargo features (parallel, wasm-threads), build.rs source hash, panic hook, the #[path] module mounting in src/lib.rs and how to find the public API from it. The WASM ABI layer in src/abi/ (handles, typed-array transfers, requests, display output): how a JS host calls the kernel.",
+      "page_notes": [
+        {
+          "content": "Key files: Cargo.toml, build.rs, src/lib.rs, src/panic_hook.rs, src/abi/*.rs (handles.rs, requests.rs, objects.rs, display.rs, io_abi.rs, modeling_a.rs, modeling_b.rs). Include a table mapping each src/ top-level directory to the lib.rs module names it provides."
+        }
+      ]
+    },
+    {
+      "title": "Kernel Conventions: Tolerances, Refusals and Reports",
+      "parent": "Overview",
+      "purpose": "The cross-cutting conventions a reader needs before any other page: the tolerance model (KernelTolerances, model scale, per-entity measured tolerances, offset construction band, VOLUME_DRIFT_*, KNOT_* constants), refusals and exported refusal constants, *_reported / Report / Ledger / census diagnostics, lanes and *_SWITCH toggles. Explain why the kernel refuses rather than returning a bad solid.",
+      "page_notes": [
+        {
+          "content": "Key files: src/geometry/tolerance.rs, src/geometry/entity_tolerance.rs, src/props/diagnostics.rs. Gather refusal constants by grepping for REFUSAL in lib.rs re-exports and list them in one table (constant, operation, meaning)."
+        }
+      ]
+    },
+    {
+      "title": "Validity, Soundness and Acceptance",
+      "parent": "Overview",
+      "purpose": "The three levels of 'is this solid OK': BrepSolid::validate (incidence), structural soundness checks (self-intersections, loop crossings, connectivity, Euler, vector-area closure), and accept_sound / resolve_face_crossing (repair or refuse). When each operation runs which check, and how a caller should use them.",
+      "page_notes": [
+        {
+          "content": "Key files: src/brep/topology/validate.rs, src/brep/soundness.rs, src/healing/accept.rs. Public: solid_self_intersections, face_self_intersections, loop_self_crossings, solid_connectivity, solid_euler, shell_vector_areas, accept_sound, accept_sound_against, resolve_face_crossing, take_crossing_repairs."
+        }
+      ]
+    },
+    {
+      "title": "End-to-End Data Flow",
+      "parent": "Overview",
+      "purpose": "Trace one concrete example from feature-history JSON to exact B-rep solid to watertight mesh and STEP file, naming the function called at each hop. Then show the same flow when calling kernel operations directly without the feature pipeline. This is the page that ties the rest together.",
+      "page_notes": [
+        {
+          "content": "Use a sketch -> extrude -> fillet -> boolean example. Entry points: execute_history_json (feature_pipeline), extrude/revolve topology builders, boolean_operation, fillet_edges, the watertight tessellation module, export_step_report_named."
+        }
+      ]
+    },
+    {
+      "title": "NURBS Curves, Surfaces and Fitting",
+      "purpose": "The geometric core: knot vectors, rational curve and surface evaluation and derivatives, constructors (lines, arcs, circles, conics, extrusion/revolution surfaces), interpolation and polyline fitting, pcurves, point projection, spatial indexing and sphere charts.",
+      "page_notes": [
+        {
+          "content": "Key files: src/geometry/curve.rs, surface.rs, fit.rs, pcurve.rs, projection.rs, spatial.rs, sphere_chart.rs, image_curve.rs, polygon.rs. Cover the fit report types (PolylineFitReport/Ledger/Exit, PcurveFitReport/Ledger/Exit) and MAX_FIT_STATIONS."
+        }
+      ]
+    },
+    {
+      "title": "Analytic Carriers",
+      "parent": "NURBS Curves, Surfaces and Fitting",
+      "purpose": "Lazy recognition of plane/cylinder/cone/sphere/torus/revolution structure on NURBS surfaces, closed-form projection, and exact analytic surface-pair intersections that bypass marching. Where the rest of the kernel relies on this fast path.",
+      "page_notes": [
+        {
+          "content": "Key files: src/geometry/analytic_surface.rs and src/geometry/analytic_surface/, src/brep/analytic_topology.rs. Public: AnalyticSurface, intersect_analytic_pair, revolution_structure, RevolutionFrame."
+        }
+      ]
+    },
+    {
+      "title": "Surface Constructors: Coons, Gordon and Extension",
+      "parent": "NURBS Curves, Surfaces and Fitting",
+      "purpose": "Building surfaces from curve networks: bilinear Coons patches and Coons with cross-boundary ribbons, Gordon surfaces through two crossing curve families, and surface extension. Inputs, compatibility requirements, refusals.",
+      "page_notes": [
+        {
+          "content": "Key files: src/geometry/coons.rs, src/geometry/coons/compat.rs, src/geometry/coons/ribbons.rs, src/geometry/gordon.rs, src/geometry/surface/extension.rs. Public: coons_bilinear, coons_with_ribbons, gordon_surface, gordon_surface_reported, GordonRefusal."
+        }
+      ]
+    },
+    {
+      "title": "Intersection and Arrangement",
+      "parent": "NURBS Curves, Surfaces and Fitting",
+      "purpose": "Curve/curve, curve/surface and marched surface/surface intersection (broad phase, Newton correction, seam wrapping, tangency, loop closure) and planar arrangement. When the analytic fast path is used instead.",
+      "page_notes": [
+        {
+          "content": "Key files: src/intersect/curve_curve_intersection.rs, curve_surface_intersection.rs, surface_surface_intersection.rs, arrangement.rs."
+        }
+      ]
+    },
+    {
+      "title": "B-rep Topology",
+      "purpose": "The topological data model: BrepSolid, Shell, Face, Loop, Coedge, Edge, Vertex; arena storage and ids; queries; seams and degenerate (pole/apex) edges; affine transforms and orientation reversal; solid serialization codec. Include a diagram of the entity relationships.",
+      "page_notes": [
+        {
+          "content": "Key files: src/brep/topology.rs, src/brep/topology/{primitives,queries,seam,validate}.rs, src/brep/topology_arena.rs, src/brep/transform_topology.rs, src/brep/solid_codec.rs."
+        }
+      ]
+    },
+    {
+      "title": "Point and Face Classification",
+      "parent": "B-rep Topology",
+      "purpose": "Point-in-solid and point-in-face classification, face containment lanes, pair classification, and the *_SWITCH toggles. Which operations depend on classification and how it fails near seams, poles and tangencies.",
+      "page_notes": [
+        {
+          "content": "Key files: src/brep/classification.rs, src/brep/classification/{solid_classifier,face_containment}.rs, src/brep/pair_classification.rs. Public: classify_point, SolidClassifier, containment_lane, ContainmentLane, parameter_point_in_face."
+        }
+      ]
+    },
+    {
+      "title": "Solid Construction: Extrude, Revolve, Loft and Sweep",
+      "parent": "B-rep Topology",
+      "purpose": "Building exact solids from profiles: primitives, extrusion and drafted extrusion, full and partial revolution, lofts (basic, closed, guided, shifted), sweeps along paths (joints, mitres, twist closure, tight-bend refusal, swept envelopes) and ribs.",
+      "page_notes": [
+        {
+          "content": "Key files: src/construction/revolve_topology.rs, loft_topology.rs and loft_topology/, sweep_topology.rs and sweep_topology/{sweep,miter,path,twist,envelope,rib}.rs, src/brep/topology/primitives.rs."
+        }
+      ]
+    },
+    {
+      "title": "Boolean Operations and Imprinting",
+      "purpose": "The CSG pipeline end to end (imprint -> fragment -> classify -> select -> assemble) with a stage diagram, then the imprint stage in depth: driver, sections, support, junctions, tangent contact, self-touch, edge splitting and gate census. Public entry points: boolean_operation, boolean_operation_nary, boolean_operation_with_diagnostics, boolean_split_operands.",
+      "page_notes": [
+        {
+          "content": "Key files: src/csg/boolean/mod.rs, src/csg/imprint.rs, src/csg/imprint/*.rs, src/csg/edge_split.rs."
+        }
+      ]
+    },
+    {
+      "title": "Fragments, Oracle and Result Assembly",
+      "parent": "Boolean Operations and Imprinting",
+      "purpose": "After imprint: fragment loops and face splitting, sampling and the in/out oracle, fragment selection, coincident-face handling (which copy is kept), operand state, rim welds, and assembling/finalizing the result solid.",
+      "page_notes": [
+        {
+          "content": "Key files: src/csg/fragment.rs, src/csg/fragment/*.rs, src/csg/oracle.rs, src/csg/boolean/{select,coincident,operand_state,rim,assemble}.rs and assemble/."
+        }
+      ]
+    },
+    {
+      "title": "Fillets, Chamfers and Edge Blends",
+      "purpose": "Constant, variable and law-driven fillets and chamfers: tool construction, edge analysis, application lanes, and the blend engine (stations, rows, open/closed edge chains, track fitting, runout, restriction, carve, collapse, fold, mitres, planar charts). Public: fillet_edge(s), fillet_edges_reported, fillet_edges_variable*, chamfer_*, BlendSelection, RadiusLaw.",
+      "page_notes": [
+        {
+          "content": "Key files: src/blending/fillet.rs and fillet/, src/blending/law.rs, src/blending/blend/mod.rs and blend/{edge,chain,stations,rows,track_fit,runout,restrict,carve,collapse,fold,miter,planar_chart}.rs."
+        }
+      ]
+    },
+    {
+      "title": "Corner and Network Blends",
+      "parent": "Fillets, Chamfers and Edge Blends",
+      "purpose": "Where blends meet at vertices: convex, mixed-concave and mixed-curved corners, general star corners, and the stripe blend network. How corners are classified and when they are refused.",
+      "page_notes": [
+        {
+          "content": "Key files: src/blending/blend/corner.rs and corner/, src/blending/blend/network.rs."
+        }
+      ]
+    },
+    {
+      "title": "Direct Editing",
+      "purpose": "History-free edits of existing solids: delete face(s) and heal (open, closed, corner, blend-network and closed-band healing), face move, face rotate, and face offset for planar, spherical, torus, revolution, tangent and freeform faces; triple-point handling and recutting of moved planes. For each operation: selection rules, how neighbours are re-intersected, and refusal cases.",
+      "page_notes": [
+        {
+          "content": "Key files: src/edit/direct_edit.rs and src/edit/direct_edit/*.rs, src/edit/split.rs. Public: rotate_faces, recut_moved_planes, recut_moved_planes_rigid, resolve_face_by_point."
+        }
+      ]
+    },
+    {
+      "title": "Offset, Shell and Thicken",
+      "purpose": "Offset surfaces and points, offset regularity (where 1 - delta*kappa folds a trimmed region), fold locus tracing and carving folded regions out, the offset_shell pipeline (carriers, carrier rebuild, connectors, outline offset, revolved wedges, vacated rims, rim welds, orientation), retrim/reintersect, and thicken of sheets.",
+      "page_notes": [
+        {
+          "content": "Key files: src/offset/{offset,point,regularity,fold_locus,carve,retrim,reintersect,measure,analytic_pair}.rs, src/offset/offset_shell.rs and offset_shell/*.rs, src/offset/thicken.rs and thicken/band.rs."
+        }
+      ]
+    },
+    {
+      "title": "Healing and Repair",
+      "purpose": "Sewing, coalescing, face merge, general healing and faceted repair of triangle soups into B-rep (mesh_to_faceted_brep, repair_triangle_soup). How these relate to acceptance in 'Validity, Soundness and Acceptance'.",
+      "page_notes": [
+        {
+          "content": "Key files: src/healing/{heal,sew,coalesce,face_merge,faceted_repair}.rs."
+        }
+      ]
+    },
+    {
+      "title": "Tessellation and Meshing",
+      "purpose": "Turning B-rep into triangles: watertight tessellation (edge sampling shared between faces, face triangulation, periodic surfaces, sphere atlas, orientation, stride encoding, profiling), simple tessellation, mesh welding, and mesh segmentation that fits carriers to meshes and rebuilds B-rep.",
+      "page_notes": [
+        {
+          "content": "Key files: src/meshing/watertight_tessellation/*, src/meshing/tessellation.rs, src/meshing/mesh_weld.rs, src/meshing/mesh_segment.rs and mesh_segment/*."
+        }
+      ]
+    },
+    {
+      "title": "Mass Properties",
+      "purpose": "Volume, area, centroid and inertia of exact solids and faces: Green/divergence integration over trimmed faces, adaptive Gauss-Legendre rules for rational integrands, winding, face-set identity, edge length totals, and profile timing.",
+      "page_notes": [
+        {
+          "content": "Key files: src/props/mass_properties.rs and mass_properties/{integration,rule,trimmed,winding,polygons,measures,identity,profile,solid_props}.rs. Public: solid_mass_properties, FullMassProperties, MassProperties, face_set_identity."
+        }
+      ]
+    },
+    {
+      "title": "STEP Import and Export",
+      "purpose": "AP214/AP242 STEP exchange: parsing, body building (supplied vs derived pcurves, planar splits, mapped items, stated precision), structured assembly import with per-part PMI, colours/appearance both directions, export tree, assembly and PMI export, reports. Explain the flat vs structured import lanes.",
+      "page_notes": [
+        {
+          "content": "Key files: src/io/step.rs and step/{assembly,export_tree,pcurve,pmi,styles}.rs, src/io/step_import/mod.rs and step_import/*.rs (builder/, supplied.rs, mapped.rs, precision.rs, trim_readings.rs, assembly.rs, assembly_pmi.rs, pmi.rs, styles.rs), src/io/step_matrix.rs, src/io/appearance.rs. Public: import_step, import_step_report, read_step_assembly, read_step_pmi, export_step_report_named, StepAssemblyExport."
+        }
+      ]
+    },
+    {
+      "title": "Other Formats: IGES, 3MF, GLB and Meshes",
+      "purpose": "IGES import/export, 3MF reading (own ZIP/inflate/XML), binary glTF (GLB) display-mesh export, mesh file I/O, and kernel snapshots. State clearly which formats carry exact geometry and which are tessellated only.",
+      "page_notes": [
+        {
+          "content": "Key files: src/io/iges/*, src/io/three_mf/{mod,model,xml,zip,inflate}.rs, src/io/glb.rs, src/io/mesh_io.rs, src/io/snapshot.rs. Public: read_3mf, ThreeMfReadResult, write_glb, GlbReport."
+        }
+      ]
+    },
+    {
+      "title": "Feature Pipeline: History Execution",
+      "purpose": "The JSON-driven parametric history engine: document schema, execute_history_json, FeatureContext and SceneMap, expression evaluation, scene metadata and snapshots, component records, context offers, persistent naming of faces/edges across features, and how a feature is registered. Include a guide to adding a new feature type.",
+      "page_notes": [
+        {
+          "content": "Key files: src/feature_pipeline/mod.rs, schema.rs, expression.rs, scene_metadata.rs, component.rs, context_offer.rs, features/mod.rs, features/common.rs."
+        }
+      ]
+    },
+    {
+      "title": "Feature Catalog",
+      "parent": "Feature Pipeline: History Execution",
+      "purpose": "Reference table of every feature type in src/feature_pipeline/features/: its JSON type id, key parameters, the kernel operation it calls, and its output. Group as primitives (cube, cylinder, cone, sphere, torus, pyramid), solid-building (extrude, revolve, sweep, path_sweep, loft, rib, tube, helix, hole, thicken, offset_shell), modifying (fillet, chamfer, boolean, split, delete_face, push_face, offset_face, transform_face), and transforms/patterns (mirror, pattern, transform, transform_bake, import3d)."
+    },
+    {
+      "title": "Sketches and the Sketch Solver",
+      "parent": "Feature Pipeline: History Execution",
+      "purpose": "Sketch features and datums (planes, datum features, splines, face profiles), sketch chains and regions, and the geometric constraint solver: constraint types (including shape constraints and foot-point tangency inside a spline span), the solve engine, DOF polish and hot constraints.",
+      "page_notes": [
+        {
+          "content": "Key files: src/feature_pipeline/features/sketch.rs and sketch/, plane.rs, datum.rs, spline.rs, face_profile.rs, src/solvers/sketch_solver.rs and sketch_solver/{engine,constraints_shape,constraints_foot,dof_polish,hot_constraint}.rs, src/solvers/linear_algebra.rs."
+        }
+      ]
+    },
+    {
+      "title": "Sheet Metal",
+      "parent": "Feature Pipeline: History Execution",
+      "purpose": "SheetTree model, fold evaluation and bends, flange, contour flange, hem, tab, cutout, corner and unfold features, and flat-pattern DXF/SVG export.",
+      "page_notes": [
+        {
+          "content": "Key files: src/feature_pipeline/sheet_metal/{mod,tree,evaluate,flat_pattern}.rs and evaluate/, features/sheet_metal_*.rs and sheet_metal_flange/."
+        }
+      ]
+    },
+    {
+      "title": "Assemblies and Constraint Solving",
+      "parent": "Feature Pipeline: History Execution",
+      "purpose": "Assembly documents and components, constraint types and their mapping to mates, constraint lifecycle and inference, the assembly solver (atoms, decomposition, mates, numerics) and resolution, and the assembly_*_impl API used by hosts.",
+      "page_notes": [
+        {
+          "content": "Key files: src/feature_pipeline/assembly.rs and assembly/{constraints,mapping,lifecycle,infer,exports}.rs, features/assembly_component.rs, src/solvers/assembly_solver.rs and assembly_solver/*.rs, src/solvers/assembly_resolve.rs."
+        }
+      ]
+    },
+    {
+      "title": "PMI Annotations",
+      "parent": "Feature Pipeline: History Execution",
+      "purpose": "Product manufacturing information in part documents: the PMI block, views and display states, annotation schemas (feature control frames, datums, linear/angular/radial dimensions, hole callouts, notes, leaders), resolution against geometry, layout, fonts and formatting; how PMI maps to STEP.",
+      "page_notes": [
+        {
+          "content": "Key files: src/feature_pipeline/pmi/{mod,annotations,resolve,layout,font}.rs; cross-link to STEP Import and Export for io/step/pmi.rs and io/step_import/pmi.rs."
+        }
+      ]
+    },
+    {
+      "title": "Ports, Pins, Parts Library and Wire Harness",
+      "parent": "Feature Pipeline: History Execution",
+      "purpose": "Part-level connection data and electrical integration: the ports block (declared connection points as part data), symbol pins bound to points, the parts library and its source-hash invalidation, waypoint features, and wire-harness routing and bundles. Note that the old PORT feature was retired in 0.6.0 and replaced by the ports block plus the waypoint feature.",
+      "page_notes": [
+        {
+          "content": "Key files: src/feature_pipeline/ports.rs, part_pins.rs, parts_library.rs, wire_harness.rs, features/waypoint.rs, build.rs (BREP_KERNEL_SOURCE_HASH)."
+        }
+      ]
+    }
+  ]
+}
