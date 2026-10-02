@@ -15,7 +15,7 @@ Consequences:
   import deletes and replaces every tracked file except the local-only ones
   below. Upstream development happens in a separate monorepo.
 - **Local-only files** (preserved across imports): `tools/`, `AGENTS.md`,
-  `CLAUDE.md`, `.devin/`. If you add another repo-local file, add it to the
+  `CLAUDE.md`, `.devin/`, `.gitignore`. If you add another repo-local file, add it to the
   `keep` list in `tools/bin/sync-crate.sh`.
 - **Not in this repo:** tests and test data (excluded from the published crate),
   the design documents comments cite (`per-entity-tolerances.md`,

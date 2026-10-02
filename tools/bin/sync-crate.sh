@@ -13,7 +13,7 @@
 #   tools/bin/sync-crate.sh --push       # import, then push main to origin
 #   tools/bin/sync-crate.sh 0.6.0        # import one specific version
 #
-# Repo-local files (tools/, AGENTS.md, CLAUDE.md, .devin/) are never touched,
+# Repo-local files (tools/, AGENTS.md, CLAUDE.md, .devin/, .gitignore) are never touched,
 # so they survive imports. Add to KEEP below for any new local-only file.
 
 set -euo pipefail
@@ -22,7 +22,7 @@ CRATE="BREP_kernel"
 BRANCH="main"
 API="https://crates.io/api/v1/crates/${CRATE}"
 MANUAL_LINK="* [Manual](https://deepwiki.com/yepher/next_brep_kernel)"
-KEEP=(tools AGENTS.md CLAUDE.md .devin)
+KEEP=(tools AGENTS.md CLAUDE.md .devin .gitignore)
 UA="${CRATE}-sync-script (https://github.com/yepher/next_brep_kernel)"
 
 dry_run=0
