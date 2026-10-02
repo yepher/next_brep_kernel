@@ -224,7 +224,8 @@
 
 use crate::extrude_profile_brep;
 use crate::feature_pipeline::features::common;
-use crate::feature_pipeline::{FeatureContext, FeatureResult, SketchProfile};
+use crate::feature_pipeline::{FeatureContext, FeatureRefusal, FeatureResult, SketchProfile};
+use crate::{KernelStage, OrRefuse};
 use crate::Vec3;
 
 /// Face-name substrings PINNED out of the portion union's coplanar merge — every
@@ -248,7 +249,7 @@ struct Step {
     distance: f64,
 }
 
-fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // ---- Profile: resolve the referenced sketch's extracted profile, else a
     // resident FACE via `face_profile` (the extrude.rs/revolve.rs two-step).
     // `from_face` gates the cap-name base and skips the consumed-sketch
@@ -271,7 +272,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                 None => {
                     return Err(format!(
                         "sweep: profile '{profile_name}' not found (no sketch profile or resident face)"
-                    ));
+                    ).into());
                 }
             },
         };
@@ -339,7 +340,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                      rotates to follow it. (Path Sweep, SWP, builds the same shape as a \
                      separate feature.)",
                     path.name(index)
-                ));
+                ).into());
             }
             let [t0, t1] = curve.domain()?;
             let direction = curve.evaluate(t1)?.sub(curve.evaluate(t0)?);
@@ -348,7 +349,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                 return Err(format!(
                     "sweep: path segment '{}' has zero length",
                     path.name(index)
-                ));
+                ).into());
             }
             steps.push(Step {
                 name: path.name(index).to_string(),
@@ -370,7 +371,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                 "sweep: path segment '{}' runs inside the profile plane — it would sweep the \
                  profile through itself rather than along the path",
                 step.name
-            ));
+            ).into());
         }
     }
 
@@ -412,7 +413,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                      Every path segment must advance through the profile the same way. Sweep \
                      the run one direction at a time.",
                     step.name
-                ));
+                ).into());
             }
         }
     }
@@ -515,7 +516,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
             return Err(format!(
                 "sweep: outer loop needs >= 2 curves, got {}",
                 outer.curves.len()
-            ));
+            ).into());
         }
         let side_count = outer.curves.len();
 
@@ -537,7 +538,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                      would have to be trimmed against the outer one, which nothing solves. Sweep \
                      the outer loop alone, or ease the bend",
                     region_index + 1
-                ));
+                ).into());
             }
             // ONE tube for the whole run, every loop carried by the PATH'S OWN
             // rigid motion from where it was drawn (`SectionPlacement::Rigid`).
@@ -639,7 +640,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                     },
                     if mitred { "mitred walls" } else { "sides" },
                     if ring { "no caps (a closed path)" } else { "2 caps" }
-                ));
+                ).into());
             }
             for (face, name) in faces.iter_mut().zip(&face_names) {
                 face.name = Some(name.clone());
@@ -720,7 +721,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                     faces.len(),
                     face_names.len(),
                     side_count
-                ));
+                ).into());
             }
             for (face, name) in faces.iter_mut().zip(&face_names) {
                 face.name = Some(name.clone());
@@ -742,7 +743,8 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                     Some(step.name.as_str()),
                     &mut |loop_index, depth| {
                         let hole_curves =
-                            common::translate_curves(&region[loop_index].curves, step.offset)?;
+                            common::translate_curves(&region[loop_index].curves, step.offset)
+                                .or_refuse(KernelStage::Collect, "translate_curves")?;
                         common::hole_prism(&hole_curves, step.direction, step.distance, depth)
                     },
                 )?;

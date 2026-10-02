@@ -85,6 +85,12 @@ fn pcurve_fraction_at_edge_fraction(
     edge: &EdgeRecord,
     edge_fraction: f64,
 ) -> Result<f64, KernelRefusal> {
+    // Closed edges have the same spatial point at both parameter ends.
+    // Preserve the named traversal endpoint instead of projecting it onto an
+    // arbitrary preimage of that point on the closed pcurve.
+    if edge_fraction == 0.0 || edge_fraction == 1.0 {
+        return Ok(if coedge.forward { edge_fraction } else { 1.0 - edge_fraction });
+    }
     let point = edge
         .curve
         .evaluate(edge.t0 + (edge.t1 - edge.t0) * edge_fraction).or_refuse(KernelStage::Sew, "evaluate")?;
@@ -244,9 +250,26 @@ fn conform_overlapping_one_use_edges_pass(
         .iter()
         .map(|vertex| (vertex.id, vertex.point))
         .collect::<HashMap<_, _>>();
+    // The assembler provisionally marks unwelded closed loops degenerate.
+    // Such a loop can still be the carrier of real one-use arc pieces on an
+    // adjacent face. Only point-collapsed geometry must be excluded here.
+    let mut conformable = std::collections::HashSet::new();
+    for edge in edge_map.values() {
+        if use_counts.get(&edge.id) != Some(&1) { continue; }
+        let mut real_span = !edge.degenerate;
+        if !real_span {
+            let start = edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Sew, "evaluate")?;
+            for fraction in [0.25, 0.5, 0.75] {
+                let point = edge.curve.evaluate(edge.t0 + fraction * (edge.t1-edge.t0))
+                    .or_refuse(KernelStage::Sew, "evaluate")?;
+                real_span |= point.sub(start).length() > assembler_weld(assembler.tolerance);
+            }
+        }
+        if real_span { conformable.insert(edge.id); }
+    }
     let candidates = edge_map
         .values()
-        .filter(|edge| use_counts.get(&edge.id) == Some(&1) && !edge.degenerate)
+        .filter(|edge| conformable.contains(&edge.id))
         .cloned()
         .collect::<Vec<_>>();
     let geometric_tolerance = assembler.tolerance.max(1e-3);
@@ -304,7 +327,7 @@ fn conform_overlapping_one_use_edges_pass(
             let Some(edge) = edge_map.get(&coedge.edge_id) else {
                 continue;
             };
-            if use_counts.get(&edge.id) != Some(&1) || edge.degenerate {
+            if !conformable.contains(&edge.id) {
                 continue;
             }
             let mut fractions = vec![0.0, 1.0];

@@ -10,7 +10,7 @@ use crate::offset_analytic_pair::{
     offset_cylinder_radius, offset_plane_pair, offset_plane_triple, OffsetPairDegeneracy,
 };
 use crate::topology::{BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, VertexRecord};
-use crate::{fit, NurbsCurve, NurbsSurface, Vec3, Vec4};
+use crate::{fit, KernelRefusal, KernelStage, NurbsCurve, NurbsSurface, OrRefuse, Vec3, Vec4};
 use super::stations::*;
 use super::edge::*;
 

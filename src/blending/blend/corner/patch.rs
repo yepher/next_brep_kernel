@@ -33,20 +33,26 @@ pub(super) fn build_octant_face(
     arcs: &[(u64, u64, u64)],
     name: Option<&str>,
     next_id: &mut dyn FnMut() -> u64,
-) -> Result<(FaceRecord, EdgeRecord), String> {
+) -> Result<(FaceRecord, EdgeRecord), KernelRefusal> {
     let [m1, m2, m3] = normals;
     if m1.cross(m2).dot(m3) < 0.5 {
-        return Err("round_convex_corner: octant normals are not right-handed".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Fragment,
+            "octant_frame",
+            "round_convex_corner: octant normals are not right-handed",
+        ));
     }
     let half = std::f64::consts::FRAC_PI_2;
-    let meridian = crate::make_arc(center, m1, m3, radius, -half, half)?;
-    let surface = crate::make_revolution(center, m3, &meridian, std::f64::consts::TAU)?;
+    let meridian = crate::make_arc(center, m1, m3, radius, -half, half)
+        .or_refuse(KernelStage::Fragment, "make_arc")?;
+    let surface = crate::make_revolution(center, m3, &meridian, std::f64::consts::TAU)
+        .or_refuse(KernelStage::Fragment, "make_revolution")?;
 
     let [t1, t2, t3] = t_ids;
     let e_pole = next_id();
     let pole_edge = EdgeRecord {
         id: e_pole,
-        curve: crate::make_line(t_pts[2], t_pts[2])?,
+        curve: crate::make_line(t_pts[2], t_pts[2]).or_refuse(KernelStage::Fragment, "make_line")?,
         t0: 0.0,
         t1: 1.0,
         start_vertex_id: t3,
@@ -57,7 +63,7 @@ pub(super) fn build_octant_face(
 
     // For a needed traversal `from -> to`, locate the fresh arc joining that
     // pair and report whether its stored orientation already runs that way.
-    let find = |from: u64, to: u64| -> Result<(u64, bool), String> {
+    let find = |from: u64, to: u64| -> Result<(u64, bool), KernelRefusal> {
         for &(eid, s, e) in arcs {
             if s == from && e == to {
                 return Ok((eid, true));
@@ -66,15 +72,20 @@ pub(super) fn build_octant_face(
                 return Ok((eid, false));
             }
         }
-        Err(format!(
-            "round_convex_corner: no tangent arc between vertices {from} and {to}"
+        Err(KernelRefusal::internal(
+            KernelStage::Fragment,
+            "tangent_arc",
+            format!("round_convex_corner: no tangent arc between vertices {from} and {to}"),
         ))
     };
     let (e12, f12) = find(t1, t2)?; // equator T1->T2  (arc ⟂ m3)
     let (e23, f23) = find(t2, t3)?; // meridian u=0.25 T2->T3 (arc ⟂ m1)
     let (e31, f31) = find(t3, t1)?; // meridian u=0    T3->T1 (arc ⟂ m2)
 
-    let pl = |u0, v0, u1, v1| crate::sweep_topology::parameter_line(u0, v0, u1, v1);
+    let pl = |u0, v0, u1, v1| {
+        crate::sweep_topology::parameter_line(u0, v0, u1, v1)
+            .or_refuse(KernelStage::Fragment, "parameter_line")
+    };
     let loop_id = next_id();
     let coedges = vec![
         CoedgeRecord {
@@ -103,9 +114,16 @@ pub(super) fn build_octant_face(
         },
     ];
 
-    let mid = surface.evaluate(0.125, 0.75)?;
-    let surface_normal = surface.normal(0.125, 0.75)?;
-    let outward = mid.sub(center).normalized()?;
+    let mid = surface
+        .evaluate(0.125, 0.75)
+        .or_refuse(KernelStage::Fragment, "evaluate")?;
+    let surface_normal = surface
+        .normal(0.125, 0.75)
+        .or_refuse(KernelStage::Fragment, "normal")?;
+    let outward = mid
+        .sub(center)
+        .normalized()
+        .or_refuse(KernelStage::Fragment, "normalized")?;
     let same_sense = surface_normal.dot(outward) > 0.0;
 
     let face = FaceRecord {
@@ -140,14 +158,18 @@ pub(in crate::blend) fn build_general_corner_patch(
     outward: bool,
     name: Option<&str>,
     next_id: &mut dyn FnMut() -> u64,
-) -> Result<FaceRecord, String> {
+) -> Result<FaceRecord, KernelRefusal> {
     use std::f64::consts::{FRAC_PI_2, PI, TAU};
     let n_faces = normals.len();
     if n_faces < 3 || arc_edges.len() != n_faces {
-        return Err(format!(
-            "build_general_corner_patch: expected N≥3 faces with one arc each, \
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "arc_count",
+            format!(
+                "build_general_corner_patch: expected N≥3 faces with one arc each, \
              found {n_faces} faces and {} arcs",
-            arc_edges.len()
+                arc_edges.len()
+            ),
         ));
     }
     // Patch centre direction (radially outward through the middle of the
@@ -156,15 +178,21 @@ pub(in crate::blend) fn build_general_corner_patch(
     let pc = normals
         .iter()
         .fold(Vec3::default(), |acc, n| acc.add(*n))
-        .normalized()?;
+        .normalized()
+        .or_refuse(KernelStage::Fragment, "normalized")?;
 
     // Revolution frame: polar axis ⟂ pc so the patch straddles the equator
     // (away from both poles).  Among all such axes pick the one that keeps the
     // N tangent points AND the great-circle arc midpoints (normalize(nᵢ+nⱼ))
     // nearest the equator — minimizing the worst |d·polar|.  x-axis = -pc puts
     // the u=0 seam on the far side (patch lands near u≈0.5).
-    let e0 = pc.perpendicular()?;
-    let e1 = pc.cross(e0).normalized()?;
+    let e0 = pc
+        .perpendicular()
+        .or_refuse(KernelStage::Fragment, "perpendicular")?;
+    let e1 = pc
+        .cross(e0)
+        .normalized()
+        .or_refuse(KernelStage::Fragment, "normalized")?;
     let mut crit: Vec<Vec3> = normals.to_vec();
     for i in 0..n_faces {
         for j in (i + 1)..n_faces {
@@ -189,10 +217,13 @@ pub(in crate::blend) fn build_general_corner_patch(
     let polar = e0
         .scale(best_phi.cos())
         .add(e1.scale(best_phi.sin()))
-        .normalized()?;
+        .normalized()
+        .or_refuse(KernelStage::Fragment, "normalized")?;
     let x_axis = pc.scale(-1.0);
-    let meridian = crate::make_arc(center, x_axis, polar, radius, -FRAC_PI_2, FRAC_PI_2)?;
-    let surface = crate::make_revolution(center, polar, &meridian, TAU)?;
+    let meridian = crate::make_arc(center, x_axis, polar, radius, -FRAC_PI_2, FRAC_PI_2)
+        .or_refuse(KernelStage::Fragment, "make_arc")?;
+    let surface = crate::make_revolution(center, polar, &meridian, TAU)
+        .or_refuse(KernelStage::Fragment, "make_revolution")?;
 
     // Chain the three arcs into a closed loop traversed OPPOSITE to the fillet
     // use: each arc is stored start->end and used forward=true by its fillet,
@@ -205,13 +236,23 @@ pub(in crate::blend) fn build_general_corner_patch(
     for _ in 0..(n_faces - 1) {
         let next = (0..n_faces)
             .find(|&j| !used[j] && arc_edges[j].end_vertex_id == chain_vertex)
-            .ok_or("build_general_corner_patch: tangent arcs do not form a closed N-gon")?;
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Fragment,
+                    "arc_chain",
+                    "build_general_corner_patch: tangent arcs do not form a closed N-gon",
+                )
+            })?;
         used[next] = true;
         order.push(next);
         chain_vertex = arc_edges[next].start_vertex_id;
     }
     if chain_vertex != arc_edges[0].end_vertex_id {
-        return Err("build_general_corner_patch: tangent arc loop is not closed".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Fragment,
+            "arc_loop",
+            "build_general_corner_patch: tangent arc loop is not closed",
+        ));
     }
 
     // Each coedge's pcurve is the arc's track on the sphere, fitted by the one
@@ -247,13 +288,17 @@ pub(in crate::blend) fn build_general_corner_patch(
             );
         }
         if !fit.on_floor {
-            return Err(format!(
-                "{} the corner patch's pcurve along arc {} misses its arc by {:.3e} at {} \
+            return Err(KernelRefusal::non_convergence(
+                KernelStage::Refine,
+                "patch_track",
+                format!(
+                    "{} the corner patch's pcurve along arc {} misses its arc by {:.3e} at {} \
                  samples, against a floor of {floor:.1e}",
-                crate::blend::PCURVE_OFF_FLOOR,
-                edge.id,
-                fit.miss,
-                fit.samples
+                    crate::blend::PCURVE_OFF_FLOOR,
+                    edge.id,
+                    fit.miss,
+                    fit.samples
+                ),
             ));
         }
         coedges.push(CoedgeRecord {
@@ -267,8 +312,11 @@ pub(in crate::blend) fn build_general_corner_patch(
     // same_sense so the face normal points radially away from C for a convex
     // corner, toward it for a concave one.
     let centre_projection =
-        crate::project_point_to_surface(&surface, center.add(pc.scale(radius)))?;
-    let surface_normal = surface.normal(centre_projection.u, centre_projection.v)?;
+        crate::project_point_to_surface(&surface, center.add(pc.scale(radius)))
+            .or_refuse(KernelStage::Fragment, "project")?;
+    let surface_normal = surface
+        .normal(centre_projection.u, centre_projection.v)
+        .or_refuse(KernelStage::Fragment, "normal")?;
     let same_sense = (surface_normal.dot(pc) > 0.0) == outward;
 
     let loop_id = next_id();
@@ -308,14 +356,18 @@ pub(in crate::blend) fn build_chamfer_corner_facet(
     outward: bool,
     name: Option<&str>,
     next_id: &mut dyn FnMut() -> u64,
-) -> Result<FaceRecord, String> {
+) -> Result<FaceRecord, KernelRefusal> {
     let n_faces = normals.len();
     if n_faces < 3 || chord_edges.len() != n_faces {
-        return Err(format!(
-            "blend network: a chamfered star closes with the facet its end chords bound, which \
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "chord_count",
+            format!(
+                "blend network: a chamfered star closes with the facet its end chords bound, which \
              needs N≥3 faces carrying one chord each — this vertex has {n_faces} faces and {} \
              sections",
-            chord_edges.len()
+                chord_edges.len()
+            ),
         ));
     }
     // Outward direction through the middle of the corner, exactly as the
@@ -324,7 +376,8 @@ pub(in crate::blend) fn build_chamfer_corner_facet(
     let pc = normals
         .iter()
         .fold(Vec3::default(), |acc, n| acc.add(*n))
-        .normalized()?;
+        .normalized()
+        .or_refuse(KernelStage::Fragment, "normalized")?;
 
     // Chain the chords into a closed loop traversed OPPOSITE to the stripes'
     // use, the same walk `build_general_corner_patch` makes over the arcs.
@@ -335,13 +388,23 @@ pub(in crate::blend) fn build_chamfer_corner_facet(
     for _ in 0..(n_faces - 1) {
         let next = (0..n_faces)
             .find(|&j| !used[j] && chord_edges[j].end_vertex_id == chain_vertex)
-            .ok_or("blend network: the chamfer facet's sections do not form a closed N-gon")?;
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Fragment,
+                    "chord_chain",
+                    "blend network: the chamfer facet's sections do not form a closed N-gon",
+                )
+            })?;
         used[next] = true;
         order.push(next);
         chain_vertex = chord_edges[next].start_vertex_id;
     }
     if chain_vertex != chord_edges[0].end_vertex_id {
-        return Err("blend network: the chamfer facet's section loop is not closed".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Fragment,
+            "chord_loop",
+            "blend network: the chamfer facet's section loop is not closed",
+        ));
     }
 
     // The plane the N-gon bounds. Each tangency point is `center + r·nᵢ` for
@@ -351,16 +414,21 @@ pub(in crate::blend) fn build_chamfer_corner_facet(
     // identity for PLANAR supports only — a curved support puts its tangency
     // point somewhere the identity does not reach — so the N-gon's flatness is
     // measured rather than assumed, and a skew one is refused by name.
-    let corner_point = |index: usize| -> Result<Vec3, String> {
+    let corner_point = |index: usize| -> Result<Vec3, KernelRefusal> {
         let edge = &chord_edges[index];
-        edge.curve.evaluate(edge.t0)
+        edge.curve
+            .evaluate(edge.t0)
+            .or_refuse(KernelStage::Fragment, "evaluate")
     };
     let points = order
         .iter()
         .map(|&index| corner_point(index))
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, KernelRefusal>>()?;
     let [a, b] = [points[0], points[1]];
-    let u_dir = b.sub(a).normalized()?;
+    let u_dir = b
+        .sub(a)
+        .normalized()
+        .or_refuse(KernelStage::Fragment, "normalized")?;
     // Newell's normal over the chained N-gon: exact for a planar polygon at
     // any N, and for N = 3 exactly the triangle's own `(b−a)×(c−a)`.
     let mut newell = Vec3::default();
@@ -369,8 +437,13 @@ pub(in crate::blend) fn build_chamfer_corner_facet(
         let to = points[(index + 1) % n_faces];
         newell = newell.add(from.sub(a).cross(to.sub(a)));
     }
-    let normal = newell.normalized()?;
-    let v_dir = normal.cross(u_dir).normalized()?;
+    let normal = newell
+        .normalized()
+        .or_refuse(KernelStage::Fragment, "normalized")?;
+    let v_dir = normal
+        .cross(u_dir)
+        .normalized()
+        .or_refuse(KernelStage::Fragment, "normalized")?;
     // The seated radius, which every tangency point shares, sets the bar the
     // N-gon's flatness is held to.
     let radius = points
@@ -381,10 +454,14 @@ pub(in crate::blend) fn build_chamfer_corner_facet(
         .iter()
         .fold(0.0f64, |worst, point| worst.max(point.sub(a).dot(normal).abs()));
     if skew > flatness {
-        return Err(format!(
-            "blend network: the {n_faces} chords at a chamfered star bound a SKEW N-gon \
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "skew_ngon",
+            format!(
+                "blend network: the {n_faces} chords at a chamfered star bound a SKEW N-gon \
              ({skew:.3e} out of plane against {flatness:.3e}); a non-planar corner fill is not \
              implemented"
+            ),
         ));
     }
     // A patch big enough to hold the facet with room to spare, laid out so the
@@ -396,9 +473,11 @@ pub(in crate::blend) fn build_chamfer_corner_facet(
         .max(1e-6)
         * 4.0;
     let origin = a.sub(u_dir.scale(reach)).sub(v_dir.scale(reach));
-    let plane = crate::make_plane(origin, u_dir, v_dir, 2.0 * reach, 2.0 * reach)?;
-    let uv_of = |point: Vec3| -> Result<(f64, f64), String> {
-        let projection = crate::project_point_to_surface(&plane, point)?;
+    let plane = crate::make_plane(origin, u_dir, v_dir, 2.0 * reach, 2.0 * reach)
+        .or_refuse(KernelStage::Fragment, "make_plane")?;
+    let uv_of = |point: Vec3| -> Result<(f64, f64), KernelRefusal> {
+        let projection = crate::project_point_to_surface(&plane, point)
+            .or_refuse(KernelStage::Fragment, "project")?;
         Ok((projection.u, projection.v))
     };
 
@@ -408,19 +487,30 @@ pub(in crate::blend) fn build_chamfer_corner_facet(
     let mut coedges = Vec::with_capacity(n_faces);
     for &index in &order {
         let edge = &chord_edges[index];
-        let (u0, v0) = uv_of(edge.curve.evaluate(edge.t1)?)?;
-        let (u1, v1) = uv_of(edge.curve.evaluate(edge.t0)?)?;
+        let (u0, v0) = uv_of(
+            edge.curve
+                .evaluate(edge.t1)
+                .or_refuse(KernelStage::Fragment, "evaluate")?,
+        )?;
+        let (u1, v1) = uv_of(
+            edge.curve
+                .evaluate(edge.t0)
+                .or_refuse(KernelStage::Fragment, "evaluate")?,
+        )?;
         coedges.push(CoedgeRecord {
             id: next_id(),
             edge_id: edge.id,
             forward: false,
-            pcurve: crate::sweep_topology::parameter_line(u0, v0, u1, v1)?,
+            pcurve: crate::sweep_topology::parameter_line(u0, v0, u1, v1)
+                .or_refuse(KernelStage::Fragment, "parameter_line")?,
         });
     }
 
     // same_sense so the face normal points away from the ball's centre at a
     // convex corner and toward it at a concave one — the patch's own rule.
-    let plane_normal = plane.normal(0.5, 0.5)?;
+    let plane_normal = plane
+        .normal(0.5, 0.5)
+        .or_refuse(KernelStage::Fragment, "normal")?;
     let same_sense = (plane_normal.dot(pc) > 0.0) == outward;
 
     let loop_id = next_id();

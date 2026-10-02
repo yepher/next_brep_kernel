@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn translated_curve(curve: &NurbsCurve, delta: Vec3) -> Result<NurbsCurve, String> {
+pub(super) fn translated_curve(curve: &NurbsCurve, delta: Vec3) -> Result<NurbsCurve, KernelRefusal> {
     NurbsCurve::new(
         curve.degree,
         curve.knots.clone(),
@@ -15,6 +15,7 @@ pub(super) fn translated_curve(curve: &NurbsCurve, delta: Vec3) -> Result<NurbsC
             })
             .collect(),
     )
+    .or_refuse(KernelStage::Fragment, "curve_new")
 }
 
 pub(crate) fn profile_area(
@@ -42,14 +43,25 @@ pub fn extrude_profile_brep(
     input_curves: &[NurbsCurve],
     direction: Vec3,
     distance: f64,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     if input_curves.len() < 2 {
-        return Err("profile needs at least 2 curves".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "profile_count",
+            "profile needs at least 2 curves",
+        ));
     }
     if distance.abs() <= 1e-12 {
-        return Err("extrudeSolid: distance must be non-zero".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "distance",
+            "extrudeSolid: distance must be non-zero",
+        ));
     }
-    let displacement = direction.normalized()?.scale(distance);
+    let displacement = direction
+        .normalized()
+        .or_input(KernelStage::Collect, "direction")?
+        .scale(distance);
     let tolerance = 1e-6;
     let mut curves: Vec<NurbsCurve> = input_curves
         .iter()
@@ -60,56 +72,69 @@ pub fn extrude_profile_brep(
                 curve.control_points.clone(),
             )
         })
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<_, _>>().or_refuse(KernelStage::Fragment, "collect")?;
 
     let mut samples = Vec::new();
     for (index, curve) in curves.iter().enumerate() {
-        let [start, end] = curve.domain()?;
+        let [start, end] = curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
         let next = &curves[(index + 1) % curves.len()];
-        let next_start = next.domain()?[0];
+        let next_start = next.domain().or_refuse(KernelStage::Fragment, "domain")?[0];
         if curve
-            .evaluate(end)?
-            .sub(next.evaluate(next_start)?)
+            .evaluate(end).or_refuse(KernelStage::Fragment, "evaluate")?
+            .sub(next.evaluate(next_start).or_refuse(KernelStage::Fragment, "evaluate")?)
             .length()
             > tolerance
         {
-            return Err(format!("profile not closed at curve {index}"));
+            return Err(KernelRefusal::input(
+                KernelStage::Collect,
+                "profile_closed",
+                format!("profile not closed at curve {index}"),
+            ));
         }
         for sample in 0..16 {
-            samples.push(curve.evaluate(start + (end - start) * sample as f64 / 16.0)?);
+            samples.push(curve.evaluate(start + (end - start) * sample as f64 / 16.0).or_refuse(KernelStage::Fragment, "evaluate")?);
         }
     }
     let mut normal = crate::polygon::newell_normal(&samples);
-    normal = normal.normalized()?;
+    // A zero Newell normal is a profile with no enclosed area: the caller's.
+    normal = normal.normalized().or_input(KernelStage::Collect, "profile_area")?;
     if normal.dot(displacement) < 0.0 {
         normal = normal.scale(-1.0);
     }
-    if normal.dot(displacement.normalized()?).abs() < 0.1 {
-        return Err("extrudeSolid: sweep direction is nearly parallel to profile plane".into());
+    if normal.dot(displacement.normalized().or_refuse(KernelStage::Fragment, "normalized")?).abs() < 0.1 {
+        return Err(KernelRefusal::input(
+            KernelStage::Classify,
+            "sliver",
+            "extrudeSolid: sweep direction is nearly parallel to profile plane",
+        ));
     }
     let origin = samples[0];
     if samples
         .iter()
         .any(|point| point.sub(origin).dot(normal).abs() > tolerance * 100.0)
     {
-        return Err("extrudeSolid: profile is not planar".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "profile_planar",
+            "extrudeSolid: profile is not planar",
+        ));
     }
-    let x_axis = normal.perpendicular()?;
-    let y_axis = normal.cross(x_axis).normalized()?;
-    let reversed_winding = profile_area(&curves, origin, x_axis, y_axis)? < 0.0;
+    let x_axis = normal.perpendicular().or_refuse(KernelStage::Fragment, "perpendicular")?;
+    let y_axis = normal.cross(x_axis).normalized().or_refuse(KernelStage::Fragment, "normalized")?;
+    let reversed_winding = profile_area(&curves, origin, x_axis, y_axis).or_refuse(KernelStage::Fragment, "profile_area")? < 0.0;
     if reversed_winding {
         curves = curves
             .iter()
             .rev()
             .map(NurbsCurve::reversed)
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<_, _>>().or_refuse(KernelStage::Fragment, "collect")?;
     }
 
     let count = curves.len();
     let points: Vec<Vec3> = curves
         .iter()
         .map(|curve| curve.domain().and_then(|domain| curve.evaluate(domain[0])))
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<_, _>>().or_refuse(KernelStage::Fragment, "collect")?;
     let mut vertices = Vec::with_capacity(count * 2);
     for (index, point) in points.iter().enumerate() {
         vertices.push(VertexRecord {
@@ -126,7 +151,7 @@ pub fn extrude_profile_brep(
 
     let mut edges = Vec::with_capacity(count * 3);
     for (index, curve) in curves.iter().enumerate() {
-        let [start, end] = curve.domain()?;
+        let [start, end] = curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
         edges.push(EdgeRecord {
             id: 10 + index as u64,
             curve: curve.clone(),
@@ -149,7 +174,7 @@ pub fn extrude_profile_brep(
         });
         edges.push(EdgeRecord {
             id: 10 + 2 * count as u64 + index as u64,
-            curve: make_line(points[index], points[index].add(displacement))?,
+            curve: make_line(points[index], points[index].add(displacement)).or_refuse(KernelStage::Fragment, "make_line")?,
             t0: 0.0,
             t1: 1.0,
             start_vertex_id: index as u64 + 1,
@@ -162,37 +187,37 @@ pub fn extrude_profile_brep(
     let mut next_id = 1000_u64;
     let mut faces = Vec::with_capacity(count + 2);
     for (index, curve) in curves.iter().enumerate() {
-        let [start, end] = curve.domain()?;
+        let [start, end] = curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
         let coedges = vec![
             CoedgeRecord {
                 id: next_id,
                 edge_id: 10 + index as u64,
                 forward: true,
-                pcurve: parameter_line(start, 0.0, end, 0.0)?,
+                pcurve: parameter_line(start, 0.0, end, 0.0).or_refuse(KernelStage::Fragment, "parameter_line")?,
             },
             CoedgeRecord {
                 id: next_id + 1,
                 edge_id: 10 + 2 * count as u64 + ((index + 1) % count) as u64,
                 forward: true,
-                pcurve: parameter_line(end, 0.0, end, 1.0)?,
+                pcurve: parameter_line(end, 0.0, end, 1.0).or_refuse(KernelStage::Fragment, "parameter_line")?,
             },
             CoedgeRecord {
                 id: next_id + 2,
                 edge_id: 10 + count as u64 + index as u64,
                 forward: false,
-                pcurve: parameter_line(end, 1.0, start, 1.0)?,
+                pcurve: parameter_line(end, 1.0, start, 1.0).or_refuse(KernelStage::Fragment, "parameter_line")?,
             },
             CoedgeRecord {
                 id: next_id + 3,
                 edge_id: 10 + 2 * count as u64 + index as u64,
                 forward: false,
-                pcurve: parameter_line(start, 1.0, start, 0.0)?,
+                pcurve: parameter_line(start, 1.0, start, 0.0).or_refuse(KernelStage::Fragment, "parameter_line")?,
             },
         ];
         next_id += 4;
         faces.push(FaceRecord {
             id: next_id + 1,
-            surface: make_extrusion(curve, displacement)?,
+            surface: make_extrusion(curve, displacement).or_refuse(KernelStage::Fragment, "make_extrusion")?,
             same_sense: true,
             loops: vec![LoopRecord {
                 id: next_id,
@@ -234,14 +259,14 @@ pub fn extrude_profile_brep(
             id: next_id,
             edge_id: 10 + index as u64,
             forward: false,
-            pcurve: curve_to_plane_parameters(&curves[index], bottom_origin, x_axis, y_axis)?
-                .reversed()?,
+            pcurve: curve_to_plane_parameters(&curves[index], bottom_origin, x_axis, y_axis).or_refuse(KernelStage::Fragment, "plane_parameters")?
+                .reversed().or_refuse(KernelStage::Fragment, "reversed")?,
         });
         next_id += 1;
     }
     faces.push(FaceRecord {
         id: next_id + 1,
-        surface: make_plane(bottom_origin, x_axis, y_axis, width, height)?,
+        surface: make_plane(bottom_origin, x_axis, y_axis, width, height).or_refuse(KernelStage::Fragment, "make_plane")?,
         same_sense: false,
         loops: vec![LoopRecord {
             id: next_id,
@@ -259,13 +284,13 @@ pub fn extrude_profile_brep(
             id: next_id,
             edge_id: 10 + count as u64 + index as u64,
             forward: true,
-            pcurve: curve_to_plane_parameters(&translated, top_origin, x_axis, y_axis)?,
+            pcurve: curve_to_plane_parameters(&translated, top_origin, x_axis, y_axis).or_refuse(KernelStage::Fragment, "plane_parameters")?,
         });
         next_id += 1;
     }
     faces.push(FaceRecord {
         id: next_id + 1,
-        surface: make_plane(top_origin, x_axis, y_axis, width, height)?,
+        surface: make_plane(top_origin, x_axis, y_axis, width, height).or_refuse(KernelStage::Fragment, "make_plane")?,
         same_sense: true,
         loops: vec![LoopRecord {
             id: next_id,
@@ -276,6 +301,7 @@ pub fn extrude_profile_brep(
     next_id += 2;
 
     let solid = BrepSolid {
+        mass_properties_cache: Default::default(),
         id: next_id + 1,
         vertices,
         edges,
@@ -286,8 +312,10 @@ pub fn extrude_profile_brep(
     if issues.is_empty() {
         Ok(solid)
     } else {
-        Err(format!(
-            "Rust extrusion builder produced invalid topology: {issues:?}"
+        Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "validate",
+            format!("Rust extrusion builder produced invalid topology: {issues:?}"),
         ))
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::{ExtendRefusal, KernelRefusal, KernelStage, OrRefuse};
 
 /// Grow a ruled-revolution neighbour along its axis so its domain covers
 /// `points` (with a small margin) — the extension is EXACT (same frame, the
@@ -10,10 +11,11 @@ pub(super) fn extend_ruled_neighbour_over(
     face_id: u64,
     points: &[Vec3],
     tolerance: f64,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let op = "delete_face_and_heal";
-    let (shell, face_pos) =
-        find_face(solid, face_id).ok_or_else(|| format!("{op}: missing face {face_id}"))?;
+    let (shell, face_pos) = find_face(solid, face_id).ok_or_else(|| {
+        KernelRefusal::internal(KernelStage::Collect, "face", format!("{op}: missing face {face_id}"))
+    })?;
     extend_ruled_carrier(&mut solid.shells[shell].faces[face_pos], points, tolerance)
 }
 
@@ -24,7 +26,7 @@ pub(super) fn extend_ruled_carrier(
     face: &mut FaceRecord,
     points: &[Vec3],
     tolerance: f64,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let Some(AnalyticSurface::RuledRevolution {
         frame,
         rho0,
@@ -52,8 +54,9 @@ pub(super) fn extend_ruled_carrier(
         .origin
         .add(frame.axis.scale(high))
         .add(frame.x_axis.scale(rho_at(high)));
-    let generatrix = make_line(start, end)?;
-    let extended = make_revolution(base, frame.axis, &generatrix, std::f64::consts::TAU)?;
+    let generatrix = make_line(start, end).or_refuse(KernelStage::Sew, "make_line")?;
+    let extended = make_revolution(base, frame.axis, &generatrix, std::f64::consts::TAU)
+        .or_refuse(KernelStage::Sew, "make_revolution")?;
     // v remap old -> new: z = old_v * height; new_v = (z - low)/(high - low).
     let v_scale = height / (high - low);
     let v_offset = -low / (high - low);
@@ -85,9 +88,14 @@ pub(super) fn extend_revolution_carrier_over(
     face_id: u64,
     points: &[Vec3],
     tolerance: f64,
-) -> Result<(), String> {
-    let (shell, face_pos) = find_face(solid, face_id)
-        .ok_or_else(|| format!("move_faces: missing ruled face {face_id}"))?;
+) -> Result<(), KernelRefusal> {
+    let (shell, face_pos) = find_face(solid, face_id).ok_or_else(|| {
+        KernelRefusal::internal(
+            KernelStage::Collect,
+            "ruled_face",
+            format!("move_faces: missing ruled face {face_id}"),
+        )
+    })?;
     extend_revolution_carrier(&mut solid.shells[shell].faces[face_pos], points, tolerance)
 }
 
@@ -97,7 +105,7 @@ pub(super) fn extend_revolution_carrier(
     face: &mut FaceRecord,
     points: &[Vec3],
     tolerance: f64,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let Some(AnalyticSurface::Revolution {
         frame,
         sweep,
@@ -111,8 +119,8 @@ pub(super) fn extend_revolution_carrier(
     if generatrix.degree != 1 || controls.len() != 2 {
         return Ok(()); // curved generatrix — not a ruled band, nothing to grow
     }
-    let p0 = controls[0].point()?;
-    let p1 = controls[1].point()?;
+    let p0 = controls[0].point().or_refuse(KernelStage::Collect, "control_point")?;
+    let p1 = controls[1].point().or_refuse(KernelStage::Collect, "control_point")?;
     let axial = |p: Vec3| p.sub(frame.origin).dot(frame.axis);
     let (z0, z1) = (axial(p0), axial(p1));
     let (span_lo, span_hi) = (z0.min(z1), z0.max(z1));
@@ -142,8 +150,9 @@ pub(super) fn extend_revolution_carrier(
         p0.add(p1.sub(p0).scale(t))
     };
     let (start_axial, end_axial) = if z1 >= z0 { (low, high) } else { (high, low) };
-    let extended = make_line(point_at(start_axial), point_at(end_axial))?;
-    let grown = make_revolution(frame.origin, frame.axis, &extended, sweep)?;
+    let extended = make_line(point_at(start_axial), point_at(end_axial)).or_refuse(KernelStage::Sew, "make_line")?;
+    let grown = make_revolution(frame.origin, frame.axis, &extended, sweep)
+        .or_refuse(KernelStage::Sew, "make_revolution")?;
     face.surface = grown;
     Ok(())
 }
@@ -169,7 +178,7 @@ pub(super) fn regrow_and_refit_carrier(
     edges: &HashMap<u64, EdgeRecord>,
     scale: f64,
     op: &str,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let tolerance = (scale * 1e-7).max(1e-9);
     let points = boundary_samples(face, edges, op)?;
     if let Ok(plane) = plane_of_surface(&face.surface, (scale * 1e-6).max(1e-7), op) {
@@ -189,7 +198,11 @@ pub(super) fn regrow_and_refit_carrier(
             v_max = v_max.max(delta.dot(plane.v_dir));
         }
         if !(u_min.is_finite() && v_min.is_finite()) {
-            return Err(format!("{op}: empty face boundary"));
+            return Err(KernelRefusal::internal(
+                KernelStage::Collect,
+                "empty_boundary",
+                format!("{op}: empty face boundary"),
+            ));
         }
         let margin = ((u_max - u_min).max(v_max - v_min) * 0.25).max(scale * 1e-3);
         let origin = plane
@@ -202,7 +215,8 @@ pub(super) fn regrow_and_refit_carrier(
             plane.v_dir,
             (u_max - u_min) + 2.0 * margin,
             (v_max - v_min) + 2.0 * margin,
-        )?;
+        )
+        .or_refuse(KernelStage::Sew, "make_plane")?;
     } else {
         extend_ruled_carrier(face, &points, tolerance)?;
         extend_revolution_carrier(face, &points, tolerance)?;
@@ -215,6 +229,7 @@ pub(super) fn regrow_and_refit_carrier(
         tolerance,
         op,
     )
+    
 }
 
 // ---------------------------------------------------------------------------
@@ -301,10 +316,15 @@ pub(super) fn extend_freeform_neighbour_over(
     face_id: u64,
     points: &[Vec3],
     tolerance: f64,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let op = "delete_face_and_heal";
-    let (shell, face_pos) =
-        find_face(solid, face_id).ok_or_else(|| format!("{op}: missing neighbour {face_id}"))?;
+    let (shell, face_pos) = find_face(solid, face_id).ok_or_else(|| {
+        KernelRefusal::internal(
+            KernelStage::Collect,
+            "neighbour",
+            format!("{op}: missing neighbour {face_id}"),
+        )
+    })?;
     let face = &mut solid.shells[shell].faces[face_pos];
     if face.surface.analytic().is_some() {
         return Ok(()); // an analytic carrier grows through its own exact lane
@@ -328,9 +348,9 @@ pub(super) fn extend_freeform_neighbour_over(
             surface.control_points[0].len(),
             surface.knots_u.len(),
             surface.knots_v.len(),
-            surface.domain_u()?,
-            surface.domain_v()?,
-            surface.closed_directions()?
+            surface.domain_u().or_refuse(KernelStage::Classify, "domain")?,
+            surface.domain_v().or_refuse(KernelStage::Classify, "domain")?,
+            surface.closed_directions().or_refuse(KernelStage::Classify, "domain")?
         );
     }
     for round in 0..FREEFORM_EXTENSION_ROUNDS {
@@ -355,9 +375,9 @@ pub(super) fn extend_freeform_neighbour_over(
                 continue;
             }
             let [low, high] = if side.is_u() {
-                surface.domain_u()?
+                surface.domain_u().or_refuse(KernelStage::Classify, "domain")?
             } else {
-                surface.domain_v()?
+                surface.domain_v().or_refuse(KernelStage::Classify, "domain")?
             };
             let floor = (high - low) * FREEFORM_MINIMUM_EXTENSION;
             let asked = (overruns[index] * FREEFORM_EXTENSION_MARGIN / floor).ceil().max(1.0) * floor;
@@ -371,21 +391,33 @@ pub(super) fn extend_freeform_neighbour_over(
                     "asked": asked,
                 })
             });
-            surface = surface
-                .extend_natural(side, asked)
-                .map_err(|refusal| {
-                    format!(
-                        "{op}: cannot extend the fitted carrier of face {face_id} past its \
-                         {side:?} boundary — {}",
-                        refusal.describe()
-                    )
-                })?;
+            // The extension's own verdict classes the refusal: a closed direction,
+            // an unclamped end, a weight past its root, a fold or a runaway growth
+            // is the carrier declining to be continued that way; an increment
+            // this lane floors and a lower-level failure are its own defects.
+            surface = surface.extend_natural(side, asked).map_err(|refusal| {
+                let message = format!(
+                    "{op}: cannot extend the fitted carrier of face {face_id} past its \
+                     {side:?} boundary — {}",
+                    refusal.describe()
+                );
+                match refusal {
+                    ExtendRefusal::DegenerateIncrement { .. } | ExtendRefusal::Failed(_) => {
+                        KernelRefusal::internal(KernelStage::Sew, "extend_natural", message)
+                    }
+                    _ => KernelRefusal::unsupported(KernelStage::Sew, "extend_natural", message),
+                }
+            })?;
         }
     }
-    Err(format!(
-        "{op}: the fitted carrier of face {face_id} still does not cover the deleted strip \
-         after {FREEFORM_EXTENSION_ROUNDS} extension rounds — refusing rather than solving \
-         on an unbounded extrapolation"
+    Err(KernelRefusal::non_convergence(
+        KernelStage::Sew,
+        "extension_rounds",
+        format!(
+            "{op}: the fitted carrier of face {face_id} still does not cover the deleted strip \
+             after {FREEFORM_EXTENSION_ROUNDS} extension rounds — refusing rather than solving \
+             on an unbounded extrapolation"
+        ),
     ))
 }
 
@@ -404,7 +436,7 @@ pub(super) fn planar_region_patch(
     plane: &Plane,
     center: Vec3,
     reach: f64,
-) -> Result<NurbsSurface, String> {
+) -> Result<NurbsSurface, KernelRefusal> {
     let on_plane = center.sub(
         plane
             .normal
@@ -414,6 +446,7 @@ pub(super) fn planar_region_patch(
         .sub(plane.u_dir.scale(reach))
         .sub(plane.v_dir.scale(reach));
     crate::make_plane(corner, plane.u_dir, plane.v_dir, reach * 2.0, reach * 2.0)
+        .or_refuse(KernelStage::Sew, "make_plane")
 }
 
 /// How far past each of the four domain boundaries `points` reach, in that
@@ -425,10 +458,10 @@ fn boundary_overruns(
     surface: &NurbsSurface,
     points: &[Vec3],
     tolerance: f64,
-) -> Result<[f64; 4], String> {
-    let [u0, u1] = surface.domain_u()?;
-    let [v0, v1] = surface.domain_v()?;
-    let (closed_u, closed_v) = surface.closed_directions()?;
+) -> Result<[f64; 4], KernelRefusal> {
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Classify, "domain")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Classify, "domain")?;
+    let (closed_u, closed_v) = surface.closed_directions().or_refuse(KernelStage::Classify, "domain")?;
     // A projection this close to a boundary is ON it: the Newton clamped, so
     // the true nearest point may be outside.
     let pinned_u = (u1 - u0) * 1e-9;
@@ -437,11 +470,14 @@ fn boundary_overruns(
     let floor_v = (v1 - v0) * FREEFORM_OVERRUN_NOISE_FLOOR;
     let mut overruns = [0.0f64; 4];
     for &point in points {
-        let projection = crate::project_point_to_surface(surface, point)?;
+        let projection =
+            crate::project_point_to_surface(surface, point).or_refuse(KernelStage::Classify, "project")?;
         if projection.distance <= tolerance {
             continue; // the point is ON the carrier; nothing overruns
         }
-        let derivatives = surface.derivatives(projection.u, projection.v, 1)?;
+        let derivatives = surface
+            .derivatives(projection.u, projection.v, 1)
+            .or_refuse(KernelStage::Classify, "derivatives")?;
         let residual = point.sub(projection.point);
         let mut record = |index: usize, tangent: Vec3, sign: f64, floor: f64| {
             let speed = tangent.length();
@@ -575,7 +611,7 @@ pub(super) fn arc_length_stations(
     edge: &EdgeRecord,
     count: usize,
     forward: bool,
-) -> Result<Vec<Vec3>, String> {
+) -> Result<Vec<Vec3>, KernelRefusal> {
     let count = count.max(2);
     let curve = &edge.curve;
     let (low, high) = (edge.t0.min(edge.t1), edge.t0.max(edge.t1));
@@ -586,7 +622,9 @@ pub(super) fn arc_length_stations(
     let mut cumulative = vec![0.0f64];
     for pair in breaks.windows(2) {
         let last = *cumulative.last().unwrap();
-        cumulative.push(last + crate::curve_arc_length(curve, pair[0], pair[1])?);
+        cumulative.push(
+            last + crate::curve_arc_length(curve, pair[0], pair[1]).or_refuse(KernelStage::Classify, "arc_length")?,
+        );
     }
     let total = *cumulative.last().unwrap();
     let mut stations = Vec::with_capacity(count);
@@ -611,13 +649,14 @@ pub(super) fn arc_length_stations(
                 bracket_low
             };
             for _ in 0..64 {
-                let excess = crate::curve_arc_length(curve, breaks[panel], t)? - along;
+                let excess =
+                    crate::curve_arc_length(curve, breaks[panel], t).or_refuse(KernelStage::Classify, "arc_length")? - along;
                 if excess > 0.0 {
                     bracket_high = t;
                 } else {
                     bracket_low = t;
                 }
-                let speed = curve.deriv1(t)?.1.length();
+                let speed = curve.deriv1(t).or_refuse(KernelStage::Classify, "derivatives")?.1.length();
                 let mut next = if speed > 0.0 { t - excess / speed } else { f64::NAN };
                 if !(next > bracket_low && next < bracket_high) {
                     next = 0.5 * (bracket_low + bracket_high);
@@ -629,7 +668,7 @@ pub(super) fn arc_length_stations(
             }
             t
         };
-        stations.push(curve.evaluate(t)?);
+        stations.push(curve.evaluate(t).or_refuse(KernelStage::Classify, "evaluate")?);
     }
     if !forward {
         stations.reverse();
@@ -690,14 +729,18 @@ pub(super) fn relocate_open_side_edge(
     on_curve_tolerance: f64,
     tolerance: f64,
     op: &str,
-) -> Result<bool, String> {
+) -> Result<bool, KernelRefusal> {
     if edge.degenerate {
-        return Err(format!(
-            "{op}: degenerate side edge {} cannot be relocated (deferred)",
-            edge.id
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Sew,
+            "degenerate_side_edge",
+            format!(
+                "{op}: degenerate side edge {} cannot be relocated (deferred)",
+                edge.id
+            ),
         ));
     }
-    let [d0, d1] = edge.curve.domain()?;
+    let [d0, d1] = edge.curve.domain().or_refuse(KernelStage::Sew, "domain")?;
     let span = (d1 - d0).max(1e-12);
     let snap = |t: f64| -> f64 {
         if (t - d0).abs() <= 1e-9 * span {
@@ -738,19 +781,23 @@ pub(super) fn relocate_open_side_edge(
     if edge.curve.straight_segment(tolerance).is_some() {
         let start_point = match &start_target {
             Some((_, point)) => *point,
-            None => edge.curve.evaluate(edge.t0)?,
+            None => edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Sew, "evaluate")?,
         };
         let end_point = match &end_target {
             Some((_, point)) => *point,
-            None => edge.curve.evaluate(edge.t1)?,
+            None => edge.curve.evaluate(edge.t1).or_refuse(KernelStage::Sew, "evaluate")?,
         };
         if start_point.sub(end_point).length() <= tolerance {
-            return Err(format!(
-                "{op}: healing would collapse side edge {} to zero length",
-                edge.id
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Sew,
+                "side_edge_collapse",
+                format!(
+                    "{op}: healing would collapse side edge {} to zero length",
+                    edge.id
+                ),
             ));
         }
-        edge.curve = make_line(start_point, end_point)?;
+        edge.curve = make_line(start_point, end_point).or_refuse(KernelStage::Sew, "make_line")?;
         edge.t0 = 0.0;
         edge.t1 = 1.0;
         if let Some((vertex, _)) = start_target {
@@ -782,7 +829,7 @@ pub(super) fn rederive_side_edge_on_carriers(
     on_curve_tolerance: f64,
     tolerance: f64,
     op: &str,
-) -> Result<EdgeRecord, String> {
+) -> Result<EdgeRecord, KernelRefusal> {
     let mut adjacent: Vec<&NurbsSurface> = Vec::new();
     for shell in &solid.shells {
         for face in &shell.faces {
@@ -796,34 +843,49 @@ pub(super) fn rederive_side_edge_on_carriers(
         }
     }
     if adjacent.len() != 2 {
-        return Err(format!(
-            "{op}: side edge {} is not shared by exactly two faces (found {})",
-            edge.id,
-            adjacent.len()
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Collect,
+            "non_manifold_side_edge",
+            format!(
+                "{op}: side edge {} is not shared by exactly two faces (found {})",
+                edge.id,
+                adjacent.len()
+            ),
         ));
     }
     let start_point = match &start_target {
         Some((_, point)) => *point,
-        None => edge.curve.evaluate(edge.t0)?,
+        None => edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Sew, "evaluate")?,
     };
     let end_point = match &end_target {
         Some((_, point)) => *point,
-        None => edge.curve.evaluate(edge.t1)?,
+        None => edge.curve.evaluate(edge.t1).or_refuse(KernelStage::Sew, "evaluate")?,
     };
     if start_point.sub(end_point).length() <= tolerance {
-        return Err(format!(
-            "{op}: healing would collapse side edge {} to zero length",
-            edge.id
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Sew,
+            "rederived_edge_collapse",
+            format!(
+                "{op}: healing would collapse side edge {} to zero length",
+                edge.id
+            ),
         ));
     }
-    let middle_point = edge.curve.evaluate(0.5 * (edge.t0 + edge.t1))?;
+    let middle_point = edge
+        .curve
+        .evaluate(0.5 * (edge.t0 + edge.t1))
+        .or_refuse(KernelStage::Sew, "evaluate")?;
     let branches =
         intersect_analytic_pair(adjacent[0], adjacent[1], tolerance).ok_or_else(|| {
-            format!(
-                "{op}: side edge {} cannot be extended onto the recovered corner (its curve \
+            KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "no_closed_form_pair",
+                format!(
+                    "{op}: side edge {} cannot be extended onto the recovered corner (its curve \
              stops short and its flanking carriers are not a closed-form analytic pair — \
              deferred)",
-                edge.id
+                    edge.id
+                ),
             )
         })?;
     for branch in branches {
@@ -842,7 +904,7 @@ pub(super) fn rederive_side_edge_on_carriers(
         {
             continue;
         }
-        let [d0, d1] = branch.domain()?;
+        let [d0, d1] = branch.domain().or_refuse(KernelStage::Sew, "domain")?;
         let branch_span = (d1 - d0).max(1e-12);
         let (t_start, t_end) = (projected_start.u, projected_end.u);
         if (t_end - t_start).abs() <= 1e-9 * branch_span {
@@ -862,7 +924,7 @@ pub(super) fn rederive_side_edge_on_carriers(
         let (curve, new_t0, new_t1) = if t_start < t_end {
             (branch, t_start, t_end)
         } else {
-            let reversed = branch.reversed()?;
+            let reversed = branch.reversed().or_refuse(KernelStage::Sew, "reverse")?;
             (reversed, d0 + d1 - t_start, d0 + d1 - t_end)
         };
         let mut record = edge.clone();
@@ -877,10 +939,14 @@ pub(super) fn rederive_side_edge_on_carriers(
         }
         return Ok(record);
     }
-    Err(format!(
-        "{op}: side edge {} cannot be extended onto the recovered corner (no closed-form \
-         intersection branch of its flanking carriers reaches both endpoints — deferred)",
-        edge.id
+    Err(KernelRefusal::unsupported(
+        KernelStage::Classify,
+        "no_branch_reaches",
+        format!(
+            "{op}: side edge {} cannot be extended onto the recovered corner (no closed-form \
+             intersection branch of its flanking carriers reaches both endpoints — deferred)",
+            edge.id
+        ),
     ))
 }
 
@@ -898,18 +964,22 @@ pub(super) fn refit_touched_pcurves(
     only_subrange: bool,
     tolerance: f64,
     op: &str,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let surface = face.surface.clone();
     for loop_record in &mut face.loops {
         for coedge in &mut loop_record.coedges {
             if !touched.contains(&coedge.edge_id) {
                 continue;
             }
-            let edge = edges
-                .get(&coedge.edge_id)
-                .ok_or_else(|| format!("{op}: missing edge {}", coedge.edge_id))?;
+            let edge = edges.get(&coedge.edge_id).ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Collect,
+                    "edge",
+                    format!("{op}: missing edge {}", coedge.edge_id),
+                )
+            })?;
             if only_subrange {
-                let [d0, d1] = edge.curve.domain()?;
+                let [d0, d1] = edge.curve.domain().or_refuse(KernelStage::Sew, "domain")?;
                 let span = (d1 - d0).max(1e-12);
                 if (edge.t0 - d0).abs() <= 1e-9 * span && (edge.t1 - d1).abs() <= 1e-9 * span {
                     continue;
@@ -922,7 +992,8 @@ pub(super) fn refit_touched_pcurves(
                 edge.t1,
                 coedge.forward,
                 tolerance,
-            )?;
+            )
+            .or_refuse(KernelStage::Sew, "pcurve_fit")?;
         }
     }
     Ok(())

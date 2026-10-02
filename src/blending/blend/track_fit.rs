@@ -36,7 +36,7 @@
 //! measured miss. The caller decides what a miss over the floor means, and says
 //! so where it decides (see [`TrackFit::on_floor`]).
 
-use crate::{NurbsCurve, NurbsSurface, Vec3, Vec4};
+use crate::{KernelRefusal, KernelStage, NurbsCurve, NurbsSurface, OrRefuse, Vec3, Vec4};
 
 use super::stations::FIT_DEGREE;
 
@@ -92,11 +92,11 @@ pub(in crate::blend) fn project_track(
     at: &dyn Fn(f64) -> Result<Vec3, String>,
     dense: usize,
     curve_breaks: &[f64],
-) -> Result<Track, String> {
+) -> Result<Track, KernelRefusal> {
     let dense = dense.max(2 * MIN_PIECE_INTERVALS);
-    let (closed_u, closed_v) = surface.closed_directions()?;
-    let [u0, u1] = surface.domain_u()?;
-    let [v0, v1] = surface.domain_v()?;
+    let (closed_u, closed_v) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain")?;
     let periods = [
         closed_u.then_some(u1 - u0),
         closed_v.then_some(v1 - v0),
@@ -109,7 +109,7 @@ pub(in crate::blend) fn project_track(
     };
     for index in 0..=dense {
         let fraction = index as f64 / dense as f64;
-        let point = at(fraction)?;
+        let point = at(fraction).or_refuse(KernelStage::Refine, "at")?;
         let raw = foot(surface, point, track.feet.last().copied())?;
         let mut uv = raw;
         if let Some(previous) = track.uv.last() {
@@ -131,13 +131,13 @@ pub(in crate::blend) fn project_track(
 /// a 1e-7 floor (measured 2026-09-17 on the revolution × NURBS rim: the ladder
 /// stalled at 1.6e-7–3.1e-7 however dense). An analytic carrier's projection is
 /// closed-form and exact, so it is returned as it is.
-fn polish(surface: &NurbsSurface, point: Vec3, uv: [f64; 2]) -> Result<[f64; 2], String> {
+fn polish(surface: &NurbsSurface, point: Vec3, uv: [f64; 2]) -> Result<[f64; 2], KernelRefusal> {
     if surface.analytic().is_some() {
         return Ok(uv);
     }
-    let [u0, u1] = surface.domain_u()?;
-    let [v0, v1] = surface.domain_v()?;
-    let (closed_u, closed_v) = surface.closed_directions()?;
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain")?;
+    let (closed_u, closed_v) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
     let inside = |value: f64, low: f64, high: f64, closed: bool| -> Option<f64> {
         if value >= low && value <= high {
             Some(value)
@@ -149,7 +149,7 @@ fn polish(surface: &NurbsSurface, point: Vec3, uv: [f64; 2]) -> Result<[f64; 2],
     };
     let mut current = uv;
     for _ in 0..8 {
-        let d = surface.derivatives_small(current[0], current[1], 2)?;
+        let d = surface.derivatives_small(current[0], current[1], 2).or_refuse(KernelStage::Refine, "derivatives")?;
         let residual = d[0][0].sub(point);
         let (su, sv) = (d[1][0], d[0][1]);
         let (f, g) = (su.dot(residual), sv.dot(residual));
@@ -182,10 +182,11 @@ fn polish(surface: &NurbsSurface, point: Vec3, uv: [f64; 2]) -> Result<[f64; 2],
 
 /// The foot of `point` seeded from `seed` (or the nearest point without one),
 /// polished ([`polish`]).
-fn foot(surface: &NurbsSurface, point: Vec3, seed: Option<[f64; 2]>) -> Result<[f64; 2], String> {
+fn foot(surface: &NurbsSurface, point: Vec3, seed: Option<[f64; 2]>) -> Result<[f64; 2], KernelRefusal> {
     let projected = match seed {
-        None => crate::project_point_to_surface(surface, point)?,
-        Some(seed) => crate::projection::project_point_to_surface_from_seed(surface, point, seed)?,
+        None => crate::project_point_to_surface(surface, point).or_refuse(KernelStage::Refine, "project")?,
+        Some(seed) => crate::projection::project_point_to_surface_from_seed(surface, point, seed)
+            .or_refuse(KernelStage::Refine, "project")?,
     };
     polish(surface, point, [projected.u, projected.v])
 }
@@ -198,11 +199,11 @@ pub(in crate::blend) fn polish_track(
     surface: &NurbsSurface,
     at: &dyn Fn(f64) -> Result<Vec3, String>,
     track: &mut Track,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let last = track.fractions.len() - 1;
     for index in 1..last {
         let raw = track.feet[index];
-        let polished = polish(surface, at(track.fractions[index])?, raw)?;
+        let polished = polish(surface, at(track.fractions[index]).or_refuse(KernelStage::Refine, "at")?, raw)?;
         let (du, dv) = (polished[0] - raw[0], polished[1] - raw[1]);
         // A wrap inside the polish moved the foot a period; the track does not.
         if du.abs() > 0.25 || dv.abs() > 0.25 {
@@ -233,8 +234,8 @@ fn unwrap_near(uv: &mut [f64; 2], near: &[f64; 2], periods: [Option<f64>; 2]) {
 /// The parameter lines of `surface`, per direction, across which it is not C2:
 /// interior knots of multiplicity at least the degree, and — in a closed
 /// direction — the seam, where the parameterisation wraps.
-fn knot_lines(surface: &NurbsSurface) -> Result<[Vec<f64>; 2], String> {
-    let (closed_u, closed_v) = surface.closed_directions()?;
+fn knot_lines(surface: &NurbsSurface) -> Result<[Vec<f64>; 2], KernelRefusal> {
+    let (closed_u, closed_v) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
     let lines = |knots: &[f64], degree: usize, closed: bool| -> Vec<f64> {
         let (low, high) = (knots[0], knots[knots.len() - 1]);
         let mut lines = Vec::new();
@@ -297,11 +298,11 @@ pub(in crate::blend) fn insert_knot_crossings(
     at: &dyn Fn(f64) -> Result<Vec3, String>,
     track: &mut Track,
     curve_breaks: &[f64],
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let lines = knot_lines(surface)?;
-    let (closed_u, closed_v) = surface.closed_directions()?;
-    let [u0, u1] = surface.domain_u()?;
-    let [v0, v1] = surface.domain_v()?;
+    let (closed_u, closed_v) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain")?;
     let periods = [
         closed_u.then_some(u1 - u0),
         closed_v.then_some(v1 - v0),
@@ -353,7 +354,7 @@ pub(in crate::blend) fn insert_knot_crossings(
                         break;
                     }
                     let middle = 0.5 * (low + high);
-                    let raw = foot(surface, at(middle)?, Some(track.feet[index]))?;
+                    let raw = foot(surface, at(middle).or_refuse(KernelStage::Refine, "at")?, Some(track.feet[index]))?;
                     let mut uv = raw;
                     unwrap_near(&mut uv, &track.uv[index], periods);
                     found = (middle, uv, raw);
@@ -377,8 +378,8 @@ pub(in crate::blend) fn insert_knot_crossings(
             .fractions
             .windows(2)
             .position(|pair| pair[0] <= fraction && fraction <= pair[1])
-            .ok_or("blend: a curve break outside its track")?;
-        let raw = foot(surface, at(fraction)?, Some(track.feet[index]))?;
+            .ok_or_else(|| KernelRefusal::internal(KernelStage::Refine, "curve_break", "blend: a curve break outside its track"))?;
+        let raw = foot(surface, at(fraction).or_refuse(KernelStage::Refine, "at")?, Some(track.feet[index]))?;
         let mut uv = raw;
         unwrap_near(&mut uv, &track.uv[index], periods);
         inserts.push((index, fraction, uv, raw));
@@ -437,8 +438,10 @@ pub(in crate::blend) fn insert_knot_crossings(
                 .fractions
                 .windows(2)
                 .position(|pair| pair[0] < fraction && fraction < pair[1])
-                .ok_or("blend: a densified sample outside its track")?;
-            let raw = foot(surface, at(fraction)?, Some(track.feet[index]))?;
+                .ok_or_else(|| {
+                    KernelRefusal::internal(KernelStage::Refine, "densified_sample", "blend: a densified sample outside its track")
+                })?;
+            let raw = foot(surface, at(fraction).or_refuse(KernelStage::Refine, "at")?, Some(track.feet[index]))?;
             let mut uv = raw;
             unwrap_near(&mut uv, &track.uv[index], periods);
             track.fractions.insert(index + 1, fraction);
@@ -470,13 +473,13 @@ pub(in crate::blend) fn fit_track(
     track: &Track,
     at: &dyn Fn(f64) -> Result<Vec3, String>,
     tolerance: f64,
-) -> Result<TrackFit, String> {
+) -> Result<TrackFit, KernelRefusal> {
     let last = track.fractions.len() - 1;
     let mut checks: Vec<(f64, Vec3)> = Vec::with_capacity(last);
     for index in 0..last {
         let fraction = 0.5 * (track.fractions[index] + track.fractions[index + 1]);
-        let [u, v] = foot(surface, at(fraction)?, Some(track.feet[index]))?;
-        checks.push((fraction, surface.evaluate(u, v)?));
+        let [u, v] = foot(surface, at(fraction).or_refuse(KernelStage::Refine, "at")?, Some(track.feet[index]))?;
+        checks.push((fraction, surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?));
     }
     let tangents: Vec<[[f64; 2]; 2]> = track
         .breaks
@@ -496,7 +499,8 @@ pub(in crate::blend) fn fit_track(
                 .collect();
             let parameters: Vec<f64> = indices.iter().map(|&i| track.fractions[i]).collect();
             (
-                crate::fit::interpolate_homogeneous(&points, FIT_DEGREE, &parameters)?,
+                crate::fit::interpolate_homogeneous(&points, FIT_DEGREE, &parameters)
+                    .or_refuse(KernelStage::Refine, "interpolate")?,
                 indices.len(),
             )
         } else {
@@ -504,8 +508,8 @@ pub(in crate::blend) fn fit_track(
         };
         let mut miss: f64 = 0.0;
         for (fraction, on_carrier) in &checks {
-            let uv = curve.evaluate(*fraction)?;
-            miss = miss.max(surface.evaluate(uv.x, uv.y)?.sub(*on_carrier).length());
+            let uv = curve.evaluate(*fraction).or_refuse(KernelStage::Refine, "evaluate")?;
+            miss = miss.max(surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Refine, "evaluate")?.sub(*on_carrier).length());
         }
         if best.as_ref().map_or(true, |known| miss < known.miss) {
             best = Some(TrackFit {
@@ -520,7 +524,7 @@ pub(in crate::blend) fn fit_track(
         }
         sections *= 2;
     }
-    best.ok_or_else(|| "blend: the track fit produced no rung".into())
+    best.ok_or_else(|| KernelRefusal::internal(KernelStage::Refine, "no_rung", "blend: the track fit produced no rung"))
 }
 
 /// Project and fit a curve's track, doubling the dense grid from `dense` up to
@@ -535,7 +539,7 @@ pub(in crate::blend) fn fit_curve_track(
     tolerance: f64,
     dense: usize,
     dense_limit: usize,
-) -> Result<TrackFit, String> {
+) -> Result<TrackFit, KernelRefusal> {
     let mut dense = dense;
     loop {
         let track = project_track(surface, at, dense, curve_breaks)?;
@@ -556,28 +560,32 @@ fn track_tangent(
     track: &Track,
     at: &dyn Fn(f64) -> Result<Vec3, String>,
     index: usize,
-) -> Result<[[f64; 2]; 2], String> {
+) -> Result<[[f64; 2]; 2], KernelRefusal> {
     let fraction = track.fractions[index];
     // Second-order ONE-SIDED differences: a curve break may be a genuine corner,
     // where a central difference would average two tangents neither side has.
     let step = 1e-5;
-    let here = at(fraction)?;
+    let here = at(fraction).or_refuse(KernelStage::Refine, "at")?;
     let left = here
         .scale(3.0)
-        .sub(at(fraction - step)?.scale(4.0))
-        .add(at(fraction - 2.0 * step)?)
+        .sub(at(fraction - step).or_refuse(KernelStage::Refine, "at")?.scale(4.0))
+        .add(at(fraction - 2.0 * step).or_refuse(KernelStage::Refine, "at")?)
         .scale(1.0 / (2.0 * step));
-    let right = at(fraction + step)?
+    let right = at(fraction + step).or_refuse(KernelStage::Refine, "at")?
         .scale(4.0)
         .sub(here.scale(3.0))
-        .sub(at(fraction + 2.0 * step)?)
+        .sub(at(fraction + 2.0 * step).or_refuse(KernelStage::Refine, "at")?)
         .scale(1.0 / (2.0 * step));
     let [u, v] = track.feet[index];
-    let (_, su, sv) = surface.deriv1(u, v)?;
+    let (_, su, sv) = surface.deriv1(u, v).or_refuse(KernelStage::Refine, "deriv1")?;
     let (a, b, c) = (su.dot(su), su.dot(sv), sv.dot(sv));
     let determinant = a * c - b * b;
     if !(determinant.abs() > 1e-300) {
-        return Err("blend: the track tangent is undefined at a knot-line crossing (a pole)".into());
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Refine,
+            "pole_tangent",
+            "blend: the track tangent is undefined at a knot-line crossing (a pole)",
+        ));
     }
     let resolve = |derivative: Vec3| {
         let (x, y) = (su.dot(derivative), sv.dot(derivative));
@@ -602,7 +610,7 @@ fn fit_in_c1_pieces(
     track: &Track,
     tangents: &[[[f64; 2]; 2]],
     sections: usize,
-) -> Result<(NurbsCurve, usize), String> {
+) -> Result<(NurbsCurve, usize), KernelRefusal> {
     let last = track.fractions.len() - 1;
     let mut bounds = vec![0usize];
     bounds.extend(track.breaks.iter().copied());
@@ -634,7 +642,7 @@ fn fit_in_c1_pieces(
         knots.extend(std::iter::repeat(parameters[parameters.len() - 1]).take(multiplicity));
         control.extend(fitted.control_points.iter().skip(usize::from(piece > 0)).copied());
     }
-    Ok((NurbsCurve::new(FIT_DEGREE, knots, control)?, samples))
+    Ok((NurbsCurve::new(FIT_DEGREE, knots, control).or_refuse(KernelStage::Refine, "curve_new")?, samples))
 }
 
 /// Cubic interpolation of 2D `points` at `parameters`, clamped over the
@@ -648,11 +656,15 @@ fn interpolate_with_tangents(
     parameters: &[f64],
     start: Option<[f64; 2]>,
     end: Option<[f64; 2]>,
-) -> Result<NurbsCurve, String> {
+) -> Result<NurbsCurve, KernelRefusal> {
     let degree = FIT_DEGREE;
     let n = points.len() - 1;
     if n < degree || parameters.len() != points.len() {
-        return Err("blend: a track piece is too short for the fit degree".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Refine,
+            "piece_short",
+            "blend: a track piece is too short for the fit degree",
+        ));
     }
     let (t0, t1) = (parameters[0], parameters[n]);
     let mut averaged: Vec<f64> = Vec::with_capacity(n + 3);
@@ -669,7 +681,7 @@ fn interpolate_with_tangents(
         knots.push(averaged[j..j + degree].iter().sum::<f64>() / degree as f64);
     }
     knots.extend(std::iter::repeat(t1).take(degree + 1));
-    let knot_vector = crate::KnotVector::new(knots.clone(), degree)?;
+    let knot_vector = crate::KnotVector::new(knots.clone(), degree).or_refuse(KernelStage::Refine, "knot_vector")?;
     let mut matrix = vec![vec![0.0; controls]; controls];
     let mut rhs: Vec<[f64; 2]> = vec![[0.0; 2]; controls];
     let mut row = 0usize;
@@ -709,7 +721,10 @@ fn interpolate_with_tangents(
     let solve = |axis: usize| {
         crate::fit::solve_collocation(&matrix, &rhs.iter().map(|value| value[axis]).collect::<Vec<_>>(), degree)
     };
-    let (us, vs) = (solve(0)?, solve(1)?);
+    let (us, vs) = (
+        solve(0).or_refuse(KernelStage::Refine, "collocation")?,
+        solve(1).or_refuse(KernelStage::Refine, "collocation")?,
+    );
     NurbsCurve::new(
         degree,
         knots,
@@ -717,6 +732,7 @@ fn interpolate_with_tangents(
             .map(|index| Vec4::from_point(Vec3::new(us[index], vs[index], 0.0), 1.0))
             .collect(),
     )
+    .or_refuse(KernelStage::Refine, "curve_new")
 }
 
 /// Whether `fraction` is already a sample of `fractions` (two breaks — a curve

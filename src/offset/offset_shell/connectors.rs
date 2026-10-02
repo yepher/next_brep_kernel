@@ -1,3 +1,4 @@
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 
 #[derive(Clone)]
@@ -30,7 +31,7 @@ pub(super) fn complete_sharp_offset_connectors(
     face_images: &[OffsetShellFaceImageRecord],
     distance: f64,
     tolerance: f64,
-) -> Result<Vec<OffsetShellFaceImageRecord>, String> {
+) -> Result<Vec<OffsetShellFaceImageRecord>, KernelRefusal> {
     let mut use_counts = HashMap::<u64, usize>::default();
     for coedge in solid
         .shells
@@ -62,7 +63,7 @@ pub(super) fn complete_sharp_offset_connectors(
         for face in &shell.faces {
             let image = face_images
                 .get(face.id.saturating_sub(1) as usize)
-                .ok_or_else(|| "offset_shell: connector face lost provenance".to_string())?;
+                .ok_or_else(|| "offset_shell: connector face lost provenance".to_string()).or_refuse(KernelStage::Sew, "offset_shell_connector_face_lost_provenance")?;
             if !matches!(image.role, OffsetFaceRole::Offset) {
                 continue;
             }
@@ -116,8 +117,8 @@ pub(super) fn complete_sharp_offset_connectors(
             let second_length = second_direction.length();
             if (first_length - second_length).abs() > tolerance * 100.0
                 || first_direction
-                    .normalized()?
-                    .dot(second_direction.normalized()?)
+                    .normalized().or_refuse(KernelStage::Sew, "normalized")?
+                    .dot(second_direction.normalized().or_refuse(KernelStage::Sew, "normalized")?)
                     > -0.999
             {
                 continue;
@@ -137,7 +138,7 @@ pub(super) fn complete_sharp_offset_connectors(
             if u.dot(v).abs() > tolerance * 100.0 * u.length() * v.length() {
                 continue;
             }
-            let normal = u.cross(v).normalized()?;
+            let normal = u.cross(v).normalized().or_refuse(KernelStage::Sew, "normalized")?;
             if second.end.sub(first.end).dot(normal).abs() > tolerance * 100.0 {
                 continue;
             }
@@ -194,14 +195,14 @@ pub(super) fn complete_sharp_offset_connectors(
         let v_vector = second.start.sub(first.end);
         let surface = crate::make_plane(
             first.end,
-            u_vector.normalized()?,
-            v_vector.normalized()?,
+            u_vector.normalized().or_refuse(KernelStage::Sew, "normalized")?,
+            v_vector.normalized().or_refuse(KernelStage::Sew, "normalized")?,
             u_vector.length(),
             v_vector.length(),
-        )?;
+        ).or_refuse(KernelStage::Sew, "make_plane")?;
         let first_bridge = EdgeRecord {
             id: next_edge_id,
-            curve: crate::make_line(first.start, second.end)?,
+            curve: crate::make_line(first.start, second.end).or_refuse(KernelStage::Sew, "make_line")?,
             t0: 0.0,
             t1: 1.0,
             start_vertex_id: if first.coedge.forward {
@@ -220,7 +221,7 @@ pub(super) fn complete_sharp_offset_connectors(
         next_edge_id += 1;
         let second_bridge = EdgeRecord {
             id: next_edge_id,
-            curve: crate::make_line(second.start, first.end)?,
+            curve: crate::make_line(second.start, first.end).or_refuse(KernelStage::Sew, "make_line")?,
             t0: 0.0,
             t1: 1.0,
             start_vertex_id: if second.coedge.forward {
@@ -246,7 +247,7 @@ pub(super) fn complete_sharp_offset_connectors(
         let mut coedges = Vec::new();
         for (edge, forward) in uses {
             let pcurve = boundary_pcurve(edge, forward, &surface, tolerance)?
-                .ok_or_else(|| "offset_shell: connector edge left its plane".to_string())?;
+                .ok_or_else(|| "offset_shell: connector edge left its plane".to_string()).or_refuse(KernelStage::Sew, "offset_shell_connector_edge_left_its_plane")?;
             coedges.push(CoedgeRecord {
                 id: next_coedge_id,
                 edge_id: edge.id,
@@ -265,7 +266,7 @@ pub(super) fn complete_sharp_offset_connectors(
             }],
             name: None,
         };
-        face.same_sense = parameter_space_area(&face)? > 0.0;
+        face.same_sense = parameter_space_area(&face).or_refuse(KernelStage::Sew, "parameter_space_area")? > 0.0;
         next_face_id += 1;
         next_loop_id += 1;
         solid.edges.push(first_bridge);
@@ -310,13 +311,13 @@ pub(super) fn edge_on_surface(
     edge: &EdgeRecord,
     surface: &crate::NurbsSurface,
     tolerance: f64,
-) -> Result<bool, String> {
+) -> Result<bool, KernelRefusal> {
     for sample in 0..=16 {
         let fraction = sample as f64 / 16.0;
         let point = edge
             .curve
-            .evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction)?;
-        if project_point_to_surface(surface, point)?.distance > tolerance {
+            .evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction).or_refuse(KernelStage::Sew, "evaluate")?;
+        if project_point_to_surface(surface, point).or_refuse(KernelStage::Sew, "project_point_to_surface")?.distance > tolerance {
             return Ok(false);
         }
     }
@@ -332,8 +333,8 @@ fn affine_plane_pcurve(
     edge: &EdgeRecord,
     forward: bool,
     surface: &crate::NurbsSurface,
-) -> Result<Option<crate::NurbsCurve>, String> {
-    if !surface.is_affine()? {
+) -> Result<Option<crate::NurbsCurve>, KernelRefusal> {
+    if !surface.is_affine().or_refuse(KernelStage::Sew, "is_affine")? {
         return Ok(None);
     }
     let [curve_t0, curve_t1] = [
@@ -343,11 +344,11 @@ fn affine_plane_pcurve(
     if (edge.t0 - curve_t0).abs() > 1e-12 || (edge.t1 - curve_t1).abs() > 1e-12 {
         return Ok(None);
     }
-    let [u0, u1] = surface.domain_u()?;
-    let [v0, v1] = surface.domain_v()?;
-    let origin = surface.evaluate(u0, v0)?;
-    let u_step = surface.evaluate(u1, v0)?.sub(origin).scale(1.0 / (u1 - u0));
-    let v_step = surface.evaluate(u0, v1)?.sub(origin).scale(1.0 / (v1 - v0));
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Sew, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Sew, "domain_v")?;
+    let origin = surface.evaluate(u0, v0).or_refuse(KernelStage::Sew, "evaluate")?;
+    let u_step = surface.evaluate(u1, v0).or_refuse(KernelStage::Sew, "evaluate")?.sub(origin).scale(1.0 / (u1 - u0));
+    let v_step = surface.evaluate(u0, v1).or_refuse(KernelStage::Sew, "evaluate")?.sub(origin).scale(1.0 / (v1 - v0));
     // Solve the 2x2 Gram system for in-plane coordinates.
     let uu = u_step.dot(u_step);
     let uv = u_step.dot(v_step);
@@ -361,7 +362,7 @@ fn affine_plane_pcurve(
         .control_points
         .iter()
         .map(|control| {
-            let point = control.point()?;
+            let point = control.point().or_refuse(KernelStage::Sew, "point")?;
             let relative = point.sub(origin);
             let pu = relative.dot(u_step);
             let pv = relative.dot(v_step);
@@ -369,9 +370,9 @@ fn affine_plane_pcurve(
             let v = v0 + (pv * uu - pu * uv) / determinant;
             Ok(crate::Vec4::from_point(Vec3::new(u, v, 0.0), control.w))
         })
-        .collect::<Result<Vec<_>, String>>()?;
-    let pcurve = crate::NurbsCurve::new(edge.curve.degree, edge.curve.knots.clone(), controls)?;
-    Ok(Some(if forward { pcurve } else { pcurve.reversed()? }))
+        .collect::<Result<Vec<_>, KernelRefusal>>()?;
+    let pcurve = crate::NurbsCurve::new(edge.curve.degree, edge.curve.knots.clone(), controls).or_refuse(KernelStage::Sew, "new")?;
+    Ok(Some(if forward { pcurve } else { pcurve.reversed().or_refuse(KernelStage::Sew, "reversed")? }))
 }
 
 pub(super) fn boundary_pcurve(
@@ -379,7 +380,7 @@ pub(super) fn boundary_pcurve(
     forward: bool,
     surface: &crate::NurbsSurface,
     tolerance: f64,
-) -> Result<Option<crate::NurbsCurve>, String> {
+) -> Result<Option<crate::NurbsCurve>, KernelRefusal> {
     if !edge_on_surface(edge, surface, tolerance)? {
         return Ok(None);
     }
@@ -393,7 +394,7 @@ pub(super) fn boundary_pcurve(
         edge.t1,
         forward,
         tolerance,
-    )?))
+    ).or_refuse(KernelStage::Sew, "build_pcurve_on_surface_range")?))
 }
 
 fn cycle_center(cycle: &[OpenBoundaryUse]) -> Vec3 {
@@ -407,7 +408,7 @@ fn cycle_center(cycle: &[OpenBoundaryUse]) -> Vec3 {
 /// such as frustum isolines paired with fitted apex-cap arcs. Doing this before
 /// face completion prevents duplicate cap faces. If disconnected shells traverse
 /// the arc in the same direction, flip the smaller shell; merge bridged shells.
-pub(super) fn weld_duplicate_one_use_arcs(solid: &mut BrepSolid, tolerance: f64) -> Result<usize, String> {
+pub(super) fn weld_duplicate_one_use_arcs(solid: &mut BrepSolid, tolerance: f64) -> Result<usize, KernelRefusal> {
     let mut welded = 0usize;
     loop {
         let mut use_addresses = HashMap::<u64, Vec<(usize, bool)>>::default();
@@ -506,7 +507,7 @@ pub(super) fn weld_duplicate_one_use_arcs(solid: &mut BrepSolid, tolerance: f64)
                     loop_record.coedges.reverse();
                     for coedge in &mut loop_record.coedges {
                         coedge.forward = !coedge.forward;
-                        coedge.pcurve = coedge.pcurve.reversed()?;
+                        coedge.pcurve = coedge.pcurve.reversed().or_refuse(KernelStage::Sew, "reversed")?;
                     }
                 }
             }
@@ -534,7 +535,7 @@ pub(super) fn weld_duplicate_one_use_arcs(solid: &mut BrepSolid, tolerance: f64)
                     first_edge.t1,
                     coedge.forward,
                     tolerance,
-                )?;
+                ).or_refuse(KernelStage::Sew, "build_pcurve_on_surface_range")?;
             }
         }
         solid.edges.retain(|edge| edge.id != second_id);
@@ -569,7 +570,7 @@ pub(super) fn complete_opening_boundary_cycles(
     opening_carriers: &[&Carrier],
     face_images: &[OffsetShellFaceImageRecord],
     tolerance: f64,
-) -> Result<Vec<OffsetShellFaceImageRecord>, String> {
+) -> Result<Vec<OffsetShellFaceImageRecord>, KernelRefusal> {
     let mut use_counts = HashMap::<u64, usize>::default();
     for coedge in solid
         .shells
@@ -594,7 +595,7 @@ pub(super) fn complete_opening_boundary_cycles(
     for face in solid.shells.iter().flat_map(|shell| &shell.faces) {
         let role = face_images
             .get(face.id.saturating_sub(1) as usize)
-            .ok_or_else(|| "offset_shell: boundary face lost provenance".to_string())?
+            .ok_or_else(|| "offset_shell: boundary face lost provenance".to_string()).or_refuse(KernelStage::Sew, "offset_shell_boundary_face_lost_provenance")?
             .role;
         for coedge in face
             .loops
@@ -856,14 +857,45 @@ pub(super) fn complete_opening_boundary_cycles(
             if loops.is_empty() {
                 continue;
             }
+            // `loops[0]` is the OUTER boundary (the kernel-wide invariant:
+            // `face_split.rs`, "the winding the SOURCE face's own outer loop
+            // uses"). A group arrives in PAIRING order — the source cycle
+            // first, then the offset cycle it was matched with — and on an
+            // outward shell's opening wall the source cycle is the cavity
+            // outline, the HOLE, while the grown offset outline is the outer:
+            // emitted as traced, the ring read `[hole, outer]`, and a face
+            // profile taken from it called the outer loop a hole touching
+            // the revolve axis. The outer is the largest |uv area|, the same
+            // rule `offset_outline_wall` reads the opening's outline by.
+            // (`same_sense` is not settled yet, so the SIGN cannot be used.)
+            let surface = carrier.solid.shells[0].faces[0].surface.clone();
+            let mut loop_areas = Vec::with_capacity(loops.len());
+            for loop_record in &loops {
+                let area = parameter_space_area(&FaceRecord {
+                    id: 0,
+                    surface: surface.clone(),
+                    same_sense: true,
+                    loops: vec![loop_record.clone()],
+                    name: None,
+                }).or_refuse(KernelStage::Sew, "parameter_space_area")?
+                .abs();
+                loop_areas.push(area);
+            }
+            if let Some(outer) = (0..loops.len()).max_by(|first, second| {
+                loop_areas[*first].total_cmp(&loop_areas[*second])
+            }) {
+                if outer != 0 {
+                    loops.swap(0, outer);
+                }
+            }
             let mut face = FaceRecord {
                 id: next_face_id,
-                surface: carrier.solid.shells[0].faces[0].surface.clone(),
+                surface,
                 same_sense: true,
                 loops,
                 name: None,
             };
-            let area = parameter_space_area(&face)?;
+            let area = parameter_space_area(&face).or_refuse(KernelStage::Sew, "parameter_space_area")?;
             if area.abs() <= 1e-12 {
                 continue;
             }

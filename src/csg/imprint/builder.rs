@@ -35,6 +35,7 @@ pub(super) fn push_edge_split(
 }
 
 pub(super) struct ImprintBuilder<'a> {
+    pub(super) open_carriers: bool,
     pub(super) edges: HashMap<(u8, u64), &'a EdgeRecord>,
     pub(super) tolerance: f64,
     /// Combined bbox extent of the two operands ([`solid_scale`]); the merge
@@ -315,6 +316,8 @@ impl<'a> ImprintBuilder<'a> {
         // overlap detection (marched curves wiggle a few 1e-6 around the
         // exact curve and every wiggle would otherwise count as a crossing).
         let overlap_limit = self.tolerance.max(1e-5);
+        let distinct_pierces_on_section =
+            std::env::var("BREP_PIERCE_DISTINCT_ON_SECTION").as_deref() != Ok("0");
         // Crossings this close to the curve's own endpoints are the
         // endpoint junction itself seen through the finders' spatial
         // tolerance: splitting there leaves a sliver piece whose surviving
@@ -551,15 +554,37 @@ impl<'a> ImprintBuilder<'a> {
                                 distance: rescued_distance,
                             };
                         }
+                        // Two pierces near each other are AMBIGUOUS when the
+                        // section cannot tell them apart — one of them lies off
+                        // it and projects to the other's place. Two pierces that
+                        // BOTH lie on the section, at places along it as far
+                        // apart as the pierces themselves, are two junctions: a
+                        // graze crossing an edge twice 0.107 apart, each pierce
+                        // on the section to 2e-9 (`22_sag_boundary_identity_t164`,
+                        // 2026-09-26), lost both to this rule and left the
+                        // sphere face bounded by a rim arc 4.6e-4 off it.
+                        // Read coincidence at the assembler's identity floor,
+                        // not the section fit's requested residual: a fitted
+                        // section can miss a real crossing by a few microns
+                        // while the crossings remain well-separated vertices.
+                        // Escape hatch BREP_PIERCE_DISTINCT_ON_SECTION=0.
+                        let on_section = assembler_weld(self.tolerance);
                         let mut ambiguous = false;
                         for other_pierce in &pierces {
-                            if std::ptr::eq(pierce, other_pierce)
-                                || other_pierce.point.sub(pierce.point).length() > 4e-3 * scale
-                            {
+                            let apart = other_pierce.point.sub(pierce.point).length();
+                            if std::ptr::eq(pierce, other_pierce) || apart > 4e-3 * scale {
                                 continue;
                             }
                             let other_projection =
                                 project_point_to_curve(&curve, other_pierce.point).or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
+                            if distinct_pierces_on_section
+                                && projection.distance <= on_section
+                                && other_projection.distance <= on_section
+                                && apart > overlap_limit
+                                && projection.point.sub(other_projection.point).length() >= 0.5 * apart
+                            {
+                                continue;
+                            }
                             if projection.distance >= 0.5 * other_projection.distance {
                                 ambiguous = true;
                                 break;
@@ -872,18 +897,34 @@ impl<'a> ImprintBuilder<'a> {
             let midpoint = piece.evaluate((t0 + t1) / 2.0).or_refuse(KernelStage::Intersect, "evaluate")?;
             let mut statuses = HashMap::default();
             for face in test_faces {
-                let projection = project_point_to_surface(&face.face.surface, midpoint).or_refuse(KernelStage::Intersect, "project_point_to_surface")?;
-                statuses.insert(
-                    face.key(),
-                    parameter_point_in_face(
-                        face.face,
-                        Vec2 {
-                            x: projection.u,
-                            y: projection.v,
-                        },
-                        1e-7,
-                    ).or_refuse(KernelStage::Intersect, "csg.imprint.builder")?,
-                );
+                let classify = |point| -> Result<PolygonClass, KernelRefusal> {
+                    let projection = project_point_to_surface(&face.face.surface, point)
+                        .or_refuse(KernelStage::Intersect, "project_point_to_surface")?;
+                    parameter_point_in_face(face.face, Vec2 { x: projection.u, y: projection.v }, 1e-7)
+                        .or_refuse(KernelStage::Intersect, "csg.imprint.builder")
+                };
+                let mut status = classify(midpoint)?;
+                if status == PolygonClass::Boundary && !self.face_has_seam_at(*face, midpoint)? {
+                    // A tangential trim contact is not an interval boundary:
+                    // a section may touch the rim at its midpoint and otherwise
+                    // lie inside the face. Check both nearby and farther points
+                    // on each side before treating the entire piece as a rim.
+                    // Riding boundaries and mixed/ambiguous probes retain the
+                    // original boundary handling, including seam ownership.
+                    let mut flank = None;
+                    for fraction in [0.25, 0.49, 0.51, 0.75] {
+                        let point = piece.evaluate(t0 + fraction * (t1 - t0))
+                            .or_refuse(KernelStage::Intersect, "evaluate")?;
+                        let class = classify(point)?;
+                        if class == PolygonClass::Boundary || flank.is_some_and(|old| old != class) {
+                            flank = None;
+                            break;
+                        }
+                        flank = Some(class);
+                    }
+                    if let Some(class) = flank { status = class; }
+                }
+                statuses.insert(face.key(), status);
             }
             if statuses
                 .values()
@@ -906,8 +947,19 @@ impl<'a> ImprintBuilder<'a> {
             for face in target_faces {
                 if statuses.get(&face.key()) == Some(&PolygonClass::Boundary) {
                     if !self.face_has_seam_at(*face, midpoint)? {
-                        invalid_boundary = true;
-                        break;
+                        // Open offset sheets have no neighbouring material face
+                        // to own this cut. Keep the accurate marched section on
+                        // the other sheet, but do not duplicate a boundary copy.
+                        let recover = self.open_carriers
+                            && refine
+                            && target_faces.len() == 2
+                            && !self.pieces.iter().any(|piece| {
+                                piece.support_faces == [first.key(), second.key()]
+                            });
+                        if !recover {
+                            invalid_boundary = true;
+                            break;
+                        }
                     }
                 } else {
                     attach.push(*face);

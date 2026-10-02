@@ -454,6 +454,24 @@ pub(super) fn build_pcurve(
         None
     };
 
+    // A spline on a plane has an exact 2D representation: project its
+    // homogeneous controls into the emitted orthonormal frame. Preserve
+    // knots and weights instead of replacing shallow curvature by a line
+    // merely because it fits inside the export sewing band.
+    if let (EmittedSurface::Plane { origin, x_axis, y_axis },
+            EmittedCurve::Spline { curve }) = (emitted_surface, emitted_curve) {
+        let controls = curve.control_points.iter().map(|p| {
+            let offset = Vec3::new(p.x - origin.x * p.w,
+                                   p.y - origin.y * p.w,
+                                   p.z - origin.z * p.w);
+            crate::Vec4 { x: offset.dot(*x_axis), y: offset.dot(*y_axis), z: 0.0, w: p.w }
+        }).collect();
+        let projected = NurbsCurve::new(curve.degree, curve.knots.clone(), controls)?;
+        if let Some(outcome) = accept(Some(Pcurve2d::Spline(projected))) {
+            return Ok(outcome);
+        }
+    }
+
     // Most exact first: a 2D line shares the emitted 3D entity's parameter
     // EXACTLY and keeps analytic exports free of B_SPLINE entities.  It covers
     // every straight edge on a plane and every iso-line on a revolution —
@@ -827,3 +845,5 @@ fn verify(
     }
     Ok(worst)
 }
+
+

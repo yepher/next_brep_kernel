@@ -1,4 +1,5 @@
 use super::*;
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::face_move::{
     cached_plane, carrier_is_planar, carrier_kind_name, carrier_ruled,
     corner_on_plane_and_ruled, plane_and_ruled_carriers, resolve_corner_on_fixed_edge,
@@ -77,13 +78,13 @@ fn unsupported_carrier(
     face_lookup: &HashMap<u64, (usize, usize)>,
     face_id: u64,
     role: &str,
-) -> String {
-    format!(
+) -> KernelRefusal {
+    KernelRefusal::unsupported(KernelStage::Classify, "carrier_kind", format!(
         "rotate_faces: {role} is a {}; a rotation re-intersects a PLANE with a plane, a \
          cylinder or a cone — whichever of the two it turns — and carries any other curved \
          carrier only when the axis leaves it invariant — refusing",
         face_label(solid, face_lookup, face_id)
-    )
+    ))
 }
 
 /// `name (face id) … kind` in one phrase, so every refusal names the thing the
@@ -195,12 +196,16 @@ fn loop_area_vector(
     loop_record: &LoopRecord,
     edges: &HashMap<u64, EdgeRecord>,
     op: &str,
-) -> Result<Vec3, String> {
+) -> Result<Vec3, KernelRefusal> {
     let mut points: Vec<Vec3> = Vec::new();
     for coedge in &loop_record.coedges {
-        let edge = edges
-            .get(&coedge.edge_id)
-            .ok_or_else(|| format!("{op}: missing edge {}", coedge.edge_id))?;
+        let edge = edges.get(&coedge.edge_id).ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Sew,
+                "loop_edge_lookup",
+                format!("{op}: missing edge {}", coedge.edge_id),
+            )
+        })?;
         if edge.degenerate {
             continue;
         }
@@ -213,7 +218,7 @@ fn loop_area_vector(
             } else {
                 1.0 - fraction
             };
-            points.push(edge.curve.evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction)?);
+            points.push(edge.curve.evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction).or_refuse(KernelStage::Sew, "evaluate")?);
         }
     }
     if points.len() < 3 {
@@ -257,7 +262,7 @@ fn orient_plane_to_loop(
     face: &FaceRecord,
     plane: &Plane,
     edges: &HashMap<u64, EdgeRecord>,
-) -> Result<Plane, String> {
+) -> Result<Plane, KernelRefusal> {
     let Some(outer) = face.loops.first() else {
         return Ok(*plane);
     };
@@ -428,7 +433,7 @@ fn verify_chord_on_curved(
     end: Vec3,
     carrier_rotation: Option<&AffineTransform>,
     tolerance: f64,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let Some((frame, rho0, rho1, height)) = carrier_ruled(solid, face_lookup, face_id) else {
         return Ok(());
     };
@@ -440,10 +445,10 @@ fn verify_chord_on_curved(
     for point in [start, midpoint, end] {
         let off = ruled_offset(&frame, rho0, rho1, height, point);
         if off > 10.0 * tolerance {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(KernelStage::Validate, "chord_off_carrier", format!(
                 "rotate_faces: rebuilding edge {edge_id} straight between its re-solved corners                  would leave its curved neighbour {} (off {off:.3e}); the rotation moves one end                  of that edge along the carrier and the other not at all, and no straight chord                  spans that — refusing",
                 face_short(solid, face_lookup, face_id)
-            ));
+            )));
         }
     }
     Ok(())
@@ -462,15 +467,15 @@ fn verify_point_on_fixed(
     vertex_id: u64,
     plane_tolerance: f64,
     tolerance: f64,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     if let Some((frame, rho0, rho1, height)) = carrier_ruled(solid, face_lookup, face_id) {
         let off = ruled_offset(&frame, rho0, rho1, height, point);
         if off > 10.0 * tolerance {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(KernelStage::Validate, "corner_off_curved_neighbour", format!(
                 "rotate_faces: the rotated corner at vertex {vertex_id} left its curved \
                  neighbour {} (off {off:.3e}) — refusing",
                 face_short(solid, face_lookup, face_id)
-            ));
+            )));
         }
         return Ok(());
     }
@@ -485,11 +490,11 @@ fn verify_point_on_fixed(
         })?;
     let off = point.sub(plane.origin).dot(plane.normal).abs();
     if off > 10.0 * tolerance {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Validate, "corner_off_fixed_neighbour", format!(
             "rotate_faces: the rotated corner at vertex {vertex_id} left its fixed neighbour \
              {} (off {off:.3e}) — refusing",
             face_short(solid, face_lookup, face_id)
-        ));
+        )));
     }
     Ok(())
 }
@@ -510,7 +515,7 @@ fn plan_straight_rebuild(
     start_new: Vec3,
     end_new: Vec3,
     tolerance: f64,
-) -> Result<EdgeAction, String> {
+) -> Result<EdgeAction, KernelRefusal> {
     let between = || -> String {
         let carriers = faces_of_edge
             .get(&edge.id)
@@ -525,37 +530,37 @@ fn plan_straight_rebuild(
         }
     };
     if edge.degenerate {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "degenerate_edge", format!(
             "rotate_faces: degenerate edge {} between {} would need re-stretching (deferred) \
              — refusing",
             edge.id,
             between()
-        ));
+        )));
     }
     if edge.curve.straight_segment(tolerance).is_none() {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "curved_edge_rebuild", format!(
             "rotate_faces: edge {} between {} must be re-stretched but is not a straight line; \
              a rotation rebuilds a curved edge only where it is the rim of the rotated plane \
              against a cylinder or cone, not between two faces that stay put — refusing",
             edge.id,
             between()
-        ));
+        )));
     }
     let new_chord = end_new.sub(start_new);
     if new_chord.length() <= tolerance {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "edge_collapse", format!(
             "rotate_faces: the rotation collapses edge {} between {} to zero length — refusing",
             edge.id,
             between()
-        ));
+        )));
     }
     if end_old.sub(start_old).dot(new_chord) <= 0.0 {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, EDGE_INVERSION, format!(
             "rotate_faces: the rotation inverts edge {} between {} (the trim is turned inside \
              out) — refusing",
             edge.id,
             between()
-        ));
+        )));
     }
     Ok(EdgeAction::Rebuild {
         start: start_new,
@@ -670,7 +675,7 @@ fn rotated_rim_section(
     start_new: Vec3,
     end_new: Vec3,
     tolerance: f64,
-) -> Result<NurbsCurve, String> {
+) -> Result<NurbsCurve, KernelRefusal> {
     let azimuth = |point: Vec3| {
         let delta = point.sub(frame.origin);
         delta.dot(frame.y_axis).atan2(delta.dot(frame.x_axis))
@@ -684,7 +689,7 @@ fn rotated_rim_section(
             value
         }
     };
-    let forward = rim_runs_forward(sense_frame, &edge.curve, edge.t0, edge.t1)?;
+    let forward = rim_runs_forward(sense_frame, &edge.curve, edge.t0, edge.t1).or_refuse(KernelStage::Refine, "rim_runs_forward")?;
     let closed = edge.start_vertex_id == edge.end_vertex_id;
     let (anchor, sweep) = if closed {
         (azimuth(start_new), tau)
@@ -694,11 +699,11 @@ fn rotated_rim_section(
         (azimuth(end_new), wrap(azimuth(start_new) - azimuth(end_new)))
     };
     if !closed && (sweep <= 1e-9 || sweep >= tau - 1e-9) {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "rim_degenerate", format!(
             "rotate_faces: the re-intersected rim of edge {} degenerates to a point or a \
              full turn — refusing",
             edge.id
-        ));
+        )));
     }
     let mut curve = plane_ruled_section_arc(
         plane.origin,
@@ -712,15 +717,15 @@ fn rotated_rim_section(
         tolerance,
     )
     .map_err(|error| {
-        format!(
+        KernelRefusal::unsupported(KernelStage::Refine, "ruled_section", format!(
             "rotate_faces: rebuilding the rim of edge {} as the section of the rotated \
              carrier with its fixed neighbour — {}",
             edge.id,
             error.trim_start_matches("plane_ruled_section_arc: ")
-        )
+        ))
     })?;
     if !forward {
-        curve = curve.reversed()?;
+        curve = curve.reversed().or_refuse(KernelStage::Refine, "reversed")?;
     }
     if closed {
         // THE TURNOVER. A closed rim's direction is genuinely FREE — reversing a
@@ -741,11 +746,11 @@ fn rotated_rim_section(
         //
         // Below the turnover this changes nothing: the transported sense and the
         // fixed carrier's already agree, and the branch is a measured no-op.
-        let before = closed_curve_area_vector(&edge.curve, edge.t0, edge.t1)?.dot(fixed_reference);
-        let [d0, d1] = curve.domain()?;
-        let after = closed_curve_area_vector(&curve, d0, d1)?.dot(fixed_reference);
+        let before = closed_curve_area_vector(&edge.curve, edge.t0, edge.t1).or_refuse(KernelStage::Refine, "closed_curve_area_vector")?.dot(fixed_reference);
+        let [d0, d1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let after = closed_curve_area_vector(&curve, d0, d1).or_refuse(KernelStage::Refine, "closed_curve_area_vector")?.dot(fixed_reference);
         if before * after < 0.0 {
-            curve = curve.reversed()?;
+            curve = curve.reversed().or_refuse(KernelStage::Refine, "reversed")?;
         }
     }
     // The same "reapply the trimming" contract every rebuilt section is held to:
@@ -763,7 +768,7 @@ fn rotated_rim_section(
         end_new,
         tolerance,
     )
-    .map_err(|error| error.replace("move_faces:", "rotate_faces:"))?;
+    .map_err(|error| error.with_message(|error| error.replace("move_faces:", "rotate_faces:")))?;
     Ok(curve)
 }
 
@@ -797,24 +802,28 @@ pub fn rotate_faces(
     axis_point: Vec3,
     axis_direction: Vec3,
     angle_radians: f64,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     if !(axis_point.x.is_finite() && axis_point.y.is_finite() && axis_point.z.is_finite()) {
-        return Err("rotate_faces: the axis point must be finite".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "axis_point", "rotate_faces: the axis point must be finite"));
     }
     if !(axis_direction.x.is_finite()
         && axis_direction.y.is_finite()
         && axis_direction.z.is_finite())
     {
-        return Err("rotate_faces: the axis direction must be finite".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "axis_direction", "rotate_faces: the axis direction must be finite"));
     }
     if !angle_radians.is_finite() {
-        return Err("rotate_faces: the angle must be finite".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "angle", "rotate_faces: the angle must be finite"));
     }
-    let axis = axis_direction
-        .normalized()
-        .map_err(|_| "rotate_faces: the axis direction has zero length".to_string())?;
+    let axis = axis_direction.normalized().map_err(|_| {
+        KernelRefusal::input(
+            KernelStage::Collect,
+            "axis_length",
+            "rotate_faces: the axis direction has zero length",
+        )
+    })?;
     if face_ids.is_empty() {
-        return Err("rotate_faces: no faces selected".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "selection", "rotate_faces: no faces selected"));
     }
     let moved: HashSet<u64> = face_ids.iter().copied().collect();
     let mut face_lookup: HashMap<u64, (usize, usize)> = HashMap::default();
@@ -827,7 +836,7 @@ pub fn rotate_faces(
     }
     for &face_id in face_ids {
         if !face_lookup.contains_key(&face_id) {
-            return Err(format!("rotate_faces: no face with id {face_id}"));
+            return Err(KernelRefusal::input(KernelStage::Collect, "face_id", format!("rotate_faces: no face with id {face_id}")));
         }
     }
 
@@ -840,7 +849,7 @@ pub fn rotate_faces(
     // "The corner landed exactly where R put it": the rigid endpoints are
     // assigned `R(point)` verbatim, so this only absorbs rounding noise.
     let rigid_tolerance = (scale * 1e-9).max(1e-12);
-    let rotation = rotation_about(axis_point, axis, angle_radians)?;
+    let rotation = rotation_about(axis_point, axis, angle_radians).or_refuse(KernelStage::Collect, "rotation")?;
 
     // --- Classify every edge by how the group uses it ----------------------
     let mut faces_of_edge: HashMap<u64, Vec<u64>> = HashMap::default();
@@ -877,11 +886,11 @@ pub fn rotate_faces(
             .unwrap_or(&[]);
         let expected = if edge.degenerate { 1 } else { 2 };
         if uses.len() != expected {
-            return Err(format!(
+            return Err(KernelRefusal::input(KernelStage::Collect, "non_manifold", format!(
                 "rotate_faces: edge {} is used {} times (non-manifold input)",
                 edge.id,
                 uses.len()
-            ));
+            )));
         }
         let moved_uses = uses.iter().filter(|face_id| moved.contains(*face_id)).count();
         let class = if moved_uses == 0 {
@@ -912,7 +921,7 @@ pub fn rotate_faces(
                 // — so there is nothing for the oblique route to re-intersect.
                 // Refused here, before any corner is solved, so the message says
                 // that instead of whichever corner solve would have failed first.
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Classify, "ruling_edge", format!(
                     "rotate_faces: boundary edge {} of {} is a straight ruling of its neighbour {} \
                      — the face is tangent to that carrier or runs along its axis, as beside a \
                      fillet band — and a rotation re-intersects a cylinder or cone only where the \
@@ -920,7 +929,7 @@ pub fn rotate_faces(
                     edge.id,
                     face_short(solid, &face_lookup, moved_face),
                     face_label(solid, &face_lookup, fixed_face)
-                ));
+                )));
             } else if !invariant(fixed_face)
                 && carrier_ruled(solid, &face_lookup, fixed_face).is_none()
             {
@@ -992,7 +1001,7 @@ pub fn rotate_faces(
                 let turned_axis = rotate_direction(&rotation, frame.axis);
                 let fixed_plane = planes[&fixed_face];
                 if turned_axis.dot(fixed_plane.normal).abs() <= PARALLEL_EPS {
-                    return Err(format!(
+                    return Err(KernelRefusal::unsupported(KernelStage::Classify, AXIS_PARALLEL_LIMIT, format!(
                         "rotate_faces: {:.6}° lays the axis of {} parallel to its neighbour {} \
                          across edge {}; the two carriers then meet in a pair of rulings rather \
                          than a conic, so there is no rim to rebuild — refusing",
@@ -1000,7 +1009,7 @@ pub fn rotate_faces(
                         face_short(solid, &face_lookup, moved_face),
                         face_short(solid, &face_lookup, fixed_face),
                         edge.id
-                    ));
+                    )));
                 }
             }
             continue;
@@ -1013,14 +1022,14 @@ pub fn rotate_faces(
         let fixed_plane = planes[&fixed_face];
         let rotated_normal = rotate_direction(&rotation, moved_plane.normal);
         if rotated_normal.cross(fixed_plane.normal).length() <= PARALLEL_EPS {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(KernelStage::Classify, PARALLEL_LIMIT, format!(
                 "rotate_faces: {:.6}° turns {} parallel to its neighbour {} across edge {}; \
                  the two carriers no longer meet, so there is no edge to rebuild — refusing",
                 angle_radians.to_degrees(),
                 face_short(solid, &face_lookup, moved_face),
                 face_short(solid, &face_lookup, fixed_face),
                 edge.id
-            ));
+            )));
         }
     }
 
@@ -1099,12 +1108,12 @@ pub fn rotate_faces(
                 .filter(|face_id| moved.contains(face_id))
                 .collect();
             if moved_here.len() != 1 {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Classify, "single_cap_only", format!(
                     "rotate_faces: the corner at vertex {} touches {} rotated faces against a \
                      ruled neighbour (a single rotated cap only) — refusing",
                     vertex.id,
                     moved_here.len()
-                ));
+                )));
             }
             let cap_plane =
                 cached_plane(&mut planes, solid, &face_lookup, moved_here[0], plane_tolerance)
@@ -1127,12 +1136,12 @@ pub fn rotate_faces(
                 })
                 .collect();
             if fixed_edges.len() != 1 {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Classify, "single_fixed_edge_only", format!(
                     "rotate_faces: the corner at vertex {} rides {} fixed edges against a ruled \
                      neighbour (exactly one required) — refusing",
                     vertex.id,
                     fixed_edges.len()
-                ));
+                )));
             }
             let fixed_edge = fixed_edges[0];
             let seed = if fixed_edge.start_vertex_id == vertex.id {
@@ -1169,7 +1178,7 @@ pub fn rotate_faces(
                     vertex.point,
                     tolerance,
                 )
-                .map_err(|error| translate_corner_refusal(&error, vertex.id))?,
+                .map_err(|error| error.with_message(|error| translate_corner_refusal(error, vertex.id)))?,
                 None => resolve_corner_on_fixed_edge(
                     fixed_edge,
                     seed,
@@ -1177,7 +1186,7 @@ pub fn rotate_faces(
                     plane_c,
                     tolerance,
                 )
-                .map_err(|error| translate_corner_refusal(&error, vertex.id))?,
+                .map_err(|error| error.with_message(|error| translate_corner_refusal(error, vertex.id)))?,
             };
             // Checked, not asserted: the corner must sit on EVERY fixed carrier
             // at the vertex and on the rotated cap, or the group tore off.
@@ -1195,11 +1204,11 @@ pub fn rotate_faces(
             }
             let off_cap = corner.sub(rotated_cap.origin).dot(rotated_cap.normal).abs();
             if off_cap > 10.0 * tolerance {
-                return Err(format!(
+                return Err(KernelRefusal::internal(KernelStage::Validate, "corner_on_cap", format!(
                     "rotate_faces: the re-solved corner at vertex {} left the ROTATED cap \
                      (off {off_cap:.3e}) — refusing",
                     vertex.id
-                ));
+                )));
             }
             new_vertex.insert(vertex.id, corner);
             continue;
@@ -1226,14 +1235,14 @@ pub fn rotate_faces(
         ) {
             let (moved_face, turned_frame, rho0, rho1, height) = moved_ruled;
             if fixed_at.len() != 1 {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Classify, "mirror_corner_flats", format!(
                     "rotate_faces: the corner at vertex {} where the rotated {} meets its \
                      neighbours touches {} fixed faces (a rotated cylinder or cone is \
                      re-intersected against exactly one flat there) — refusing",
                     vertex.id,
                     face_short(solid, &face_lookup, moved_face),
                     fixed_at.len()
-                ));
+                )));
             }
             let fixed_face = fixed_at[0];
             let flat = cached_plane(&mut planes, solid, &face_lookup, fixed_face, plane_tolerance)
@@ -1263,14 +1272,14 @@ pub fn rotate_faces(
             // group's own at it, and nothing then says where on the new ellipse
             // it belongs. It refuses here rather than being placed by guesswork.
             if seam.len() != 1 {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Classify, "seam_edge_count", format!(
                     "rotate_faces: the corner at vertex {} on the rotated {} rides {} of the \
                      group's own edges (the seam generatrix, exactly one, is what places it) \
                      — refusing",
                     vertex.id,
                     face_short(solid, &face_lookup, moved_face),
                     seam.len()
-                ));
+                )));
             }
             let seam = seam[0];
             let seed = if seam.start_vertex_id == vertex.id {
@@ -1279,7 +1288,7 @@ pub fn rotate_faces(
                 seam.t1
             };
             let turned_seam = EdgeRecord {
-                curve: transform_curve(&seam.curve, rotation)?,
+                curve: transform_curve(&seam.curve, rotation).or_refuse(KernelStage::Refine, "transform_curve")?,
                 ..seam.clone()
             };
             let corner = resolve_corner_on_fixed_edge(
@@ -1289,7 +1298,7 @@ pub fn rotate_faces(
                 flat.normal.dot(flat.origin),
                 tolerance,
             )
-            .map_err(|error| translate_corner_refusal(&error, vertex.id))?;
+            .map_err(|error| error.with_message(|error| translate_corner_refusal(error, vertex.id)))?;
             // Checked, not asserted, exactly as every other corner here is: on
             // the flat it must stay on, and on the carrier the rotation left.
             verify_point_on_fixed(
@@ -1304,12 +1313,12 @@ pub fn rotate_faces(
             )?;
             let off = ruled_offset(&turned_frame, rho0, rho1, height, corner);
             if off > 10.0 * tolerance {
-                return Err(format!(
+                return Err(KernelRefusal::internal(KernelStage::Validate, "mirror_corner_on_carrier", format!(
                     "rotate_faces: the re-solved corner at vertex {} left the ROTATED {} \
                      (off {off:.3e}) — refusing",
                     vertex.id,
                     face_short(solid, &face_lookup, moved_face)
-                ));
+                )));
             }
             new_vertex.insert(vertex.id, corner);
             continue;
@@ -1351,21 +1360,21 @@ pub fn rotate_faces(
             corner_planes.push(rotate_plane(&rotation, &plane));
         }
         let corner = solve_corner(&corner_planes).ok_or_else(|| {
-            format!(
+            KernelRefusal::ill_posed(KernelStage::Refine, "corner_underconstrained", format!(
                 "rotate_faces: cannot re-intersect the carriers meeting at vertex {} \
                  (parallel or under-constrained planes) — refusing",
                 vertex.id
-            )
+            ))
         })?;
         // The corner must genuinely sit on EVERY carrier; otherwise the group
         // tears away from its fixed neighbours and no manifold heal exists.
         for plane in &corner_planes {
             if corner.sub(plane.origin).dot(plane.normal).abs() > tolerance {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Refine, "corner_tear", format!(
                     "rotate_faces: the rotated group tears away from its neighbours at \
                      vertex {} — refusing rather than emitting an invalid solid",
                     vertex.id
-                ));
+                )));
             }
         }
         new_vertex.insert(vertex.id, corner);
@@ -1379,11 +1388,14 @@ pub fn rotate_faces(
         .collect();
     let mut actions: HashMap<u64, EdgeAction> = HashMap::default();
     for edge in &solid.edges {
-        let position = |vertex_id: u64| -> Result<Vec3, String> {
-            vertex_position
-                .get(&vertex_id)
-                .copied()
-                .ok_or_else(|| format!("rotate_faces: missing vertex {vertex_id}"))
+        let position = |vertex_id: u64| -> Result<Vec3, KernelRefusal> {
+            vertex_position.get(&vertex_id).copied().ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Collect,
+                    "vertex_lookup",
+                    format!("rotate_faces: missing vertex {vertex_id}"),
+                )
+            })
         };
         let start_old = position(edge.start_vertex_id)?;
         let end_old = position(edge.end_vertex_id)?;
@@ -1408,7 +1420,7 @@ pub fn rotate_faces(
         }
         let rigid = start_new.sub(rotation.point(start_old)).length() <= rigid_tolerance
             && end_new.sub(rotation.point(end_old)).length() <= rigid_tolerance;
-        let rebuild = |planes: &mut HashMap<u64, Plane>| -> Result<EdgeAction, String> {
+        let rebuild = |planes: &mut HashMap<u64, Plane>| -> Result<EdgeAction, KernelRefusal> {
             // Every carrier of an edge that is REBUILT straight has to be
             // re-trimmed around it afterwards, and the only re-trims here are the
             // planar one and the invariant-ruled one.
@@ -1694,17 +1706,17 @@ pub fn rotate_faces(
     for edge in &mut result.edges {
         match actions.get(&edge.id) {
             Some(EdgeAction::Rotate) => {
-                edge.curve = transform_curve(&edge.curve, rotation)?;
+                edge.curve = transform_curve(&edge.curve, rotation).or_refuse(KernelStage::Sew, "transform_curve")?;
             }
             Some(EdgeAction::Rebuild { start, end }) => {
-                edge.curve = make_line(*start, *end)?;
+                edge.curve = make_line(*start, *end).or_refuse(KernelStage::Sew, "make_line")?;
                 edge.t0 = 0.0;
                 edge.t1 = 1.0;
             }
             Some(EdgeAction::Replace { curve }) => {
                 // An exactly re-intersected section spans its whole domain by
                 // construction, so the trim IS the domain.
-                let [d0, d1] = curve.domain()?;
+                let [d0, d1] = curve.domain().or_refuse(KernelStage::Sew, "domain")?;
                 edge.curve = curve.clone();
                 edge.t0 = d0;
                 edge.t1 = d1;
@@ -1726,7 +1738,7 @@ pub fn rotate_faces(
         let face = &mut result.shells[shell_index].faces[face_index];
         match action {
             FaceAction::RotateSurface => {
-                face.surface = transform_surface(&face.surface, rotation)?;
+                face.surface = transform_surface(&face.surface, rotation).or_refuse(KernelStage::Sew, "transform_surface")?;
             }
             FaceAction::Retrim(plane) => {
                 // A MOVED face's carrier frame is this operation's to choose,
@@ -1771,10 +1783,10 @@ pub fn rotate_faces(
     // of the same solid would buy nothing.
     let report = result.validate_detailed(&crate::KernelTolerances::for_solid(&result, 1e-7));
     if !report.issues.is_empty() {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Validate, "validate", format!(
             "rotate_faces: rotated solid failed validation: {:?}",
             report.issues
-        ));
+        )));
     }
     // THE ACCEPTANCE FLOOR. `validate()` tests INCIDENCE: it would pass a face
     // whose own trim loop crosses itself in its own parameter domain, because no
@@ -1784,34 +1796,30 @@ pub fn rotate_faces(
     // is no answer, not a clean one.
     let crossings = crate::loop_self_crossings(&result);
     if !crossings.unreadable.is_empty() {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Validate, "crossing_scan_unreadable", format!(
             "rotate_faces: the loop self-crossing scan could not read {:?}; refusing rather \
              than shipping an unchecked result",
             crossings.unreadable
-        ));
+        )));
     }
     if crossings.loops == 0 {
-        return Err(
-            "rotate_faces: the loop self-crossing scan read no loops at all; refusing rather              than shipping an unchecked result"
-                .into(),
-        );
+        return Err(KernelRefusal::internal(KernelStage::Validate, "crossing_scan_empty",
+            "rotate_faces: the loop self-crossing scan read no loops at all; refusing rather              than shipping an unchecked result"));
     }
     if crossings.is_flagged() {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Validate, "loop_self_crossing", format!(
             "rotate_faces: the rotation makes a re-trimmed neighbour's own loop cross itself \
              ({}) — refusing",
             crossings.summary().unwrap_or_default()
-        ));
+        )));
     }
     // Belt and braces on top of the per-edge inversion guard: a global inversion
     // flips the signed volume even if every edge kept its direction.
     if let (Ok(before), Ok(after)) = (solid_signed_volume(solid), solid_signed_volume(&result)) {
         if before * after <= 0.0 {
-            return Err(
+            return Err(KernelRefusal::unsupported(KernelStage::Validate, SOLID_INVERSION,
                 "rotate_faces: the rotation inverts the solid (signed volume changed sign) \
-                 — refusing"
-                    .into(),
-            );
+                 — refusing"));
         }
     }
     // ...and a guard on a quantity the signed volume CANNOT carry.
@@ -1845,7 +1853,7 @@ pub fn rotate_faces(
             .validate_detailed(&crate::KernelTolerances::for_solid(solid, 1e-7))
             .wire_warnings;
         if report.wire_warnings.len() > inherited.len() {
-            return Err(format!(
+            return Err(KernelRefusal::internal(KernelStage::Validate, "chart_winding", format!(
                 "rotate_faces: the rotation leaves a face whose (u,v) chart is left-handed \
                  against its own normal ({}) — refusing",
                 report
@@ -1854,7 +1862,7 @@ pub fn rotate_faces(
                     .map(|warning| warning.message.as_str())
                     .collect::<Vec<_>>()
                     .join("; ")
-            ));
+            )));
         }
     }
     Ok(result)

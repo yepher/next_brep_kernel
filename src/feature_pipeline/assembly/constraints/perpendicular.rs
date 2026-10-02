@@ -1,5 +1,5 @@
-//! Perpendicular (`PERP`) — two direction-bearing elements at right angles
-//! (spec §4).
+//! Perpendicular (`PERP`) — two direction-bearing elements at right
+//! angles.
 
 use super::super::mapping::{
     angle_between_deg, mate, require_direction, ConstraintFailure, MappedConstraint,

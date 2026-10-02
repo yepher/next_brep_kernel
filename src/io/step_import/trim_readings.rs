@@ -92,7 +92,7 @@ pub fn import_step_trim_readings(text: &str) -> Result<StepTrimReadings, String>
             StepBody::SurfaceModelShell { shell_ref, .. } => shell_ref,
         };
         let (solid, capture) = match build_step_body_captured(&resolver, body) {
-            Ok((solid, capture)) => (Ok(solid), capture.unwrap_or_default()),
+            Ok((solid, capture, _bounded)) => (Ok(solid), capture.unwrap_or_default()),
             Err(error) => (Err(error), Default::default()),
         };
         let mut edges: Vec<StepEdgeReading> = Vec::new();

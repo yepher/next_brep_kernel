@@ -1,7 +1,7 @@
-//! The assembly SESSION + exported ABI (build-spec §10 item 5): constraint
-//! CRUD with auto-solve, manual solve, per-constraint status JSON, DOF summary
-//! JSON, overlay-geometry JSON, and the generic document fold that writes the
-//! solved state + poses back into the history document.
+//! The assembly SESSION + exported ABI: constraint CRUD with auto-solve,
+//! manual solve, per-constraint status JSON, DOF summary JSON,
+//! overlay-geometry JSON, and the generic document fold that writes the solved
+//! state + poses back into the history document.
 //!
 //! The session is installed by the history-execution tail
 //! ([`super::finish_history_run`]) after EVERY run: the post-solve constraint
@@ -106,7 +106,7 @@ pub fn assembly_state_json() -> String {
 }
 
 /// Per-constraint status rows: `[{id, type, enabled, open, status, message,
-/// satisfied, error}]` (requirements §5 vocabulary).
+/// satisfied, error}]`.
 #[wasm_bindgen]
 pub fn assembly_statuses_json() -> String {
     SESSION.with(|session| {
@@ -182,7 +182,7 @@ pub fn assembly_pose_updates_json() -> String {
 /// into the owning feature's `inputParams` (matched by `inputParams.id` —
 /// generic JSON, no dependency on the ACOMP feature shape). The app calls this
 /// on its document before persisting or re-running (the pose-authority
-/// write-back, spec §6 step 4).
+/// write-back).
 #[wasm_bindgen]
 pub fn assembly_apply_document_json(document_json: &str) -> Result<String, JsValue> {
     assembly_apply_document_impl(document_json).map_err(|error| JsValue::from_str(&error))
@@ -345,7 +345,7 @@ fn geometry_tag(geometry: &crate::SelectionGeometry) -> &'static str {
 }
 
 // ===========================================================================
-// Mutation surface (spec §6 scheduling: every mutation auto-solves)
+// Mutation surface
 // ===========================================================================
 
 /// Add a constraint of `constraint_type` with the given `inputParams` JSON

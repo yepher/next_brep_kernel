@@ -369,7 +369,7 @@ pub(super) fn record_closed_heal_census(
     });
     let operation = |body: &BrepSolid| -> Result<BrepSolid, String> {
         let boundary = strip_boundary(body, face_id).ok_or("strip vanished")?;
-        heal_closed_transition(body, shell_index, face_index, &boundary)
+        Ok(heal_closed_transition(body, shell_index, face_index, &boundary)?)
     };
     let line = census_line("closed", solid, &edges, &vertices, &rims, &operation, detail);
     append(directory, &line);
@@ -403,7 +403,7 @@ pub(super) fn record_closed_band_census(directory: &str, solid: &BrepSolid, band
     });
     let operation = |body: &BrepSolid| -> Result<BrepSolid, String> {
         let band = classify_closed_band(body, &faces).ok_or("the copy is no longer a closed band")?;
-        heal_closed_band(body, &band, "delete_faces_and_heal")
+        Ok(heal_closed_band(body, &band, "delete_faces_and_heal")?)
     };
     let line = census_line("band", solid, &edges, &vertices, &rim_edges, &operation, detail);
     append(directory, &line);
@@ -467,7 +467,8 @@ pub(super) fn record_push_census(directory: &str, solid: &BrepSolid, face_id: u6
         .flat_map(|edge| [edge.start_vertex_id, edge.end_vertex_id])
         .collect();
     let detail = serde_json::json!({ "face": face_id, "distance": distance });
-    let operation = |body: &BrepSolid| offset_ruled_face(body, face_id, distance);
+    let operation =
+        |body: &BrepSolid| offset_ruled_face(body, face_id, distance).map_err(String::from);
     let line = census_line("push", solid, &edges, &vertices, &[], &operation, detail);
     append(directory, &line);
 }

@@ -26,15 +26,29 @@
 //! ([`check_collapse_closure`]), because an identification is a trim moved
 //! onto what already existed, which `validate()` cannot see.
 
+use crate::{KernelRefusal, KernelStage, OrRefuse, RefusalClass};
 use crate::topology::BrepSolid;
 use crate::Vec3;
 
 /// The refusal for a full-width collapse this construction cannot finish —
 /// see [`collapse_full_width`].  TERMINAL in the group lane (like
-/// [`crate::blend::CONSUMED_SNAP_UNSOUND`]): the cutter composition's answer to
+/// [`crate::blend::is_consumed_snap`]): the cutter composition's answer to
 /// a full-width corner the network does not build was measured wrong.
 pub(crate) const FULL_WIDTH_COLLAPSE_UNSOUND: &str =
     "blend: the full-width corner does not collapse to a sound body —";
+
+/// The slugs of those refusals: `UnsupportedGeometry`, except the face that
+/// uses a missing edge, which is `Internal` (its text is under
+/// [`FULL_WIDTH_COLLAPSE_UNSOUND`] too, and the fallbacks treat it the same).
+pub(crate) const FULL_WIDTH_COLLAPSE_WHAT: &str = "full_width_collapse";
+pub(crate) const FULL_WIDTH_COLLAPSE_EDGE_WHAT: &str = "full_width_collapse_edge";
+
+/// Is this a full-width collapse refusal ([`FULL_WIDTH_COLLAPSE_UNSOUND`])?
+/// Read off the class and its slug, which the mint site and this check share.
+pub(crate) fn is_full_width_collapse(refusal: &KernelRefusal) -> bool {
+    matches!(&refusal.class, RefusalClass::UnsupportedGeometry { what } if what == FULL_WIDTH_COLLAPSE_WHAT) ||
+        matches!(&refusal.class, RefusalClass::Internal { what } if what == FULL_WIDTH_COLLAPSE_EDGE_WHAT)
+}
 
 /// What [`collapse_full_width`] changed, for the passes that run after it.
 #[derive(Default)]
@@ -87,19 +101,19 @@ pub(in crate::blend) fn collapse_full_width(
     identified: &[(u64, u64)],
     collapsed: bool,
     band: f64,
-) -> Result<Collapse, String> {
+) -> Result<Collapse, KernelRefusal> {
     let mut collapse = Collapse::default();
     if !collapsed && identified.is_empty() {
         return Ok(collapse);
     }
     let is_input_vertex = |id: u64| input.vertices.iter().any(|vertex| vertex.id == id);
-    let point_of = |solid: &BrepSolid, id: u64| -> Result<Vec3, String> {
+    let point_of = |solid: &BrepSolid, id: u64| -> Result<Vec3, KernelRefusal> {
         solid
             .vertices
             .iter()
             .find(|vertex| vertex.id == id)
             .map(|vertex| vertex.point)
-            .ok_or_else(|| format!("{FULL_WIDTH_COLLAPSE_UNSOUND} vertex {id} is missing"))
+            .ok_or_else(|| format!("{FULL_WIDTH_COLLAPSE_UNSOUND} vertex {id} is missing")).or_refuse(KernelStage::Refine, "ok_or_else")
     };
 
     // ---- 1. Identify the rims, keeping an input vertex where there is one. ----
@@ -117,10 +131,10 @@ pub(in crate::blend) fn collapse_full_width(
         }
         let (kept, merged) = match (is_input_vertex(a), is_input_vertex(b)) {
             (true, true) => {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Validate, FULL_WIDTH_COLLAPSE_WHAT, format!(
                     "{FULL_WIDTH_COLLAPSE_UNSOUND} a collapsed rail would identify two vertices \
                      of the part, {a} and {b}"
-                ))
+                )))
             }
             (true, false) => (a, b),
             (false, true) => (b, a),
@@ -128,10 +142,10 @@ pub(in crate::blend) fn collapse_full_width(
         };
         let gap = point_of(result, kept)?.sub(point_of(result, merged)?).length();
         if gap > band {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(KernelStage::Validate, FULL_WIDTH_COLLAPSE_WHAT, format!(
                 "{FULL_WIDTH_COLLAPSE_UNSOUND} a collapsed rail's two rims stand {gap:.3e} apart, \
                  more than the {band:.3e} band that called the rail a point"
-            ));
+            )));
         }
         collapse.moved = collapse.moved.max(gap);
         representative.push((merged, kept));
@@ -176,11 +190,11 @@ pub(in crate::blend) fn collapse_full_width(
             let empty = face.loops.iter().filter(|l| l.coedges.is_empty()).count();
             if empty > 0 {
                 if empty != face.loops.len() {
-                    return Err(format!(
+                    return Err(KernelRefusal::unsupported(KernelStage::Validate, FULL_WIDTH_COLLAPSE_WHAT, format!(
                         "{FULL_WIDTH_COLLAPSE_UNSOUND} face {face_id} lost {empty} of its \
                          {} loops whole",
                         face.loops.len()
-                    ));
+                    )));
                 }
                 drop_face(result, face_id);
                 collapse.dropped_faces.push(face_id);
@@ -196,9 +210,9 @@ pub(in crate::blend) fn collapse_full_width(
             }
             let edge_of = |id: u64| result.edges.iter().find(|edge| edge.id == id);
             let (Some(a), Some(b)) = (edge_of(first.edge_id), edge_of(second.edge_id)) else {
-                return Err(format!(
+                return Err(KernelRefusal::internal(KernelStage::Validate, FULL_WIDTH_COLLAPSE_EDGE_WHAT, format!(
                     "{FULL_WIDTH_COLLAPSE_UNSOUND} face {face_id} uses a missing edge"
-                ));
+                )));
             };
             let aligned = a.start_vertex_id == b.start_vertex_id && a.end_vertex_id == b.end_vertex_id;
             let opposed = a.start_vertex_id == b.end_vertex_id && a.end_vertex_id == b.start_vertex_id;
@@ -212,14 +226,14 @@ pub(in crate::blend) fn collapse_full_width(
             let mut coincident = true;
             for sample in 0..=COINCIDENCE_SAMPLES {
                 let fraction = sample as f64 / COINCIDENCE_SAMPLES as f64;
-                let on_b = b.curve.evaluate(b.t0 + (b.t1 - b.t0) * fraction)?;
+                let on_b = b.curve.evaluate(b.t0 + (b.t1 - b.t0) * fraction).or_refuse(KernelStage::Refine, "evaluate")?;
                 let a_fraction = if aligned { fraction } else { 1.0 - fraction };
-                let on_a = a.curve.evaluate(a.t0 + (a.t1 - a.t0) * a_fraction)?;
+                let on_a = a.curve.evaluate(a.t0 + (a.t1 - a.t0) * a_fraction).or_refuse(KernelStage::Refine, "evaluate")?;
                 if on_a.sub(on_b).length() <= band {
                     continue;
                 }
                 affine = false;
-                let foot = crate::project_point_to_curve(&a.curve, on_b)?;
+                let foot = crate::project_point_to_curve(&a.curve, on_b).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
                 let inside = foot.u >= a.t0.min(a.t1) - 1e-9 && foot.u <= a.t0.max(a.t1) + 1e-9;
                 if foot.distance > band || !inside {
                     coincident = false;
@@ -270,7 +284,7 @@ fn merge_edge(
     merged: u64,
     kept: u64,
     affine: bool,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let edge_of = |id: u64| {
         result
             .edges
@@ -279,7 +293,7 @@ fn merge_edge(
             .cloned()
             .ok_or_else(|| format!("{FULL_WIDTH_COLLAPSE_UNSOUND} edge {id} is missing"))
     };
-    let (merged_edge, kept_edge) = (edge_of(merged)?, edge_of(kept)?);
+    let (merged_edge, kept_edge) = (edge_of(merged).or_refuse(KernelStage::Refine, "edge_of")?, edge_of(kept).or_refuse(KernelStage::Refine, "edge_of")?);
     let flipped = merged_edge.start_vertex_id != kept_edge.start_vertex_id;
     for face in result.shells.iter_mut().flat_map(|shell| &mut shell.faces) {
         let surface = face.surface.clone();
@@ -310,11 +324,11 @@ fn merge_edge(
                 let fit =
                     super::track_fit::fit_curve_track(&surface, &at, &breaks, floor, 256, 4096)?;
                 if !fit.on_floor {
-                    return Err(format!(
+                    return Err(KernelRefusal::unsupported(KernelStage::Validate, FULL_WIDTH_COLLAPSE_WHAT, format!(
                         "{FULL_WIDTH_COLLAPSE_UNSOUND} the merged edge {kept}'s pcurve misses it by \
                          {:.3e} at {} samples against a floor of {floor:.1e}",
                         fit.miss, fit.samples
-                    ));
+                    )));
                 }
                 coedge.pcurve = fit.curve;
             }
@@ -331,7 +345,7 @@ fn merge_edge(
 pub(in crate::blend) fn check_collapse_closure(
     input: &BrepSolid,
     result: &BrepSolid,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let report = crate::shell_vector_areas(result);
     if !report.is_flagged() && report.unreadable.is_empty() {
         return Ok(());
@@ -342,7 +356,7 @@ pub(in crate::blend) fn check_collapse_closure(
     let (residual, bar) = report
         .worst_shell()
         .map_or((f64::NAN, f64::NAN), |shell| (shell.residual(), shell.bar));
-    Err(format!(
+    Err(KernelRefusal::unsupported(KernelStage::Validate, FULL_WIDTH_COLLAPSE_WHAT, format!(
         "{FULL_WIDTH_COLLAPSE_UNSOUND} its trims close to {residual:.3e} against a bar of \
          {bar:.3e}{}",
         if report.unreadable.is_empty() {
@@ -350,5 +364,5 @@ pub(in crate::blend) fn check_collapse_closure(
         } else {
             format!(" ({} faces unreadable)", report.unreadable.len())
         }
-    ))
+    )))
 }

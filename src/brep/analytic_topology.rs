@@ -40,6 +40,7 @@ pub fn make_sphere_brep_framed(
     let seam = surface.iso_curve_u(0.0)?;
     validated(
         BrepSolid {
+            mass_properties_cache: Default::default(),
             id: 120,
             vertices: vec![
                 VertexRecord {
@@ -139,6 +140,7 @@ pub fn make_torus_brep(
     let tube_curve = surface.iso_curve_u(0.0)?;
     validated(
         BrepSolid {
+            mass_properties_cache: Default::default(),
             id: 130,
             vertices: vec![VertexRecord {
                 id: 1,
@@ -259,6 +261,7 @@ pub fn make_cone_brep(
         let apex = side.evaluate(0.0, 1.0)?;
         return validated(
             BrepSolid {
+                mass_properties_cache: Default::default(),
                 id: 140,
                 vertices: vec![
                     VertexRecord {
@@ -362,6 +365,7 @@ pub fn make_cone_brep(
     let top_pcurve = curve_to_plane_parameters(&top_circle, top_origin, x_axis, y_axis)?;
     validated(
         BrepSolid {
+            mass_properties_cache: Default::default(),
             id: 150,
             vertices: vec![
                 VertexRecord {

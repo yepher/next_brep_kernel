@@ -8,39 +8,66 @@ struct SectionFrame {
     planar: bool,
 }
 
-pub(super) fn closed_points(curves: &[NurbsCurve], tolerance: f64) -> Result<Vec<Vec3>, String> {
+pub(super) fn closed_points(
+    curves: &[NurbsCurve],
+    tolerance: f64,
+) -> Result<Vec<Vec3>, KernelRefusal> {
     if curves.len() < 2 {
-        return Err("loftSolid: a section needs at least 2 curves".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "section_curve_count",
+            "loftSolid: a section needs at least 2 curves",
+        ));
     }
     let mut points = Vec::with_capacity(curves.len());
     for (index, curve) in curves.iter().enumerate() {
-        let [start, end] = curve.domain()?;
+        let [start, end] = curve.domain().or_refuse(KernelStage::Collect, "domain")?;
         let next = &curves[(index + 1) % curves.len()];
-        let next_start = next.domain()?[0];
+        let next_start = next.domain().or_refuse(KernelStage::Collect, "domain")?[0];
         if curve
-            .evaluate(end)?
-            .sub(next.evaluate(next_start)?)
+            .evaluate(end)
+            .or_refuse(KernelStage::Collect, "evaluate")?
+            .sub(
+                next.evaluate(next_start)
+                    .or_refuse(KernelStage::Collect, "evaluate")?,
+            )
             .length()
             > tolerance
         {
-            return Err(format!("loftSolid: section is open at curve {index}"));
+            return Err(KernelRefusal::input(
+                KernelStage::Collect,
+                "open_section",
+                format!("loftSolid: section is open at curve {index}"),
+            ));
         }
-        points.push(curve.evaluate(start)?);
+        points.push(
+            curve
+                .evaluate(start)
+                .or_refuse(KernelStage::Collect, "evaluate")?,
+        );
     }
     Ok(points)
 }
 
-fn section_frame(curves: &[NurbsCurve], tolerance: f64) -> Result<SectionFrame, String> {
+fn section_frame(curves: &[NurbsCurve], tolerance: f64) -> Result<SectionFrame, KernelRefusal> {
     let mut samples = Vec::new();
     for curve in curves {
-        let [start, end] = curve.domain()?;
+        let [start, end] = curve.domain().or_refuse(KernelStage::Classify, "domain")?;
         for index in 0..16 {
-            samples.push(curve.evaluate(start + (end - start) * index as f64 / 16.0)?);
+            samples.push(
+                curve
+                    .evaluate(start + (end - start) * index as f64 / 16.0)
+                    .or_refuse(KernelStage::Classify, "evaluate")?,
+            );
         }
     }
     let mut normal = crate::polygon::newell_normal(&samples);
     let mut centroid = samples.iter().fold(Vec3::default(), |sum, &point| sum.add(point));
-    normal = normal.normalized()?;
+    // A zero Newell normal is a section without area — the caller's loop, not a
+    // solve, so it is an input refusal carrying the vector helper's own text.
+    normal = normal
+        .normalized()
+        .or_input(KernelStage::Classify, "section_normal")?;
     centroid = centroid.scale(1.0 / samples.len() as f64);
     let planar = samples
         .iter()
@@ -70,7 +97,7 @@ fn advance_from(
     normal: Vec3,
     order: impl Iterator<Item = usize>,
     tolerance: f64,
-) -> Result<Option<Vec3>, String> {
+) -> Result<Option<Vec3>, KernelRefusal> {
     for index in order {
         let step = section_frame(&sections[index], tolerance)?
             .centroid
@@ -83,8 +110,13 @@ fn advance_from(
     Ok(None)
 }
 
-fn reverse_section(curves: &[NurbsCurve]) -> Result<Vec<NurbsCurve>, String> {
-    curves.iter().rev().map(NurbsCurve::reversed).collect()
+fn reverse_section(curves: &[NurbsCurve]) -> Result<Vec<NurbsCurve>, KernelRefusal> {
+    curves
+        .iter()
+        .rev()
+        .map(NurbsCurve::reversed)
+        .collect::<Result<Vec<_>, String>>()
+        .or_refuse(KernelStage::Classify, "reverse_section")
 }
 
 /// One end cap. `advance` is the direction the loft RUNS THROUGH this cap —
@@ -98,14 +130,19 @@ fn cap_face(
     advance: Vec3,
     outward: bool,
     next_id: &mut u64,
-) -> Result<FaceRecord, String> {
+) -> Result<FaceRecord, KernelRefusal> {
     let normal = if frame.normal.dot(advance) >= 0.0 {
         frame.normal
     } else {
         frame.normal.scale(-1.0)
     };
-    let x_axis = normal.perpendicular()?;
-    let y_axis = normal.cross(x_axis).normalized()?;
+    let x_axis = normal
+        .perpendicular()
+        .or_refuse(KernelStage::Fragment, "cap_frame")?;
+    let y_axis = normal
+        .cross(x_axis)
+        .normalized()
+        .or_refuse(KernelStage::Fragment, "cap_frame")?;
     let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
     let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
     for point in &frame.samples {
@@ -126,7 +163,8 @@ fn cap_face(
         y_axis,
         max_x - min_x + 2.0 * padding,
         max_y - min_y + 2.0 * padding,
-    )?;
+    )
+    .or_refuse(KernelStage::Fragment, "cap_plane")?;
     let mut coedges = Vec::with_capacity(curves.len());
     if outward {
         for (index, curve) in curves.iter().enumerate() {
@@ -134,7 +172,8 @@ fn cap_face(
                 id: *next_id,
                 edge_id: edge_ids[index],
                 forward: true,
-                pcurve: curve_to_plane_parameters(curve, origin, x_axis, y_axis)?,
+                pcurve: curve_to_plane_parameters(curve, origin, x_axis, y_axis)
+                    .or_refuse(KernelStage::Fragment, "cap_pcurve")?,
             });
             *next_id += 1;
         }
@@ -144,8 +183,10 @@ fn cap_face(
                 id: *next_id,
                 edge_id: edge_ids[index],
                 forward: false,
-                pcurve: curve_to_plane_parameters(&curves[index], origin, x_axis, y_axis)?
-                    .reversed()?,
+                pcurve: curve_to_plane_parameters(&curves[index], origin, x_axis, y_axis)
+                    .or_refuse(KernelStage::Fragment, "cap_pcurve")?
+                    .reversed()
+                    .or_refuse(KernelStage::Fragment, "cap_pcurve")?,
             });
             *next_id += 1;
         }
@@ -166,7 +207,7 @@ fn cap_face(
     })
 }
 
-pub fn loft_profile_brep(input_sections: &[Vec<NurbsCurve>]) -> Result<BrepSolid, String> {
+pub fn loft_profile_brep(input_sections: &[Vec<NurbsCurve>]) -> Result<BrepSolid, KernelRefusal> {
     loft_profile_brep_core(input_sections, None)
 }
 
@@ -180,24 +221,36 @@ pub fn loft_profile_brep_tangent(
     input_sections: &[Vec<NurbsCurve>],
     start_direction: Vec3,
     end_direction: Vec3,
-) -> Result<BrepSolid, String> {
-    let start = start_direction
-        .normalized()
-        .map_err(|_| "loftSolid: start tangent must be a nonzero direction".to_string())?;
-    let end = end_direction
-        .normalized()
-        .map_err(|_| "loftSolid: end tangent must be a nonzero direction".to_string())?;
+) -> Result<BrepSolid, KernelRefusal> {
+    let start = start_direction.normalized().map_err(|_| {
+        KernelRefusal::input(
+            KernelStage::Collect,
+            "start_tangent",
+            "loftSolid: start tangent must be a nonzero direction",
+        )
+    })?;
+    let end = end_direction.normalized().map_err(|_| {
+        KernelRefusal::input(
+            KernelStage::Collect,
+            "end_tangent",
+            "loftSolid: end tangent must be a nonzero direction",
+        )
+    })?;
     loft_profile_brep_core(input_sections, Some((start, end)))
 }
 
 fn loft_profile_brep_core(
     input_sections: &[Vec<NurbsCurve>],
     end_tangents: Option<(Vec3, Vec3)>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let tolerance = 1e-6;
     let section_count = input_sections.len();
     if section_count < 2 {
-        return Err("loftSolid: need at least 2 sections".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "section_count",
+            "loftSolid: need at least 2 sections",
+        ));
     }
     let mut sections = input_sections.to_vec();
     let curve_count = validate_sections(&sections, tolerance, "loftSolid", true)?;
@@ -205,7 +258,11 @@ fn loft_profile_brep_core(
     let first_frame = section_frame(&sections[0], tolerance)?;
     let last_frame = section_frame(&sections[section_count - 1], tolerance)?;
     if !first_frame.planar || !last_frame.planar {
-        return Err("loftSolid: end sections must be planar".into());
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "planar_end_sections",
+            "loftSolid: end sections must be planar",
+        ));
     }
     // Ends in the same place put the two caps on top of each other whatever the
     // run does in between; say that before blaming a section plane below.
@@ -213,7 +270,13 @@ fn loft_profile_brep_core(
         .centroid
         .sub(first_frame.centroid)
         .normalized()
-        .map_err(|_| "loftSolid: end sections coincide".to_string())?;
+        .map_err(|_| {
+            KernelRefusal::input(
+                KernelStage::Classify,
+                "coincident_ends",
+                "loftSolid: end sections coincide",
+            )
+        })?;
     // Each cap must face away from its own inward advance direction; a turning
     // loft can leave one end edge-on even when the other end is valid.
     let start_advance = advance_from(
@@ -223,10 +286,14 @@ fn loft_profile_brep_core(
         1..section_count,
         tolerance,
     )?
-    .ok_or(
-        "loftSolid: the loft runs inside its START section's plane — every later section \
-         lies in it, so the start cap would be a sliver rather than a face",
-    )?;
+    .ok_or_else(|| {
+        KernelRefusal::input(
+            KernelStage::Classify,
+            "start_in_plane",
+            "loftSolid: the loft runs inside its START section's plane — every later section \
+             lies in it, so the start cap would be a sliver rather than a face",
+        )
+    })?;
     // Walking inward from the FAR end measures backwards, so negate it: both
     // directions point the way the loft runs, start to finish.
     let finish_advance = advance_from(
@@ -237,17 +304,26 @@ fn loft_profile_brep_core(
         tolerance,
     )?
     .map(|step| step.scale(-1.0))
-    .ok_or(
-        "loftSolid: the loft runs inside its END section's plane — every earlier section \
-         lies in it, so the end cap would be a sliver rather than a face",
-    )?;
+    .ok_or_else(|| {
+        KernelRefusal::input(
+            KernelStage::Classify,
+            "end_in_plane",
+            "loftSolid: the loft runs inside its END section's plane — every earlier section \
+             lies in it, so the end cap would be a sliver rather than a face",
+        )
+    })?;
     let first_normal = if first_frame.normal.dot(start_advance) >= 0.0 {
         first_frame.normal
     } else {
         first_frame.normal.scale(-1.0)
     };
-    let x_axis = first_normal.perpendicular()?;
-    let y_axis = first_normal.cross(x_axis).normalized()?;
+    let x_axis = first_normal
+        .perpendicular()
+        .or_refuse(KernelStage::Classify, "section_frame")?;
+    let y_axis = first_normal
+        .cross(x_axis)
+        .normalized()
+        .or_refuse(KernelStage::Classify, "section_frame")?;
     // Winding is normalized PER SECTION against this one frame, not decided once
     // from section 0 and applied to every section.
     //
@@ -284,7 +360,11 @@ fn loft_profile_brep_core(
     // the original rule verbatim, so its behaviour — and the side-face
     // permutation below, which keys off section 0 alone — is byte-identical.
     let mut section_reversed = Vec::with_capacity(section_count);
-    section_reversed.push(profile_area(&sections[0], first_frame.centroid, x_axis, y_axis)? < 0.0);
+    section_reversed.push(
+        profile_area(&sections[0], first_frame.centroid, x_axis, y_axis)
+            .or_refuse(KernelStage::Classify, "profile_area")?
+            < 0.0,
+    );
     let mut previous_normal = if section_reversed[0] {
         first_frame.normal.scale(-1.0)
     } else {
@@ -315,9 +395,11 @@ fn loft_profile_brep_core(
             for section_index in 1..section_count {
                 let previous = sections[section_index - 1][curve_index].control_points
                     [control_index]
-                    .point()?;
-                let current =
-                    sections[section_index][curve_index].control_points[control_index].point()?;
+                    .point()
+                    .or_refuse(KernelStage::Refine, "control_point")?;
+                let current = sections[section_index][curve_index].control_points[control_index]
+                    .point()
+                    .or_refuse(KernelStage::Refine, "control_point")?;
                 total += current.sub(previous).length();
                 chords[section_index] = total;
             }
@@ -331,7 +413,11 @@ fn loft_profile_brep_core(
         }
     }
     if columns == 0 {
-        return Err("loftSolid: sections coincide".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Classify,
+            "coincident_sections",
+            "loftSolid: sections coincide",
+        ));
     }
     for index in 0..section_count {
         parameters[index] = accumulated[index] / columns as f64;
@@ -339,7 +425,11 @@ fn loft_profile_brep_core(
     parameters[0] = 0.0;
     parameters[section_count - 1] = 1.0;
     if parameters.windows(2).any(|pair| pair[1] <= pair[0] + 1e-9) {
-        return Err("loftSolid: sections are not strictly ordered".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Classify,
+            "section_order",
+            "loftSolid: sections are not strictly ordered",
+        ));
     }
     // Tangent lofts always interpolate cubically — the end-derivative rows
     // need the two extra control points even for a 2-section Hermite loft.
@@ -357,9 +447,11 @@ fn loft_profile_brep_core(
             let points = sections
                 .iter()
                 .map(|section| section[curve_index].control_points[control_index].point())
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, String>>()
+                .or_refuse(KernelStage::Refine, "control_point")?;
             let interpolated = match end_tangents {
-                None => interpolate_curve(&points, degree_v, &parameters)?,
+                None => interpolate_curve(&points, degree_v, &parameters)
+                    .or_refuse(KernelStage::Refine, "interpolate")?,
                 Some((start_direction, end_direction)) => {
                     let chord: f64 = points
                         .windows(2)
@@ -373,7 +465,8 @@ fn loft_profile_brep_core(
                         &parameters,
                         start_direction.scale(magnitude),
                         end_direction.scale(magnitude),
-                    )?
+                    )
+                    .or_refuse(KernelStage::Refine, "interpolate_tangent")?
                 }
             };
             knots_v = interpolated.knots.clone();
@@ -392,7 +485,8 @@ fn loft_profile_brep_core(
             reference.knots.clone(),
             knots_v,
             grid,
-        )?);
+        )
+        .or_refuse(KernelStage::Fragment, "skin")?);
     }
 
     let bottom = &sections[0];
@@ -411,7 +505,9 @@ fn loft_profile_brep_core(
     let mut top_edge_ids = Vec::new();
     let mut vertical_edge_ids = Vec::new();
     for index in 0..curve_count {
-        let [start, end] = bottom[index].domain()?;
+        let [start, end] = bottom[index]
+            .domain()
+            .or_refuse(KernelStage::Fragment, "domain")?;
         // The TOP curve's own range, which is NOT the bottom's once the winding
         // normalization has reversed one section's curve ORDER: `reverse_section`
         // reverses the order and `reversed()` preserves each curve's domain, so
@@ -420,7 +516,9 @@ fn loft_profile_brep_core(
         // curve outside its own domain — pinned at an end while the skin swept
         // the real arc — which on a circular section split into two half-arcs is
         // a deviation of exactly the diameter.
-        let [top_start, top_end] = top[index].domain()?;
+        let [top_start, top_end] = top[index]
+            .domain()
+            .or_refuse(KernelStage::Fragment, "domain")?;
         let bottom_id = 10 + index as u64;
         let top_id = 10 + curve_count as u64 + index as u64;
         let vertical_id = 10 + 2 * curve_count as u64 + index as u64;
@@ -447,8 +545,12 @@ fn loft_profile_brep_core(
             degenerate: false,
             name: None,
         });
-        let vertical = skins[index].iso_curve_u(start)?;
-        let [v_start, v_end] = vertical.domain()?;
+        let vertical = skins[index]
+            .iso_curve_u(start)
+            .or_refuse(KernelStage::Fragment, "iso_curve")?;
+        let [v_start, v_end] = vertical
+            .domain()
+            .or_refuse(KernelStage::Fragment, "domain")?;
         edges.push(EdgeRecord {
             id: vertical_id,
             curve: vertical,
@@ -464,31 +566,37 @@ fn loft_profile_brep_core(
     let mut next_id = 1000u64;
     let mut faces = Vec::with_capacity(curve_count + 2);
     for index in 0..curve_count {
-        let [start, end] = bottom[index].domain()?;
+        let [start, end] = bottom[index]
+            .domain()
+            .or_refuse(KernelStage::Fragment, "domain")?;
         let coedges = vec![
             CoedgeRecord {
                 id: next_id,
                 edge_id: bottom_edge_ids[index],
                 forward: true,
-                pcurve: parameter_line(start, 0.0, end, 0.0)?,
+                pcurve: parameter_line(start, 0.0, end, 0.0)
+                    .or_refuse(KernelStage::Fragment, "pcurve")?,
             },
             CoedgeRecord {
                 id: next_id + 1,
                 edge_id: vertical_edge_ids[(index + 1) % curve_count],
                 forward: true,
-                pcurve: parameter_line(end, 0.0, end, 1.0)?,
+                pcurve: parameter_line(end, 0.0, end, 1.0)
+                    .or_refuse(KernelStage::Fragment, "pcurve")?,
             },
             CoedgeRecord {
                 id: next_id + 2,
                 edge_id: top_edge_ids[index],
                 forward: false,
-                pcurve: parameter_line(end, 1.0, start, 1.0)?,
+                pcurve: parameter_line(end, 1.0, start, 1.0)
+                    .or_refuse(KernelStage::Fragment, "pcurve")?,
             },
             CoedgeRecord {
                 id: next_id + 3,
                 edge_id: vertical_edge_ids[index],
                 forward: false,
-                pcurve: parameter_line(start, 1.0, start, 0.0)?,
+                pcurve: parameter_line(start, 1.0, start, 0.0)
+                    .or_refuse(KernelStage::Fragment, "pcurve")?,
             },
         ];
         next_id += 4;
@@ -531,6 +639,7 @@ fn loft_profile_brep_core(
         &mut next_id,
     )?);
     let solid = BrepSolid {
+        mass_properties_cache: Default::default(),
         id: next_id + 1,
         vertices,
         edges,
@@ -539,8 +648,12 @@ fn loft_profile_brep_core(
     };
     let issues = solid.validate();
     if !issues.is_empty() {
-        return Err(format!(
-            "Rust loft builder produced invalid topology: {issues:?}"
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "validate",
+            format!(
+                "Rust loft builder produced invalid topology: {issues:?}"
+            ),
         ));
     }
     // `validate()` is an INCIDENCE test: a loft whose walls pass through each

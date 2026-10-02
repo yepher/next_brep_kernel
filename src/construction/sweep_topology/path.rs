@@ -196,9 +196,13 @@ pub struct SweepPath {
 impl SweepPath {
     /// Classify `curves` (ordered head-to-tail) into a path. `names` may be
     /// shorter than `curves`, or empty.
-    pub fn new(curves: Vec<NurbsCurve>, names: Vec<String>) -> Result<Self, String> {
+    pub fn new(curves: Vec<NurbsCurve>, names: Vec<String>) -> Result<Self, KernelRefusal> {
         if curves.is_empty() {
-            return Err("sweepSolid: path chain is empty".into());
+            return Err(KernelRefusal::input(
+                KernelStage::Collect,
+                "chain_empty",
+                "sweepSolid: path chain is empty",
+            ));
         }
         // --- Endpoints, and the SCALE every position test below is relative to.
         //     Same form as the chainer's (`1e-5 * scale`, floored at 1.0 so a
@@ -208,8 +212,8 @@ impl SweepPath {
         //     run it produced is a ring.
         let mut endpoints = Vec::with_capacity(curves.len());
         for curve in &curves {
-            let [t0, t1] = curve.domain()?;
-            endpoints.push((curve.evaluate(t0)?, curve.evaluate(t1)?));
+            let [t0, t1] = curve.domain().or_refuse(KernelStage::Classify, "domain")?;
+            endpoints.push((curve.evaluate(t0).or_refuse(KernelStage::Classify, "evaluate")?, curve.evaluate(t1).or_refuse(KernelStage::Classify, "evaluate")?));
         }
         let first_start = endpoints[0].0;
         let scale = endpoints
@@ -225,9 +229,9 @@ impl SweepPath {
         //     plane, so a path and a profile are held to the same resolution.
         let mut samples = Vec::with_capacity(16 * curves.len() + 1);
         for curve in &curves {
-            let [t0, t1] = curve.domain()?;
+            let [t0, t1] = curve.domain().or_refuse(KernelStage::Classify, "domain")?;
             for index in 0..16 {
-                samples.push(curve.evaluate(t0 + (t1 - t0) * index as f64 / 16.0)?);
+                samples.push(curve.evaluate(t0 + (t1 - t0) * index as f64 / 16.0).or_refuse(KernelStage::Classify, "evaluate")?);
             }
         }
         samples.push(endpoints[curves.len() - 1].1);
@@ -298,12 +302,16 @@ impl SweepPath {
 
     /// Attach each segment's SCREW AXIS ([`Self::screw_axes`]), parallel to the
     /// curves. A zero axis is refused rather than silently read as "no axis".
-    pub fn with_screw_axes(mut self, axes: Vec<Option<Vec3>>) -> Result<Self, String> {
+    pub fn with_screw_axes(mut self, axes: Vec<Option<Vec3>>) -> Result<Self, KernelRefusal> {
         if axes.len() != self.curves.len() {
-            return Err(format!(
-                "sweepSolid: {} screw axes for a {}-segment path",
-                axes.len(),
-                self.curves.len()
+            return Err(KernelRefusal::input(
+                KernelStage::Collect,
+                "screw_axes_count",
+                format!(
+                    "sweepSolid: {} screw axes for a {}-segment path",
+                    axes.len(),
+                    self.curves.len()
+                ),
             ));
         }
         self.screw_axes = axes
@@ -312,9 +320,13 @@ impl SweepPath {
             .map(|(index, axis)| {
                 axis.map(|axis| {
                     axis.normalized().map_err(|_| {
-                        format!(
-                            "sweepSolid: path segment '{}' has a degenerate screw axis",
-                            self.name(index)
+                        KernelRefusal::input(
+                            KernelStage::Collect,
+                            "screw_axis",
+                            format!(
+                                "sweepSolid: path segment '{}' has a degenerate screw axis",
+                                self.name(index)
+                            ),
                         )
                     })
                 })
@@ -326,7 +338,7 @@ impl SweepPath {
 
     /// Classify a borrowed chain — the entry a caller assembling curves for one
     /// build uses ([`Self::new`] takes them by value for a caller that owns them).
-    pub fn from_curves(curves: &[NurbsCurve], names: &[String]) -> Result<Self, String> {
+    pub fn from_curves(curves: &[NurbsCurve], names: &[String]) -> Result<Self, KernelRefusal> {
         Self::new(curves.to_vec(), names.to_vec())
     }
 
@@ -341,7 +353,7 @@ impl SweepPath {
         before: usize,
         after: usize,
         closing: bool,
-    ) -> Result<PathJoint, String> {
+    ) -> Result<PathJoint, KernelRefusal> {
         let arriving = Self::frame_at(&curves[before], true, before, "end")?;
         let departing = Self::frame_at(&curves[after], false, after, "start")?;
         // Both unit, so the dot is the cosine of the break.
@@ -379,13 +391,17 @@ impl SweepPath {
         at_end: bool,
         index: usize,
         which: &str,
-    ) -> Result<(Vec3, Vec3), String> {
-        let [t0, t1] = curve.domain()?;
+    ) -> Result<(Vec3, Vec3), KernelRefusal> {
+        let [t0, t1] = curve.domain().or_refuse(KernelStage::Classify, "domain")?;
         let parameter = if at_end { t1 } else { t0 };
-        let derivatives = curve.derivatives(parameter, 2)?;
+        let derivatives = curve.derivatives(parameter, 2).or_refuse(KernelStage::Classify, "derivatives")?;
         let speed = derivatives[1].length();
         let tangent = derivatives[1].normalized().map_err(|_| {
-            format!("sweepSolid: path tangent is degenerate at the {which} of segment {index}")
+            KernelRefusal::input(
+                KernelStage::Classify,
+                "path_tangent",
+                format!("sweepSolid: path tangent is degenerate at the {which} of segment {index}"),
+            )
         })?;
         let curvature = derivatives[1]
             .cross(derivatives[2])

@@ -3,8 +3,7 @@
 //! orientation-preference handling (`preferredOppose` XOR
 //! reverse/opposeNormals), first-solve initialization, and the rigid-pose math
 //! shared with the write-back lane. The PER-TYPE `map` functions live with
-//! their constraints ([`super::constraints`], one module per type — build-spec
-//! §4 table).
+//! their constraints ([`super::constraints`], one module per type).
 //!
 //! # Selection-ref conventions (cross-lane contract)
 //!
@@ -232,7 +231,7 @@ fn parse_triple(coords: &str) -> Option<Vec3> {
 }
 
 // ===========================================================================
-// Mate construction (spec §4 table)
+// Mate construction
 // ===========================================================================
 
 /// One mapped mate: local geometry sides keyed by owning component id.
@@ -271,7 +270,7 @@ pub(super) struct MappedConstraint {
 /// count against the type's range). `persistent` is the entry's live
 /// `persistentData` — the orientation-preference cache (`preferredOppose`) is
 /// captured/re-captured here immediately (it is a resolve-time cache, not a
-/// solve result — requirements §6).
+/// solve result).
 pub(super) fn map_constraint(
     entry: &mut ConstraintEntry,
     resolved: &[ResolvedElement],
@@ -426,9 +425,9 @@ pub(super) fn effective_align(
 
 
 
-/// First-solve initialization (requirements §6): when `flag_key` is not yet
-/// set in `persistentData`, the target ADOPTS the current measurement and both
-/// the param and the flag are queued for commit on solve success.
+/// First-solve initialization: when `flag_key` is not yet set in
+/// `persistentData`, the target ADOPTS the current measurement and both the
+/// param and the flag are queued for commit on solve success.
 #[allow(clippy::type_complexity)]
 pub(super) fn first_solve_target(
     entry: &ConstraintEntry,

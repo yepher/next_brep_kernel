@@ -86,6 +86,8 @@ mod outline_offset;
 mod vacated_rim;
 #[path = "offset_shell/pipeline.rs"]
 mod pipeline;
+#[path = "offset_shell/refusals.rs"]
+mod refusals;
 
 use carrier_rebuild::*;
 use carriers::*;
@@ -97,6 +99,7 @@ use rim_welds::*;
 use smooth_sync::*;
 
 pub use pipeline::{offset_shell, offset_shell_with_diagnostics};
+pub(crate) use refusals::{is_offset_shell_no_retained_face, is_offset_shell_open_curved_rim};
 pub(crate) use orientation::{flip_all_faces, flip_shell_faces, orient_open_solid_faces};
 
 /// Merge connected shells, preserving the first shell record and face encounter order.

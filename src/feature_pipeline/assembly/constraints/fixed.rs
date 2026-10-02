@@ -1,7 +1,7 @@
-//! Fixed (`FIXD`) — ground ONE component in place (spec §4). The only
-//! one-element type, and the only one with no `map`: [`super::super::lifecycle`]
-//! grounds the resolved component (`set_component_fixed`) BEFORE body building,
-//! so every later fixed-flag read sees it.
+//! Fixed (`FIXD`) — ground ONE component in place. The only one-element type,
+//! and the only one with no `map`: [`super::super::lifecycle`] grounds the
+//! resolved component (`set_component_fixed`) BEFORE body building, so every
+//! later fixed-flag read sees it.
 
 use super::{elements_field, id_field, schema_entry, ConstraintTypeDef};
 use crate::feature_pipeline::SelectionProbe;

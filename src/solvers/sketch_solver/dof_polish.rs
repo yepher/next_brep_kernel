@@ -450,6 +450,11 @@ impl Engine {
         for i in 0..npts {
             coords[2 * i] = self.points[i].x;
             coords[2 * i + 1] = self.points[i].y;
+            // The part-origin reference sits wherever the world origin projects,
+            // possibly far from the drawing; it must not loosen the tolerances.
+            if is_sketch_origin_point_id(&self.points[i].id) {
+                continue;
+            }
             if self.points[i].x.is_finite() {
                 scale = scale.max(self.points[i].x.abs());
             }

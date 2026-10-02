@@ -62,6 +62,9 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
         // No valid face selections → the caller warns + returns empty (soft no-op).
         return result;
     }
+    // The feature proceeds on the faces that resolved: a miss is reported as
+    // a typed partial fulfilment beside `unresolved`, never silently.
+    result.note_partial_resolution(&selections);
 
     let feature_id = if ctx.id.is_empty() {
         ctx.feature_type.clone()
@@ -72,6 +75,9 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     let width = faces.len().to_string().len().max(2);
 
     let mut failures: Vec<String> = Vec::new();
+    // The first face's refusal carries its class to the feature result; the
+    // text stays the joined sentence over every face that failed.
+    let mut first_refusal: Option<crate::KernelRefusal> = None;
     for (index, (face_name, face)) in faces.iter().enumerate() {
         let result_name = if multiple {
             format!(
@@ -114,16 +120,23 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
                     });
                 }
             }
-            Err(error) => failures.push(format!("{face_name}: {error}")),
+            Err(error) => {
+                failures.push(format!("{face_name}: {error}"));
+                first_refusal.get_or_insert(error);
+            }
         }
     }
 
     // Hard error only when NOTHING was produced.
     if result.added.is_empty() {
-        return ctx.fail(format!(
+        let message = format!(
             "Thicken failed to produce any solids: {}",
             failures.join("; ")
-        ));
+        );
+        return match first_refusal {
+            Some(refusal) => ctx.fail(refusal.with_message(|_| message)),
+            None => ctx.fail(message),
+        };
     }
     result
 }
@@ -154,14 +167,20 @@ fn sanitize_token(value: &str) -> String {
 }
 
 /// Thicken one face (by resident handle + face id) into a slab solid.
-fn thicken_face(handle: u32, face_id: u64, distance: f64) -> Result<Vec<BrepSolid>, String> {
-    crate::with_registered_solid_str(handle, |solid| {
+fn thicken_face(handle: u32, face_id: u64, distance: f64) -> Result<Vec<BrepSolid>, crate::KernelRefusal> {
+    crate::with_registered_solid_typed(handle, |solid| {
         let face = solid
             .shells
             .iter()
             .flat_map(|shell| &shell.faces)
             .find(|face| face.id == face_id)
-            .ok_or_else(|| format!("thicken: face {face_id} not found on solid"))?;
+            .ok_or_else(|| {
+                crate::KernelRefusal::internal(
+                    crate::KernelStage::Collect,
+                    "thicken_face_not_found",
+                    format!("thicken: face {face_id} not found on solid"),
+                )
+            })?;
         // Grow along the face OUTWARD normal: the thickener's normal is Su×Sv, the
         // face normal is that only when `same_sense`, so flip the sign otherwise.
         let thickness = if face.same_sense { distance } else { -distance };
@@ -177,7 +196,7 @@ fn thicken_face(handle: u32, face_id: u64, distance: f64) -> Result<Vec<BrepSoli
         // missing (`offset/thicken.rs` non-iso trim on a curved sheet).
         // Propagate the real reason instead: a capability gap must present as
         // a refusal, never as a different solid.
-        let loops = build_trim_loops(face)?;
+        let loops = crate::OrRefuse::or_refuse(build_trim_loops(face), crate::KernelStage::Collect, "build_trim_loops")?;
         crate::thicken_trimmed_sheet(&face.surface, &loops, thickness, false)
     })
 }

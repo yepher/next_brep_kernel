@@ -32,7 +32,9 @@
 //! carries them imports as pure geometry rather than failing. A package that
 //! declares such an extension REQUIRED (`requiredextensions`) is refused
 //! instead, because honouring it is exactly what this reader cannot do.
-//! `<metadata>`, thumbnails and object names carry no geometry and are skipped.
+//! `<metadata>` and thumbnails carry no geometry and are skipped. An object's
+//! `name` is kept on each [`ThreeMfInstance`] only so a consumer can say WHICH
+//! object a refusal is about.
 //!
 //! Anything the core specification makes required and the file omits — the
 //! start-part relationship, an object id, a triangle's vertex indices, a
@@ -241,6 +243,10 @@ pub struct ThreeMfInstance {
     pub vertex_count: usize,
     pub first_triangle: usize,
     pub triangle_count: usize,
+    /// The placed object's `name`, or failing that the nearest named
+    /// `<components>` object above it; `None` when nothing on the way was
+    /// named. Carries no geometry.
+    pub name: Option<String>,
 }
 
 impl ThreeMfInstance {
@@ -461,7 +467,7 @@ fn flatten(
         for value in &mut transform[9..12] {
             *value *= scale;
         }
-        place(&document, &model_part, item.object_id, transform, 0, &mut instances)?;
+        place(&document, &model_part, item.object_id, transform, 0, None, &mut instances)?;
     }
     let mut positions = Vec::new();
     let mut indices = Vec::new();
@@ -515,6 +521,7 @@ fn place(
     object_id: u32,
     transform: [f64; 12],
     depth: usize,
+    inherited_name: Option<&str>,
     instances: &mut Vec<ThreeMfInstance>,
 ) -> Result<(), ThreeMfError> {
     if depth > MAX_COMPONENT_DEPTH {
@@ -527,6 +534,7 @@ fn place(
         part: model_part.to_owned(),
         detail: format!("object {object_id} is placed but never defined"),
     })?;
+    let name = object.name.as_deref().or(inherited_name);
     match &object.content {
         model::ObjectContent::Mesh(mesh) => {
             // Only PRINTABLE geometry reaches the soup: support, surface and
@@ -547,6 +555,7 @@ fn place(
                     vertex_count: 0,
                     first_triangle: 0,
                     triangle_count: 0,
+                    name: name.map(str::to_owned),
                 });
             }
             Ok(())
@@ -568,6 +577,7 @@ fn place(
                     component.object_id,
                     composed,
                     depth + 1,
+                    name,
                     instances,
                 )?;
             }

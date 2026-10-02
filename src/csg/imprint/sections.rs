@@ -612,6 +612,36 @@ pub(super) fn reuse_boundary_section_edges(
                 ok = false;
                 break;
             };
+            // Reusing an imported boundary must not introduce that boundary's
+            // residual onto a different support carrier. Its owning face may
+            // inherit an import error; a newly cut face may not borrow it.
+            if std::env::var("BREP_SHARED_SECTION_CARRIER_FLOOR").as_deref() != Ok("0") {
+                let [lo, hi] = reuse.arc.domain().or_refuse(KernelStage::Intersect, "domain")?;
+                let mut off = 0.0f64;
+                // Include each knot span so a short span is not skipped by a
+                // whole-domain grid. This is a sampled residual check, like the
+                // existing bidirectional section/arc comparison above.
+                for knots in reuse.arc.knots.windows(2) {
+                    let a = knots[0].max(lo);
+                    let b = knots[1].min(hi);
+                    if b <= a {
+                        continue;
+                    }
+                    for station in 0..=8 {
+                        let point = reuse.arc.evaluate(a + (b - a) * station as f64 / 8.0)
+                            .or_refuse(KernelStage::Intersect, "evaluate")?;
+                        off = off.max(project_point_to_surface(surface, point)
+                            .or_refuse(KernelStage::Intersect, "project_point_to_surface")?.distance);
+                    }
+                }
+                if debug {
+                    eprintln!("shared-section CARRIER piece {} face {}:{} off={off:.3e}", piece.id, key.operand, key.face_id);
+                }
+                if off > tolerance.max(1e-7) {
+                    ok = false;
+                    break;
+                }
+            }
             match build_pcurve_on_surface(surface, &reuse.arc) {
                 Ok(pcurve) => new_pcurves.push(FacePcurve {
                     operand: key.operand,

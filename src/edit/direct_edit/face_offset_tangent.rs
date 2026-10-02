@@ -1,5 +1,6 @@
 use super::plan::{EdgeEnd, PlanEdge, PlanVertex, PlannedCoedge, PlannedEdge, PlannedFace, RebuildPlan};
 use super::*;
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 
 // ---------------------------------------------------------------------------
 // A push whose MOUTH meets its floor at TANGENT vertices.
@@ -55,10 +56,16 @@ fn traversal(edge: &EdgeRecord, forward: bool) -> (u64, u64) {
     }
 }
 
-fn face_record(solid: &BrepSolid, face_id: u64) -> Result<&FaceRecord, String> {
+fn face_record(solid: &BrepSolid, face_id: u64) -> Result<&FaceRecord, KernelRefusal> {
     find_face(solid, face_id)
         .map(|(shell, position)| &solid.shells[shell].faces[position])
-        .ok_or_else(|| format!("offset_ruled_face: missing face {face_id}"))
+        .ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Collect,
+                "missing_face",
+                format!("offset_ruled_face: missing face {face_id}"),
+            )
+        })
 }
 
 /// The tangent vertices of the pushed face, read off topology, with their
@@ -77,7 +84,7 @@ pub(super) fn tangent_vertices(
     faces_of_edge: &HashMap<u64, Vec<u64>>,
     edge_by_id: &HashMap<u64, &EdgeRecord>,
     plane_tolerance: f64,
-) -> Result<Vec<TangentVertex>, String> {
+) -> Result<Vec<TangentVertex>, KernelRefusal> {
     let pushed = face_record(solid, face_id)?;
     let other = |edge_id: u64| -> Option<u64> {
         let incident = faces_of_edge.get(&edge_id)?;
@@ -140,14 +147,24 @@ pub(super) fn tangent_vertices(
                 .iter()
                 .find(|record| record.id == vertex)
                 .map(|record| record.point)
-                .ok_or_else(|| format!("offset_ruled_face: missing vertex {vertex}"))?;
+                .ok_or_else(|| {
+                    KernelRefusal::internal(
+                        KernelStage::Classify,
+                        "missing_vertex",
+                        format!("offset_ruled_face: missing vertex {vertex}"),
+                    )
+                })?;
             let surface_of = |face: u64| face_record(solid, face).map(|record| &record.surface);
             for floor in [floor_first, floor_second] {
                 if !matches!(surface_of(floor)?.analytic(), Some(AnalyticSurface::Plane { .. })) {
-                    return Err(format!(
+                    return Err(KernelRefusal::unsupported(
+                        KernelStage::Classify,
+                        "tangent_floor_not_planar",
+                        format!(
                         "offset_ruled_face: the push's mouth meets floor faces {floor_first} and \
                          {floor_second} at tangent vertex {vertex}, and face {floor} is not planar; \
                          a tangent vertex is split only on a PLANAR floor (refusing)"
+                    ),
                     ));
                 }
             }
@@ -182,31 +199,37 @@ fn into_face(
     face_id: u64,
     edge: &EdgeRecord,
     at_start: bool,
-) -> Result<Vec3, String> {
+) -> Result<Vec3, KernelRefusal> {
     let face = face_record(solid, face_id)?;
     let coedge = face
         .loops
         .iter()
         .flat_map(|loop_record| &loop_record.coedges)
         .find(|coedge| coedge.edge_id == edge.id)
-        .ok_or_else(|| format!("offset_ruled_face: face {face_id} does not use edge {}", edge.id))?;
-    let [u0, u1] = face.surface.domain_u()?;
-    let [v0, v1] = face.surface.domain_v()?;
-    let mut normal = face.surface.normal(0.5 * (u0 + u1), 0.5 * (v0 + v1))?;
+        .ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Classify,
+                "edge_use",
+                format!("offset_ruled_face: face {face_id} does not use edge {}", edge.id),
+            )
+        })?;
+    let [u0, u1] = face.surface.domain_u().or_refuse(KernelStage::Classify, "domain_u")?;
+    let [v0, v1] = face.surface.domain_v().or_refuse(KernelStage::Classify, "domain_v")?;
+    let mut normal = face.surface.normal(0.5 * (u0 + u1), 0.5 * (v0 + v1)).or_refuse(KernelStage::Classify, "normal")?;
     if !face.same_sense {
         normal = normal.scale(-1.0);
     }
     let parameter = if at_start { edge.t0 } else { edge.t1 };
-    let mut tangent = edge.curve.derivatives(parameter, 1)?[1];
+    let mut tangent = edge.curve.derivatives(parameter, 1).or_refuse(KernelStage::Classify, "derivatives")?[1];
     if !coedge.forward {
         tangent = tangent.scale(-1.0);
     }
-    normal.cross(tangent).normalized()
+    normal.cross(tangent).normalized().or_refuse(KernelStage::Classify, "normalized")
 }
 
 /// The pushed carrier's radius at `point`'s axial station, and `point`'s own
 /// distance from the axis.
-fn mouth_radius_at(s_prime: &NurbsSurface, point: Vec3) -> Result<(f64, f64), String> {
+fn mouth_radius_at(s_prime: &NurbsSurface, point: Vec3) -> Result<(f64, f64), KernelRefusal> {
     let Some(AnalyticSurface::RuledRevolution {
         frame,
         rho0,
@@ -214,7 +237,11 @@ fn mouth_radius_at(s_prime: &NurbsSurface, point: Vec3) -> Result<(f64, f64), St
         height,
     }) = s_prime.analytic()
     else {
-        return Err("offset_ruled_face: the pushed carrier is not a ruled revolution".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Classify,
+            "carrier_kind",
+            "offset_ruled_face: the pushed carrier is not a ruled revolution",
+        ));
     };
     let offset = point.sub(frame.origin);
     let station = offset.dot(frame.axis);
@@ -241,7 +268,7 @@ pub(super) fn plan_tangent_vertices(
     new_vertex: &mut HashMap<u64, Vec3>,
     cap_faces: &mut HashSet<u64>,
     plan: &mut RebuildPlan,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     if tangents.is_empty() {
         return Ok(());
     }
@@ -249,13 +276,25 @@ pub(super) fn plan_tangent_vertices(
         edge_by_id
             .get(&id)
             .copied()
-            .ok_or_else(|| format!("offset_ruled_face: missing edge {id}"))
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Fragment,
+                    "missing_edge",
+                    format!("offset_ruled_face: missing edge {id}"),
+                )
+            })
     };
     let old = |id: u64| {
         vertex_pos
             .get(&id)
             .copied()
-            .ok_or_else(|| format!("offset_ruled_face: missing vertex {id}"))
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Fragment,
+                    "vertex_pos",
+                    format!("offset_ruled_face: missing vertex {id}"),
+                )
+            })
     };
 
     // Which way did the rim go at each tangent vertex?
@@ -264,17 +303,25 @@ pub(super) fn plan_tangent_vertices(
     for tangent in tangents {
         let before = old(tangent.vertex)?;
         let after = new_vertex.get(&tangent.vertex).copied().ok_or_else(|| {
-            format!(
+            KernelRefusal::internal(
+                KernelStage::Fragment,
+                "tangent_unsolved",
+                format!(
                 "offset_ruled_face: tangent vertex {} was not solved by the rim pass — refusing",
                 tangent.vertex
+            ),
             )
         })?;
         let moved = after.sub(before);
         if moved.length() <= plane_tolerance {
-            return Err(format!(
+            return Err(KernelRefusal::input(
+                KernelStage::Classify,
+                "tangent_unmoved",
+                format!(
                 "offset_ruled_face: the push leaves tangent vertex {} where it is, so there is \
                  nothing to split — refusing",
                 tangent.vertex
+            ),
             ));
         }
         let mut sides = Vec::new();
@@ -284,19 +331,24 @@ pub(super) fn plan_tangent_vertices(
             sides.push(moved.dot(inward) > 0.0);
         }
         if sides[0] != sides[1] {
-            return Err(format!(
+            return Err(KernelRefusal::ill_posed(
+                KernelStage::Classify,
+                "tangent_mixed_sides",
+                format!(
                 "offset_ruled_face: at tangent vertex {} the rebuilt rim moves over one floor face \
                  and away from the other — refusing",
                 tangent.vertex
+            ),
             ));
         }
         match over_floor {
             Some(known) if known != sides[0] => {
-                return Err(
+                return Err(KernelRefusal::ill_posed(
+                    KernelStage::Classify,
+                    "tangent_mixed_vertices",
                     "offset_ruled_face: the rebuilt rim moves over the floor at some tangent \
-                     vertices and away from it at others — refusing"
-                        .into(),
-                )
+                     vertices and away from it at others — refusing",
+                ))
             }
             _ => over_floor = Some(sides[0]),
         }
@@ -342,7 +394,7 @@ pub(super) fn plan_tangent_vertices(
             plan.added_edges.push(PlannedEdge {
                 start: PlanVertex::Existing(tangent.vertex),
                 end: PlanVertex::Added(added[&tangent.vertex]),
-                curve: make_line(old(tangent.vertex)?, plan.added_vertices[added[&tangent.vertex]])?,
+                curve: make_line(old(tangent.vertex)?, plan.added_vertices[added[&tangent.vertex]]).or_refuse(KernelStage::Fragment, "make_line")?,
             });
         }
         for floor in &floors {
@@ -374,10 +426,14 @@ pub(super) fn plan_tangent_vertices(
                     } else if rims.contains(&here.edge_id) && !rims.contains(&next.edge_id) {
                         false
                     } else {
-                        return Err(format!(
+                        return Err(KernelRefusal::internal(
+                            KernelStage::Fragment,
+                            "bridge_splice",
+                            format!(
                             "offset_ruled_face: floor face {floor} does not pass tangent vertex {} \
                              between its rim and its own edge — refusing",
                             tangent.vertex
+                        ),
                         ));
                     };
                     planned.push(PlannedCoedge {
@@ -393,9 +449,13 @@ pub(super) fn plan_tangent_vertices(
                 .filter(|tangent| tangent.floor_a == *floor || tangent.floor_b == *floor)
                 .count();
             if spliced != expected {
-                return Err(format!(
+                return Err(KernelRefusal::internal(
+                    KernelStage::Fragment,
+                    "bridge_count",
+                    format!(
                     "offset_ruled_face: floor face {floor} meets {expected} tangent vertices but its \
                      loops pass {spliced} of them — refusing"
+                ),
                 ));
             }
             plan.faces.push(PlannedFace {
@@ -419,9 +479,13 @@ pub(super) fn plan_tangent_vertices(
         if own.normal.cross(plane.normal).length() > 1e-9
             || own.origin.sub(plane.origin).dot(plane.normal).abs() > plane_tolerance
         {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "floors_not_coplanar",
+                format!(
                 "offset_ruled_face: the floor faces the mouth crosses at its tangent vertices do not \
                  share one plane (face {floor}) — refusing"
+            ),
             ));
         }
         for loop_record in &face.loops {
@@ -433,12 +497,16 @@ pub(super) fn plan_tangent_vertices(
                         let point = old(vertex)?;
                         let (mouth, radial) = mouth_radius_at(s_prime, point)?;
                         if radial >= mouth - plane_tolerance {
-                            return Err(format!(
+                            return Err(KernelRefusal::unsupported(
+                                KernelStage::Classify,
+                                "mouth_short_of_corner",
+                                format!(
                                 "offset_ruled_face: the push carries the mouth over floor face \
                                  {floor} but not past its corner vertex {vertex} (the far end of \
                                  edge {}: {radial:.6} from the axis, the new mouth {mouth:.6}); the \
                                  floor would need new faces between the rim and that corner — refusing",
                                 record.id
+                            ),
                             ));
                         }
                     }
@@ -464,7 +532,7 @@ pub(super) fn plan_tangent_vertices(
     // With the floor gone, its other neighbours (the flats) are bounded below
     // by the new face, so they must stand on the far side of the floor's plane
     // from the pushed face — otherwise the grown mouth cuts through them.
-    let side = |face: u64| -> Result<(f64, f64), String> {
+    let side = |face: u64| -> Result<(f64, f64), KernelRefusal> {
         let record = face_record(solid, face)?;
         let (mut low, mut high) = (0.0f64, 0.0f64);
         for coedge in record.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
@@ -483,10 +551,14 @@ pub(super) fn plan_tangent_vertices(
     } else if pushed_low < -plane_tolerance && pushed_high <= plane_tolerance {
         -1.0
     } else {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "pushed_face_straddles_floor",
+            format!(
             "offset_ruled_face: the pushed face does not lie on one side of floor face {}'s plane \
              — refusing",
             floors[0]
+        ),
         ));
     };
     for neighbour in &beyond {
@@ -497,9 +569,13 @@ pub(super) fn plan_tangent_vertices(
             low < -plane_tolerance
         };
         if wrong {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "neighbour_cut_by_mouth",
+                format!(
                 "offset_ruled_face: face {neighbour} meets the floor on the pushed face's side of \
                  its plane, so a mouth grown past the floor would cut it — refusing"
+            ),
             ));
         }
     }
@@ -526,26 +602,38 @@ pub(super) fn plan_tangent_vertices(
                 .filter(|index| open[*index] && uses[*index].1 == head)
                 .collect();
             if successors.len() != 1 {
-                return Err(format!(
+                return Err(KernelRefusal::internal(
+                    KernelStage::Fragment,
+                    "merge_loops",
+                    format!(
                     "offset_ruled_face: merging floor faces {floors:?} leaves a boundary that does \
                      not close into loops ({} ways on from {head:?}) — refusing",
                     successors.len()
+                ),
                 ));
             }
             at = successors[0];
         }
         if rim_count != 0 && rim_count != chain.len() {
-            return Err(format!(
+            return Err(KernelRefusal::internal(
+                KernelStage::Fragment,
+                "merge_rim_loop",
+                format!(
                 "offset_ruled_face: merging floor faces {floors:?} leaves a loop that runs along the \
                  rim and off it — refusing"
+            ),
             ));
         }
         loops.push((rim_count != 0, chain));
     }
     if loops.iter().filter(|(rim, _)| *rim).count() != 1 {
-        return Err(format!(
+        return Err(KernelRefusal::internal(
+            KernelStage::Fragment,
+            "merge_rim_count",
+            format!(
             "offset_ruled_face: merging floor faces {floors:?} does not leave the rim as one loop — \
              refusing"
+        ),
         ));
     }
     loops.sort_by_key(|(rim, _)| !*rim);

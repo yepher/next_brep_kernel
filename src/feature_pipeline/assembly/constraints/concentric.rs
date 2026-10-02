@@ -1,4 +1,4 @@
-//! Concentric (`CONC`) — two axis-bearing elements share an axis (spec §4):
+//! Concentric (`CONC`) — two axis-bearing elements share an axis:
 //! cylindrical/conical faces, circular edges.
 
 use super::super::mapping::{

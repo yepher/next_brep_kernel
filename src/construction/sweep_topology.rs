@@ -6,6 +6,7 @@ use crate::{
     make_extrusion, make_line, make_plane, project_point_to_curve, BooleanOperation,
     BooleanOptions, NurbsCurve, NurbsSurface, Vec3, Vec4,
 };
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 
 #[path = "sweep_topology/extrude.rs"]
 mod extrude;
@@ -44,6 +45,7 @@ pub use sweep::{
     ProfileAnchor, SectionPlacement, SweepClosure, SWEEP_TIGHT_BEND_REFUSAL,
 };
 
+pub(crate) use sweep::is_sweep_tight_bend;
 pub use twist::SWEEP_TWIST_CLOSURE_REFUSAL;
 use twist::{closing_twist, ClosingTwist};
 

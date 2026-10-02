@@ -11,7 +11,7 @@ pub(crate) struct TangentLoftRequest {
 pub fn loft_profile_brep_closed_json(request_json: &str) -> Result<String, JsValue> {
     let request: LoftBrepRequest =
         serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
-    let solid = loft_profile_brep_closed(&request.sections).map_err(javascript_error)?;
+    let solid = loft_profile_brep_closed(&request.sections).map_err(javascript_refusal)?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -19,7 +19,7 @@ pub fn loft_profile_brep_closed_json(request_json: &str) -> Result<String, JsVal
 pub fn loft_profile_brep_closed_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValue> {
     let request: LoftBrepRequest =
         serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
-    let solid = loft_profile_brep_closed(&request.sections).map_err(javascript_error)?;
+    let solid = loft_profile_brep_closed(&request.sections).map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
 }
 
@@ -32,7 +32,7 @@ pub fn loft_profile_brep_tangent_json(request_json: &str) -> Result<String, JsVa
         request.start_direction,
         request.end_direction,
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -45,7 +45,7 @@ pub fn loft_profile_brep_tangent_buffer(request_json: &str) -> Result<WasmSolidB
         request.start_direction,
         request.end_direction,
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
 }
 
@@ -53,7 +53,7 @@ pub fn loft_profile_brep_tangent_buffer(request_json: &str) -> Result<WasmSolidB
 pub fn loft_profile_brep_guided_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValue> {
     let request: GuidedLoftRequest =
         serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
-    let solid = guided_loft_dispatch(&request).map_err(javascript_error)?;
+    let solid = guided_loft_dispatch(&request).map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
 }
 
@@ -62,7 +62,7 @@ pub fn sweep_profile_along_path_json(request_json: &str) -> Result<String, JsVal
     let request: SweepRequest =
         serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
     let solid = sweep_profile_along_path(&request.profile, &request.path, request.name.as_deref())
-        .map_err(javascript_error)?;
+        .map_err(javascript_refusal)?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -71,7 +71,7 @@ pub fn sweep_profile_along_path_buffer(request_json: &str) -> Result<WasmSolidBu
     let request: SweepRequest =
         serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
     let solid = sweep_profile_along_path(&request.profile, &request.path, request.name.as_deref())
-        .map_err(javascript_error)?;
+        .map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
 }
 
@@ -95,7 +95,7 @@ pub fn sweep_profile_twisted_json(request_json: &str) -> Result<String, JsValue>
         request.twist_angle,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -109,7 +109,7 @@ pub fn sweep_profile_twisted_buffer(request_json: &str) -> Result<WasmSolidBuffe
         request.twist_angle,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
 }
 
@@ -126,7 +126,7 @@ pub fn sweep_profile_helix_json(request_json: &str) -> Result<String, JsValue> {
         request.turns,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -143,7 +143,7 @@ pub fn sweep_profile_helix_buffer(request_json: &str) -> Result<WasmSolidBuffer,
         request.turns,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
 }
 
@@ -369,7 +369,7 @@ pub fn offset_surface_json(request_json: &str) -> Result<String, JsValue> {
     let request: OffsetSurfaceRequest =
         serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
     let surface = offset_surface(&request.face, request.distance, request.planar_extension)
-        .map_err(javascript_error)?;
+        .map_err(javascript_refusal)?;
     serde_json::to_string(&surface).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -444,7 +444,7 @@ pub fn thicken_face_sheet_json(request_json: &str) -> Result<String, JsValue> {
     let request: ThickenSheetRequest =
         serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
     let bodies = thicken_face_sheet(&request.surface, request.thickness, request.symmetric)
-        .map_err(javascript_error)?;
+        .map_err(javascript_refusal)?;
     serde_json::to_string(&bodies).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -453,7 +453,7 @@ pub fn thicken_face_sheet_buffer(request_json: &str) -> Result<WasmSolidBuffer, 
     let request: ThickenSheetRequest =
         serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
     let bodies = thicken_face_sheet(&request.surface, request.thickness, request.symmetric)
-        .map_err(javascript_error)?;
+        .map_err(javascript_refusal)?;
     solid_buffer(single_body(&bodies, "thicken_face_sheet")?, "{}".into())
 }
 
@@ -478,7 +478,7 @@ pub fn thicken_trimmed_sheet_json(request_json: &str) -> Result<String, JsValue>
         request.thickness,
         request.symmetric,
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     serde_json::to_string(&bodies).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -492,7 +492,7 @@ pub fn thicken_trimmed_sheet_buffer(request_json: &str) -> Result<WasmSolidBuffe
         request.thickness,
         request.symmetric,
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     solid_buffer(single_body(&bodies, "thicken_trimmed_sheet")?, "{}".into())
 }
 
@@ -524,7 +524,7 @@ pub fn offset_face_carrier_json(request_json: &str) -> Result<String, JsValue> {
         request.distance,
         request.planar_extension,
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     serde_json::to_string(&carrier).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -533,7 +533,7 @@ pub fn offset_shell_json(request_json: &str) -> Result<String, JsValue> {
     let request: OffsetShellRequest =
         serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
     let result = offset_shell(&request.solid, &request.opening_face_ids, request.distance)
-        .map_err(javascript_error)?;
+        .map_err(javascript_refusal)?;
     serde_json::to_string(&result).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -547,7 +547,7 @@ pub fn offset_shell_diagnostics_json(request_json: &str) -> Result<String, JsVal
         request.distance,
         request.tolerances,
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     serde_json::to_string(&result).map_err(|error| javascript_error(error.to_string()))
 }
 

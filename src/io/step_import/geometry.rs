@@ -38,16 +38,42 @@ pub(super) fn surface_scale(surface: &NurbsSurface) -> Result<f64, String> {
     Ok(scale.max(1.0))
 }
 
-/// The pcurve fit target for every trim on `surface`.
+/// The pcurve fit target for every trim on `surface`: the kernel's absolute
+/// refinement floor, [`crate::PCURVE_REFINEMENT_TOLERANCE`].
 ///
-/// It must stay INSIDE the validator's pcurve band, whose floor is ABSOLUTE
-/// (4e-3): a purely scale-proportional target lets the fitter stop above the
-/// validation limit on large (BIM-sized) parts even though the locus is
-/// exactly representable.
+/// Until 2026-09-26 this was `min(1e-6·(1 + scale), 0.5·pcurve_consistency)`,
+/// a bar relative to the part: 2.0e-3 on a building model, 1.5e-4 on a 172 mm
+/// engine block. The 2026-09-18 fidelity census read 5286 imported pcurves as
+/// the fitter's own error, 3633 of them UNDER that ask, and showed the ask,
+/// not the fitter, was the defect: the same builder asked for 1e-9 improved
+/// 312 of the worst 400 by ten times or more. The ask is now the floor every
+/// other fitter in the kernel refines to, the builder measures what it
+/// reached out of sample and refuses over the ask plus the stations' own
+/// standoff (`crate::pcurve::accept_fit`), and a file whose curve is not on
+/// its carrier is fitted to its own standoff instead of chased to the sample
+/// cap.
+///
+/// `surface` is taken so a size-dependent floor can be argued from it later;
+/// today the floor is absolute, as measured for the kernel's other fitters.
 pub(super) fn loop_pcurve_tolerance(surface: &NurbsSurface) -> Result<f64, String> {
+    // The REFINEMENT target, restored to the size-derived formula the importer
+    // carried until 2026-09-26. For one landing it was the absolute 1e-7
+    // floor: a station fitter chasing the feet of a curve that stands 1e-5 to
+    // 1e-3 off its carrier down to 1e-7 fits the file's noise — the soundness
+    // scan then reads more self-crossing loops on abc_00000011/12/13/23 (4, 4,
+    // 4, 7 against 3, 3, 3, 6) and an offset-shell stage indexes past its
+    // rail. The 1e-7 floor is the DETECTOR the fit is read against, reported
+    // per trim on the import (`builder/loops.rs`), not the target it chases.
     let scale = surface_scale(surface)?;
     Ok((1e-6 * (1.0 + scale))
         .min(0.5 * crate::KernelTolerances::for_scale(scale, 1e-7).pcurve_consistency))
+}
+
+/// The bar every derived trim is READ against and reported over: the
+/// kernel's absolute refinement floor, plus the stations' own standoff (no
+/// pcurve can image a curve closer than it stands off its carrier).
+pub(super) fn trim_detector_bar(report: &crate::PcurveFitReport) -> f64 {
+    crate::PCURVE_REFINEMENT_TOLERANCE + report.off_surface
 }
 
 /// The on-surface seam ruling between two rim seam-vertices of a periodic

@@ -7,11 +7,15 @@ pub(super) fn validate_sections(
     tolerance: f64,
     operation: &str,
     detailed_errors: bool,
-) -> Result<usize, String> {
+) -> Result<usize, KernelRefusal> {
     let curve_count = sections[0].len();
     if sections.iter().any(|section| section.len() != curve_count) {
-        return Err(format!(
-            "{operation}: sections must have the same curve count"
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "curve_count",
+            format!(
+                "{operation}: sections must have the same curve count"
+            ),
         ));
     }
     for section in sections {
@@ -24,8 +28,12 @@ pub(super) fn validate_sections(
             if curve.degree != reference.degree
                 || curve.control_points.len() != reference.control_points.len()
             {
-                return Err(format!(
-                    "{operation}: section {section_index} curve {curve_index} incompatible with section 0"
+                return Err(KernelRefusal::input(
+                    KernelStage::Collect,
+                    "section_degree",
+                    format!(
+                        "{operation}: section {section_index} curve {curve_index} incompatible with section 0"
+                    ),
                 ));
             }
             if curve.knots.len() != reference.knots.len()
@@ -40,8 +48,12 @@ pub(super) fn validate_sections(
                 } else {
                     "incompatible with section 0"
                 };
-                return Err(format!(
-                    "{operation}: section {section_index} curve {curve_index} {reason}"
+                return Err(KernelRefusal::input(
+                    KernelStage::Collect,
+                    "section_knots",
+                    format!(
+                        "{operation}: section {section_index} curve {curve_index} {reason}"
+                    ),
                 ));
             }
             if curve
@@ -55,8 +67,12 @@ pub(super) fn validate_sections(
                 } else {
                     "incompatible with section 0"
                 };
-                return Err(format!(
-                    "{operation}: section {section_index} curve {curve_index} {reason}"
+                return Err(KernelRefusal::input(
+                    KernelStage::Collect,
+                    "section_weights",
+                    format!(
+                        "{operation}: section {section_index} curve {curve_index} {reason}"
+                    ),
                 ));
             }
         }

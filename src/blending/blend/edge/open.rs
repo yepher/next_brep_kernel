@@ -1,3 +1,4 @@
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 
 /// General OPEN-edge rolling-ball fillet or chamfer: §4.9 march +
@@ -8,9 +9,9 @@ pub fn blend_open_edge(
     radius: f64,
     chamfer: bool,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     if !(radius > 0.0) || !radius.is_finite() {
-        return Err("blend: radius must be positive".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "radius", "blend: radius must be positive"));
     }
     blend_open_edge_impl(solid, edge_id, &|_| radius, chamfer, name)
 }
@@ -21,14 +22,14 @@ pub(super) fn blend_open_edge_impl(
     radius_at: &dyn Fn(f64) -> f64,
     chamfer: bool,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let edge = solid
         .edges
         .iter()
         .find(|edge| edge.id == edge_id)
-        .ok_or_else(|| format!("blend: edge {edge_id} not found"))?;
+        .ok_or_else(|| format!("blend: edge {edge_id} not found")).or_refuse(KernelStage::Refine, "ok_or_else")?;
     if edge.start_vertex_id == edge.end_vertex_id {
-        return Err("blend: blend_open_edge requires an open edge".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "open_edge", "blend: blend_open_edge requires an open edge"));
     }
     let (first_face, first_loop, first_coedge) = locate_mate(solid, edge_id, None)?;
     let (second_face, second_loop, second_coedge) =
@@ -76,7 +77,7 @@ pub(super) fn blend_open_edge_impl(
             ep
         );
     }
-    let compute = |overshoot_fraction: f64| -> Result<(FittedRows, Vec<EndSurgery>, bool), String> {
+    let compute = |overshoot_fraction: f64| -> Result<(FittedRows, Vec<EndSurgery>, bool), KernelRefusal> {
         // The open-edge surgery locates its ends by support crossings, not by
         // the marched vertex stations; the snapped indices only break the fit
         // where the carriers' extension starts (`fit_open_rows`).
@@ -172,7 +173,7 @@ pub(super) fn blend_open_edge_impl(
     // fallback-to-first-Ok semantics), so the seed can improve the first
     // landing but never change the fallback behaviour.
     let mut chosen: Option<(FittedRows, Vec<EndSurgery>)> = None;
-    let mut last_error: Option<String> = None;
+    let mut last_error: Option<KernelRefusal> = None;
     if let Some(fraction) = seeded_fraction {
         match compute(fraction) {
             Ok((rows, ends, true)) => chosen = Some((rows, ends)),
@@ -197,12 +198,18 @@ pub(super) fn blend_open_edge_impl(
         }
     }
     let (rows, ends) = chosen.ok_or_else(|| {
-        last_error.unwrap_or_else(|| "blend: open march failed at every overshoot".into())
+        last_error.unwrap_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Refine,
+                "open_march",
+                "blend: open march failed at every overshoot",
+            )
+        })
     })?;
 
     let [start_end, finish_end] = match <[EndSurgery; 2]>::try_from(ends) {
         Ok(pair) => pair,
-        Err(_) => return Err("blend: open surgery needs exactly two ends".into()),
+        Err(_) => return Err(KernelRefusal::internal(KernelStage::Sew, "open_surgery_ends", "blend: open surgery needs exactly two ends")),
     };
     // A crossing that only resolved on a looser rung of the tolerance ladder
     // builds something master refused outright, so it must earn its answer
@@ -283,7 +290,7 @@ pub(in crate::blend) fn build_open_surgery(
     rows: FittedRows,
     ends: [EndPlan; 2],
     name: Option<&str>,
-) -> Result<SewnStripe, String> {
+) -> Result<SewnStripe, KernelRefusal> {
     let [start_end, finish_end] = ends;
 
     // Trim the support rows to the crossing window.
@@ -292,13 +299,13 @@ pub(in crate::blend) fn build_open_surgery(
     // split off on that side.  Only equality: a stop PAST the row's end — a
     // free end's crossing the rows never reached — still fails the split and
     // refuses, rather than building a rail out to wherever the rows stop.
-    let trim_row = |row: &NurbsCurve, a: f64, b: f64| -> Result<NurbsCurve, String> {
-        let [low, high] = row.domain()?;
-        let tail = if a == low { row.clone() } else { row.split(a)?.1 };
+    let trim_row = |row: &NurbsCurve, a: f64, b: f64| -> Result<NurbsCurve, KernelRefusal> {
+        let [low, high] = row.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let tail = if a == low { row.clone() } else { row.split(a).or_refuse(KernelStage::Refine, "split")?.1 };
         if b == high {
             return Ok(tail);
         }
-        let (middle, _) = tail.split(b)?;
+        let (middle, _) = tail.split(b).or_refuse(KernelStage::Refine, "split")?;
         Ok(middle)
     };
     let kind = |plan: &EndPlan| match plan {
@@ -307,18 +314,20 @@ pub(in crate::blend) fn build_open_surgery(
         EndPlan::Miter(_) => "miter",
         EndPlan::Cap(_) => "cap",
     };
-    let describe_trim = |error: String| {
-        format!(
-            "{error} (edge {} rows trimmed for a {} start at cr {:.6}/cs {:.6} and a {} finish \
-             at cr {:.6}/cs {:.6})",
-            edge.id,
-            kind(&start_end),
-            start_end.cr_parameter(),
-            start_end.cs_parameter(),
-            kind(&finish_end),
-            finish_end.cr_parameter(),
-            finish_end.cs_parameter()
-        )
+    let describe_trim = |error: KernelRefusal| {
+        error.with_message(|error| {
+            format!(
+                "{error} (edge {} rows trimmed for a {} start at cr {:.6}/cs {:.6} and a {} finish \
+                 at cr {:.6}/cs {:.6})",
+                edge.id,
+                kind(&start_end),
+                start_end.cr_parameter(),
+                start_end.cs_parameter(),
+                kind(&finish_end),
+                finish_end.cr_parameter(),
+                finish_end.cs_parameter()
+            )
+        })
     };
     // A rail whose two stops are one point within `consumed_band` has no strip
     // to trim: the blend takes that mate down to a single point along this
@@ -330,10 +339,10 @@ pub(in crate::blend) fn build_open_surgery(
     // identifies (`SewnStripe::identified`) once every stripe is in.  A stripe
     // free at BOTH ends has no corner to collapse onto, so it refuses.
     let band = consumed_band(solid);
-    let collapses = |row: &NurbsCurve, a: f64, b: f64| -> Result<bool, String> {
-        let from = row.evaluate(a)?;
-        Ok(row.evaluate(b)?.sub(from).length() <= band
-            && row.evaluate(0.5 * (a + b))?.sub(from).length() <= band)
+    let collapses = |row: &NurbsCurve, a: f64, b: f64| -> Result<bool, KernelRefusal> {
+        let from = row.evaluate(a).or_refuse(KernelStage::Refine, "evaluate")?;
+        Ok(row.evaluate(b).or_refuse(KernelStage::Refine, "evaluate")?.sub(from).length() <= band
+            && row.evaluate(0.5 * (a + b)).or_refuse(KernelStage::Refine, "evaluate")?.sub(from).length() <= band)
     };
     let cr_collapsed = collapses(&rows.cr, start_end.cr_parameter(), finish_end.cr_parameter())?;
     let cs_collapsed = collapses(&rows.cs, start_end.cs_parameter(), finish_end.cs_parameter())?;
@@ -348,10 +357,10 @@ pub(in crate::blend) fn build_open_surgery(
             None
         };
         if let Some(reason) = unsupported {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(KernelStage::Sew, super::RAIL_COLLAPSE_WHAT, format!(
                 "{RAIL_COLLAPSE_UNSUPPORTED} edge {}'s rail shrinks to a point and {reason}",
                 edge.id
-            ));
+            )));
         }
     }
     let trim_rail = |collapsed: bool,
@@ -359,7 +368,7 @@ pub(in crate::blend) fn build_open_surgery(
                      pcurve: &NurbsCurve,
                      a: f64,
                      b: f64|
-     -> Result<Option<(NurbsCurve, NurbsCurve)>, String> {
+     -> Result<Option<(NurbsCurve, NurbsCurve)>, KernelRefusal> {
         if collapsed {
             return Ok(None);
         }
@@ -381,11 +390,11 @@ pub(in crate::blend) fn build_open_surgery(
     )?;
     // A collapsed rail's domain is its two stops, which are one point.
     let cr_domain = match &cr_rail {
-        Some((cr, _)) => cr.domain()?,
+        Some((cr, _)) => cr.domain().or_refuse(KernelStage::Refine, "domain")?,
         None => [start_end.cr_parameter(), finish_end.cr_parameter()],
     };
     let cs_domain = match &cs_rail {
-        Some((cs, _)) => cs.domain()?,
+        Some((cs, _)) => cs.domain().or_refuse(KernelStage::Refine, "domain")?,
         None => [start_end.cs_parameter(), finish_end.cs_parameter()],
     };
     // A rail's end points, read off the trimmed rail or, collapsed, the row.
@@ -411,12 +420,12 @@ pub(in crate::blend) fn build_open_surgery(
     // Consumed means within `consumed_band` — the slack `check_support_extent`
     // refuses past, so a rail between the two is not possible.
     let classify =
-        |boundary_id: u64, boundary_param: f64, corner: u64| -> Result<RimResolution, String> {
+        |boundary_id: u64, boundary_param: f64, corner: u64| -> Result<RimResolution, KernelRefusal> {
             let boundary = result
                 .edges
                 .iter()
                 .find(|candidate| candidate.id == boundary_id)
-                .ok_or("blend: end boundary edge missing during surgery")?;
+                .ok_or(KernelRefusal::internal(KernelStage::Sew, "end_boundary_edge", "blend: end boundary edge missing during surgery"))?;
             let span = (boundary.t1 - boundary.t0).abs().max(1e-12);
             let far_vertex = if boundary.start_vertex_id == corner {
                 Some((boundary.end_vertex_id, boundary.t1, boundary.t0))
@@ -441,8 +450,8 @@ pub(in crate::blend) fn build_open_surgery(
                     .iter()
                     .find(|candidate| candidate.id == far_id)
                     .map(|candidate| candidate.point)
-                    .ok_or("blend: consumed boundary far vertex missing")?;
-                let crossing = boundary.curve.evaluate_extended(boundary_param)?;
+                    .ok_or(KernelRefusal::internal(KernelStage::Sew, "far_vertex", "blend: consumed boundary far vertex missing"))?;
+                let crossing = boundary.curve.evaluate_extended(boundary_param).or_refuse(KernelStage::Refine, "evaluate_extended")?;
                 let _ = span;
                 let past_far = crossing.sub(far_point).length();
                 if past_far <= band {
@@ -452,7 +461,7 @@ pub(in crate::blend) fn build_open_surgery(
                         .iter()
                         .any(|candidate| candidate.id == far_id)
                     {
-                        return Err("blend: consumed boundary far vertex missing".into());
+                        return Err(KernelRefusal::internal(KernelStage::Sew, "far_vertex", "blend: consumed boundary far vertex missing"));
                     }
                     return Ok(RimResolution::Consumed(far_id));
                 }
@@ -469,11 +478,11 @@ pub(in crate::blend) fn build_open_surgery(
                 // r = 10.001 pinch past an earlier round (2e-3 past), both of
                 // which refused later in the surgery before.
                 if (boundary_param - far_t) * (far_t - near_t) > 0.0 {
-                    return Err(format!(
+                    return Err(KernelRefusal::unsupported(KernelStage::Sew, "blend_wider_than_face", format!(
                         "{BLEND_WIDER_THAN_FACE} its rail crosses edge {boundary_id} {past_far:.3e} \
                          past that edge's far vertex, and a rail within {band:.3e} of it is the \
                          most this surgery snaps onto the edge"
-                    ));
+                    )));
                 }
             }
             Ok(RimResolution::Fresh)
@@ -484,7 +493,7 @@ pub(in crate::blend) fn build_open_surgery(
     let resolve_side = |plan: &EndPlan,
                         side_first: bool,
                         corner: u64|
-     -> Result<RimResolution, String> {
+     -> Result<RimResolution, KernelRefusal> {
         if let Some(vertex) = plan.planned_rim(side_first) {
             return Ok(RimResolution::Corner(vertex));
         }
@@ -503,7 +512,7 @@ pub(in crate::blend) fn build_open_surgery(
                 corner,
             ),
             EndPlan::Corner(_) | EndPlan::Miter(_) | EndPlan::Cap(_) => {
-                Err("blend: planned end without rim vertices".into())
+                Err(KernelRefusal::internal(KernelStage::Sew, "rim_vertices", "blend: planned end without rim vertices"))
             }
         }
     };
@@ -576,12 +585,12 @@ pub(in crate::blend) fn build_open_surgery(
 
     // Resolve the four rim vertices: reuse the existing vertex for a consumed
     // side, else create a fresh vertex at the support-row endpoint.
-    let mut resolve = |rim: &RimResolution, point: Result<Vec3, String>| -> Result<u64, String> {
+    let mut resolve = |rim: &RimResolution, point: Result<Vec3, String>| -> Result<u64, KernelRefusal> {
         match rim.existing() {
             Some(id) => Ok(id),
             None => {
                 let id = take_id();
-                result.vertices.push(VertexRecord { id, point: point? });
+                result.vertices.push(VertexRecord { id, point: point.or_refuse(KernelStage::Refine, "point")? });
                 Ok(id)
             }
         }
@@ -597,10 +606,10 @@ pub(in crate::blend) fn build_open_surgery(
         .flatten()
         .fold(0.0f64, |worst, sew| worst.max(sew.deviation));
     for (rim, vertex, row_end) in [
-        (&start_first, w1a, cr_at(cr_domain[0])?),
-        (&finish_first, w1b, cr_at(cr_domain[1])?),
-        (&start_second, w2a, cs_at(cs_domain[0])?),
-        (&finish_second, w2b, cs_at(cs_domain[1])?),
+        (&start_first, w1a, cr_at(cr_domain[0]).or_refuse(KernelStage::Refine, "cr_at")?),
+        (&finish_first, w1b, cr_at(cr_domain[1]).or_refuse(KernelStage::Refine, "cr_at")?),
+        (&start_second, w2a, cs_at(cs_domain[0]).or_refuse(KernelStage::Refine, "cs_at")?),
+        (&finish_second, w2b, cs_at(cs_domain[1]).or_refuse(KernelStage::Refine, "cs_at")?),
     ] {
         if !rim.is_consumed() {
             continue;
@@ -609,7 +618,7 @@ pub(in crate::blend) fn build_open_surgery(
             .vertices
             .iter()
             .find(|candidate| candidate.id == vertex)
-            .ok_or("blend: consumed rim vertex missing")?
+            .ok_or(KernelRefusal::internal(KernelStage::Sew, "rim_vertex", "blend: consumed rim vertex missing"))?
             .point;
         snap = snap.max(row_end.sub(point).length());
     }
@@ -661,12 +670,12 @@ pub(in crate::blend) fn build_open_surgery(
     let mut commit_end_edge = |plan: &EndPlan,
                                first_rim: u64,
                                second_rim: u64|
-     -> Result<Option<u64>, String> {
+     -> Result<Option<u64>, KernelRefusal> {
         match plan {
             EndPlan::Corner(_) | EndPlan::Miter(_) | EndPlan::Cap(_) => Ok(None),
             EndPlan::Free(free) => {
                 let id = take_id();
-                let domain = free.transverse_curve.domain()?;
+                let domain = free.transverse_curve.domain().or_refuse(KernelStage::Refine, "domain")?;
                 result.edges.push(EdgeRecord {
                     id,
                     curve: free.transverse_curve.clone(),
@@ -702,13 +711,13 @@ pub(in crate::blend) fn build_open_surgery(
             .iter_mut()
             .flat_map(|shell| &mut shell.faces)
             .find(|face| face.id == mate.face.id)
-            .ok_or("blend: mate face lost during surgery")?;
+            .ok_or(KernelRefusal::internal(KernelStage::Sew, "mate_face", "blend: mate face lost during surgery"))?;
         let loop_record = &mut face.loops[mate.loop_index];
         let position = loop_record
             .coedges
             .iter()
             .position(|coedge| coedge.edge_id == edge.id)
-            .ok_or("blend: edge coedge lost during surgery")?;
+            .ok_or(KernelRefusal::internal(KernelStage::Sew, "edge_coedge", "blend: edge coedge lost during surgery"))?;
         let Some((new_edge_id, (_, pcurve_forward))) = rail else {
             loop_record.coedges.remove(position);
             continue;
@@ -721,7 +730,7 @@ pub(in crate::blend) fn build_open_surgery(
             pcurve: if old_forward {
                 pcurve_forward.clone()
             } else {
-                pcurve_forward.reversed()?
+                pcurve_forward.reversed().or_refuse(KernelStage::Refine, "reversed")?
             },
         };
     }
@@ -739,20 +748,20 @@ pub(in crate::blend) fn build_open_surgery(
             (second, cs_edge_id, &cap.second_leg, if at_start { w2a } else { w2b }),
         ] {
             // Refused above: a capped end never meets a collapsed rail.
-            let rail_edge_id = rail_edge_id.ok_or("blend: a capped end lost its rail")?;
+            let rail_edge_id = rail_edge_id.ok_or(KernelRefusal::internal(KernelStage::Sew, "end_rail", "blend: a capped end lost its rail"))?;
             let face = result
                 .shells
                 .iter_mut()
                 .flat_map(|shell| &mut shell.faces)
                 .find(|face| face.id == mate.face.id)
-                .ok_or("blend: mate face lost during cap splice")?;
+                .ok_or(KernelRefusal::internal(KernelStage::Sew, "mate_face", "blend: mate face lost during cap splice"))?;
             let loop_record = &mut face.loops[mate.loop_index];
             let count = loop_record.coedges.len();
             let rail_at = loop_record
                 .coedges
                 .iter()
                 .position(|coedge| coedge.edge_id == rail_edge_id)
-                .ok_or("blend: rail coedge lost during cap splice")?;
+                .ok_or(KernelRefusal::internal(KernelStage::Sew, "rail_coedge", "blend: rail coedge lost during cap splice"))?;
             // Which side of the rail coedge is this end?  The rail coedge
             // traverses rim-to-rim; the capped end is at its traversal END
             // when walking forward means station order and this is the
@@ -765,7 +774,7 @@ pub(in crate::blend) fn build_open_surgery(
                 (rail_at + 1, true, leg.1.clone())
             } else {
                 // continuing edge -> [leg vertex->rim] -> rim ... rail
-                (rail_at, false, leg.1.reversed()?)
+                (rail_at, false, leg.1.reversed().or_refuse(KernelStage::Refine, "reversed")?)
             };
             let _ = (count, rim);
             loop_record.coedges.insert(
@@ -819,7 +828,7 @@ pub(in crate::blend) fn build_open_surgery(
                     .iter_mut()
                     .flat_map(|shell| &mut shell.faces)
                     .find(|face| face.id == mate.face.id)
-                    .ok_or("blend: mate face lost during surgery")?;
+                    .ok_or(KernelRefusal::internal(KernelStage::Sew, "mate_face", "blend: mate face lost during surgery"))?;
                 face.loops[mate.loop_index]
                     .coedges
                     .retain(|coedge| coedge.edge_id != boundary_id);
@@ -871,7 +880,7 @@ pub(in crate::blend) fn build_open_surgery(
             .iter()
             .flat_map(|shell| &shell.faces)
             .find(|face| face.id == end.end_face_id)
-            .ok_or("blend: end face lost during surgery")?;
+            .ok_or(KernelRefusal::internal(KernelStage::Sew, "end_face", "blend: end face lost during surgery"))?;
         // Key on stable coedge ids (not indices) so processing one end can't
         // invalidate another that shares this face.
         let Some(located) = locate_end_corner(
@@ -881,7 +890,7 @@ pub(in crate::blend) fn build_open_surgery(
             end.first_edge_id,
             end.second_edge_id,
         ) else {
-            return Err("blend: end-face corner (adjacent boundary coedges) not found".into());
+            return Err(KernelRefusal::internal(KernelStage::Sew, "end_face_corner", "blend: end-face corner (adjacent boundary coedges) not found"));
         };
         // The apex the transverse curve cuts off goes with the boundaries the
         // blend consumes.
@@ -946,7 +955,7 @@ pub(in crate::blend) fn build_open_surgery(
         let pcurve = if forward {
             transverse_end_pcurve
         } else {
-            transverse_end_pcurve.reversed()?
+            transverse_end_pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")?
         };
         let (x_consumed, y_consumed) = if located.x_is_first {
             (first_consumed, second_consumed)
@@ -976,13 +985,13 @@ pub(in crate::blend) fn build_open_surgery(
     let (mid_u, station_uv) = match (&cr_rail, &cs_rail) {
         (Some((_, cr_pcurve)), _) => {
             let mid_u = (cr_domain[0] + cr_domain[1]) * 0.5;
-            (mid_u, cr_pcurve.evaluate(mid_u)?)
+            (mid_u, cr_pcurve.evaluate(mid_u).or_refuse(KernelStage::Refine, "evaluate")?)
         }
         (None, Some(_)) => {
             let mid_u = (cs_domain[0] + cs_domain[1]) * 0.5;
-            (mid_u, rows.cr_pcurve.evaluate(mid_u)?)
+            (mid_u, rows.cr_pcurve.evaluate(mid_u).or_refuse(KernelStage::Refine, "evaluate")?)
         }
-        (None, None) => (cr_domain[0], rows.cr_pcurve.evaluate(cr_domain[0])?),
+        (None, None) => (cr_domain[0], rows.cr_pcurve.evaluate(cr_domain[0]).or_refuse(KernelStage::Refine, "evaluate")?),
     };
     let blend_normal = raw_normal(&rows.surface, mid_u, 0.0)?;
     let n1 = raw_normal(&first.face.surface, station_uv.x, station_uv.y)?;
@@ -1018,7 +1027,7 @@ pub(in crate::blend) fn build_open_surgery(
     let mut end_slot = |plan: &EndPlan,
                         free_edge_id: Option<u64>,
                         natural_forward: bool|
-     -> Result<Vec<CoedgeRecord>, String> {
+     -> Result<Vec<CoedgeRecord>, KernelRefusal> {
         match plan {
             EndPlan::Corner(end) => Ok(vec![CoedgeRecord {
                 id: take_id(),
@@ -1046,7 +1055,7 @@ pub(in crate::blend) fn build_open_surgery(
                 .collect(),
             EndPlan::Free(free) => {
                 let edge_id =
-                    free_edge_id.ok_or("blend: free end without its transverse edge")?;
+                    free_edge_id.ok_or(KernelRefusal::internal(KernelStage::Sew, "transverse_edge", "blend: free end without its transverse edge"))?;
                 Ok(vec![if natural_forward {
                     CoedgeRecord {
                         id: take_id(),
@@ -1059,7 +1068,7 @@ pub(in crate::blend) fn build_open_surgery(
                         id: take_id(),
                         edge_id,
                         forward: false,
-                        pcurve: free.transverse_blend_pcurve.reversed()?,
+                        pcurve: free.transverse_blend_pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")?,
                     }
                 }])
             }
@@ -1081,7 +1090,7 @@ pub(in crate::blend) fn build_open_surgery(
                     0.0,
                     cr_domain[1],
                     0.0,
-                )?,
+                ).or_refuse(KernelStage::Refine, "parameter_line")?,
             });
         }
         coedges.extend(finish_slot);
@@ -1107,7 +1116,7 @@ pub(in crate::blend) fn build_open_surgery(
                     0.0,
                     cr_domain[0],
                     0.0,
-                )?,
+                ).or_refuse(KernelStage::Refine, "parameter_line")?,
             });
         }
         coedges.extend(start_slot);
@@ -1121,7 +1130,7 @@ pub(in crate::blend) fn build_open_surgery(
                     1.0,
                     cs_domain[1],
                     1.0,
-                )?,
+                ).or_refuse(KernelStage::Refine, "parameter_line")?,
             });
         }
         coedges.extend(finish_slot);
@@ -1145,7 +1154,7 @@ pub(in crate::blend) fn build_open_surgery(
         .shells
         .iter()
         .position(|shell| shell.faces.iter().any(|face| face.id == first.face.id))
-        .ok_or("blend: mate shell lost during surgery")?;
+        .ok_or(KernelRefusal::internal(KernelStage::Sew, "mate_shell", "blend: mate shell lost during surgery"))?;
     // Drop the fully-consumed mate faces (lesson 3): their loops collapsed
     // between the sewn edge and the blend; the consumed boundaries and
     // lesson-7 leftovers are deleted below, the sewn edge lives on shared by
@@ -1187,7 +1196,7 @@ pub(in crate::blend) fn build_open_surgery(
 /// geometry is untouched; only its chart is.  Used to hand an exact
 /// cylinder patch built with its section along v to the analytic recogniser,
 /// which wants the circle along u.
-pub(in crate::blend) fn transpose_face(face: &mut FaceRecord) -> Result<(), String> {
+pub(in crate::blend) fn transpose_face(face: &mut FaceRecord) -> Result<(), KernelRefusal> {
     let surface = &face.surface;
     let rows_u = surface.control_points.len();
     let rows_v = surface.control_points.first().map(|row| row.len()).unwrap_or(0);
@@ -1203,7 +1212,7 @@ pub(in crate::blend) fn transpose_face(face: &mut FaceRecord) -> Result<(), Stri
         surface.knots_v.clone(),
         surface.knots_u.clone(),
         transposed,
-    )?;
+    ).or_refuse(KernelStage::Refine, "new")?;
     for loop_record in &mut face.loops {
         for coedge in &mut loop_record.coedges {
             for control in &mut coedge.pcurve.control_points {
@@ -1230,7 +1239,7 @@ pub(in crate::blend) fn prune_orphan_vertices(result: &mut BrepSolid) {
         .retain(|candidate| used.contains(&candidate.id));
 }
 
-fn cs_blend_pcurve_reversed(cs_domain: &[f64; 2]) -> Result<NurbsCurve, String> {
-    crate::sweep_topology::parameter_line(cs_domain[1], 1.0, cs_domain[0], 1.0)
+fn cs_blend_pcurve_reversed(cs_domain: &[f64; 2]) -> Result<NurbsCurve, KernelRefusal> {
+    crate::sweep_topology::parameter_line(cs_domain[1], 1.0, cs_domain[0], 1.0).or_refuse(KernelStage::Refine, "parameter_line")
 }
 

@@ -143,7 +143,7 @@ impl WasmBrepSolid {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let result = offset_shell(&self.solid, &face_ids, distance).map_err(javascript_error)?;
+        let result = offset_shell(&self.solid, &face_ids, distance).map_err(javascript_refusal)?;
         let metadata = serde_json::json!({ "face_images": result.face_images });
         solid_buffer(&result.solid, metadata.to_string())
     }
@@ -282,7 +282,7 @@ impl WasmBrepSolid {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let result = offset_shell(&self.solid, &face_ids, distance).map_err(javascript_error)?;
+        let result = offset_shell(&self.solid, &face_ids, distance).map_err(javascript_refusal)?;
         serde_json::to_string(&result).map_err(|error| javascript_error(error.to_string()))
     }
 
@@ -297,7 +297,7 @@ impl WasmBrepSolid {
                 "delete_face_and_heal: face id must be a non-negative integer".into(),
             ));
         }
-        let solid = delete_face_and_heal(&self.solid, face_id as u64).map_err(javascript_error)?;
+        let solid = delete_face_and_heal(&self.solid, face_id as u64).map_err(javascript_refusal)?;
         solid_buffer(&solid, "{}".into())
     }
 
@@ -308,7 +308,7 @@ impl WasmBrepSolid {
                 "delete_face_and_heal: face id must be a non-negative integer".into(),
             ));
         }
-        let solid = delete_face_and_heal(&self.solid, face_id as u64).map_err(javascript_error)?;
+        let solid = delete_face_and_heal(&self.solid, face_id as u64).map_err(javascript_refusal)?;
         serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
     }
 
@@ -337,7 +337,7 @@ impl WasmBrepSolid {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let solid =
-            move_faces(&self.solid, &face_ids, Vec3::new(dx, dy, dz)).map_err(javascript_error)?;
+            move_faces(&self.solid, &face_ids, Vec3::new(dx, dy, dz)).map_err(javascript_refusal)?;
         serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
     }
 
@@ -357,7 +357,7 @@ impl WasmBrepSolid {
         } else {
             1e-4
         };
-        let (solid, report) = sew_solid(&self.solid, tolerance).map_err(javascript_error)?;
+        let (solid, report) = sew_solid(&self.solid, tolerance).map_err(javascript_refusal)?;
         serde_json::to_string(&serde_json::json!({ "solid": solid, "report": report }))
             .map_err(|error| javascript_error(error.to_string()))
     }

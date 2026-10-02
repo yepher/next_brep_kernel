@@ -186,6 +186,10 @@ pub(super) fn source_edge(source: &FragmentEdgeSource, index: &AssembleIndex) ->
 pub(in crate::boolean) struct Assembler {
     pub(in crate::boolean) tolerance: f64,
     pub(in crate::boolean) vertices: Vec<VertexRecord>,
+    // Source positions retain their lookup records after a witnessed edge
+    // correspondence joins them. Future coedges resolve those records to the
+    // same canonical vertex instead of recreating the old endpoint identity.
+    pub(in crate::boolean) vertex_aliases: HashMap<u64, u64>,
     pub(in crate::boolean) edges: Vec<EdgeRecord>,
     pub(in crate::boolean) edge_use_counts: HashMap<u64, usize>,
     // Result `forward` of the FIRST coedge attached to each edge, keyed by
@@ -245,6 +249,7 @@ impl Assembler {
     /// it, so a future change that breaks density fails loudly rather than
     /// silently welding edges to the wrong vertex position.
     fn vertex_point(&self, id: u64) -> Result<Vec3, KernelRefusal> {
+        let id = self.canonical_vertex(id);
         let record = id
             .checked_sub(1)
             .and_then(|offset| usize::try_from(offset).ok())
@@ -259,18 +264,78 @@ impl Assembler {
         Ok(record.point)
     }
 
+    fn canonical_vertex(&self, mut id: u64) -> u64 {
+        while let Some(&next) = self.vertex_aliases.get(&id) {
+            id = next;
+        }
+        id
+    }
+
+    fn join_weld_endpoints(
+        &mut self, source_start: Vec3, source_end: Vec3,
+        target_start: u64, target_end: u64, reversed: bool,
+    ) -> Result<bool, KernelRefusal> {
+        let source_ids = [self.vertex(source_start), self.vertex(source_end)];
+        let target_ids = if reversed { [target_end, target_start] }
+                         else { [target_start, target_end] };
+        let mut aliases = self.vertex_aliases.clone();
+        fn root(aliases: &HashMap<u64, u64>, mut id: u64) -> u64 {
+            while let Some(&next) = aliases.get(&id) { id = next; }
+            id
+        }
+        for (from, to) in source_ids.into_iter().zip(target_ids) {
+            let (from, to) = (root(&aliases, from), root(&aliases, to));
+            if from != to { aliases.insert(from, to); }
+        }
+        if aliases == self.vertex_aliases { return Ok(true); }
+        let band = self.tolerance.max(1e-7);
+        for vertex in &self.vertices {
+            let target = root(&aliases, vertex.id);
+            if vertex.point.sub(self.vertex_point(target)?).length() > band {
+                return Ok(false);
+            }
+        }
+        if self.edges.iter().any(|edge| !edge.degenerate
+            && edge.start_vertex_id != edge.end_vertex_id
+            && root(&aliases, edge.start_vertex_id) == root(&aliases, edge.end_vertex_id))
+        {
+            return Ok(false);
+        }
+        // Validate every geometric edit before committing the correspondence.
+        let mut replacements = Vec::new();
+        for (index, edge) in self.edges.iter().enumerate() {
+            let start = root(&aliases, edge.start_vertex_id);
+            let end = root(&aliases, edge.end_vertex_id);
+            if (start, end) == (edge.start_vertex_id, edge.end_vertex_id) { continue; }
+            let curve = snap_edge_curve_endpoints(edge.curve.clone(), edge.t0, edge.t1,
+                self.vertex_point(start)?, self.vertex_point(end)?)?;
+            let [t0, t1] = curve.domain().or_refuse(KernelStage::Sew, "domain")?;
+            replacements.push((index, start, end, curve, t0, t1));
+        }
+        for (index, start, end, curve, t0, t1) in replacements {
+            let edge = &mut self.edges[index];
+            edge.start_vertex_id = start;
+            edge.end_vertex_id = end;
+            edge.curve = curve;
+            edge.t0 = t0;
+            edge.t1 = t1;
+        }
+        self.vertex_aliases = aliases;
+        Ok(true)
+    }
+
     fn vertex(&mut self, point: Vec3) -> u64 {
         // Offset/intersection endpoints are independently fitted and can
         // differ by the sewing tolerance. Welding those endpoint vertices is
         // what makes consecutive coedges form a topological loop; the edge
         // geometry itself remains unchanged.
-        let tolerance = assembler_weld(self.tolerance);
+        let tolerance = self.tolerance.max(1e-7);
         if let Some(vertex) = self
             .vertices
             .iter()
             .find(|vertex| vertex.point.sub(point).length() <= tolerance)
         {
-            return vertex.id;
+            return self.canonical_vertex(vertex.id);
         }
         let id = self.next_vertex_id;
         self.next_vertex_id += 1;
@@ -284,14 +349,16 @@ impl Assembler {
         incoming_forward: bool,
     ) -> Result<(u64, bool), KernelRefusal> {
         let weld_tolerance = assembler_weld(self.tolerance);
+        let identity_tolerance = self.tolerance.max(1e-7);
         let source_degenerate =
-            source.degenerate || source.start.sub(source.end).length() <= weld_tolerance;
+            source.degenerate || source.start.sub(source.end).length() <= identity_tolerance;
         // A degenerate pole edge is a face-local topological placeholder,
         // not a shared boundary. Geometrically coincident pole edges must
         // remain distinct so each is referenced by exactly one coedge.
         if !source_degenerate {
             let mut welded: Option<(usize, bool)> = None;
-            for (index, edge) in self.edges.iter().enumerate() {
+            for index in 0..self.edges.len() {
+                let edge = &self.edges[index];
                 if self.edge_use_counts.get(&edge.id).copied().unwrap_or(0) >= 2 {
                     continue;
                 }
@@ -303,13 +370,19 @@ impl Assembler {
                 }
                 let start = self.vertex_point(edge.start_vertex_id)?;
                 let end = self.vertex_point(edge.end_vertex_id)?;
-                if edge.degenerate || start.sub(end).length() <= weld_tolerance {
+                if edge.degenerate || start.sub(end).length() <= identity_tolerance {
                     continue;
                 }
-                let direct = start.sub(source.start).length() <= weld_tolerance
-                    && end.sub(source.end).length() <= weld_tolerance;
-                let reversed = start.sub(source.end).length() <= weld_tolerance
-                    && end.sub(source.start).length() <= weld_tolerance;
+                let direct_gap = start.sub(source.start).length()
+                    .max(end.sub(source.end).length());
+                let reversed_gap = start.sub(source.end).length()
+                    .max(end.sub(source.start).length());
+                // A broad curve-comparison band cannot establish endpoint
+                // identity. A later conformance piece may connect these two
+                // nearby vertices, even if that short edge is not built yet.
+                let direct = direct_gap <= identity_tolerance;
+                let reversed = reversed_gap <= identity_tolerance
+                    && (!direct || reversed_gap < direct_gap);
                 if !direct && !reversed {
                     continue;
                 }
@@ -368,6 +441,9 @@ impl Assembler {
                     if self.edge_first_forward.get(&edge.id) == Some(&would_be_forward) {
                         continue;
                     }
+                    let endpoints = (edge.start_vertex_id, edge.end_vertex_id);
+                    if !self.join_weld_endpoints(source.start, source.end,
+                        endpoints.0, endpoints.1, reversed)? { continue; }
                     welded = Some((index, reversed));
                     break;
                 }
@@ -410,7 +486,7 @@ impl Assembler {
         let admit_any_closed =
             std::env::var("BREP_CLOSED_WELD_ANY").as_deref() != Ok("0");
         let source_closed = (source_degenerate || admit_any_closed)
-            && source.start.sub(source.end).length() <= weld_tolerance
+            && source.start.sub(source.end).length() <= identity_tolerance
             && interior_sweeps_away(&source.curve, source.t0, source.t1, source.start);
         if source_closed && std::env::var("BREP_DEBUG_EDGE").as_deref() == Ok("weld") {
             eprintln!(
@@ -422,7 +498,8 @@ impl Assembler {
         }
         if source_closed {
             let mut welded: Option<(usize, bool)> = None;
-            for (index, edge) in self.edges.iter().enumerate() {
+            for index in 0..self.edges.len() {
+                let edge = &self.edges[index];
                 if self.edge_use_counts.get(&edge.id).copied().unwrap_or(0) >= 2 {
                     continue;
                 }
@@ -438,8 +515,8 @@ impl Assembler {
                 // geometry sharing the seam vertex; a different seam
                 // position means the mate's loop starts elsewhere and the
                 // copies cannot share topology.
-                if start.sub(end).length() > weld_tolerance
-                    || start.sub(source.start).length() > weld_tolerance
+                if start.sub(end).length() > identity_tolerance
+                    || start.sub(source.start).length() > identity_tolerance
                     || !interior_sweeps_away(&edge.curve, edge.t0, edge.t1, start)
                 {
                     continue;
@@ -504,6 +581,9 @@ impl Assembler {
                     }
                     continue;
                 }
+                let endpoints = (edge.start_vertex_id, edge.end_vertex_id);
+                if !self.join_weld_endpoints(source.start, source.end,
+                    endpoints.0, endpoints.1, reversed)? { continue; }
                 welded = Some((index, reversed));
                 break;
             }
@@ -547,7 +627,7 @@ impl Assembler {
                 source
                     .curve
                     .evaluate(parameter)
-                    .is_ok_and(|point| point.sub(canonical_start).length() <= 10.0 * weld_tolerance)
+                    .is_ok_and(|point| point.sub(canonical_start).length() <= 10.0 * assembler_weld(self.tolerance))
             });
         // Compare the CURVE'S evaluated endpoints against the canonical
         // vertices, not the source's claimed endpoints: imprint stamps the
@@ -616,7 +696,7 @@ impl Assembler {
             // clears this flag on success — see above).
             degenerate: source_degenerate
                 || start_vertex_id == end_vertex_id
-                || canonical_start.sub(canonical_end).length() <= weld_tolerance,
+                || canonical_start.sub(canonical_end).length() <= identity_tolerance,
             name: source.name,
         });
         self.edge_use_counts.insert(id, 1);
@@ -646,3 +726,4 @@ pub(super) fn weld_refused_by_identity(
         _ => false,
     }
 }
+

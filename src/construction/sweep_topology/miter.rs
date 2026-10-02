@@ -266,7 +266,7 @@ pub(super) fn sweep_section_mitered(
     section_normal: Vec3,
     path: &SweepPath,
     twist: f64,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let plan = plan_mitre(section, section_normal, path, twist)?;
     // --- 7. TOPOLOGY. Ids are positional, so every face's boundary references
     //     the same edge records its neighbours do — which is what makes the
@@ -312,8 +312,8 @@ pub(super) fn sweep_section_mitered(
     for (index, curves) in rings.iter().take(ring_count).enumerate() {
         let mut points = Vec::with_capacity(count);
         for curve in curves {
-            let [t0, _] = curve.domain()?;
-            points.push(curve.evaluate(t0)?);
+            let [t0, _] = curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
+            points.push(curve.evaluate(t0).or_refuse(KernelStage::Fragment, "evaluate")?);
         }
         for (corner, point) in points.iter().enumerate() {
             vertices.push(VertexRecord {
@@ -327,7 +327,7 @@ pub(super) fn sweep_section_mitered(
     let mut edges = Vec::with_capacity((ring_count + segments) * count);
     for (index, curves) in rings.iter().take(ring_count).enumerate() {
         for (corner, curve) in curves.iter().enumerate() {
-            let [t0, t1] = curve.domain()?;
+            let [t0, t1] = curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
             edges.push(EdgeRecord {
                 id: ring_edge_id(index, corner),
                 curve: curve.clone(),
@@ -349,7 +349,7 @@ pub(super) fn sweep_section_mitered(
                 None => make_line(
                     ring_points[segment][corner],
                     ring_points[next_ring][arriving],
-                )?,
+                ).or_refuse(KernelStage::Fragment, "make_line")?,
                 Some(bands) => twisted_side(
                     &rings[segment][corner],
                     &rings[next_ring][arriving],
@@ -377,7 +377,7 @@ pub(super) fn sweep_section_mitered(
             let (next_ring, arriving) = landing(segment, corner);
             let bottom = &rings[segment][corner];
             let top = &rings[next_ring][arriving];
-            let [t0, t1] = bottom.domain()?;
+            let [t0, t1] = bottom.domain().or_refuse(KernelStage::Fragment, "domain")?;
             // Both rows are projections of one section along one direction, so
             // the ruling is exactly `û`, the patch is the exact swept surface,
             // and all four boundary pcurves are parameter lines. A TWISTED side
@@ -392,25 +392,25 @@ pub(super) fn sweep_section_mitered(
                     id: next_id,
                     edge_id: ring_edge_id(segment, corner),
                     forward: true,
-                    pcurve: parameter_line(t0, 0.0, t1, 0.0)?,
+                    pcurve: parameter_line(t0, 0.0, t1, 0.0).or_refuse(KernelStage::Fragment, "parameter_line")?,
                 },
                 CoedgeRecord {
                     id: next_id + 1,
                     edge_id: side_edge_id(segment, (corner + 1) % count),
                     forward: true,
-                    pcurve: parameter_line(t1, 0.0, t1, 1.0)?,
+                    pcurve: parameter_line(t1, 0.0, t1, 1.0).or_refuse(KernelStage::Fragment, "parameter_line")?,
                 },
                 CoedgeRecord {
                     id: next_id + 2,
                     edge_id: ring_edge_id(next_ring, arriving),
                     forward: false,
-                    pcurve: parameter_line(t1, 1.0, t0, 1.0)?,
+                    pcurve: parameter_line(t1, 1.0, t0, 1.0).or_refuse(KernelStage::Fragment, "parameter_line")?,
                 },
                 CoedgeRecord {
                     id: next_id + 3,
                     edge_id: side_edge_id(segment, corner),
                     forward: false,
-                    pcurve: parameter_line(t0, 1.0, t0, 0.0)?,
+                    pcurve: parameter_line(t0, 1.0, t0, 0.0).or_refuse(KernelStage::Fragment, "parameter_line")?,
                 },
             ];
             next_id += 4;
@@ -444,7 +444,7 @@ pub(super) fn sweep_section_mitered(
                    ey: Vec3,
                    forward: bool,
                    next_id: &mut u64|
-     -> Result<FaceRecord, String> {
+     -> Result<FaceRecord, KernelRefusal> {
         let curves = &rings[index];
         let anchor = ring_points[index][0];
         let mut min_x = f64::INFINITY;
@@ -452,9 +452,9 @@ pub(super) fn sweep_section_mitered(
         let mut max_x = f64::NEG_INFINITY;
         let mut max_y = f64::NEG_INFINITY;
         for curve in curves {
-            let [t0, t1] = curve.domain()?;
+            let [t0, t1] = curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
             for sample in 0..=16 {
-                let point = curve.evaluate(t0 + (t1 - t0) * sample as f64 / 16.0)?;
+                let point = curve.evaluate(t0 + (t1 - t0) * sample as f64 / 16.0).or_refuse(KernelStage::Fragment, "evaluate")?;
                 let delta = point.sub(anchor);
                 min_x = min_x.min(delta.dot(ex));
                 max_x = max_x.max(delta.dot(ex));
@@ -472,7 +472,7 @@ pub(super) fn sweep_section_mitered(
             ey,
             max_x - min_x + 2.0 * padding,
             max_y - min_y + 2.0 * padding,
-        )?;
+        ).or_refuse(KernelStage::Fragment, "make_plane")?;
         let mut coedges = Vec::with_capacity(count);
         if forward {
             for (corner, curve) in curves.iter().enumerate() {
@@ -480,7 +480,7 @@ pub(super) fn sweep_section_mitered(
                     id: *next_id,
                     edge_id: ring_edge_id(index, corner),
                     forward: true,
-                    pcurve: curve_to_plane_parameters(curve, origin, ex, ey)?,
+                    pcurve: curve_to_plane_parameters(curve, origin, ex, ey).or_refuse(KernelStage::Fragment, "plane_parameters")?,
                 });
                 *next_id += 1;
             }
@@ -490,7 +490,7 @@ pub(super) fn sweep_section_mitered(
                     id: *next_id,
                     edge_id: ring_edge_id(index, corner),
                     forward: false,
-                    pcurve: curve_to_plane_parameters(&curves[corner], origin, ex, ey)?.reversed()?,
+                    pcurve: curve_to_plane_parameters(&curves[corner], origin, ex, ey).or_refuse(KernelStage::Fragment, "plane_parameters")?.reversed().or_refuse(KernelStage::Fragment, "reversed")?,
                 });
                 *next_id += 1;
             }
@@ -516,6 +516,7 @@ pub(super) fn sweep_section_mitered(
     }
 
     let solid = BrepSolid {
+        mass_properties_cache: Default::default(),
         id: next_id + 1,
         vertices,
         edges,
@@ -529,9 +530,13 @@ pub(super) fn sweep_section_mitered(
     };
     let issues = solid.validate();
     if !issues.is_empty() {
-        return Err(format!(
-            "sweepSolid: the mitred {} produced invalid topology: {issues:?}",
-            if closed { "frame" } else { "sweep" }
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "validate",
+            format!(
+                "sweepSolid: the mitred {} produced invalid topology: {issues:?}",
+                if closed { "frame" } else { "sweep" }
+            ),
         ));
     }
     // The mitred lane assembles its own topology rather than lofting, so it
@@ -558,28 +563,34 @@ fn plan_mitre(
     section_normal: Vec3,
     path: &SweepPath,
     requested: f64,
-) -> Result<MitrePlan, String> {
+) -> Result<MitrePlan, KernelRefusal> {
     let tolerance = 1e-6;
     let count = section.len();
     if count < 2 {
-        return Err("sweepSolid: a mitred sweep needs a section of at least 2 curves".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "section_count",
+            "sweepSolid: a mitred sweep needs a section of at least 2 curves",
+        ));
     }
     if requested != 0.0 && !path.closed {
-        return Err(
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Collect,
+            "open_run_twist",
             "sweepSolid: a twist on a mitred run is rolled along the sides of a CLOSED frame; \
-             this path is open"
-                .into(),
-        );
+             this path is open",
+        ));
     }
     // The lane's own precondition, restated where it is relied on: the caller
     // ([`sweep_profile_along_chain_stations`]) selects this builder on exactly
     // this predicate.
     if !path.cornered_polyline() {
-        return Err(
+        return Err(KernelRefusal::internal(
+            KernelStage::Collect,
+            "lane_precondition",
             "sweepSolid: the mitre lane takes a path of STRAIGHT segments with at least one \
-             corner"
-                .into(),
-        );
+             corner",
+        ));
     }
     let segments = path.len();
     // The ONE branch that runs through this whole builder: a CLOSED run mitres
@@ -587,10 +598,14 @@ fn plan_mitre(
     // cap, one ring per joint instead of one per joint plus two, and no caps.
     let closed = path.closed;
     if closed && segments < 3 {
-        return Err(format!(
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "frame_segments",
+            format!(
             "sweepSolid: a CLOSED cornered path needs at least 3 segments to be a frame; this \
              one has {segments}. Two straight segments that close on each other are the same \
              line twice"
+            ),
         ));
     }
     // The RINGS the topology carries: one per joint for a frame, one per joint
@@ -608,17 +623,21 @@ fn plan_mitre(
     let mut joints: Vec<Vec3> = Vec::with_capacity(segments + 1);
     let mut dirs: Vec<Vec3> = Vec::with_capacity(segments);
     let mut lengths: Vec<f64> = Vec::with_capacity(segments);
-    let [first_t0, _] = path.curves[0].domain()?;
-    joints.push(path.curves[0].evaluate(first_t0)?);
+    let [first_t0, _] = path.curves[0].domain().or_refuse(KernelStage::Classify, "domain")?;
+    joints.push(path.curves[0].evaluate(first_t0).or_refuse(KernelStage::Classify, "evaluate")?);
     for index in 0..segments {
         let curve = &path.curves[index];
-        let [t0, t1] = curve.domain()?;
-        let chord = curve.evaluate(t1)?.sub(curve.evaluate(t0)?);
+        let [t0, t1] = curve.domain().or_refuse(KernelStage::Classify, "domain")?;
+        let chord = curve.evaluate(t1).or_refuse(KernelStage::Classify, "evaluate")?.sub(curve.evaluate(t0).or_refuse(KernelStage::Classify, "evaluate")?);
         let length = chord.length();
         if length <= tolerance {
-            return Err(format!(
-                "sweepSolid: path segment '{}' has zero length",
-                path.name(index)
+            return Err(KernelRefusal::input(
+                KernelStage::Collect,
+                "segment_length",
+                format!(
+                    "sweepSolid: path segment '{}' has zero length",
+                    path.name(index)
+                ),
             ));
         }
         dirs.push(chord.scale(1.0 / length));
@@ -651,7 +670,10 @@ fn plan_mitre(
         let cos_half = bisector.length() * 0.5;
         let turn = arriving.dot(departing).clamp(-1.0, 1.0).acos();
         if cos_half < MITER_TRANSVERSALITY_FLOOR {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "collapsed_bend",
+                format!(
                 "sweepSolid: the joint between path segments '{}' and '{}' is a COLLAPSED bend — \
                  it turns {:.3}°, at or past the {:.3}° fold angle a mitre can carry. The mitre \
                  plane bisects the two directions, so at {:.3}° it makes only {:.2}° with the \
@@ -665,6 +687,7 @@ fn plan_mitre(
                 turn.to_degrees(),
                 (90.0 - turn.to_degrees() / 2.0),
                 1.0 / cos_half.max(f64::MIN_POSITIVE),
+                ),
             ));
         }
         plane_normal[index] = bisector.scale(1.0 / (2.0 * cos_half));
@@ -701,7 +724,10 @@ fn plan_mitre(
                     joints[second + 1],
                 );
                 if gap <= tolerance * travel {
-                    return Err(format!(
+                    return Err(KernelRefusal::input(
+                        KernelStage::Classify,
+                        "self_crossing",
+                        format!(
                         "sweepSolid: this closed path CROSSES ITSELF — segments '{}' and '{}' \
                          pass within {gap:.6e} of each other, and they do not share a joint. \
                          Every joint of it still has a mitre, so the frame would be built and \
@@ -709,6 +735,7 @@ fn plan_mitre(
                          so its sides only meet at its corners",
                         path.name(first),
                         path.name(second),
+                        ),
                     ));
                 }
             }
@@ -725,38 +752,43 @@ fn plan_mitre(
     //     by the SAME joint rotation, so `ν̂ᵢ·ûᵢ` is the same number at every
     //     segment. A `Rigid` sweep's section keeps the angle to the path it was
     //     drawn at, all the way round the corners.
-    let mut normal = section_normal
-        .normalized()
-        .map_err(|_| "sweepSolid: the section's plane normal is degenerate".to_string())?;
+    let mut normal = section_normal.normalized().map_err(|_| {
+        KernelRefusal::internal(
+            KernelStage::Classify,
+            "section_normal",
+            "sweepSolid: the section's plane normal is degenerate",
+        )
+    })?;
     if normal.dot(dirs[0]) < 0.0 {
         normal = normal.scale(-1.0);
     }
     if normal.dot(dirs[0]) < MITER_TRANSVERSALITY_FLOOR {
-        return Err(
+        return Err(KernelRefusal::input(
+            KernelStage::Classify,
+            "sliver",
             "sweepSolid: the path is nearly parallel to the section plane, which sweeps a sliver \
-             rather than a solid"
-                .into(),
-        );
+             rather than a solid",
+        ));
     }
-    let x_axis = normal.perpendicular()?;
-    let y_axis = normal.cross(x_axis).normalized()?;
+    let x_axis = normal.perpendicular().or_refuse(KernelStage::Classify, "perpendicular")?;
+    let y_axis = normal.cross(x_axis).normalized().or_refuse(KernelStage::Classify, "normalized")?;
 
     // WINDING, normalized exactly as the prism builder normalizes it: the loop
     // is made counter-clockwise about the section normal, so every wall's
     // `T × û` points OUT of the material. A reversed input loop is un-permuted
     // at the end (the caller names walls by INPUT-curve index).
     let section_origin = {
-        let [t0, _] = section[0].domain()?;
-        section[0].evaluate(t0)?
+        let [t0, _] = section[0].domain().or_refuse(KernelStage::Classify, "domain")?;
+        section[0].evaluate(t0).or_refuse(KernelStage::Classify, "evaluate")?
     };
     let mut ring: Vec<NurbsCurve> = section.to_vec();
-    let reversed_winding = profile_area(&ring, section_origin, x_axis, y_axis)? < 0.0;
+    let reversed_winding = profile_area(&ring, section_origin, x_axis, y_axis).or_refuse(KernelStage::Classify, "profile_area")? < 0.0;
     if reversed_winding {
         ring = ring
             .iter()
             .rev()
             .map(NurbsCurve::reversed)
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<_, _>>().or_refuse(KernelStage::Classify, "collect")?;
     }
     // On an OPEN run the section's own plane IS the start cap's plane; on a
     // CLOSED one slot 0 is already the closing joint's bisector plane, and the
@@ -880,13 +912,16 @@ fn plan_mitre(
             let slice = rings[0]
                 .iter()
                 .map(|curve| project_curve_along(curve, dirs[0], joints[0], dirs[0]))
-                .collect::<Result<Vec<_>, String>>()?;
+                .collect::<Result<Vec<_>, KernelRefusal>>()?;
             closing_twist(&slice, joints[0], dirs[0], requested, room_floor)?
         };
         if holonomy.abs() <= round_off && requested.twist == 0.0 {
             let residual = ring_residual(&rings[segments], &rings[0])?;
             if residual > room_floor {
-                return Err(format!(
+                return Err(KernelRefusal::internal(
+                    KernelStage::Classify,
+                    "frame_closure",
+                    format!(
                     "sweepSolid: this closed path's frame does NOT close. Carried round the loop \
                      and projected back onto the closing joint's own bisector plane, the section \
                      returns {residual:.6e} away from the ring it started as, past the \
@@ -895,6 +930,7 @@ fn plan_mitre(
                      the joint rotations' own rounding ({round_off:.1e} rad), so the loop should \
                      have closed as a planar one does",
                     holonomy.to_degrees(),
+                    ),
                 ));
             }
             closure = Some(SweepClosure {
@@ -943,7 +979,10 @@ fn plan_mitre(
                 .collect();
             let residual = ring_residual(&twisted[segments], &landed)?;
             if residual > room_floor {
-                return Err(format!(
+                return Err(KernelRefusal::internal(
+                    KernelStage::Classify,
+                    "twisted_closure",
+                    format!(
                     "sweepSolid: this closed path's frame does NOT close under its twist. Its \
                      holonomy is {:.6}°, a twist of {:.6}° (requested {:.6}°) was shared over its \
                      segments, yet the section returns {residual:.6e} from the ring it started \
@@ -951,6 +990,7 @@ fn plan_mitre(
                     holonomy.to_degrees(),
                     twist.to_degrees(),
                     requested.twist.to_degrees(),
+                    ),
                 ));
             }
             // --- 6c. Where each share ROLLS: the MIDDLE HALF of its segment,
@@ -985,7 +1025,7 @@ fn plan_mitre(
                 let mut reach = 0.0_f64;
                 for curve in &twisted[index] {
                     for control in &curve.control_points {
-                        let offset = control.point()?.sub(origin);
+                        let offset = control.point().or_refuse(KernelStage::Classify, "control_point")?.sub(origin);
                         let along = offset.dot(direction);
                         behind = behind.max(along);
                         reach = reach.max(offset.sub(direction.scale(along)).length());
@@ -994,13 +1034,16 @@ fn plan_mitre(
                 let mut ahead = f64::INFINITY;
                 for curve in &twisted[index + 1] {
                     for control in &curve.control_points {
-                        ahead = ahead.min(control.point()?.sub(origin).dot(direction));
+                        ahead = ahead.min(control.point().or_refuse(KernelStage::Classify, "control_point")?.sub(origin).dot(direction));
                     }
                 }
                 let pieces = (share.abs() / std::f64::consts::FRAC_PI_2).ceil().max(1.0);
                 let rate = 3.0 * (share.abs() / pieces / 2.0).tan() / ((end - start) / pieces);
                 if reach * rate > max_tilt {
-                    return Err(format!(
+                    return Err(KernelRefusal::unsupported(
+                        KernelStage::Classify,
+                        "twist_room_short",
+                        format!(
                         "{MITRED_TWIST_ROOM_REFUSAL}: path segment '{}' is too SHORT for its share of \
                          the twist. This loop's holonomy is {:.6}° and the twist requested on top of \
                          its counter-twist is {:.6}°, and the segment's {:.6}° share rolls over the \
@@ -1016,10 +1059,14 @@ fn plan_mitre(
                         requested.twist.to_degrees(),
                         share.to_degrees(),
                         reach * rate,
+                        ),
                     ));
                 }
                 if behind > start - room_floor || ahead < end + room_floor {
-                    return Err(format!(
+                    return Err(KernelRefusal::unsupported(
+                        KernelStage::Classify,
+                        "twist_room_middle",
+                        format!(
                         "{MITRED_TWIST_ROOM_REFUSAL}: path segment '{}' has NO UNTRIMMED MIDDLE for \
                          its share of the twist. This loop comes back rolled by its holonomy, \
                          {:.6}°, with {:.6}° of twist requested on top, and the frame closes by \
@@ -1034,6 +1081,7 @@ fn plan_mitre(
                         holonomy.to_degrees(),
                         requested.twist.to_degrees(),
                         share.to_degrees(),
+                        ),
                     ));
                 }
                 planned.push(TwistBand {
@@ -1089,7 +1137,7 @@ fn plan_mitre(
             let mut room = f64::INFINITY;
             for curve in &rings[index] {
                 for control in &curve.control_points {
-                    let point = control.point()?;
+                    let point = control.point().or_refuse(KernelStage::Classify, "control_point")?;
                     room = room.min(plane_point[index + 1].sub(point).dot(plane_normal[index + 1]) / denominator);
                 }
             }
@@ -1112,7 +1160,10 @@ fn plan_mitre(
                         path.name((index + 1) % segments)
                     ));
                 }
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "mitre_room",
+                    format!(
                     "sweepSolid: the bend is too TIGHT for the section at path segment '{}'. The \
                      segment is {:.6} long and {} the section {:.6} back into it ({}), \
                      leaving {:.6e} of wall at the innermost point of the section: the bisector plane \
@@ -1132,6 +1183,7 @@ fn plan_mitre(
                     } else {
                         ""
                     },
+                    ),
                 ));
             }
         }
@@ -1205,20 +1257,26 @@ pub(super) fn mitred_frame_closure(
     section_normal: Vec3,
     path: &SweepPath,
     twist: f64,
-) -> Result<SweepClosure, String> {
+) -> Result<SweepClosure, KernelRefusal> {
     plan_mitre(section, section_normal, path, twist)?
         .closure
-        .ok_or_else(|| "sweepSolid: an OPEN mitred run has no lap to close".to_string())
+        .ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Collect,
+                "open_run",
+                "sweepSolid: an OPEN mitred run has no lap to close",
+            )
+        })
 }
 
 /// The largest control-point distance between two rings of the same
 /// representation — how far a lap's returned ring lands from the one it started
 /// as.
-fn ring_residual(returned: &[NurbsCurve], start: &[NurbsCurve]) -> Result<f64, String> {
+fn ring_residual(returned: &[NurbsCurve], start: &[NurbsCurve]) -> Result<f64, KernelRefusal> {
     let mut residual = 0.0_f64;
     for (a_curve, b_curve) in returned.iter().zip(start) {
         for (a, b) in a_curve.control_points.iter().zip(&b_curve.control_points) {
-            residual = residual.max(a.point()?.sub(b.point()?).length());
+            residual = residual.max(a.point().or_refuse(KernelStage::Classify, "control_point")?.sub(b.point().or_refuse(KernelStage::Classify, "control_point")?).length());
         }
     }
     Ok(residual)
@@ -1232,7 +1290,7 @@ fn roll_curve_about(
     origin: Vec3,
     direction: Vec3,
     angle: f64,
-) -> Result<NurbsCurve, String> {
+) -> Result<NurbsCurve, KernelRefusal> {
     let (sin, cos) = angle.sin_cos();
     let control_points = curve
         .control_points
@@ -1246,8 +1304,10 @@ fn roll_curve_about(
                 .add(direction.cross(across).scale(sin));
             Ok(Vec4::from_point(origin.add(rolled), control.w))
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, String>>()
+        .or_refuse(KernelStage::Fragment, "control_point")?;
     NurbsCurve::new(curve.degree, curve.knots.clone(), control_points)
+        .or_refuse(KernelStage::Fragment, "curve_new")
 }
 
 /// The degree of a counter-twisted wall across its roll: `u = tan(β/2)·(3v²−2v³)`
@@ -1395,19 +1455,24 @@ fn twisted_wall(
     bottom: &NurbsCurve,
     top: &NurbsCurve,
     band: &TwistBand,
-) -> Result<NurbsSurface, String> {
+) -> Result<NurbsSurface, KernelRefusal> {
     if bottom.degree != top.degree
         || bottom.control_points.len() != top.control_points.len()
         || bottom.knots.len() != top.knots.len()
     {
-        return Err("twisted_wall: rows are not representation-compatible".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Fragment,
+            "twisted_rows",
+            "twisted_wall: rows are not representation-compatible",
+        ));
     }
     let grid = bottom
         .control_points
         .iter()
         .zip(&top.control_points)
         .map(|(a, b)| Ok(twisted_column(a.point()?, a.w, b.point()?, band)))
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, String>>()
+        .or_refuse(KernelStage::Fragment, "control_point")?;
     NurbsSurface::new(
         bottom.degree,
         TWISTED_WALL_DEGREE,
@@ -1415,6 +1480,7 @@ fn twisted_wall(
         twisted_wall_knots(band.pieces),
         grid,
     )
+    .or_refuse(KernelStage::Fragment, "surface_new")
 }
 
 /// A counter-twisted SIDE EDGE: the trajectory of the section vertex at the start
@@ -1423,16 +1489,23 @@ fn twisted_side(
     bottom: &NurbsCurve,
     top: &NurbsCurve,
     band: &TwistBand,
-) -> Result<NurbsCurve, String> {
+) -> Result<NurbsCurve, KernelRefusal> {
     let (first, last) = match (bottom.control_points.first(), top.control_points.first()) {
         (Some(first), Some(last)) => (first, last),
-        _ => return Err("twisted_side: a ring curve has no control points".into()),
+        _ => {
+            return Err(KernelRefusal::internal(
+                KernelStage::Fragment,
+                "twisted_side",
+                "twisted_side: a ring curve has no control points",
+            ))
+        }
     };
     NurbsCurve::new(
         TWISTED_WALL_DEGREE,
         twisted_wall_knots(band.pieces),
-        twisted_column(first.point()?, first.w, last.point()?, band),
+        twisted_column(first.point().or_refuse(KernelStage::Fragment, "control_point")?, first.w, last.point().or_refuse(KernelStage::Fragment, "control_point")?, band),
     )
+    .or_refuse(KernelStage::Fragment, "curve_new")
 }
 
 /// Rotate `x` by the MINIMAL rotation carrying unit `from` onto unit `to` — the
@@ -1476,10 +1549,14 @@ fn rotate_minimal(x: Vec3, from: Vec3, to: Vec3) -> Vec3 {
 /// and `M`'s rotation is the rotation by the loop's total turning, `±2π`. It
 /// departs from zero only as the joint axes stop being parallel, which is exactly
 /// what makes a closed polyline spatial.
-fn frame_holonomy(dirs: &[Vec3]) -> Result<f64, String> {
-    let reference = dirs[0]
-        .perpendicular()
-        .map_err(|_| "sweepSolid: the first path segment's direction is degenerate".to_string())?;
+fn frame_holonomy(dirs: &[Vec3]) -> Result<f64, KernelRefusal> {
+    let reference = dirs[0].perpendicular().map_err(|_| {
+        KernelRefusal::internal(
+            KernelStage::Classify,
+            "holonomy_reference",
+            "sweepSolid: the first path segment's direction is degenerate",
+        )
+    })?;
     let across = dirs[0].cross(reference);
     let mut carried = reference;
     for index in 1..dirs.len() {
@@ -1545,15 +1622,16 @@ fn project_curve_along(
     direction: Vec3,
     plane_point: Vec3,
     plane_normal: Vec3,
-) -> Result<NurbsCurve, String> {
+) -> Result<NurbsCurve, KernelRefusal> {
     let denominator = direction.dot(plane_normal);
     if denominator.abs() < MITER_TRANSVERSALITY_FLOOR {
-        return Err(
+        return Err(KernelRefusal::internal(
+            KernelStage::Fragment,
+            "projection_grazing",
             "sweepSolid: a mitre plane grazes the segment it trims (the transversality floor is \
              checked before this point; reaching it means the planes and the directions \
-             disagree)"
-                .into(),
-        );
+             disagree)",
+        ));
     }
     let control_points = curve
         .control_points
@@ -1563,6 +1641,8 @@ fn project_curve_along(
             let advance = plane_point.sub(point).dot(plane_normal) / denominator;
             Ok(Vec4::from_point(point.add(direction.scale(advance)), control.w))
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, String>>()
+        .or_refuse(KernelStage::Fragment, "control_point")?;
     NurbsCurve::new(curve.degree, curve.knots.clone(), control_points)
+        .or_refuse(KernelStage::Fragment, "curve_new")
 }

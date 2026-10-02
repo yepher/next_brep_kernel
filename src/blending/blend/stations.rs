@@ -1,3 +1,4 @@
+use crate::{KernelRefusal, KernelStage, OrRefuse, RefusalClass};
 use crate::topology::{BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord};
 use crate::offset_point::StationaryChart;
 use crate::{fit, NurbsCurve, NurbsSurface, OffsetEvaluator, OffsetNormal, Vec3, Vec4};
@@ -28,6 +29,44 @@ pub(super) const MAX_REFINEMENT_DEPTH: usize = 4;
 /// reaching this cap retain their best available refinement.
 pub(super) const MAX_STATIONS: usize = SEED_INTERVALS << MAX_REFINEMENT_DEPTH;
 
+/// How an open march's local station refinement ended
+/// ([`crate::blend::edge::march_open_stations_ending`]'s `refine_bar`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::blend) enum StationRefineExit {
+    /// No refinement was asked for.
+    #[default]
+    NotAsked,
+    /// Every checked interval's mid-span station sits within the bar of
+    /// the cubic the neighbouring stations predict there.
+    Converged,
+    /// A round's worst miss did not fall below 0.9 of the previous round's.
+    NoProgress,
+    /// The rounds ran out with misses left.
+    RoundBudget,
+    /// Inserting the next round's stations would pass the station ceiling.
+    StationCeiling,
+}
+
+/// What an open march's local refinement did: its exit, the stations it
+/// inserted, and the worst mid-span miss still over the bar when it did not
+/// converge (with the edge parameter where it sits).
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::blend) struct StationRefinement {
+    pub(in crate::blend) exit: StationRefineExit,
+    pub(in crate::blend) inserted: usize,
+    pub(in crate::blend) worst_miss: f64,
+    pub(in crate::blend) worst_t: f64,
+}
+
+/// Rounds of local station refinement an open march may take: each halves
+/// the spacing of the intervals that still miss, so six rounds reach 1/64 of
+/// the uniform spacing where it is needed.
+pub(in crate::blend) const REFINE_ROUNDS: usize = 6;
+
+/// The station ceiling of a refined open march, as a multiple of its uniform
+/// station count.
+pub(in crate::blend) const REFINE_STATION_FACTOR: usize = 4;
+
 pub(super) struct Station {
     pub(super) uv1: [f64; 2],
     pub(super) uv2: [f64; 2],
@@ -45,8 +84,8 @@ pub(super) struct Station {
 /// domain extension, with the orientation carried in the SIGN OF ρ rather than
 /// in the face's `same_sense` (`signed_radii`). That is the shared evaluator's
 /// [`OffsetNormal::Raw`] lane; this is its adapter.
-pub(super) fn raw_normal(surface: &NurbsSurface, u: f64, v: f64) -> Result<Vec3, String> {
-    blend_offset(surface).normal(u, v)
+pub(super) fn raw_normal(surface: &NurbsSurface, u: f64, v: f64) -> Result<Vec3, KernelRefusal> {
+    blend_offset(surface).normal(u, v).or_refuse(KernelStage::Refine, "normal")
 }
 
 /// The march's pointwise offset evaluator for one support carrier.
@@ -92,20 +131,20 @@ pub(super) fn march_section(
     t: f64,
     station_step: f64,
     site: &str,
-) -> Result<(Vec3, Vec3), String> {
+) -> Result<(Vec3, Vec3), KernelRefusal> {
     let named = |error: String| format!("{site}: edge {}: {error}", edge.id);
     let (point, tangent) = edge
         .curve
         .point_and_unit_tangent_extended(t, edge.t0, edge.t1)
-        .map_err(named)?;
-    let Some(boundary) = edge.curve.stationary_open_end(t).map_err(named)? else {
+        .map_err(named).or_refuse(KernelStage::Refine, "map_err")?;
+    let Some(boundary) = edge.curve.stationary_open_end(t).map_err(named).or_refuse(KernelStage::Refine, "map_err")? else {
         return Ok((point, tangent));
     };
-    let [start, end] = edge.curve.domain().map_err(named)?;
+    let [start, end] = edge.curve.domain().map_err(named).or_refuse(KernelStage::Refine, "map_err")?;
     let outward = if t < boundary { -1.0 } else { 1.0 };
     let previous = (boundary - outward * station_step).clamp(start, end);
     let chord = point
-        .sub(edge.curve.evaluate(previous).map_err(named)?)
+        .sub(edge.curve.evaluate(previous).map_err(named).or_refuse(KernelStage::Refine, "map_err")?)
         .length();
     let steps = (t - boundary).abs() / station_step;
     Ok((point.add(tangent.scale(outward * steps * chord)), tangent))
@@ -117,8 +156,8 @@ pub(super) fn edge_uv_on_face(
     coedge: &CoedgeRecord,
     edge: &EdgeRecord,
     t: f64,
-) -> Result<[f64; 2], String> {
-    let [p0, p1] = coedge.pcurve.domain()?;
+) -> Result<[f64; 2], KernelRefusal> {
+    let [p0, p1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
     let span = edge.t1 - edge.t0;
     let fraction = if span.abs() <= 1e-15 {
         0.0
@@ -130,7 +169,7 @@ pub(super) fn edge_uv_on_face(
     } else {
         p1 - (p1 - p0) * fraction
     };
-    let point = coedge.pcurve.evaluate(parameter)?;
+    let point = coedge.pcurve.evaluate(parameter).or_refuse(KernelStage::Refine, "evaluate")?;
     Ok([point.x, point.y])
 }
 
@@ -165,14 +204,14 @@ fn tangency_state(
     uv: [f64; 4],
     section_point: Vec3,
     section_tangent: Vec3,
-) -> Result<TangencyState, String> {
+) -> Result<TangencyState, KernelRefusal> {
     // The two offset evaluations the whole residual is built from. Each is ONE
     // surface evaluation: `deriv1_extended` returns the point together with the
     // partials the normal needs, and its point is bit-identical to
     // `evaluate_extended` because
     // `derivatives_extended(..,0)[0][0] == derivatives_extended(..,1)[0][0]`.
-    let first = blend_offset(first).at(uv[0], uv[1], rho[0])?;
-    let second = blend_offset(second).at(uv[2], uv[3], rho[1])?;
+    let first = blend_offset(first).at(uv[0], uv[1], rho[0]).or_refuse(KernelStage::Refine, "at")?;
+    let second = blend_offset(second).at(uv[2], uv[3], rho[1]).or_refuse(KernelStage::Refine, "at")?;
     // Coincident ball centres = the two offset surfaces intersect here.
     let center = first.point;
     let mismatch = center.sub(second.point);
@@ -195,7 +234,7 @@ pub(super) fn tangency_residual(
     uv: [f64; 4],
     section_point: Vec3,
     section_tangent: Vec3,
-) -> Result<([f64; 4], Vec3, Vec3, Vec3), String> {
+) -> Result<([f64; 4], Vec3, Vec3, Vec3), KernelRefusal> {
     let state = tangency_state(first, second, rho, uv, section_point, section_tangent)?;
     Ok((state.residual, state.p1, state.p2, state.center))
 }
@@ -211,7 +250,7 @@ fn solve_station_state(
     section_point: Vec3,
     section_tangent: Vec3,
     scale: f64,
-) -> Result<([f64; 4], TangencyState), String> {
+) -> Result<([f64; 4], TangencyState), KernelRefusal> {
     let mut uv = seed;
     let tolerance = 1e-11 * (1.0 + scale);
     for _ in 0..NEWTON_ITERATIONS {
@@ -247,7 +286,7 @@ fn solve_station_state(
             }
         }
         let delta = fit::solve_small::<4>(jacobian, state.residual, 4)
-            .map_err(|error| format!("blend: station Newton is singular ({error})"))?;
+            .map_err(|error| format!("blend: station Newton is singular ({error})")).or_refuse(KernelStage::Refine, "solve_small")?;
         for ((value, correction), chart) in uv.iter_mut().zip(delta).zip(charts) {
             match chart {
                 Some(chart) => *value = chart.parameter(chart.regular(*value) - correction),
@@ -255,7 +294,7 @@ fn solve_station_state(
             }
         }
     }
-    Err("blend: tangency Newton did not converge".into())
+    Err(KernelRefusal::non_convergence(KernelStage::Refine, "tangency_newton", "blend: tangency Newton did not converge"))
 }
 
 /// A column whose reach over its carrier's domain is below this fraction of the
@@ -286,7 +325,7 @@ fn station_charts(
     surfaces: [&NurbsSurface; 2],
     uv: [f64; 4],
     jacobian: &[[f64; 4]; 4],
-) -> Result<[Option<StationaryChart>; 4], String> {
+) -> Result<[Option<StationaryChart>; 4], KernelRefusal> {
     let mut charts = [None; 4];
     let reach = |column: usize, span: f64| -> f64 {
         jacobian
@@ -298,8 +337,8 @@ fn station_charts(
     };
     for (index, surface) in surfaces.into_iter().enumerate() {
         let [u_column, v_column] = [2 * index, 2 * index + 1];
-        let [u0, u1] = surface.domain_u()?;
-        let [v0, v1] = surface.domain_v()?;
+        let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+        let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
         let reach_u = reach(u_column, u1 - u0);
         let reach_v = reach(v_column, v1 - v0);
         for (column, along_u, small) in [
@@ -308,7 +347,7 @@ fn station_charts(
         ] {
             if small {
                 charts[column] =
-                    blend_offset(surface).stationary_chart(along_u, uv[u_column], uv[v_column])?;
+                    blend_offset(surface).stationary_chart(along_u, uv[u_column], uv[v_column]).or_refuse(KernelStage::Refine, "stationary_chart")?;
             }
         }
     }
@@ -324,7 +363,7 @@ pub(super) fn solve_station(
     section_point: Vec3,
     section_tangent: Vec3,
     scale: f64,
-) -> Result<[f64; 4], String> {
+) -> Result<[f64; 4], KernelRefusal> {
     solve_station_state(
         first,
         second,
@@ -335,6 +374,181 @@ pub(super) fn solve_station(
         scale,
     )
     .map(|(uv, _)| uv)
+}
+
+/// [`solve_station`] that also returns the converged ball centre, read off
+/// the solver's final tangency evaluation instead of re-evaluating both
+/// surfaces.  The uniform marches feed it to [`branch_hop`].
+pub(super) fn solve_station_centered(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    rho: [f64; 2],
+    seed: [f64; 4],
+    section_point: Vec3,
+    section_tangent: Vec3,
+    scale: f64,
+) -> Result<([f64; 4], Vec3), KernelRefusal> {
+    solve_station_state(
+        first,
+        second,
+        rho,
+        seed,
+        section_point,
+        section_tangent,
+        scale,
+    )
+    .map(|(uv, state)| (uv, state.center))
+}
+
+/// One converged station of a march, as the continuation guard reads it:
+/// its section parameter, its solve and the ball centre the solve rests on.
+/// A pole station of the open march is set from the edge's pcurves rather
+/// than solved, so its centre may be unreadable; the centre bar is skipped
+/// across such a step and the period bar still applies.
+#[derive(Clone, Copy)]
+pub(super) struct Continued {
+    pub(super) t: f64,
+    pub(super) uv: [f64; 4],
+    pub(super) center: Option<Vec3>,
+}
+
+/// Is the converged station `right` on ANOTHER branch of the tangency
+/// system than its neighbour `left`?  `Some(reason)` when it is.
+///
+/// The tangency Newton is undamped, and a converged answer is only a root
+/// of the system — not necessarily the one the march is following.  A
+/// section plane can cut the ball-centre locus more than once (an
+/// elongated intersection loop is cut again across its own width), and
+/// from a seed one station back the first Newton step can fly many
+/// carrier periods before settling on the far crossing.  Two readings say
+/// a node is on another branch:
+///
+/// * A contact moved half a period or more round a CLOSED carrier
+///   direction.  The 2026-09-23 skew-cylinder report's far-branch root read
+///   11.7 periods on the closed-edge march.
+/// * The ball CENTRE moved further than the edge chord plus the ball's
+///   diameter.  The same document's second loop at radius 1.5 hopped
+///   within one period — support 1 moved 0.34 of a lap, the centre 8.7
+///   units for an edge chord under one.  On the open march of a 20°
+///   crossing's notched crotch arc (2026-09-26) the hop read support 2
+///   moved 0.85 of a period and the centre 9.9 for a 2.1 chord, where the
+///   root on the followed branch was 0.86 away.
+///
+/// Neither bar is a theorem about every blend: a sharp crotch swings the
+/// centre round the edge faster than the edge advances, and a coarse seed
+/// step there can exceed either (a 34° crossing's chain march read a
+/// centre step of 3.9 for a 3.0 diameter at its coarsest rung).  Every
+/// caller therefore answers a trip with a RETRY from a nearer seed and
+/// never with a refusal: [`MarchFrame::continue_node`] bisects its
+/// interval, [`continue_station`] halves its seed.
+///
+/// The edge is read continued past its ends (`point_and_unit_tangent_extended`):
+/// the anchored closed march runs t once round past t1, and the open march
+/// overshoots both vertices.  A carrier that cannot answer a closure or
+/// domain query is not checked here; the solve itself already evaluated
+/// it, so any real fault surfaced there.  An unreadable chord skips the
+/// centre bar the same way.
+pub(super) fn branch_hop(
+    surfaces: [&NurbsSurface; 2],
+    edge: &EdgeRecord,
+    rho_at: &dyn Fn(f64) -> [f64; 2],
+    left: &Continued,
+    right: &Continued,
+) -> Option<KernelRefusal> {
+    for (index, surface) in surfaces.into_iter().enumerate() {
+        let (Ok((closed_u, closed_v)), Ok(domain_u), Ok(domain_v)) =
+            (surface.closed_directions(), surface.domain_u(), surface.domain_v())
+        else {
+            continue;
+        };
+        for (direction, closed, domain) in [(0, closed_u, domain_u), (1, closed_v, domain_v)] {
+            let period = domain[1] - domain[0];
+            let column = 2 * index + direction;
+            let step = (right.uv[column] - left.uv[column]).abs();
+            if closed && step >= 0.5 * period {
+                return Some(KernelRefusal::non_convergence(
+                    KernelStage::Refine,
+                    "branch_hop",
+                    format!(
+                        "blend: the station Newton converged on another branch between t={:.9} \
+                         and t={:.9} — support {} moved {:.3} of a period round its closed \
+                         carrier in one step",
+                        left.t,
+                        right.t,
+                        index + 1,
+                        step / period,
+                    ),
+                ));
+            }
+        }
+    }
+    let (Some(left_center), Some(right_center)) = (left.center, right.center) else {
+        return None;
+    };
+    let point = |t: f64| {
+        edge.curve
+            .point_and_unit_tangent_extended(t, edge.t0, edge.t1)
+            .map(|(point, _)| point)
+    };
+    let chord = point(right.t).and_then(|right| Ok(right.sub(point(left.t)?).length()));
+    let Ok(chord) = chord else {
+        return None;
+    };
+    let [rho_left, _] = rho_at(left.t);
+    let [rho_right, _] = rho_at(right.t);
+    let diameter = 2.0 * rho_left.abs().max(rho_right.abs());
+    let moved = right_center.sub(left_center).length();
+    if moved > chord + diameter {
+        return Some(KernelRefusal::non_convergence(
+            KernelStage::Refine,
+            "branch_hop",
+            format!(
+                "blend: the station Newton converged on another branch between t={:.9} \
+                 and t={:.9} — the ball centre moved {moved:.6} for an edge chord of \
+                 {chord:.6} and a ball diameter of {diameter:.6}",
+                left.t, right.t
+            ),
+        ));
+    }
+    None
+}
+
+/// Solve the station at `t` of a UNIFORM march as the continuation of its
+/// converged neighbour `left`, halving the seed toward it when the answer
+/// is on another branch ([`branch_hop`]).
+///
+/// The uniform marches (`chain/march.rs`, `edge/support.rs`) keep their
+/// station grid, so unlike [`MarchFrame::march_interval`] a retry inserts
+/// no station: the halfway solve is only a nearer SEED for the station
+/// asked for, itself continued from `left` under the same guard.  The
+/// first attempt is the plain neighbour-seeded solve every station took
+/// before the guard existed, so a march that never hops is unchanged to
+/// the bit.  Both recursions share one `depth` budget of
+/// [`MAX_REFINEMENT_DEPTH`]; at the cap the node is taken as before — the
+/// guard adds retries, never a refusal — and a Newton that does not
+/// converge surfaces as it always did.
+pub(super) fn continue_station(
+    solve: &dyn Fn(f64, [f64; 4]) -> Result<([f64; 4], Vec3), KernelRefusal>,
+    hop: &dyn Fn(&Continued, &Continued) -> Option<KernelRefusal>,
+    left: &Continued,
+    t: f64,
+    depth: usize,
+) -> Result<Continued, KernelRefusal> {
+    let (uv, center) = solve(t, left.uv)?;
+    let node = Continued { t, uv, center: Some(center) };
+    if depth >= MAX_REFINEMENT_DEPTH {
+        return Ok(node);
+    }
+    let Some(reason) = hop(left, &node) else {
+        return Ok(node);
+    };
+    // `BREP_BLEND_STATION_TRACE=1` names every retry, so a march's station
+    // trace can be read against the hops it was guarded from.
+    if std::env::var("BREP_BLEND_STATION_TRACE").ok().as_deref() == Some("1") {
+        eprintln!("blend guard: depth {depth}, seed halved — {reason}");
+    }
+    let halfway = continue_station(solve, hop, left, 0.5 * (left.t + t), depth + 1)?;
+    continue_station(solve, hop, &halfway, t, depth + 1)
 }
 
 /// Anchored start: one surface parameter frozen on a seam meridian while
@@ -352,11 +566,11 @@ fn solve_anchored_start(
     seed_t: f64,
     seed_uv: [f64; 4],
     scale: f64,
-) -> Result<(f64, [f64; 4], TangencyState), String> {
+) -> Result<(f64, [f64; 4], TangencyState), KernelRefusal> {
     let free: [usize; 3] = match lock_index {
         0 => [1, 2, 3],
         2 => [0, 1, 3],
-        _ => return Err("blend: unsupported anchor lock index".into()),
+        _ => return Err(KernelRefusal::internal(KernelStage::Refine, "anchor_lock", "blend: unsupported anchor lock index")),
     };
     let mut x = [seed_t, seed_uv[free[0]], seed_uv[free[1]], seed_uv[free[2]]];
     let tolerance = 1e-11 * (1.0 + scale);
@@ -368,11 +582,11 @@ fn solve_anchored_start(
         uv[free[2]] = x[3];
         uv
     };
-    let state_at = |x: &[f64; 4]| -> Result<TangencyState, String> {
+    let state_at = |x: &[f64; 4]| -> Result<TangencyState, KernelRefusal> {
         let (section_point, section_tangent) = edge
             .curve
             .point_and_unit_tangent_extended(x[0], edge.t0, edge.t1)
-            .map_err(|error| format!("blend anchored start: edge {}: {error}", edge.id))?;
+            .map_err(|error| format!("blend anchored start: edge {}: {error}", edge.id)).or_refuse(KernelStage::Refine, "point_and_unit_tangent_extended")?;
         tangency_state(
             first,
             second,
@@ -403,7 +617,7 @@ fn solve_anchored_start(
             }
         }
         let delta = fit::solve_small::<4>(jacobian, state.residual, 4)
-            .map_err(|error| format!("blend: anchored-start Newton is singular ({error})"))?;
+            .map_err(|error| format!("blend: anchored-start Newton is singular ({error})")).or_refuse(KernelStage::Refine, "solve_small")?;
         for (value, correction) in x.iter_mut().zip(delta) {
             *value -= correction;
         }
@@ -417,7 +631,7 @@ fn solve_anchored_start(
     // surface parameters.  Acceptance still requires ALL FOUR original
     // residuals, so this cannot hide a genuinely wrong anchor.
     let mut fixed = [x[1], x[2], x[3]];
-    let fixed_state = |values: &[f64; 3]| -> Result<TangencyState, String> {
+    let fixed_state = |values: &[f64; 3]| -> Result<TangencyState, KernelRefusal> {
         let full = [seed_t, values[0], values[1], values[2]];
         state_at(&full)
     };
@@ -445,7 +659,7 @@ fn solve_anchored_start(
         }
         let mismatch = [state.residual[0], state.residual[1], state.residual[2]];
         let delta = fit::solve_small::<3>(jacobian, mismatch, 3)
-            .map_err(|error| format!("blend: fixed-seam Newton is singular ({error})"))?;
+            .map_err(|error| format!("blend: fixed-seam Newton is singular ({error})")).or_refuse(KernelStage::Refine, "solve_small")?;
         for (value, correction) in fixed.iter_mut().zip(delta) {
             *value -= correction;
         }
@@ -465,7 +679,7 @@ fn solve_anchored_start(
             );
         }
     }
-    Err("blend: anchored seam start did not converge".into())
+    Err(KernelRefusal::non_convergence(KernelStage::Refine, "anchored_seam_start", "blend: anchored seam start did not converge"))
 }
 
 pub(super) fn apex_point(
@@ -474,12 +688,12 @@ pub(super) fn apex_point(
     p2: Vec3,
     n2: Vec3,
     center: Vec3,
-) -> Result<Vec3, String> {
+) -> Result<Vec3, KernelRefusal> {
     let section_normal = p2
         .sub(p1)
         .cross(center.sub(p1))
         .normalized()
-        .map_err(|_| "blend: degenerate section (tangency points collapsed)".to_string())?;
+        .map_err(|_| "blend: degenerate section (tangency points collapsed)".to_string()).or_refuse(KernelStage::Refine, "map_err")?;
     let matrix = [
         [n1.x, n1.y, n1.z],
         [n2.x, n2.y, n2.z],
@@ -487,7 +701,7 @@ pub(super) fn apex_point(
     ];
     let rhs = [n1.dot(p1), n2.dot(p2), section_normal.dot(p1)];
     let solution = fit::solve_small::<3>(matrix, rhs, 3)
-        .map_err(|_| "blend: tangent planes are parallel in the section".to_string())?;
+        .map_err(|_| "blend: tangent planes are parallel in the section".to_string()).or_refuse(KernelStage::Refine, "map_err")?;
     Ok(Vec3::new(solution[0], solution[1], solution[2]))
 }
 
@@ -507,6 +721,15 @@ struct MarchNode {
 /// construction, the tool cutter) build a blend the rolling ball never made,
 /// so an escape is reported as-is instead.
 pub(crate) const BALL_OFF_CARRIER: &str = "blend: no ball of radius";
+
+/// The slug of that refusal (`UnsupportedGeometry`).
+pub(crate) const BALL_OFF_CARRIER_WHAT: &str = "ball_off_carrier";
+
+/// Is this the escaped march's refusal ([`BALL_OFF_CARRIER`])?
+/// Read off the class and its slug, which the mint site and this check share.
+pub(crate) fn is_ball_off_carrier(refusal: &KernelRefusal) -> bool {
+    matches!(&refusal.class, RefusalClass::UnsupportedGeometry { what } if what == BALL_OFF_CARRIER_WHAT)
+}
 
 /// Shared context of one closed-edge march.
 struct MarchFrame<'a> {
@@ -546,15 +769,15 @@ impl MarchFrame<'_> {
     /// station) and an escape (283 spans on its middle ones).  CLOSED
     /// directions are exempt — the march deliberately unwraps a periodic
     /// carrier's parameter and every image is the same real surface.
-    fn check_supports_on_carriers(&self, t: f64, uv: [f64; 4]) -> Result<(), String> {
+    fn check_supports_on_carriers(&self, t: f64, uv: [f64; 4]) -> Result<(), KernelRefusal> {
         for (index, surface, uv) in [
             (1usize, self.surface1, [uv[0], uv[1]]),
             (2usize, self.surface2, [uv[2], uv[3]]),
         ] {
-            let (closed_u, closed_v) = surface.closed_directions()?;
+            let (closed_u, closed_v) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
             for (axis, closed, value, domain) in [
-                ("u", closed_u, uv[0], surface.domain_u()?),
-                ("v", closed_v, uv[1], surface.domain_v()?),
+                ("u", closed_u, uv[0], surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?),
+                ("v", closed_v, uv[1], surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?),
             ] {
                 let span = domain[1] - domain[0];
                 if closed || (value >= domain[0] - span && value <= domain[1] + span) {
@@ -567,12 +790,12 @@ impl MarchFrame<'_> {
                 // names a point: `evaluate` would clamp it to the seam and
                 // report the wrong end of the lap.
                 let point = self.edge.curve.evaluate(self.wrapped(t)).unwrap_or_default();
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Refine, BALL_OFF_CARRIER_WHAT, format!(
                     "{BALL_OFF_CARRIER} {radius} is tangent to both faces at \
                      ({:.6}, {:.6}, {:.6}): the contact ran off carrier {index}'s \
                      surface ({axis} = {value:.6} outside [{:.6}, {:.6}])",
                     point.x, point.y, point.z, domain[0], domain[1]
-                ));
+                )));
             }
         }
         Ok(())
@@ -592,12 +815,12 @@ impl MarchFrame<'_> {
     /// Finish a converged solve into a station, reusing the solver's final
     /// tangency evaluation (points, center, normals) instead of
     /// re-evaluating both surfaces.
-    fn node(&self, t: f64, uv: [f64; 4], state: &TangencyState) -> Result<MarchNode, String> {
+    fn node(&self, t: f64, uv: [f64; 4], state: &TangencyState) -> Result<MarchNode, KernelRefusal> {
         self.check_supports_on_carriers(t, uv)?;
         let cos_alpha = self.signs[0] * self.signs[1] * state.n1.dot(state.n2);
         let weight = ((1.0 + cos_alpha) * 0.5).max(0.0).sqrt();
         if weight <= 1e-6 {
-            return Err("blend: faces are tangent at a station (α = π)".into());
+            return Err(KernelRefusal::unsupported(KernelStage::Refine, "tangent_faces", "blend: faces are tangent at a station (α = π)"));
         }
         let apex = apex_point(state.p1, state.n1, state.p2, state.n2, state.center)?;
         Ok(MarchNode {
@@ -621,7 +844,7 @@ impl MarchFrame<'_> {
     /// not keep the uv track continuous: an undamped Newton can still hop to
     /// another root — see [`MarchFrame::continue_node`], which the march
     /// solves through.
-    fn solve_node(&self, t: f64, seed: [f64; 4], lock: Option<f64>) -> Result<MarchNode, String> {
+    fn solve_node(&self, t: f64, seed: [f64; 4], lock: Option<f64>) -> Result<MarchNode, KernelRefusal> {
         if let Some(u_lock) = lock {
             let (t_solved, uv, state) = solve_anchored_start(
                 self.edge,
@@ -640,7 +863,7 @@ impl MarchFrame<'_> {
                 .edge
                 .curve
                 .point_and_unit_tangent_extended(t, self.edge.t0, self.edge.t1)
-                .map_err(|error| format!("blend march: edge {}: {error}", self.edge.id))?;
+                .map_err(|error| format!("blend march: edge {}: {error}", self.edge.id)).or_refuse(KernelStage::Refine, "point_and_unit_tangent_extended")?;
             let (uv, state) = solve_station_state(
                 self.surface1,
                 self.surface2,
@@ -692,42 +915,25 @@ impl MarchFrame<'_> {
     /// `(left_t, left_uv)`, refusing a root on another branch.
     ///
     /// The tangency Newton is undamped, and a converged answer is only a root
-    /// of the system — not necessarily the one the march is following.  A
-    /// section plane can cut the ball-centre locus more than once (an
-    /// elongated intersection loop is cut again across its own width), and
-    /// from a seed a whole seed interval back the first Newton step can fly
-    /// many carrier periods before settling on the far crossing.  The
+    /// of the system — not necessarily the one the march is following.  The
     /// 2026-09-23 reported document — a thin cylinder unioned through a fat
-    /// one at 34° — did exactly that past the loop's sharp crotch: from
-    /// t = 0.625 the first step moved u₁ by 8.5 periods and the solve
-    /// converged on the other side of the loop, 7 units from its neighbour.
-    /// Every station after it walked the wrong branch, the anchored closing
-    /// station hopped back, and the rows fitted through both branches ran
-    /// through the material the interference gate then found.
+    /// one at 34° — hopped past the loop's sharp crotch: from t = 0.625 the
+    /// first step moved u₁ by 8.5 periods and the solve converged on the
+    /// other side of the loop, 7 units from its neighbour.  Every station
+    /// after it walked the wrong branch, the anchored closing station hopped
+    /// back, and the rows fitted through both branches ran through the
+    /// material the interference gate then found.
     ///
-    /// Two readings say a converged node is on another branch, and either
-    /// refuses it like a Newton that did not converge: the interval bisects
-    /// and the solve is retried from a nearer seed.  At the depth cap
-    /// (`enforce` false) the node is taken as before: halving can no longer
-    /// help, and where no nearby root exists at all — a ball over its
-    /// ceiling, whose Newton escapes onto a carrier's extension — the escape
-    /// guard downstream names the geometry
+    /// The two readings are [`branch_hop`], shared with the uniform marches.
+    /// Either refuses the node like a Newton that did not converge: the
+    /// interval bisects and the solve is retried from a nearer seed.  At the
+    /// depth cap (`enforce` false) the node is taken as before: halving can
+    /// no longer help, and where no nearby root exists at all — a ball over
+    /// its ceiling, whose Newton escapes onto a carrier's extension — the
+    /// escape guard downstream names the geometry
     /// (`inbox_20260910_fillet_mouth_over_wall` pins that message), which a
-    /// branch-hop refusal here would pre-empt.
-    ///
-    /// * A contact moved half a period or more round a CLOSED carrier
-    ///   direction.  The far-branch root above read 11.7 periods.
-    /// * The ball CENTRE moved further than the edge chord plus the ball's
-    ///   diameter.  The same document's second loop at radius 1.5 hopped
-    ///   within one period — support 1 moved 0.34 of a lap, the centre 8.7
-    ///   units for an edge chord under one — and its congruent twin built.
-    ///   Legitimate steps on both loops moved the centre at most 0.69 for a
-    ///   1.69 chord.
-    ///
-    /// Neither bar is a theorem about every blend: a sharp crotch swings the
-    /// centre round the edge faster than the edge advances, and a coarse
-    /// seed step there could exceed either.  That is safe because a trip
-    /// only ever bisects: this check adds retries, never a refusal.
+    /// branch-hop refusal here would pre-empt.  A trip only ever bisects:
+    /// this check adds retries, never a refusal.
     fn continue_node(
         &self,
         left_t: f64,
@@ -736,59 +942,17 @@ impl MarchFrame<'_> {
         t: f64,
         lock: Option<f64>,
         enforce: bool,
-    ) -> Result<MarchNode, String> {
+    ) -> Result<MarchNode, KernelRefusal> {
         let node = self.solve_node(t, left_uv, lock)?;
         if !enforce {
             return Ok(node);
         }
-        for (index, surface) in [self.surface1, self.surface2].into_iter().enumerate() {
-            // A carrier that cannot answer is not checked here; the solve
-            // itself already evaluated it, so any real fault surfaced there.
-            let (Ok((closed_u, closed_v)), Ok(domain_u), Ok(domain_v)) =
-                (surface.closed_directions(), surface.domain_u(), surface.domain_v())
-            else {
-                continue;
-            };
-            for (direction, closed, domain) in [(0, closed_u, domain_u), (1, closed_v, domain_v)] {
-                let period = domain[1] - domain[0];
-                let column = 2 * index + direction;
-                let step = (node.uv[column] - left_uv[column]).abs();
-                if closed && step >= 0.5 * period {
-                    return Err(format!(
-                        "blend: the station Newton converged on another branch between t={left_t:.9} \
-                         and t={t:.9} — support {} moved {:.3} of a period round its closed \
-                         carrier in one step",
-                        index + 1,
-                        step / period,
-                    ));
-                }
-            }
+        let left = Continued { t: left_t, uv: left_uv, center: Some(left_center) };
+        let right = Continued { t: node.t, uv: node.uv, center: Some(node.station.center) };
+        match branch_hop([self.surface1, self.surface2], self.edge, self.rho_at, &left, &right) {
+            Some(reason) => Err(reason),
+            None => Ok(node),
         }
-        {
-            // The anchored march runs past t1 once round, so read the edge
-            // the way the solve does: continued past its ends.
-            let point = |t: f64| {
-                self.edge
-                    .curve
-                    .point_and_unit_tangent_extended(t, self.edge.t0, self.edge.t1)
-                    .map(|(point, _)| point)
-            };
-            let chord = point(node.t).and_then(|right| Ok(right.sub(point(left_t)?).length()));
-            if let Ok(chord) = chord {
-                let [rho_left, _] = (self.rho_at)(left_t);
-                let [rho_right, _] = (self.rho_at)(node.t);
-                let diameter = 2.0 * rho_left.abs().max(rho_right.abs());
-                let moved = node.station.center.sub(left_center).length();
-                if moved > chord + diameter {
-                    return Err(format!(
-                        "blend: the station Newton converged on another branch between t={left_t:.9} \
-                         and t={t:.9} — the ball centre moved {moved:.6} for an edge chord of \
-                         {chord:.6} and a ball diameter of {diameter:.6}"
-                    ));
-                }
-            }
-        }
-        Ok(node)
     }
 
     /// Solve and append every station in (nodes.last().t, right_t], in
@@ -807,7 +971,7 @@ impl MarchFrame<'_> {
         lock: Option<f64>,
         presolved: Option<MarchNode>,
         depth: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), KernelRefusal> {
         let (left_t, left_uv, left_center) = {
             let left = nodes
                 .last()
@@ -887,8 +1051,8 @@ pub(super) fn march_model_scale(
     t0: f64,
     t1: f64,
     radius: f64,
-) -> Result<f64, String> {
-    Ok(crate::curve_model_scale(curve, t0, t1)?
+) -> Result<f64, KernelRefusal> {
+    Ok(crate::curve_model_scale(curve, t0, t1).or_refuse(KernelStage::Refine, "curve_model_scale")?
         .max(radius.abs())
         .max(1.0))
 }
@@ -908,7 +1072,7 @@ pub(super) fn march_stations(
     second: &BlendMate,
     radius_at: &dyn Fn(f64) -> f64,
     anchor_u: Option<f64>,
-) -> Result<Vec<Station>, String> {
+) -> Result<Vec<Station>, KernelRefusal> {
     let span = edge.t1 - edge.t0;
     let radius_extent = [0.0, 0.5, 1.0]
         .into_iter()
@@ -928,7 +1092,7 @@ pub(super) fn march_stations(
         [signs[0] * radius, signs[1] * radius]
     };
     let u_span = {
-        let [u0, u1] = surface1.domain_u()?;
+        let [u0, u1] = surface1.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
         u1 - u0
     };
     // Anchoring: find the edge parameter whose tangency point sits on ANY
@@ -1017,7 +1181,7 @@ pub(super) fn march_stations(
     {
         let probe = |t: f64,
                      seed: [f64; 4]|
-         -> Result<([f64; 4], Vec3, Vec3, Vec3), String> {
+         -> Result<([f64; 4], Vec3, Vec3, Vec3), KernelRefusal> {
             let node = frame.solve_node(t, seed, None)?;
             Ok((node.uv, node.station.p1, node.station.p2, node.station.center))
         };
@@ -1039,7 +1203,7 @@ pub(super) fn march_stations(
     if last_station.p1.sub(first_station.p1).length() > 1e-6 * scale
         || last_station.p2.sub(first_station.p2).length() > 1e-6 * scale
     {
-        return Err("blend: closed-edge march did not return to its start".into());
+        return Err(KernelRefusal::non_convergence(KernelStage::Refine, "closed_march_closure", "blend: closed-edge march did not return to its start"));
     }
     Ok(stations)
 }
@@ -1103,7 +1267,7 @@ pub(super) fn exact_closed_revolution_rows(
     first: &BlendMate,
     second: &BlendMate,
     chamfer: bool,
-) -> Option<Result<FittedRows, String>> {
+) -> Option<Result<FittedRows, KernelRefusal>> {
     let analytic1 = first.face.surface.analytic()?;
     let analytic2 = second.face.surface.analytic()?;
     let (axis_origin, base_axis) = match (analytic1, analytic2) {
@@ -1146,10 +1310,10 @@ pub(super) fn exact_closed_revolution_rows(
         }
     };
     Some((|| {
-        let first_station = stations.first().ok_or("blend: no sphere stations")?;
+        let first_station = stations.first().ok_or(KernelRefusal::internal(KernelStage::Refine, "sphere_stations", "blend: no sphere stations"))?;
         let next_station = stations
             .get(1)
-            .ok_or("blend: exact revolution needs two stations")?;
+            .ok_or(KernelRefusal::internal(KernelStage::Refine, "revolution_stations", "blend: exact revolution needs two stations"))?;
         let radial = |point: Vec3| {
             let offset = point.sub(axis_origin);
             offset.sub(base_axis.scale(offset.dot(base_axis)))
@@ -1164,7 +1328,7 @@ pub(super) fn exact_closed_revolution_rows(
             base_axis
         };
         let generatrix = if chamfer {
-            crate::make_line(first_station.p1, first_station.p2)?
+            crate::make_line(first_station.p1, first_station.p2).or_refuse(KernelStage::Refine, "make_line")?
         } else {
             NurbsCurve::new(
                 2,
@@ -1174,12 +1338,12 @@ pub(super) fn exact_closed_revolution_rows(
                     Vec4::from_point(first_station.apex, first_station.weight),
                     Vec4::from_point(first_station.p2, 1.0),
                 ],
-            )?
+            ).or_refuse(KernelStage::Refine, "new")?
         };
         let surface =
-            crate::make_revolution(axis_origin, axis, &generatrix, std::f64::consts::TAU)?;
-        let cr = surface.iso_curve_v(0.0)?;
-        let cs = surface.iso_curve_v(1.0)?;
+            crate::make_revolution(axis_origin, axis, &generatrix, std::f64::consts::TAU).or_refuse(KernelStage::Refine, "make_revolution")?;
+        let cr = surface.iso_curve_v(0.0).or_refuse(KernelStage::Refine, "iso_curve_v")?;
+        let cs = surface.iso_curve_v(1.0).or_refuse(KernelStage::Refine, "iso_curve_v")?;
         // The exact 3D rims are circles about the centre line, but on a
         // sphere whose stored polar frame uses another axis their UV tracks
         // are curved.  Fit those marched tracks against the exact rational
@@ -1189,8 +1353,8 @@ pub(super) fn exact_closed_revolution_rows(
         let mut revolution_parameters = Vec::with_capacity(stations.len());
         revolution_parameters.push(0.0);
         for pair in stations.windows(2) {
-            let from = radial(pair[0].p1).normalized()?;
-            let to = radial(pair[1].p1).normalized()?;
+            let from = radial(pair[0].p1).normalized().or_refuse(KernelStage::Refine, "normalized")?;
+            let to = radial(pair[1].p1).normalized().or_refuse(KernelStage::Refine, "normalized")?;
             let mut step = from.cross(to).dot(axis).atan2(from.dot(to));
             if step < 0.0 {
                 step += std::f64::consts::TAU;
@@ -1228,7 +1392,7 @@ pub(super) fn fit_closed_rows(
     stations: &[Station],
     parameters: &[f64],
     chamfer: bool,
-) -> Result<FittedRows, String> {
+) -> Result<FittedRows, KernelRefusal> {
     let count = stations.len();
     // Unwrapped pcurve periods: how far each uv track travelled in one
     // loop (zero on open carriers, ±domain-span across a seam).
@@ -1294,10 +1458,10 @@ pub(super) fn fit_closed_rows(
         .collect();
     let seam_low = (0.0 - low) / range;
     let seam_high = (1.0 - low) / range;
-    let fit_row = |samples: &[Vec4]| -> Result<NurbsCurve, String> {
-        let curve = fit::interpolate_homogeneous(samples, FIT_DEGREE, &normalized)?;
-        let (_, tail) = curve.split(seam_low)?;
-        let (middle, _) = tail.split(seam_high)?;
+    let fit_row = |samples: &[Vec4]| -> Result<NurbsCurve, KernelRefusal> {
+        let curve = fit::interpolate_homogeneous(samples, FIT_DEGREE, &normalized).or_refuse(KernelStage::Refine, "interpolate_homogeneous")?;
+        let (_, tail) = curve.split(seam_low).or_refuse(KernelStage::Refine, "split")?;
+        let (middle, _) = tail.split(seam_high).or_refuse(KernelStage::Refine, "split")?;
         Ok(middle)
     };
     let cr = fit_row(&samples_cr)?;
@@ -1309,7 +1473,7 @@ pub(super) fn fit_closed_rows(
     } else {
         Some(fit_row(&samples_mid)?)
     };
-    let u_domain = cr.domain()?;
+    let u_domain = cr.domain().or_refuse(KernelStage::Refine, "domain")?;
     let surface = crate::blend::rows::surface_from_rows(FIT_DEGREE, &cr, &cs, mid.as_ref(), true)?;
     Ok(FittedRows {
         surface,
@@ -1328,7 +1492,7 @@ pub(super) fn locate_mate<'a>(
     solid: &'a BrepSolid,
     edge_id: u64,
     skip: Option<(u64, usize)>,
-) -> Result<(&'a FaceRecord, usize, &'a CoedgeRecord), String> {
+) -> Result<(&'a FaceRecord, usize, &'a CoedgeRecord), KernelRefusal> {
     for shell in &solid.shells {
         for face in &shell.faces {
             for (loop_index, loop_record) in face.loops.iter().enumerate() {
@@ -1345,7 +1509,7 @@ pub(super) fn locate_mate<'a>(
             }
         }
     }
-    Err(format!("blend: edge {edge_id} has no (second) mating face"))
+    Err(KernelRefusal::internal(KernelStage::Classify, "mating_face", format!("blend: edge {edge_id} has no (second) mating face")))
 }
 
 /// Signed radii ρ1/ρ2 (4.9.2): the ball center sits along the inward
@@ -1358,7 +1522,7 @@ pub(super) fn signed_radii(
     second_face: &FaceRecord,
     second_coedge: &CoedgeRecord,
     radius: f64,
-) -> Result<(f64, f64), String> {
+) -> Result<(f64, f64), KernelRefusal> {
     let probe_step = (radius * 0.25).max(1e-4);
     // A closed circle's parameter midpoint can land exactly on a periodic
     // carrier seam even though it is far from the edge's topological seam.
@@ -1367,11 +1531,11 @@ pub(super) fn signed_radii(
     let mut seed = None;
     for fraction in [0.5, 0.375, 0.625, 0.25, 0.75] {
         let t = edge.t0 + (edge.t1 - edge.t0) * fraction;
-        let point = edge.curve.evaluate(t)?;
+        let point = edge.curve.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?;
         let tangent = edge
             .curve
             .unit_tangent(t, edge.t0, edge.t1)
-            .map_err(|error| format!("blend: edge {}: {error}", edge.id))?;
+            .map_err(|error| format!("blend: edge {}: {error}", edge.id)).or_refuse(KernelStage::Refine, "unit_tangent")?;
         let Ok(into1) = crate::fillet::into_face_direction(
             first_face, point, tangent, point, tangent, probe_step,
         ) else {
@@ -1393,15 +1557,15 @@ pub(super) fn signed_radii(
         break;
     }
     let (mid_point, into1, into2, uv1_mid, uv2_mid) =
-        seed.ok_or("blend: could not orient support directions away from carrier seams")?;
+        seed.ok_or(KernelRefusal::internal(KernelStage::Classify, "support_orientation", "blend: could not orient support directions away from carrier seams"))?;
     let n1_mid = raw_normal(&first_face.surface, uv1_mid[0], uv1_mid[1])?;
     let n2_mid = raw_normal(&second_face.surface, uv2_mid[0], uv2_mid[1])?;
     let cos_theta = into1.dot(into2).clamp(-1.0, 1.0);
     let theta = cos_theta.acos();
     if theta <= 1e-6 || theta >= std::f64::consts::PI - 1e-6 {
-        return Err("blend: dihedral angle too degenerate".into());
+        return Err(KernelRefusal::unsupported(KernelStage::Classify, "degenerate_dihedral", "blend: dihedral angle too degenerate"));
     }
-    let bisector = into1.add(into2).normalized()?;
+    let bisector = into1.add(into2).normalized().or_refuse(KernelStage::Refine, "normalized")?;
     let center_seed = mid_point.add(bisector.scale(radius / (theta * 0.5).sin()));
     let tangent_offset = radius / (theta * 0.5).tan();
     let p1_seed = mid_point.add(into1.scale(tangent_offset));

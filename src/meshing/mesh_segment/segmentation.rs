@@ -401,7 +401,8 @@ const CYLINDER_PEEL_SEED_RINGS: usize = 3;
 /// interpolation: three times the carrier's degrees of freedom (a cylinder
 /// has five, a cone six, a sphere four).  Each pass works on what the
 /// previous ones left.
-const PEEL_KINDS: [(&str, usize); 3] = [("cylinder", 15), ("cone", 18), ("sphere", 12)];
+const PEEL_KINDS: [(&str, usize); 4] =
+    [("cylinder", 15), ("cone", 18), ("sphere", 12), ("torus", 21)];
 
 /// Peel single-carrier groups off a tangent-smooth compound the cascade
 /// could not classify: a rounded outline (arcs of different radii joined on
@@ -539,11 +540,24 @@ fn peel_carriers(
             "cylinder" => fit_cylinder(data, &tris, &verts),
             "cone" => fit_cone(data, &tris, &verts, accept_tol),
             "sphere" => fit_sphere(data, &tris, &verts),
+            "torus" => fit_torus_refined(data, &tris, &verts, 10.0 * accept_tol),
             _ => None,
         }
     };
     let fit_facets = |kind: &str, facet_ids: &[usize]| -> Option<CandidateFit> {
         fit_kind(kind, facet_ids).filter(|fit| fit.max_dev.is_finite() && fit.max_dev <= bar)
+    };
+    // A growing torus refits from its own current carrier: the cold fit
+    // (normal-line axis, then a vertex refinement) per wave is what made a
+    // dense fillet band cost a minute.
+    let grow_fit = |kind: &str, facet_ids: &[usize], carrier: &RegionCarrier| -> Option<CandidateFit> {
+        if kind != "torus" {
+            return fit_facets(kind, facet_ids);
+        }
+        let tris = facet_tris(facet_ids);
+        let verts = region_vertices(data, &tris);
+        refine_torus_carrier(data, &tris, &verts, carrier, TORUS_REFINE_ITERATIONS)
+            .filter(|fit| fit.max_dev.is_finite() && fit.max_dev <= bar)
     };
     // Loose pre-filter against the current carrier: the refit decides.
     let plausible = |carrier: &RegionCarrier, facet: usize| -> bool {
@@ -565,6 +579,10 @@ fn peel_carriers(
     order.sort_by(|&a, &b| facet_area[b].total_cmp(&facet_area[a]).then(a.cmp(&b)));
     let mut assigned = vec![false; facets.len()];
     let mut pieces: Vec<(Vec<u32>, RegionOutcome)> = Vec::new();
+    // A torus seed is tried once across all rounds: the rounds exist for a
+    // one-strip wall whose seed neighbourhood clears once its dome is
+    // claimed, and a torus band that failed once does not become one.
+    let mut torus_tried = vec![false; facets.len()];
     // Rounds until nothing new is claimed: a wall one strip tall has its
     // seed neighborhood polluted by the dome or fillet beyond its rim until
     // that neighbor has been claimed by its own pass.
@@ -573,10 +591,13 @@ fn peel_carriers(
     for (kind, min_vertices) in PEEL_KINDS {
     let mut tried = vec![false; facets.len()];
     for &seed in &order {
-        if assigned[seed] || tried[seed] {
+        if assigned[seed] || tried[seed] || (kind == "torus" && torus_tried[seed]) {
             continue;
         }
         tried[seed] = true;
+        if kind == "torus" {
+            torus_tried[seed] = true;
+        }
         let mut group = vec![seed];
         let mut in_group = vec![false; facets.len()];
         in_group[seed] = true;
@@ -618,7 +639,7 @@ fn peel_carriers(
             }
             let mut trial = group.clone();
             trial.extend(wave.iter().copied());
-            if let Some(fit) = fit_facets(kind, &trial) {
+            if let Some(fit) = grow_fit(kind, &trial, &carrier) {
                 for &facet in &wave {
                     in_group[facet] = true;
                 }
@@ -627,11 +648,46 @@ fn peel_carriers(
                 continue;
             }
             // The wave crossed a junction: admit its facets one at a time.
+            // A torus admits the facets its current carrier already holds at
+            // the bar, then refits once: a refit per junction facet is what
+            // a dense freeform compound cannot afford.
+            if kind == "torus" {
+                let holds = |facet: usize| {
+                    facets[facet].iter().all(|&index| {
+                        data.tris[tri_ids[index] as usize]
+                            .verts
+                            .iter()
+                            .all(|&v| carrier_distance(&carrier, data.verts[v]) <= bar)
+                    })
+                };
+                let (inside, outside): (Vec<usize>, Vec<usize>) =
+                    wave.into_iter().partition(|&facet| holds(facet));
+                for facet in outside {
+                    blocked[facet] = true;
+                }
+                if inside.is_empty() {
+                    break;
+                }
+                let mut trial = group.clone();
+                trial.extend(inside.iter().copied());
+                let Some(fit) = grow_fit(kind, &trial, &carrier) else {
+                    for facet in inside {
+                        blocked[facet] = true;
+                    }
+                    break;
+                };
+                for &facet in &inside {
+                    in_group[facet] = true;
+                }
+                group = trial;
+                carrier = fit.carrier;
+                continue;
+            }
             let mut accepted_any = false;
             for facet in wave {
                 let mut trial = group.clone();
                 trial.push(facet);
-                if let Some(fit) = fit_facets(kind, &trial) {
+                if let Some(fit) = grow_fit(kind, &trial, &carrier) {
                     in_group[facet] = true;
                     group = trial;
                     carrier = fit.carrier;
@@ -651,7 +707,7 @@ fn peel_carriers(
             continue;
         }
         tris.sort_unstable();
-        let outcome = fit_region(data, &tris, options);
+        let outcome = fit_peeled(data, &tris, options);
         if debug {
             let size = match outcome.fit.carrier {
                 RegionCarrier::Cylinder { radius, .. } | RegionCarrier::Sphere { radius, .. } => {
@@ -675,6 +731,13 @@ fn peel_carriers(
             );
         }
         if !outcome.accepted || outcome.fit.carrier.kind() != kind {
+            continue;
+        }
+        // A torus is claimed only as a FULL band around its axis — the
+        // shape a mesh rebuild can bound by closed rings. A partial torus
+        // (a fillet running along an arc of an outline) stays with the
+        // planar strips it has always been read as.
+        if kind == "torus" && !covers_full_azimuth(data, &tris, &outcome.fit.carrier) {
             continue;
         }
         for &facet in &group {
@@ -730,12 +793,12 @@ fn peel_carriers(
             )
         });
         if !same_carrier {
-            remainder.extend(component);
+            remainder.extend(straddle_rejoin(data, options, bar, &mut pieces, &adjacent_pieces, component));
             continue;
         }
         let mut union: Vec<u32> = pieces[first].0.iter().chain(component.iter()).copied().collect();
         union.sort_unstable();
-        let outcome = fit_region(data, &union, options);
+        let outcome = fit_peeled(data, &union, options);
         let rejoined = outcome.accepted
             && outcome.fit.carrier.kind() == pieces[first].1.fit.carrier.kind();
         if debug {
@@ -751,11 +814,117 @@ fn peel_carriers(
         if rejoined {
             pieces[first] = (union, outcome);
         } else {
-            remainder.extend(component);
+            remainder.extend(straddle_rejoin(data, options, bar, &mut pieces, &adjacent_pieces, component));
         }
     }
     remainder.sort_unstable();
     (pieces, remainder)
+}
+
+/// The cascade's verdict on a peeled piece. The cascade keeps its plain
+/// torus fit; a torus the peel grew and judged at the precision bar carries
+/// the vertex-refined carrier instead, so a mesh rebuild gets its true
+/// axis and radii.
+fn fit_peeled(data: &MeshData, tris: &[u32], options: &SegmentOptions) -> RegionOutcome {
+    let mut outcome = fit_region(data, tris, options);
+    if outcome.accepted && outcome.fit.carrier.kind() == "torus" {
+        let verts = region_vertices(data, tris);
+        if let Some(refined) =
+            refine_torus_carrier(data, tris, &verts, &outcome.fit.carrier, TORUS_REFINE_ITERATIONS)
+        {
+            if refined.max_dev < outcome.fit.max_dev {
+                outcome.fit = refined;
+            }
+        }
+    }
+    outcome
+}
+
+/// Whether a torus region's vertices surround its axis with no azimuthal gap
+/// wider than a twelfth of a turn.
+fn covers_full_azimuth(data: &MeshData, tri_ids: &[u32], carrier: &RegionCarrier) -> bool {
+    let RegionCarrier::Torus { center, axis_dir, .. } = carrier else {
+        return false;
+    };
+    let Ok(axis) = axis_dir.normalized() else {
+        return false;
+    };
+    let Ok(x_axis) = axis.perpendicular() else {
+        return false;
+    };
+    let y_axis = axis.cross(x_axis);
+    let mut angles = region_vertices(data, tri_ids)
+        .into_iter()
+        .map(|v| {
+            let d = data.verts[v].sub(*center);
+            d.dot(y_axis).atan2(d.dot(x_axis))
+        })
+        .collect::<Vec<_>>();
+    if angles.len() < 3 {
+        return false;
+    }
+    angles.sort_by(f64::total_cmp);
+    let wrap = angles[0] + std::f64::consts::TAU - angles[angles.len() - 1];
+    let widest = angles
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .fold(wrap, f64::max);
+    widest <= std::f64::consts::TAU / 12.0
+}
+
+/// A leftover strip at the tangent junction of DIFFERENT carriers (the
+/// first row of a fillet torus against its cylinder) is not one carrier's
+/// gap, but each of its triangles still lies on exactly one side. A triangle
+/// joins the adjacent piece whose carrier holds all three of its vertices
+/// within the peel's precision bar (the closest when several do), and a
+/// piece that took any is re-fitted and must still pass the cascade as the
+/// same kind, or it keeps its old triangles and they stay out. A triangle
+/// no adjacent carrier holds at the bar is returned.
+fn straddle_rejoin(
+    data: &MeshData,
+    options: &SegmentOptions,
+    bar: f64,
+    pieces: &mut [(Vec<u32>, RegionOutcome)],
+    adjacent_pieces: &[usize],
+    component: Vec<u32>,
+) -> Vec<u32> {
+    let mut taken: Vec<Vec<u32>> = vec![Vec::new(); adjacent_pieces.len()];
+    let mut left = Vec::new();
+    for t in component {
+        let tri = &data.tris[t as usize];
+        let best = adjacent_pieces
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, &piece)| {
+                let carrier = &pieces[piece].1.fit.carrier;
+                let worst = tri
+                    .verts
+                    .iter()
+                    .map(|&v| carrier_distance(carrier, data.verts[v]))
+                    .fold(0.0_f64, f64::max);
+                (worst <= bar).then_some((slot, worst))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        match best {
+            Some((slot, _)) => taken[slot].push(t),
+            None => left.push(t),
+        }
+    }
+    for (slot, extra) in taken.into_iter().enumerate() {
+        if extra.is_empty() {
+            continue;
+        }
+        let piece = adjacent_pieces[slot];
+        let mut union: Vec<u32> = pieces[piece].0.iter().chain(extra.iter()).copied().collect();
+        union.sort_unstable();
+        let outcome = fit_peeled(data, &union, options);
+        if outcome.accepted && outcome.fit.carrier.kind() == pieces[piece].1.fit.carrier.kind() {
+            pieces[piece] = (union, outcome);
+        } else {
+            left.extend(extra);
+        }
+    }
+    left
 }
 
 // ---------------------------------------------------------------------------

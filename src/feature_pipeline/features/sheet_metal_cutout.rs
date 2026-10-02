@@ -610,7 +610,7 @@ fn extrude_footprint(
         profile.push(first);
         profile.push(second);
     }
-    crate::extrude_profile_brep(&profile, Vec3::new(0.0, 0.0, 1.0), z_len)
+    crate::extrude_profile_brep(&profile, Vec3::new(0.0, 0.0, 1.0), z_len).map_err(String::from)
 }
 
 /// Read the union prism's perpendicular TOP cross-section back out as closed

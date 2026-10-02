@@ -60,6 +60,7 @@
 //!   they found, in their own order. Which one is *this* rim, and which way it
 //!   must run, is decided at the site from the boundary it is replacing.
 
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use crate::topology::EdgeRecord;
 use crate::{
     fit_polyline, intersect_analytic_pair, intersect_surfaces, project_point_to_surface, NurbsCurve,
@@ -130,14 +131,14 @@ impl RimIntersection {
     /// pick — which is right for two well-separated conics — chooses wrongly
     /// between two branches of one section set that pass near each other, and a
     /// wall with two holes against one neighbour SURFACE gets exactly that.
-    pub(crate) fn nearest_section(&self, reference: &[Vec3]) -> Result<&RimSection, String> {
+    pub(crate) fn nearest_section(&self, reference: &[Vec3]) -> Result<&RimSection, KernelRefusal> {
         let mut best: Option<(f64, &RimSection)> = None;
         for section in &self.sections {
-            let [t0, t1] = section.curve.domain()?;
+            let [t0, t1] = section.curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
             let mut samples = Vec::with_capacity(SECTION_MATCH_SAMPLES);
             for index in 0..SECTION_MATCH_SAMPLES {
                 let fraction = index as f64 / (SECTION_MATCH_SAMPLES - 1) as f64;
-                samples.push(section.curve.evaluate(t0 + (t1 - t0) * fraction)?);
+                samples.push(section.curve.evaluate(t0 + (t1 - t0) * fraction).or_refuse(KernelStage::Intersect, "evaluate")?);
             }
             let mut worst = 0.0f64;
             for point in reference {
@@ -152,7 +153,13 @@ impl RimIntersection {
             }
         }
         best.map(|(_, section)| section)
-            .ok_or_else(|| "no section to match against the old boundary".to_string())
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Intersect,
+                    "reintersect_no_section",
+                    "no section to match against the old boundary",
+                )
+            })
     }
 }
 
@@ -177,7 +184,7 @@ pub(crate) enum ReintersectRefusal {
     Residual { drift: f64, limit: f64 },
     /// A lower-level failure (the marcher, the fit, an evaluation), carried
     /// verbatim so the site can prefix it with its own operation name.
-    Failed(String),
+    Failed(KernelRefusal),
 }
 
 impl ReintersectRefusal {
@@ -189,7 +196,7 @@ impl ReintersectRefusal {
             Self::Residual { drift, limit } => format!(
                 "the marched section drifts {drift:.3e} off a carrier (limit {limit:.3e})"
             ),
-            Self::Failed(message) => message.clone(),
+            Self::Failed(refusal) => refusal.message.clone(),
         }
     }
 }
@@ -265,7 +272,9 @@ pub(crate) fn reintersect_carriers(
             ..SurfaceIntersectionOptions::default()
         },
     )
-    .map_err(ReintersectRefusal::Failed)?;
+    .map_err(|message| {
+        ReintersectRefusal::Failed(KernelRefusal::internal(KernelStage::Intersect, "intersect_surfaces", message))
+    })?;
 
     let mut sections: Vec<RimSection> = Vec::new();
     let mut worst_residual = 0.0f64;
@@ -290,7 +299,9 @@ pub(crate) fn reintersect_carriers(
             MAXIMUM_FIT_POINTS,
             false,
         )
-        .map_err(ReintersectRefusal::Failed)?;
+        .map_err(|message| {
+            ReintersectRefusal::Failed(KernelRefusal::internal(KernelStage::Intersect, "fit_polyline", message))
+        })?;
         let curve = if branch.closed {
             close_exactly(&fit.curve, policy.tolerance).map_err(ReintersectRefusal::Failed)?
         } else {
@@ -354,9 +365,9 @@ pub(crate) fn reintersect_carriers(
 /// FITTED curve would land on the fit, which is the approximation. And because
 /// [`arc_of_section`] cuts the same ring at the same index, an arc's ends and
 /// its vertices agree exactly rather than to within a fit residual.
-pub(crate) fn section_corner(section: &RimSection, old: Vec3) -> Result<Vec3, String> {
+pub(crate) fn section_corner(section: &RimSection, old: Vec3) -> Result<Vec3, KernelRefusal> {
     if !section.closed || section.polyline.len() < 4 {
-        return Err("a section that is not a traced closed loop has no corner samples".into());
+        return Err(KernelRefusal::internal(KernelStage::Intersect, "reintersect_open_section", "a section that is not a traced closed loop has no corner samples"));
     }
     let ring = &section.polyline[..section.polyline.len() - 1];
     ring.iter()
@@ -366,7 +377,7 @@ pub(crate) fn section_corner(section: &RimSection, old: Vec3) -> Result<Vec3, St
                 .length()
                 .total_cmp(&b.sub(old).length())
         })
-        .ok_or_else(|| "empty section ring".to_string())
+        .ok_or_else(|| KernelRefusal::internal(KernelStage::Intersect, "reintersect_empty_ring", "empty section ring"))
 }
 
 pub(crate) fn arc_of_section(
@@ -375,9 +386,9 @@ pub(crate) fn arc_of_section(
     to: Vec3,
     through: Vec3,
     tolerance: f64,
-) -> Result<NurbsCurve, String> {
+) -> Result<NurbsCurve, KernelRefusal> {
     if !section.closed || section.polyline.len() < 4 {
-        return Err("a section that is not a traced closed loop cannot be cut into arcs".into());
+        return Err(KernelRefusal::internal(KernelStage::Intersect, "reintersect_open_section", "a section that is not a traced closed loop cannot be cut into arcs"));
     }
     // `trace` closes a loop by pushing the START point back on, so the last
     // sample duplicates the first; the cyclic ring is everything but that.
@@ -405,14 +416,12 @@ pub(crate) fn arc_of_section(
             .collect();
         chosen[0] = from;
         chosen.push(from);
-        let fit = fit_polyline(&chosen, tolerance.max(1e-7), MAXIMUM_FIT_POINTS, false)?;
+        let fit = fit_polyline(&chosen, tolerance.max(1e-7), MAXIMUM_FIT_POINTS, false).or_refuse(KernelStage::Intersect, "fit_polyline")?;
         return close_exactly(&fit.curve, tolerance);
     }
     let forward_len = (end + count - start) % count;
     if forward_len < 2 || count - forward_len < 2 {
-        return Err(
-            "the two ends of an arc land on the same place of its section — refusing".into(),
-        );
+        return Err(KernelRefusal::internal(KernelStage::Intersect, "reintersect_arc_ends_coincide", "the two ends of an arc land on the same place of its section — refusing"));
     }
     let run = |begin: usize, step: isize| -> Vec<Vec3> {
         let mut points = Vec::new();
@@ -445,9 +454,9 @@ pub(crate) fn arc_of_section(
     chosen[0] = from;
     chosen[last] = to;
     if chosen.len() < 3 {
-        return Err("a rebuilt arc has too few samples to fit — refusing".into());
+        return Err(KernelRefusal::internal(KernelStage::Intersect, "reintersect_arc_samples", "a rebuilt arc has too few samples to fit — refusing"));
     }
-    Ok(fit_polyline(&chosen, tolerance.max(1e-7), MAXIMUM_FIT_POINTS, false)?.curve)
+    Ok(fit_polyline(&chosen, tolerance.max(1e-7), MAXIMUM_FIT_POINTS, false).or_refuse(KernelStage::Intersect, "fit_polyline")?.curve)
 }
 
 /// Make a fitted CLOSED section close bitwise.
@@ -460,27 +469,27 @@ pub(crate) fn arc_of_section(
 /// or `validate` reports a gap. Snap the last control point onto the first,
 /// after checking they already agree within tolerance (so this can only remove
 /// rounding, never bend a curve shut).
-fn close_exactly(curve: &NurbsCurve, tolerance: f64) -> Result<NurbsCurve, String> {
+fn close_exactly(curve: &NurbsCurve, tolerance: f64) -> Result<NurbsCurve, KernelRefusal> {
     let controls = &curve.control_points;
     let (Some(first), Some(last)) = (controls.first(), controls.last()) else {
         return Ok(curve.clone());
     };
-    let gap = last.point()?.sub(first.point()?).length();
+    let gap = last.point().or_refuse(KernelStage::Intersect, "point")?.sub(first.point().or_refuse(KernelStage::Intersect, "point")?).length();
     if gap == 0.0 {
         return Ok(curve.clone());
     }
     if gap > tolerance.max(1e-9) * 10.0 {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Intersect, "reintersect_closure_gap", format!(
             "a marched section reported itself closed but its fit leaves a {gap:.3e} gap"
-        ));
+        )));
     }
     let mut controls = controls.clone();
     let head = controls[0];
     let tail_weight = controls[controls.len() - 1].w;
-    let head_point = head.point()?;
+    let head_point = head.point().or_refuse(KernelStage::Intersect, "point")?;
     let index = controls.len() - 1;
     controls[index] = Vec4::from_point(head_point, tail_weight);
-    NurbsCurve::new(curve.degree, curve.knots.clone(), controls)
+    NurbsCurve::new(curve.degree, curve.knots.clone(), controls).or_refuse(KernelStage::Intersect, "new")
 }
 
 /// The worst distance from a sampled point of `curve` to either carrier.
@@ -495,14 +504,14 @@ fn section_residual(
     curve: &NurbsCurve,
     first: &NurbsSurface,
     second: &NurbsSurface,
-) -> Result<f64, String> {
-    let [t0, t1] = curve.domain()?;
+) -> Result<f64, KernelRefusal> {
+    let [t0, t1] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
     let mut worst = 0.0f64;
     for index in 0..RESIDUAL_SAMPLES {
         let fraction = index as f64 / (RESIDUAL_SAMPLES - 1) as f64;
-        let point = curve.evaluate(t0 + (t1 - t0) * fraction)?;
-        worst = worst.max(project_point_to_surface(first, point)?.distance);
-        worst = worst.max(project_point_to_surface(second, point)?.distance);
+        let point = curve.evaluate(t0 + (t1 - t0) * fraction).or_refuse(KernelStage::Intersect, "evaluate")?;
+        worst = worst.max(project_point_to_surface(first, point).or_refuse(KernelStage::Intersect, "project_point_to_surface")?.distance);
+        worst = worst.max(project_point_to_surface(second, point).or_refuse(KernelStage::Intersect, "project_point_to_surface")?.distance);
     }
     Ok(worst)
 }
@@ -513,12 +522,14 @@ fn section_residual(
 /// replacing it: for any push small against the feature the two run close
 /// together, and the marcher drops a seed that does not land on both carriers,
 /// so a seed that has stopped being relevant costs nothing.
-pub(crate) fn edge_seeds(edge: &EdgeRecord, count: usize) -> Result<Vec<Vec3>, String> {
+pub(crate) fn edge_seeds(edge: &EdgeRecord, count: usize) -> Result<Vec<Vec3>, KernelRefusal> {
     let count = count.max(2);
     (0..count)
         .map(|index| {
             let fraction = index as f64 / (count - 1) as f64;
-            edge.curve.evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction)
+            edge.curve
+                .evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction)
+                .or_refuse(KernelStage::Intersect, "evaluate")
         })
         .collect()
 }
@@ -536,15 +547,15 @@ pub(crate) fn edge_seeds(edge: &EdgeRecord, count: usize) -> Result<Vec<Vec3>, S
 pub(crate) fn match_marched_rim_direction(
     rim: NurbsCurve,
     previous: &EdgeRecord,
-) -> Result<NurbsCurve, String> {
-    let [d0, _] = rim.domain()?;
-    let head = rim.evaluate(d0)?;
-    let projection = crate::project_point_to_curve(&previous.curve, head)?;
+) -> Result<NurbsCurve, KernelRefusal> {
+    let [d0, _] = rim.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    let head = rim.evaluate(d0).or_refuse(KernelStage::Intersect, "evaluate")?;
+    let projection = crate::project_point_to_curve(&previous.curve, head).or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
     let parameter = projection.u.clamp(previous.t0.min(previous.t1), previous.t1.max(previous.t0));
-    let incoming = previous.curve.derivatives(parameter, 1)?;
-    let rebuilt = rim.derivatives(d0, 1)?;
+    let incoming = previous.curve.derivatives(parameter, 1).or_refuse(KernelStage::Intersect, "derivatives")?;
+    let rebuilt = rim.derivatives(d0, 1).or_refuse(KernelStage::Intersect, "derivatives")?;
     if incoming[1].dot(rebuilt[1]) < 0.0 {
-        return rim.reversed();
+        return rim.reversed().or_refuse(KernelStage::Intersect, "reversed");
     }
     Ok(rim)
 }

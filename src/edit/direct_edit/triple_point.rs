@@ -59,6 +59,7 @@
 
 use super::*;
 use crate::{project_point_to_surface, project_point_to_surface_seeded};
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 
 /// One carrier of a triple-point solve, read as a signed distance.
 #[derive(Clone, Debug)]
@@ -103,14 +104,14 @@ pub(super) fn carrier_kind(carrier: &TripleCarrier) -> &'static str {
 impl<'a> TripleCarrier<'a> {
     /// Read `surface` as its infinite analytic carrier when it has one, and as
     /// its patch otherwise.
-    pub(super) fn of(surface: &'a NurbsSurface) -> Result<Self, String> {
+    pub(super) fn of(surface: &'a NurbsSurface) -> Result<Self, KernelRefusal> {
         let Some(analytic) = surface.analytic() else {
             return Ok(Self::Patch(surface));
         };
         Ok(match analytic {
             AnalyticSurface::Plane { origin, u_dir, v_dir, .. } => Self::Plane {
                 origin: *origin,
-                normal: u_dir.cross(*v_dir).normalized()?,
+                normal: u_dir.cross(*v_dir).normalized().or_refuse(KernelStage::Classify, "carrier_normal")?,
             },
             AnalyticSurface::RuledRevolution {
                 frame,
@@ -123,7 +124,7 @@ impl<'a> TripleCarrier<'a> {
                 }
                 Self::Ruled {
                     origin: frame.origin,
-                    axis: frame.axis.normalized()?,
+                    axis: frame.axis.normalized().or_refuse(KernelStage::Classify, "carrier_axis")?,
                     rho0: *rho0,
                     slope: (rho1 - rho0) / height,
                 }
@@ -138,7 +139,7 @@ impl<'a> TripleCarrier<'a> {
                 minor_radius,
             } => Self::Torus {
                 origin: frame.origin,
-                axis: frame.axis.normalized()?,
+                axis: frame.axis.normalized().or_refuse(KernelStage::Classify, "carrier_axis")?,
                 major: *major_radius,
                 minor: *minor_radius,
             },
@@ -147,7 +148,7 @@ impl<'a> TripleCarrier<'a> {
             } => {
                 // A straight generatrix sweeps a cone, a cylinder or an annulus;
                 // anything else is read through its patch.
-                let axis = frame.axis.normalized()?;
+                let axis = frame.axis.normalized().or_refuse(KernelStage::Classify, "carrier_axis")?;
                 let Some((start, end)) = generatrix.straight_segment(PARALLEL_EPS) else {
                     return Ok(Self::Patch(surface));
                 };
@@ -187,7 +188,7 @@ impl<'a> TripleCarrier<'a> {
         &self,
         point: Vec3,
         foot: &mut Option<(f64, f64)>,
-    ) -> Result<(f64, Vec3, f64), String> {
+    ) -> Result<(f64, Vec3, f64), KernelRefusal> {
         const FOCAL: f64 = 1e-12;
         match self {
             Self::Plane { origin, normal } => {
@@ -205,7 +206,11 @@ impl<'a> TripleCarrier<'a> {
                 let radial = delta.sub(axis.scale(axial));
                 let rho = radial.length();
                 if rho <= FOCAL * (1.0 + axial.abs()) {
-                    return Err("the point lies on the cylinder/cone axis".into());
+                    return Err(KernelRefusal::ill_posed(
+                        KernelStage::Classify,
+                        "focal_axis",
+                        "the point lies on the cylinder/cone axis",
+                    ));
                 }
                 let norm = (1.0 + slope * slope).sqrt();
                 let signed = (rho - rho0 - slope * axial) / norm;
@@ -216,7 +221,11 @@ impl<'a> TripleCarrier<'a> {
                 let delta = point.sub(*center);
                 let length = delta.length();
                 if length <= FOCAL * (1.0 + radius) {
-                    return Err("the point lies on the sphere's centre".into());
+                    return Err(KernelRefusal::ill_posed(
+                        KernelStage::Classify,
+                        "focal_centre",
+                        "the point lies on the sphere's centre",
+                    ));
                 }
                 let signed = length - radius;
                 Ok((signed, delta.scale(1.0 / length), signed.abs()))
@@ -232,12 +241,20 @@ impl<'a> TripleCarrier<'a> {
                 let radial = delta.sub(axis.scale(axial));
                 let rho = radial.length();
                 if rho <= FOCAL * (1.0 + major) {
-                    return Err("the point lies on the torus axis".into());
+                    return Err(KernelRefusal::ill_posed(
+                        KernelStage::Classify,
+                        "focal_torus_axis",
+                        "the point lies on the torus axis",
+                    ));
                 }
                 let across = rho - major;
                 let tube = (across * across + axial * axial).sqrt();
                 if tube <= FOCAL * (1.0 + minor) {
-                    return Err("the point lies on the torus's tube circle".into());
+                    return Err(KernelRefusal::ill_posed(
+                        KernelStage::Classify,
+                        "focal_tube",
+                        "the point lies on the torus's tube circle",
+                    ));
                 }
                 let signed = tube - minor;
                 let gradient = radial
@@ -247,11 +264,16 @@ impl<'a> TripleCarrier<'a> {
             }
             Self::Patch(surface) => {
                 let projection = match *foot {
-                    Some((u, v)) => project_point_to_surface_seeded(surface, point, u, v)?,
-                    None => project_point_to_surface(surface, point)?,
+                    Some((u, v)) => project_point_to_surface_seeded(surface, point, u, v)
+                        .or_refuse(KernelStage::Classify, "project")?,
+                    None => project_point_to_surface(surface, point).or_refuse(KernelStage::Classify, "project")?,
                 };
                 *foot = Some((projection.u, projection.v));
-                let normal = surface.normal(projection.u, projection.v)?.normalized()?;
+                let normal = surface
+                    .normal(projection.u, projection.v)
+                    .or_refuse(KernelStage::Classify, "normal")?
+                    .normalized()
+                    .or_refuse(KernelStage::Classify, "normal")?;
                 let offset = point.sub(projection.point);
                 Ok((offset.dot(normal), normal, offset.length()))
             }
@@ -265,18 +287,18 @@ impl<'a> TripleCarrier<'a> {
         &self,
         point: Vec3,
         foot: &mut Option<(f64, f64)>,
-    ) -> Result<(f64, f64), String> {
+    ) -> Result<(f64, f64), KernelRefusal> {
         self.distance(point, foot).map(|(signed, _, distance)| (signed, distance))
     }
 
     /// The signed distance alone, for root enumeration along a curve.
-    pub(super) fn signed_distance(&self, point: Vec3) -> Result<f64, String> {
+    pub(super) fn signed_distance(&self, point: Vec3) -> Result<f64, KernelRefusal> {
         let mut foot = None;
         self.distance(point, &mut foot).map(|(signed, _, _)| signed)
     }
 
     /// The unit normal of the carrier at (or nearest) `point`.
-    pub(super) fn normal_at(&self, point: Vec3) -> Result<Vec3, String> {
+    pub(super) fn normal_at(&self, point: Vec3) -> Result<Vec3, KernelRefusal> {
         let mut foot = None;
         self.distance(point, &mut foot).map(|(_, gradient, _)| gradient)
     }
@@ -315,8 +337,9 @@ pub(super) struct TriplePoint {
 /// Why a triple-point solve declined, with what it measured.
 #[derive(Clone, Debug)]
 pub(super) enum TripleRefusal {
-    /// A carrier could not be read at an iterate.
-    Unreadable { carrier: usize, reason: String },
+    /// A carrier could not be read at an iterate; `reason` keeps the reading's
+    /// own refusal (a focal point, a projection that failed) and its class.
+    Unreadable { carrier: usize, reason: KernelRefusal },
     /// The three normals are dependent: the carriers do not cross transversally.
     Singular { iteration: usize, sigma_min: f64 },
     /// The iterate left the caller's reach of the seed.
@@ -366,6 +389,29 @@ impl TripleRefusal {
                 "the carriers are too near tangent to place the point: σ_min {sigma_min:.3e} \
                  moves it {sensitivity:.3e} per model tolerance, over the bar {bar:.3e}"
             ),
+        }
+    }
+
+    /// This refusal as a [`KernelRefusal`], its text rewritten by `wrap` (the
+    /// caller's own sentence around [`Self::describe`]) and its class read off
+    /// the variant, at the origin: an unreadable carrier keeps the reading's
+    /// class; dependent normals and near-tangent carriers are ill-posed (the
+    /// carriers do not pin one point within the bar); a solve that wandered or
+    /// ran out of iterations did not converge; a point off a fitted patch is a
+    /// deferral, since a patch is not read past its own domain.
+    pub(super) fn into_refusal(self, wrap: impl FnOnce(&str) -> String) -> KernelRefusal {
+        let text = wrap(&self.describe());
+        match self {
+            Self::Unreadable { reason, .. } => reason.with_message(|_| text),
+            Self::Singular { .. } => KernelRefusal::ill_posed(KernelStage::Refine, "singular_normals", text),
+            Self::Wandered { .. } => KernelRefusal::non_convergence(KernelStage::Refine, "wandered", text),
+            Self::NotConverged { .. } => {
+                KernelRefusal::non_convergence(KernelStage::Refine, "newton_budget", text)
+            }
+            Self::OffPatch { .. } => KernelRefusal::unsupported(KernelStage::Refine, "off_patch", text),
+            Self::IllConditioned { .. } => {
+                KernelRefusal::ill_posed(KernelStage::Refine, "ill_conditioned", text)
+            }
         }
     }
 }

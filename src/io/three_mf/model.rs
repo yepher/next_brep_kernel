@@ -35,6 +35,8 @@ pub(super) struct Object {
     /// (`support`, `solidsupport`, `surface`, `other`) are resources of the
     /// print job and are not placed.
     pub model_type: bool,
+    /// The `name` attribute, for naming the object in a refusal.
+    pub name: Option<String>,
     pub content: ObjectContent,
 }
 
@@ -328,7 +330,12 @@ fn parse_object(
     let Some(content) = content else {
         return parser.fail(format!("object {id} has neither <mesh> nor <components>"));
     };
-    document.objects.push(Object { id, model_type, content });
+    let name = object
+        .attribute("name")
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    document.objects.push(Object { id, model_type, name, content });
     document.by_id.insert(id, document.objects.len() - 1);
     Ok(())
 }

@@ -105,19 +105,38 @@ impl NurbsSurface {
         let [u0, u1] = self.domain_u()?;
         let [v0, v1] = self.domain_v()?;
         let closed_along = |direction_u: bool| -> Result<bool, String> {
+            // A direction whose two boundary rows coincide is closed only if
+            // the surface TRAVELS between them: a sliver patch narrower than
+            // the seam tolerance (a 7.24e-7-wide plane our own STL→STEP writer
+            // emits for a degenerate facet, 2026-09-26) has coincident rows
+            // too, and reading it as periodic wraps its far edge onto its near
+            // one — `evaluate_extended` then images a trim on that edge a
+            // whole patch width away.
+            let mut travels = false;
             for fraction in [0.17, 0.5, 0.83] {
-                let (a, b) = if direction_u {
+                let (a, b, middle) = if direction_u {
                     let v = v0 + (v1 - v0) * fraction;
-                    (self.evaluate(u0, v)?, self.evaluate(u1, v)?)
+                    (
+                        self.evaluate(u0, v)?,
+                        self.evaluate(u1, v)?,
+                        self.evaluate(0.5 * (u0 + u1), v)?,
+                    )
                 } else {
                     let u = u0 + (u1 - u0) * fraction;
-                    (self.evaluate(u, v0)?, self.evaluate(u, v1)?)
+                    (
+                        self.evaluate(u, v0)?,
+                        self.evaluate(u, v1)?,
+                        self.evaluate(u, 0.5 * (v0 + v1))?,
+                    )
                 };
                 if a.sub(b).length() > CLOSED_SEAM_TOLERANCE {
                     return Ok(false);
                 }
+                if middle.sub(a).length() > CLOSED_SEAM_TOLERANCE {
+                    travels = true;
+                }
             }
-            Ok(true)
+            Ok(travels)
         };
         let value = (closed_along(true)?, closed_along(false)?);
         Ok(*self.closed_directions.get_or_init(|| value))

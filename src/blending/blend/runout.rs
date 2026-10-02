@@ -53,13 +53,11 @@
 //! # What this module is for
 //!
 //! It measures the class: the station, the carrier pair, the marched stretch
-//! with its contact residuals, the stop and the pole.  The mixed-convexity
+//! with its contact residuals, the stop and the pole. The mixed-convexity
 //! refusal (`fillet/edges.rs`) reports those numbers instead of only naming
 //! the corner, so the refusal says WHICH construction is missing and where.
-//! Composing it — three stretches, two flush junctions and a degenerate pole
-//! per spine end — is `fillet-stripe-network.md` item 2/4 and is NOT done
-//! here.
 
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use crate::topology::{BrepSolid, EdgeRecord, FaceRecord};
 use crate::{intersect_curves, project_point_to_surface, NurbsCurve, NurbsSurface, Vec3};
 
@@ -164,7 +162,7 @@ fn solve_ball(
     edge: &EdgeRecord,
     t: f64,
     scale: f64,
-) -> Result<Ball, String> {
+) -> Result<Ball, KernelRefusal> {
     let (section_point, section_tangent) = section_frame(edge, t)?;
     let uv = solve_station(
         surface1,
@@ -194,10 +192,10 @@ fn solve_ball(
 /// How far `uv` lies OUTSIDE `surface`'s own domain, as a fraction of the
 /// domain span, worst of the two directions.  Closed directions are exempt:
 /// every periodic image is the same real surface.
-fn domain_excursion(surface: &NurbsSurface, uv: [f64; 2]) -> Result<f64, String> {
-    let [u0, u1] = surface.domain_u()?;
-    let [v0, v1] = surface.domain_v()?;
-    let (closed_u, closed_v) = surface.closed_directions()?;
+fn domain_excursion(surface: &NurbsSurface, uv: [f64; 2]) -> Result<f64, KernelRefusal> {
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    let (closed_u, closed_v) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
     let mut worst = 0.0f64;
     for (closed, value, low, high) in [
         (closed_u, uv[0], u0, u1),
@@ -216,8 +214,8 @@ fn domain_excursion(surface: &NurbsSurface, uv: [f64; 2]) -> Result<f64, String>
 }
 
 /// Distance from `point` to `surface`, and the parameters it projects to.
-fn surface_gap(surface: &NurbsSurface, point: Vec3) -> Result<(f64, f64, f64), String> {
-    let projection = project_point_to_surface(surface, point)?;
+fn surface_gap(surface: &NurbsSurface, point: Vec3) -> Result<(f64, f64, f64), KernelRefusal> {
+    let projection = project_point_to_surface(surface, point).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
     Ok((projection.distance, projection.u, projection.v))
 }
 
@@ -235,7 +233,7 @@ fn fit_stripe(
     second: &BlendMate,
     radius: f64,
     widest: bool,
-) -> Result<FittedRows, String> {
+) -> Result<FittedRows, KernelRefusal> {
     let radius_at = |_: f64| radius;
     let mut last = None;
     let ladder: Vec<f64> = if widest {
@@ -259,19 +257,19 @@ fn fit_stripe(
             Err(error) => last = Some(error),
         }
     }
-    Err(last.unwrap_or_else(|| format!("blend runout: edge {} did not march", edge.id)))
+    Err(last.unwrap_or_else(|| KernelRefusal::internal(KernelStage::Refine, "runout_march", format!("blend runout: edge {} did not march", edge.id))))
 }
 
 /// Arc distance from `vertex_t` to `t` along `curve`, by chord sampling (the
 /// convex edges this runs on are straight, and a chord sum is exact there and
 /// conservative elsewhere).
-fn arc_distance(curve: &NurbsCurve, vertex_t: f64, t: f64) -> Result<f64, String> {
+fn arc_distance(curve: &NurbsCurve, vertex_t: f64, t: f64) -> Result<f64, KernelRefusal> {
     const STEPS: usize = 64;
     let mut total = 0.0;
-    let mut previous = curve.evaluate_extended(vertex_t)?;
+    let mut previous = curve.evaluate_extended(vertex_t).or_refuse(KernelStage::Refine, "evaluate_extended")?;
     for step in 1..=STEPS {
         let at = vertex_t + (t - vertex_t) * step as f64 / STEPS as f64;
-        let point = curve.evaluate_extended(at)?;
+        let point = curve.evaluate_extended(at).or_refuse(KernelStage::Refine, "evaluate_extended")?;
         total += point.sub(previous).length();
         previous = point;
     }
@@ -286,12 +284,12 @@ pub(crate) fn plan_runout(
     edge_ids: &[u64],
     radius: f64,
     corner: &MixedCorner,
-) -> Result<RunoutPlan, String> {
+) -> Result<RunoutPlan, KernelRefusal> {
     let mates = stripe_mates(solid, edge_ids, radius)?;
     let convex_index = *corner
         .convex
         .first()
-        .ok_or("blend runout: the corner names no convex edge")?;
+        .ok_or(KernelRefusal::internal(KernelStage::Classify, "runout_convex_edge", "blend runout: the corner names no convex edge"))?;
     let (convex_edge, convex_first, convex_second) = &mates[convex_index];
     // The corner vertex is the one the convex edge shares with the concave
     // ones; `mixed_convexity_corner` reports its point, so match on that.
@@ -305,7 +303,7 @@ pub(crate) fn plan_runout(
                 .map(|vertex| vertex.point.sub(corner.point).length() <= 1e-9 * (1.0 + radius))
                 .unwrap_or(false)
         })
-        .ok_or("blend runout: the convex edge does not end at the reported corner")?;
+        .ok_or(KernelRefusal::internal(KernelStage::Classify, "runout_convex_edge", "blend runout: the convex edge does not end at the reported corner"))?;
     let concave: Vec<usize> = corner
         .concave
         .iter()
@@ -316,7 +314,7 @@ pub(crate) fn plan_runout(
         })
         .collect();
     if concave.len() < 2 {
-        return Err("blend runout: fewer than two concave edges reach the corner".into());
+        return Err(KernelRefusal::unsupported(KernelStage::Classify, "runout_concave_edges", "blend runout: fewer than two concave edges reach the corner"));
     }
     // The face the concave stripes SHARE and the convex stripe does not touch.
     let convex_faces = [convex_first.face.id, convex_second.face.id];
@@ -337,7 +335,7 @@ pub(crate) fn plan_runout(
         }
     }
     let shared = shared.ok_or(
-        "blend runout: the concave edges at the corner share no face the convex edge misses",
+        KernelRefusal::unsupported(KernelStage::Classify, "runout_shared_face", "blend runout: the concave edges at the corner share no face the convex edge misses",)
     )?;
 
     // ---- Station A: the convex ball tangent to the shared face. ----
@@ -355,7 +353,7 @@ pub(crate) fn plan_runout(
     let rho = [convex_first.rho, convex_second.rho];
     let surface1 = &convex_first.face.surface;
     let surface2 = &convex_second.face.surface;
-    let seed_at = |t: f64| -> Result<[f64; 4], String> {
+    let seed_at = |t: f64| -> Result<[f64; 4], KernelRefusal> {
         let clamped = t.clamp(convex_edge.t0, convex_edge.t1);
         let uv1 = edge_uv_on_face(convex_first.coedge, convex_edge, clamped)?;
         let uv2 = edge_uv_on_face(convex_second.coedge, convex_edge, clamped)?;
@@ -385,7 +383,7 @@ pub(crate) fn plan_runout(
             "blend runout: the ball on edge {} never becomes tangent to face {} along it",
             convex_edge.id, shared.id
         )
-    })?;
+    }).or_refuse(KernelStage::Refine, "ok_or_else")?;
     let station_ball = {
         let mut seed = seed_at(low)?;
         let mut best = solve_ball(surface1, surface2, rho, seed, convex_edge, low, scale)?;
@@ -438,7 +436,7 @@ pub(crate) fn plan_runout(
     let other_index = ranked
         .get(1)
         .map(|(index, _)| *index)
-        .ok_or("blend runout: only one concave stripe at the corner")?;
+        .ok_or(KernelRefusal::unsupported(KernelStage::Classify, "runout_concave_stripes", "blend runout: only one concave stripe at the corner"))?;
     let (_, other_rows) = stripes
         .iter()
         .find(|(index, _)| *index == other_index)
@@ -473,17 +471,17 @@ pub(crate) fn plan_runout(
     };
 
     // ---- The pole: the two stripes' rails on the shared face meet. ----
-    let rail_on = |index: usize, rows: &FittedRows| -> Result<NurbsCurve, String> {
+    let rail_on = |index: usize, rows: &FittedRows| -> Result<NurbsCurve, KernelRefusal> {
         let (_, first, second) = &mates[index];
         if first.face.id == shared.id {
             Ok(rows.cr.clone())
         } else if second.face.id == shared.id {
             Ok(rows.cs.clone())
         } else {
-            Err(format!(
+            Err(KernelRefusal::internal(KernelStage::Refine, "runout_shared_face", format!(
                 "blend runout: edge {} does not touch the shared face {}",
                 mates[index].0.id, shared.id
-            ))
+            )))
         }
     };
     // The rails are FITS, so their crossing is only as sharp as the fit: the
@@ -532,7 +530,7 @@ pub(crate) fn plan_runout(
     // along the RAW normal, and which way is read off the station itself.
     let (_, stripe_u, stripe_v) = surface_gap(&second_rows.surface, station_ball.center)?;
     let stripe_normal = raw_normal(&second_rows.surface, stripe_u, stripe_v)?;
-    let stripe_point = second_rows.surface.evaluate(stripe_u, stripe_v)?;
+    let stripe_point = second_rows.surface.evaluate(stripe_u, stripe_v).or_refuse(KernelStage::Refine, "evaluate")?;
     let stripe_rho = radius * station_ball.center.sub(stripe_point).dot(stripe_normal).signum();
     let runout_rho = [kept_rho, stripe_rho];
     let kept_uv = if kept == convex_first.face.id {
@@ -547,7 +545,7 @@ pub(crate) fn plan_runout(
         Some(point) => section_parameter(convex_edge, point, station_t, vertex_t)?,
         None => vertex_t,
     };
-    let graze = |t: f64, seed: [f64; 4]| -> Result<(f64, Ball), String> {
+    let graze = |t: f64, seed: [f64; 4]| -> Result<(f64, Ball), KernelRefusal> {
         let ball = solve_ball(
             kept_surface,
             &second_rows.surface,
@@ -675,8 +673,8 @@ pub(crate) fn plan_runout(
             let mut worst: f64 = 0.0;
             for (station, u) in stations.iter().zip(&parameters) {
                 worst = worst
-                    .max(rows.cr.evaluate(*u)?.sub(station.p1).length())
-                    .max(rows.cs.evaluate(*u)?.sub(station.p2).length());
+                    .max(rows.cr.evaluate(*u).or_refuse(KernelStage::Refine, "evaluate")?.sub(station.p1).length())
+                    .max(rows.cs.evaluate(*u).or_refuse(KernelStage::Refine, "evaluate")?.sub(station.p2).length());
             }
             fit_residual = worst;
         }
@@ -707,7 +705,7 @@ pub(crate) fn plan_runout(
 /// (`march_section`). The runout's own reads (bracketing, bisection, its
 /// stretch) have no one step, so every one of them takes the stripe march's
 /// `span / STATIONS`, which keeps them on one family of section planes.
-fn section_frame(edge: &EdgeRecord, t: f64) -> Result<(Vec3, Vec3), String> {
+fn section_frame(edge: &EdgeRecord, t: f64) -> Result<(Vec3, Vec3), KernelRefusal> {
     let station_step = (edge.t1 - edge.t0).abs() / STATIONS as f64;
     march_section(edge, t, station_step, "blend runout")
 }
@@ -721,8 +719,8 @@ fn section_parameter(
     point: Vec3,
     from: f64,
     to: f64,
-) -> Result<f64, String> {
-    let value = |t: f64| -> Result<f64, String> {
+) -> Result<f64, KernelRefusal> {
+    let value = |t: f64| -> Result<f64, KernelRefusal> {
         let (section_point, section_tangent) = section_frame(edge, t)?;
         Ok(point.sub(section_point).dot(section_tangent))
     };
@@ -745,7 +743,7 @@ fn section_parameter(
         low_value = current;
     }
     if !found {
-        return Err("blend runout: the pole has no section plane on the convex edge".into());
+        return Err(KernelRefusal::internal(KernelStage::Refine, "runout_section_plane", "blend runout: the pole has no section plane on the convex edge"));
     }
     for _ in 0..BISECTIONS {
         let middle = 0.5 * (low + high);

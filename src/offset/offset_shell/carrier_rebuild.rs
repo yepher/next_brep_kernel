@@ -1,3 +1,4 @@
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 
 /// Extend a hole-wall offset carrier's trim past the opening planes it
@@ -56,7 +57,7 @@ pub(super) fn extend_offset_carriers_past_open_hole_rims(
     opening_set: &HashSet<u64>,
     smooth_pairs: &HashSet<(usize, usize)>,
     scale: f64,
-) -> Result<HashSet<usize>, String> {
+) -> Result<HashSet<usize>, KernelRefusal> {
     let weld_band = 2e-3f64.max(scale * 5e-5);
     let source_edge_by_id = source
         .edges
@@ -114,13 +115,13 @@ pub(super) fn extend_offset_carriers_past_open_hole_rims(
         }
         let carrier_face = carriers[index].solid.shells[0].faces[0].clone();
         let surface = carrier_face.surface.clone();
-        let [su0, su1] = surface.domain_u()?;
-        let [sv0, sv1] = surface.domain_v()?;
+        let [su0, su1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+        let [sv0, sv1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
         let v_mid = (sv0 + sv1) * 0.5;
         // The band must close in u (a periodic wall around the hole bore).
         if surface
-            .evaluate(su0, v_mid)?
-            .sub(surface.evaluate(su1, v_mid)?)
+            .evaluate(su0, v_mid).or_refuse(KernelStage::Refine, "evaluate")?
+            .sub(surface.evaluate(su1, v_mid).or_refuse(KernelStage::Refine, "evaluate")?)
             .length()
             > weld_band
         {
@@ -130,14 +131,14 @@ pub(super) fn extend_offset_carriers_past_open_hole_rims(
         for (loop_index, coedge_index, rim_edge) in &rims {
             let source_coedge = &source_face.loops[*loop_index].coedges[*coedge_index];
             // Full-period rim: its pcurve sweeps the whole u domain.
-            let [p0, p1] = source_coedge.pcurve.domain()?;
+            let [p0, p1] = source_coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
             let mut u_low = f64::MAX;
             let mut u_high = f64::MIN;
             let mut v_mean = 0.0f64;
             for sample in 0..=32 {
                 let uv = source_coedge
                     .pcurve
-                    .evaluate(p0 + (p1 - p0) * sample as f64 / 32.0)?;
+                    .evaluate(p0 + (p1 - p0) * sample as f64 / 32.0).or_refuse(KernelStage::Refine, "evaluate")?;
                 u_low = u_low.min(uv.x);
                 u_high = u_high.max(uv.x);
                 v_mean += uv.y / 33.0;
@@ -171,7 +172,7 @@ pub(super) fn extend_offset_carriers_past_open_hole_rims(
                     same_sense: true,
                     loops: vec![loop_record.clone()],
                     name: None,
-                })?
+                }).or_refuse(KernelStage::Refine, "parameter_space_area")?
                 .abs();
                 if loop_record
                     .coedges
@@ -204,7 +205,7 @@ pub(super) fn extend_offset_carriers_past_open_hole_rims(
             for sample in 0..=32 {
                 let point = image_edge.curve.evaluate(
                     image_edge.t0 + (image_edge.t1 - image_edge.t0) * sample as f64 / 32.0,
-                )?;
+                ).or_refuse(KernelStage::Refine, "evaluate")?;
                 off_plane = off_plane.max(point.sub(plane_point).dot(plane_normal).abs());
             }
             if off_plane <= weld_band {
@@ -216,14 +217,14 @@ pub(super) fn extend_offset_carriers_past_open_hole_rims(
         // nearer to it, and require the extended isoline to clear that plane
         // on the far side (opposite the band interior).
         rim_planes.sort_by(|first, second| first.0.total_cmp(&second.0));
-        let interior = surface.evaluate((su0 + su1) * 0.5, v_mid)?;
+        let interior = surface.evaluate((su0 + su1) * 0.5, v_mid).or_refuse(KernelStage::Refine, "evaluate")?;
         for (v_end, (_, plane_point, plane_normal)) in [(sv0, rim_planes[0]), (sv1, rim_planes[1])]
         {
             let interior_sign = interior.sub(plane_point).dot(plane_normal).signum();
-            let iso = surface.iso_curve_v(v_end)?;
-            let [t0, t1] = iso.domain()?;
+            let iso = surface.iso_curve_v(v_end).or_refuse(KernelStage::Refine, "iso_curve_v")?;
+            let [t0, t1] = iso.domain().or_refuse(KernelStage::Refine, "domain")?;
             for sample in 0..=32 {
-                let point = iso.evaluate(t0 + (t1 - t0) * sample as f64 / 32.0)?;
+                let point = iso.evaluate(t0 + (t1 - t0) * sample as f64 / 32.0).or_refuse(KernelStage::Refine, "evaluate")?;
                 if point.sub(plane_point).dot(plane_normal) * interior_sign > -weld_band {
                     continue 'carrier;
                 }
@@ -232,46 +233,46 @@ pub(super) fn extend_offset_carriers_past_open_hole_rims(
         // Rebuild the carrier as the full-domain band with exact isoline
         // rims — structurally the same face a freshly made cylinder/cone
         // side carries, which is the arrangement's best-tested input.
-        let winding = parameter_space_area(&carrier_face)?;
-        let bottom_rim = surface.iso_curve_v(sv0)?;
-        let top_rim = surface.iso_curve_v(sv1)?;
-        let seam = surface.iso_curve_u(su0)?;
-        let [bottom_t0, bottom_t1] = bottom_rim.domain()?;
-        let [top_t0, top_t1] = top_rim.domain()?;
-        let corner_bottom = surface.evaluate(su0, sv0)?;
-        let corner_top = surface.evaluate(su0, sv1)?;
+        let winding = parameter_space_area(&carrier_face).or_refuse(KernelStage::Refine, "parameter_space_area")?;
+        let bottom_rim = surface.iso_curve_v(sv0).or_refuse(KernelStage::Refine, "iso_curve_v")?;
+        let top_rim = surface.iso_curve_v(sv1).or_refuse(KernelStage::Refine, "iso_curve_v")?;
+        let seam = surface.iso_curve_u(su0).or_refuse(KernelStage::Refine, "iso_curve_u")?;
+        let [bottom_t0, bottom_t1] = bottom_rim.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let [top_t0, top_t1] = top_rim.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let corner_bottom = surface.evaluate(su0, sv0).or_refuse(KernelStage::Refine, "evaluate")?;
+        let corner_top = surface.evaluate(su0, sv1).or_refuse(KernelStage::Refine, "evaluate")?;
         let flat = |u: f64, v: f64| Vec3::new(u, v, 0.0);
         let mut coedges = vec![
             CoedgeRecord {
                 id: 1,
                 edge_id: 1,
                 forward: true,
-                pcurve: crate::make_line(flat(su0, sv0), flat(su1, sv0))?,
+                pcurve: crate::make_line(flat(su0, sv0), flat(su1, sv0)).or_refuse(KernelStage::Refine, "make_line")?,
             },
             CoedgeRecord {
                 id: 2,
                 edge_id: 3,
                 forward: true,
-                pcurve: crate::make_line(flat(su1, sv0), flat(su1, sv1))?,
+                pcurve: crate::make_line(flat(su1, sv0), flat(su1, sv1)).or_refuse(KernelStage::Refine, "make_line")?,
             },
             CoedgeRecord {
                 id: 3,
                 edge_id: 2,
                 forward: false,
-                pcurve: crate::make_line(flat(su1, sv1), flat(su0, sv1))?,
+                pcurve: crate::make_line(flat(su1, sv1), flat(su0, sv1)).or_refuse(KernelStage::Refine, "make_line")?,
             },
             CoedgeRecord {
                 id: 4,
                 edge_id: 3,
                 forward: false,
-                pcurve: crate::make_line(flat(su0, sv1), flat(su0, sv0))?,
+                pcurve: crate::make_line(flat(su0, sv1), flat(su0, sv0)).or_refuse(KernelStage::Refine, "make_line")?,
             },
         ];
         if winding < 0.0 {
             coedges.reverse();
             for coedge in &mut coedges {
                 coedge.forward = !coedge.forward;
-                coedge.pcurve = coedge.pcurve.reversed()?;
+                coedge.pcurve = coedge.pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")?;
             }
         }
         os_debug!(
@@ -279,6 +280,7 @@ pub(super) fn extend_offset_carriers_past_open_hole_rims(
             carriers[index].source_face_id,
         );
         carriers[index].solid = BrepSolid {
+            mass_properties_cache: Default::default(),
             id: carriers[index].solid.id,
             vertices: vec![
                 VertexRecord {
@@ -379,7 +381,7 @@ pub(super) fn extend_fallshort_curved_carriers(
     already_extended: &HashSet<usize>,
     scale: f64,
     distance: f64,
-) -> Result<usize, String> {
+) -> Result<usize, KernelRefusal> {
     let weld_band = 2e-3f64.max(scale * 5e-5);
     let source_edge_by_id = source
         .edges
@@ -407,18 +409,18 @@ pub(super) fn extend_fallshort_curved_carriers(
         };
         // Affine carriers translate along their normal: the shared rim's
         // image stays on the opening surface by construction.
-        if source_face.surface.is_affine()? {
+        if source_face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
             continue;
         }
         let carrier_face = carriers[index].solid.shells[0].faces[0].clone();
         let surface = carrier_face.surface.clone();
-        let [su0, su1] = surface.domain_u()?;
-        let [sv0, sv1] = surface.domain_v()?;
+        let [su0, su1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+        let [sv0, sv1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
         let v_mid = (sv0 + sv1) * 0.5;
         // The full-domain rebuild needs a seam-gluable (u-closed) surface.
         if surface
-            .evaluate(su0, v_mid)?
-            .sub(surface.evaluate(su1, v_mid)?)
+            .evaluate(su0, v_mid).or_refuse(KernelStage::Refine, "evaluate")?
+            .sub(surface.evaluate(su1, v_mid).or_refuse(KernelStage::Refine, "evaluate")?)
             .length()
             > weld_band
         {
@@ -487,7 +489,7 @@ pub(super) fn extend_fallshort_curved_carriers(
                             same_sense: true,
                             loops: vec![loop_record.clone()],
                             name: None,
-                        })?
+                        }).or_refuse(KernelStage::Refine, "parameter_space_area")?
                         .abs();
                         if loop_record
                             .coedges
@@ -529,7 +531,7 @@ pub(super) fn extend_fallshort_curved_carriers(
                 for sample in 0..=16 {
                     let point = image_edge.curve.evaluate(
                         image_edge.t0 + (image_edge.t1 - image_edge.t0) * sample as f64 / 16.0,
-                    )?;
+                    ).or_refuse(KernelStage::Refine, "evaluate")?;
                     if point.sub(plane_point).dot(plane_normal) > -weld_band {
                         falls_short = false;
                         break;
@@ -547,7 +549,7 @@ pub(super) fn extend_fallshort_curved_carriers(
                         let point = surface.evaluate(
                             su0 + (su1 - su0) * iu as f64 / 16.0,
                             sv0 + (sv1 - sv0) * iv as f64 / 16.0,
-                        )?;
+                        ).or_refuse(KernelStage::Refine, "evaluate")?;
                         if point.sub(plane_point).dot(plane_normal) > weld_band {
                             crosses = true;
                             break 'grid;
@@ -577,6 +579,320 @@ pub(super) fn extend_fallshort_curved_carriers(
     Ok(extended)
 }
 
+/// CUT-RIM lane: a retained face whose rim with a PLANAR opening runs ACROSS
+/// its surface — a boolean cut of a loft wall or of an extruded free-form
+/// wall, rather than an opening at the surface's own v end — has its offset
+/// carrier built over the FULL RECTANGLE of its surface's domain, so that the
+/// opening plane truncates the offset skin the way it does on every other
+/// road. Returns the source solid with that face's trim so rebuilt, for the
+/// carrier to be built over (the carve's own substitution), or `None`.
+///
+/// `offset_face_carrier` trims the carrier with the parametric image of the
+/// source trim, so a carrier built over the cut face ends at the cut rim's
+/// image. For an inward shell that image lies INSIDE the material wherever
+/// the plane rises away from the wall (the free-form prism cut at 0.08, over
+/// part of its rim) and outside wherever the plane dips (the rest of it) —
+/// the MIXED rim — or inside all round (the twisted loft's oblique cut).
+/// Where it is inside the carrier never reaches the opening, the pair imprint
+/// finds nothing, the rim dangles and the rim band lane corked it BELOW the
+/// plane: the twisted loft's oblique cut validated 14.172505 against the plane
+/// bracket 14.242887, 0.49 % short, and the void under its band was material
+/// (the cork witness 0.149 from retained material at d = 0.3, 2026-09-18). The
+/// mixed rim refused by name.
+///
+/// Neither `fallshort_opening_reach` (it grows the DOMAIN along the rulings
+/// from the surface's own v end, which a cut rim does not sit at) nor
+/// `extend_fallshort_curved_carriers` (u-closed surfaces whose image falls
+/// short ENTIRELY, rebuilt with a seam after the fact) reaches such a rim.
+/// This lane rebuilds the SOURCE trim before the carrier is fitted, so the
+/// carrier is the full-domain offset with a four-sided trim — the isolines at
+/// u₀, u₁, v₀ and v₁ — which the smooth-junction sync then rewrites against
+/// its tangent neighbours exactly as it does any other carrier (the walls of
+/// a C1 free-form prism are all smooth-paired, and a carrier reshaped AFTER
+/// that sync would lose it). The skin runs through the plane on the inside
+/// stretches and past it on the outside ones; the carrier × opening-plane
+/// imprint cuts the exact trace, the arrangement keeps the fragments on the
+/// material side, and the wall on the plane is the region between the source
+/// rim and that trace.
+///
+/// Qualification, narrow so every landed lane keeps its path: an inward
+/// shell; a face that is not u-closed (a tilted drill's wall is the seam
+/// lanes' — its full domain is a band with a seam, not a rectangle, and
+/// `oblique_through_hole_rim_pair_still_refuses` pins that road); an AFFINE
+/// face only where its rim image falls short of the plane by more than the
+/// weld band (a drafted wall; a perpendicular wall's image lies in the
+/// plane and keeps the ordinary road);
+/// a non-degenerate rim shared with a PLANAR opening whose uv trace is NOT a
+/// v-isoline at either domain end (an end rim is the reach lane's); and the
+/// surface's full domain crossing the plane on the outside, so the rebuilt
+/// trim genuinely reaches through it. It is NOT gated on the rim image
+/// falling short: the mixed prism's inside stretch sits under the weld band
+/// (1e-3 at d = 0.3) and read as "reaches everywhere", and a cut rim whose
+/// image lies wholly past the plane is truncated by the same imprint either
+/// way (the widening loft cut at 0.08 reads its plane bracket on both roads).
+/// A face with more than one loop keeps its own trim: the rectangle would
+/// drop the holes.
+pub(super) fn cut_rim_full_rectangle_source(
+    source: &BrepSolid,
+    face: &FaceRecord,
+    source_faces: &[&FaceRecord],
+    opening_set: &HashSet<u64>,
+    distance: f64,
+) -> Result<Option<BrepSolid>, KernelRefusal> {
+    if distance <= 0.0 || face.loops.len() != 1 {
+        return Ok(None);
+    }
+    let affine = face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")?;
+    let scale = crate::solid_scale(source);
+    let weld_band = 2e-3f64.max(scale * 5e-5);
+    let surface = &face.surface;
+    let [su0, su1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [sv0, sv1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    let v_span = (sv1 - sv0).abs().max(1.0);
+    // A u-closed surface (a tilted drill through a box) is the seam lanes'
+    // territory: its full domain is a band with a seam, not a rectangle.
+    if surface
+        .evaluate(su0, (sv0 + sv1) * 0.5).or_refuse(KernelStage::Refine, "evaluate")?
+        .sub(surface.evaluate(su1, (sv0 + sv1) * 0.5).or_refuse(KernelStage::Refine, "evaluate")?)
+        .length()
+        <= weld_band
+    {
+        return Ok(None);
+    }
+    let edge_by_id = source
+        .edges
+        .iter()
+        .map(|edge| (edge.id, edge))
+        .collect::<HashMap<_, _>>();
+    let offsets = face_offsets(face);
+    // Every TANGENT junction with a retained neighbour must run along a
+    // domain isoline, so the rectangle keeps it as one of its four sides and
+    // the smooth-junction sync still finds its image (`carrier_use_imaging`).
+    // A sharp junction needs no image — the pair imprint cuts it — and a
+    // drafted extrude's trapezoid sides run diagonally across their affine
+    // patch. A face whose tangent junction is a curved trim boundary keeps
+    // its own trim: the 2026-09-06 fillet-rail document's rebuilt fillet
+    // face had six uses in its source loop and four in its carrier's, and
+    // the sync indexed the sixth — a panic on master until this decline.
+    let v_band = 1e-9 * v_span;
+    let u_band = 1e-9 * (su1 - su0).abs().max(1.0);
+    for coedge in face.loops.iter().flat_map(|record| &record.coedges) {
+        let Some(edge) = edge_by_id.get(&coedge.edge_id) else {
+            continue;
+        };
+        if edge.degenerate {
+            continue;
+        }
+        let Some((mate, mate_use)) = junction_mate(source_faces, face, coedge.edge_id) else {
+            continue;
+        };
+        if opening_set.contains(&mate.id) || !uses_are_tangent(face, coedge, mate, mate_use)? {
+            continue;
+        }
+        let [q0, q1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let mut on = [true; 4];
+        for sample in 0..=8 {
+            let uv = coedge.pcurve.evaluate(q0 + (q1 - q0) * sample as f64 / 8.0).or_refuse(KernelStage::Refine, "evaluate")?;
+            on[0] &= (uv.x - su0).abs() <= u_band;
+            on[1] &= (uv.x - su1).abs() <= u_band;
+            on[2] &= (uv.y - sv0).abs() <= v_band;
+            on[3] &= (uv.y - sv1).abs() <= v_band;
+        }
+        if !on.iter().any(|hit| *hit) {
+            os_debug!(
+                "cut-rim lane: source face {} keeps its trim — its TANGENT junction with retained \
+                 face {} (edge {}) runs along no domain isoline, so a rectangle would lose it",
+                face.id,
+                mate.id,
+                coedge.edge_id
+            );
+            return Ok(None);
+        }
+    }
+    let mut qualifies = false;
+    for coedge in face.loops.iter().flat_map(|record| &record.coedges) {
+        let Some(edge) = edge_by_id.get(&coedge.edge_id) else {
+            continue;
+        };
+        if edge.degenerate {
+            continue;
+        }
+        let Some((opening, _)) = junction_mate(source_faces, face, coedge.edge_id)
+            .filter(|(mate, _)| opening_set.contains(&mate.id))
+        else {
+            continue;
+        };
+        let Some((plane_point, mut plane_normal)) = planar_surface_frame(&opening.surface, weld_band)? else {
+            continue;
+        };
+        let Some(outward) = opening
+            .loops
+            .iter()
+            .flat_map(|loop_record| &loop_record.coedges)
+            .find_map(|opening_coedge| {
+                let [p0, p1] = opening_coedge.pcurve.domain().ok()?;
+                let opening_uv = opening_coedge.pcurve.evaluate((p0 + p1) * 0.5).ok()?;
+                face_normal(opening, opening_uv.x, opening_uv.y).ok()
+            })
+        else {
+            continue;
+        };
+        if plane_normal.dot(outward) < 0.0 {
+            plane_normal = plane_normal.scale(-1.0);
+        }
+        let [q0, q1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let mut at_v_end = true;
+        let mut deepest = f64::NEG_INFINITY;
+        for sample in 0..=16 {
+            let uv = coedge.pcurve.evaluate(q0 + (q1 - q0) * sample as f64 / 16.0).or_refuse(KernelStage::Refine, "evaluate")?;
+            if (uv.y - sv0).abs() > 1e-9 * v_span && (uv.y - sv1).abs() > 1e-9 * v_span {
+                at_v_end = false;
+            }
+            // How far the rim station's pointwise inward offset image sits on
+            // the material side of the plane — a report quantity: the mixed
+            // prism's inside stretch is under the weld band (1e-3 at d = 0.3),
+            // so the rebuild is not gated on it. Every cut rim on a planar
+            // opening takes this road, and the plane truncates the skin
+            // whether the image was short of it or past it.
+            if let Ok(image) = offsets.at(uv.x, uv.y, -distance) {
+                deepest = deepest.max(-image.point.sub(plane_point).dot(plane_normal));
+            }
+        }
+        if at_v_end {
+            os_debug!("cut-rim lane: source face {} rim edge {} sits at a v end", face.id, coedge.edge_id);
+            continue;
+        }
+        os_debug!(
+            "cut-rim lane: source face {} rim edge {} image at most {deepest:.3e} inside the opening plane",
+            face.id,
+            coedge.edge_id
+        );
+        // An affine wall's rim image is a straight line a constant distance
+        // from the plane: exactly in it for a wall perpendicular to the
+        // opening (the ordinary planar case, left alone), d·sin(draft) short
+        // for a DRAFTED wall — the drafted extrude's walls are affine
+        // patches trimmed to trapezoids, whose carriers stopped 0.150 short
+        // of the far cap at d = 0.5 on 17.5° walls. The band gate is safe
+        // here because the shortfall does not vary along the rim.
+        if affine && deepest <= weld_band {
+            continue;
+        }
+        let mut crosses = false;
+        'grid: for iu in 0..=16 {
+            for iv in 0..=16 {
+                let point = surface.evaluate(
+                    su0 + (su1 - su0) * iu as f64 / 16.0,
+                    sv0 + (sv1 - sv0) * iv as f64 / 16.0,
+                ).or_refuse(KernelStage::Refine, "evaluate")?;
+                if point.sub(plane_point).dot(plane_normal) > weld_band {
+                    crosses = true;
+                    break 'grid;
+                }
+            }
+        }
+        if !crosses {
+            os_debug!(
+                "cut-rim lane: source face {} never crosses opening {} over its full domain",
+                face.id,
+                opening.id
+            );
+            continue;
+        }
+        qualifies = true;
+        break;
+    }
+    if !qualifies {
+        return Ok(None);
+    }
+    os_debug!(
+        "cut-rim lane: source face {} rebuilt over its full rectangle for the opening plane to truncate",
+        face.id
+    );
+    Ok(Some(full_rectangle_face(source, face)?))
+}
+
+/// Replace one face's trim with its surface's parameter rectangle. Neighbour
+/// carriers must subsequently cut this construction surface back to the skin.
+pub(super) fn full_rectangle_face(source: &BrepSolid, face: &FaceRecord) -> Result<BrepSolid, KernelRefusal> {
+    let surface = &face.surface;
+    let [su0, su1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [sv0, sv1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    // The face's trim becomes the full rectangle: four isoline edges on four
+    // new vertices appended to a copy of the source, the loop wound the way
+    // the face's own trim was.
+    let mut solid = source.clone();
+    let mut next_id = solid
+        .vertices
+        .iter()
+        .map(|vertex| vertex.id)
+        .chain(solid.edges.iter().map(|edge| edge.id))
+        .chain(solid.shells.iter().flat_map(|shell| &shell.faces).flat_map(|face| {
+            face.loops
+                .iter()
+                .flat_map(|loop_record| loop_record.coedges.iter().map(|coedge| coedge.id).chain([loop_record.id]))
+        }))
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let mut vertex_ids = [0u64; 4];
+    for (slot, (u, v)) in [(su0, sv0), (su1, sv0), (su1, sv1), (su0, sv1)].into_iter().enumerate() {
+        solid.vertices.push(VertexRecord {
+            id: next_id,
+            point: surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?,
+        });
+        vertex_ids[slot] = next_id;
+        next_id += 1;
+    }
+    let flat = |u: f64, v: f64| Vec3::new(u, v, 0.0);
+    // Edges 0..4: v0 (0→1), u1 (1→2), v1 (3→2), u0 (0→3).
+    let isolines = [
+        (surface.iso_curve_v(sv0).or_refuse(KernelStage::Refine, "iso_curve_v")?, vertex_ids[0], vertex_ids[1], flat(su0, sv0), flat(su1, sv0), true),
+        (surface.iso_curve_u(su1).or_refuse(KernelStage::Refine, "iso_curve_u")?, vertex_ids[1], vertex_ids[2], flat(su1, sv0), flat(su1, sv1), true),
+        (surface.iso_curve_v(sv1).or_refuse(KernelStage::Refine, "iso_curve_v")?, vertex_ids[3], vertex_ids[2], flat(su1, sv1), flat(su0, sv1), false),
+        (surface.iso_curve_u(su0).or_refuse(KernelStage::Refine, "iso_curve_u")?, vertex_ids[0], vertex_ids[3], flat(su0, sv1), flat(su0, sv0), false),
+    ];
+    let mut coedges = Vec::with_capacity(4);
+    for (curve, start, end, from, to, forward) in isolines {
+        let [t0, t1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let edge_id = next_id;
+        next_id += 1;
+        solid.edges.push(EdgeRecord {
+            id: edge_id,
+            curve,
+            t0,
+            t1,
+            start_vertex_id: start,
+            end_vertex_id: end,
+            degenerate: false,
+            name: None,
+        });
+        coedges.push(CoedgeRecord {
+            id: next_id,
+            edge_id,
+            forward,
+            pcurve: crate::make_line(from, to).or_refuse(KernelStage::Refine, "make_line")?,
+        });
+        next_id += 1;
+    }
+    if parameter_space_area(face).or_refuse(KernelStage::Refine, "parameter_space_area")? < 0.0 {
+        coedges.reverse();
+        for coedge in &mut coedges {
+            coedge.forward = !coedge.forward;
+            coedge.pcurve = coedge.pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")?;
+        }
+    }
+    let mut rebuilt = face.clone();
+    rebuilt.loops = vec![LoopRecord { id: next_id, coedges }];
+    for shell in &mut solid.shells {
+        for existing in &mut shell.faces {
+            if existing.id == face.id {
+                *existing = rebuilt.clone();
+            }
+        }
+    }
+    Ok(solid)
+}
+
 /// Rebuild an offset carrier as its surface's FULL-DOMAIN face: seam edge
 /// used twice, v-domain ends as closed rims — or degenerate point edges when
 /// the iso curve collapses (poles), matching a freshly made sphere face. Any
@@ -590,16 +906,16 @@ fn rebuild_carrier_full_domain(
     distance: f64,
     index: usize,
     reason: &str,
-) -> Result<bool, String> {
+) -> Result<bool, KernelRefusal> {
     let carrier_face = carrier.solid.shells[0].faces[0].clone();
     let mut surface = carrier_face.surface.clone();
-    let [mut su0, mut su1] = surface.domain_u()?;
-    let [mut sv0, mut sv1] = surface.domain_v()?;
+    let [mut su0, mut su1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [mut sv0, mut sv1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
     let v_mid = (sv0 + sv1) * 0.5;
     // The full-domain rebuild needs a seam-gluable (u-closed) surface.
     if surface
-        .evaluate(su0, v_mid)?
-        .sub(surface.evaluate(su1, v_mid)?)
+        .evaluate(su0, v_mid).or_refuse(KernelStage::Refine, "evaluate")?
+        .sub(surface.evaluate(su1, v_mid).or_refuse(KernelStage::Refine, "evaluate")?)
         .length()
         > weld_band
     {
@@ -617,7 +933,7 @@ fn rebuild_carrier_full_domain(
     if let Some(crate::AnalyticSurface::Sphere { frame, radius }) =
         crate::analytic_surface::recognize(&source_face.surface)
     {
-        let mid = surface.evaluate((su0 + su1) * 0.5, (sv0 + sv1) * 0.5)?;
+        let mid = surface.evaluate((su0 + su1) * 0.5, (sv0 + sv1) * 0.5).or_refuse(KernelStage::Refine, "evaluate")?;
         let measured = mid.sub(frame.origin).length();
         let grown = radius + distance.abs();
         let shrunk = (radius - distance.abs()).abs();
@@ -629,14 +945,14 @@ fn rebuild_carrier_full_domain(
             shrunk
         };
         if (measured - target).abs() <= weld_band.max(distance.abs() * 0.5) && target > weld_band {
-            let full = crate::make_sphere_surface(frame.origin, target, frame.axis)?;
-            let [fu0, fu1] = full.domain_u()?;
-            let [fv0, fv1] = full.domain_v()?;
-            let old_normal = surface.normal((su0 + su1) * 0.5, (sv0 + sv1) * 0.5)?;
-            let radial = mid.sub(frame.origin).normalized()?;
-            let sample = full.evaluate((fu0 + fu1) * 0.5, (fv0 + fv1) * 0.5)?;
-            let new_normal = full.normal((fu0 + fu1) * 0.5, (fv0 + fv1) * 0.5)?;
-            let new_radial = sample.sub(frame.origin).normalized()?;
+            let full = crate::make_sphere_surface(frame.origin, target, frame.axis).or_refuse(KernelStage::Refine, "make_sphere_surface")?;
+            let [fu0, fu1] = full.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+            let [fv0, fv1] = full.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+            let old_normal = surface.normal((su0 + su1) * 0.5, (sv0 + sv1) * 0.5).or_refuse(KernelStage::Refine, "normal")?;
+            let radial = mid.sub(frame.origin).normalized().or_refuse(KernelStage::Refine, "normalized")?;
+            let sample = full.evaluate((fu0 + fu1) * 0.5, (fv0 + fv1) * 0.5).or_refuse(KernelStage::Refine, "evaluate")?;
+            let new_normal = full.normal((fu0 + fu1) * 0.5, (fv0 + fv1) * 0.5).or_refuse(KernelStage::Refine, "normal")?;
+            let new_radial = sample.sub(frame.origin).normalized().or_refuse(KernelStage::Refine, "normalized")?;
             // The rebuilt net must agree with the fitted carrier on which
             // side the surface normal faces; a mismatch would silently
             // invert the face, so refuse the rebuild instead (the honest
@@ -655,34 +971,34 @@ fn rebuild_carrier_full_domain(
             );
         }
     }
-    let winding = parameter_space_area(&carrier_face)?;
-    let pole_point = |iso: &crate::NurbsCurve| -> Result<Option<Vec3>, String> {
-        let [t0, t1] = iso.domain()?;
-        let anchor = iso.evaluate(t0)?;
+    let winding = parameter_space_area(&carrier_face).or_refuse(KernelStage::Refine, "parameter_space_area")?;
+    let pole_point = |iso: &crate::NurbsCurve| -> Result<Option<Vec3>, KernelRefusal> {
+        let [t0, t1] = iso.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let anchor = iso.evaluate(t0).or_refuse(KernelStage::Refine, "evaluate")?;
         let mut deviation = 0.0f64;
         for sample in 1..=8 {
-            let point = iso.evaluate(t0 + (t1 - t0) * sample as f64 / 8.0)?;
+            let point = iso.evaluate(t0 + (t1 - t0) * sample as f64 / 8.0).or_refuse(KernelStage::Refine, "evaluate")?;
             deviation = deviation.max(point.sub(anchor).length());
         }
         os_debug!("  pole probe: max deviation {deviation:.6}");
         Ok((deviation <= weld_band).then_some(anchor))
     };
-    let bottom_iso = surface.iso_curve_v(sv0)?;
-    let top_iso = surface.iso_curve_v(sv1)?;
+    let bottom_iso = surface.iso_curve_v(sv0).or_refuse(KernelStage::Refine, "iso_curve_v")?;
+    let top_iso = surface.iso_curve_v(sv1).or_refuse(KernelStage::Refine, "iso_curve_v")?;
     let bottom_pole = pole_point(&bottom_iso)?;
     let top_pole = pole_point(&top_iso)?;
-    let corner_bottom = surface.evaluate(su0, sv0)?;
-    let corner_top = surface.evaluate(su0, sv1)?;
-    let seam = surface.iso_curve_u(su0)?;
+    let corner_bottom = surface.evaluate(su0, sv0).or_refuse(KernelStage::Refine, "evaluate")?;
+    let corner_top = surface.evaluate(su0, sv1).or_refuse(KernelStage::Refine, "evaluate")?;
+    let seam = surface.iso_curve_u(su0).or_refuse(KernelStage::Refine, "iso_curve_u")?;
     let v_end_edge = |id: u64,
                       iso: crate::NurbsCurve,
                       pole: Option<Vec3>,
                       vertex: u64|
-     -> Result<EdgeRecord, String> {
+     -> Result<EdgeRecord, KernelRefusal> {
         Ok(match pole {
             Some(point) => EdgeRecord {
                 id,
-                curve: crate::make_line(point, point)?,
+                curve: crate::make_line(point, point).or_refuse(KernelStage::Refine, "make_line")?,
                 t0: 0.0,
                 t1: 1.0,
                 start_vertex_id: vertex,
@@ -691,7 +1007,7 @@ fn rebuild_carrier_full_domain(
                 name: None,
             },
             None => {
-                let [t0, t1] = iso.domain()?;
+                let [t0, t1] = iso.domain().or_refuse(KernelStage::Refine, "domain")?;
                 EdgeRecord {
                     id,
                     curve: iso,
@@ -711,32 +1027,32 @@ fn rebuild_carrier_full_domain(
             id: 1,
             edge_id: 1,
             forward: true,
-            pcurve: crate::make_line(flat(su0, sv0), flat(su1, sv0))?,
+            pcurve: crate::make_line(flat(su0, sv0), flat(su1, sv0)).or_refuse(KernelStage::Refine, "make_line")?,
         },
         CoedgeRecord {
             id: 2,
             edge_id: 3,
             forward: true,
-            pcurve: crate::make_line(flat(su1, sv0), flat(su1, sv1))?,
+            pcurve: crate::make_line(flat(su1, sv0), flat(su1, sv1)).or_refuse(KernelStage::Refine, "make_line")?,
         },
         CoedgeRecord {
             id: 3,
             edge_id: 2,
             forward: false,
-            pcurve: crate::make_line(flat(su1, sv1), flat(su0, sv1))?,
+            pcurve: crate::make_line(flat(su1, sv1), flat(su0, sv1)).or_refuse(KernelStage::Refine, "make_line")?,
         },
         CoedgeRecord {
             id: 4,
             edge_id: 3,
             forward: false,
-            pcurve: crate::make_line(flat(su0, sv1), flat(su0, sv0))?,
+            pcurve: crate::make_line(flat(su0, sv1), flat(su0, sv0)).or_refuse(KernelStage::Refine, "make_line")?,
         },
     ];
     if winding < 0.0 {
         coedges.reverse();
         for coedge in &mut coedges {
             coedge.forward = !coedge.forward;
-            coedge.pcurve = coedge.pcurve.reversed()?;
+            coedge.pcurve = coedge.pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")?;
         }
     }
     os_debug!(
@@ -747,6 +1063,7 @@ fn rebuild_carrier_full_domain(
         top_pole.is_some(),
     );
     carrier.solid = BrepSolid {
+        mass_properties_cache: Default::default(),
         id: carrier.solid.id,
         vertices: vec![
             VertexRecord {
@@ -805,7 +1122,7 @@ pub(super) fn rebuild_reflex_rim_carriers(
     smooth_pairs: &HashSet<(usize, usize)>,
     scale: f64,
     distance: f64,
-) -> Result<HashSet<usize>, String> {
+) -> Result<HashSet<usize>, KernelRefusal> {
     let weld_band = 2e-3f64.max(scale * 5e-5);
     let mut rebuilt = HashSet::default();
     for index in 0..carriers.len() {
@@ -824,7 +1141,7 @@ pub(super) fn rebuild_reflex_rim_carriers(
         else {
             continue;
         };
-        if source_face.surface.is_affine()? {
+        if source_face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
             continue;
         }
         if face_reflex_miter_tan(source, source_face)?.is_none() {
@@ -883,13 +1200,13 @@ pub(super) fn junction_stations(
     coedge: &CoedgeRecord,
     edge: &EdgeRecord,
     mate: &FaceRecord,
-) -> Result<Vec<JunctionStation>, String> {
+) -> Result<Vec<JunctionStation>, KernelRefusal> {
     let mut stations = Vec::new();
     for fraction in [0.1f64, 0.3, 0.5, 0.7, 0.9] {
         let t_sample = edge.t0 + (edge.t1 - edge.t0) * fraction;
         let step = ((edge.t1 - edge.t0) * 1e-3).max(1e-9);
-        let before = edge.curve.evaluate(t_sample - step)?;
-        let after = edge.curve.evaluate(t_sample + step)?;
+        let before = edge.curve.evaluate(t_sample - step).or_refuse(KernelStage::Refine, "evaluate")?;
+        let after = edge.curve.evaluate(t_sample + step).or_refuse(KernelStage::Refine, "evaluate")?;
         let mut tangent = after.sub(before);
         if tangent.length() <= 1e-12 {
             continue;
@@ -905,16 +1222,16 @@ pub(super) fn junction_stations(
         // read as a sharp crossing, and the sign came out reflex for
         // two of a corner's three fillets — full-domain rebuilding
         // the corner sphere into a carrier nothing could trim.
-        let station = edge.curve.evaluate(t_sample)?;
+        let station = edge.curve.evaluate(t_sample).or_refuse(KernelStage::Refine, "evaluate")?;
         let uv_this = {
-            let projection = project_point_to_surface(&face.surface, station)?;
+            let projection = project_point_to_surface(&face.surface, station).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
             Vec2 {
                 x: projection.u,
                 y: projection.v,
             }
         };
         let uv_mate = {
-            let projection = project_point_to_surface(&mate.surface, station)?;
+            let projection = project_point_to_surface(&mate.surface, station).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
             Vec2 {
                 x: projection.u,
                 y: projection.v,
@@ -964,7 +1281,7 @@ pub(super) fn junction_mate<'a>(
 /// unbounded as the join becomes tangential), so a flat d-sized extension
 /// only covers joins at 90° or steeper. A smooth/tangent join (|n1×n2| ≈ 0)
 /// is neither reflex nor convex. `None` = no reflex edge.
-pub(super) fn face_reflex_miter_tan(source: &BrepSolid, face: &FaceRecord) -> Result<Option<f64>, String> {
+pub(super) fn face_reflex_miter_tan(source: &BrepSolid, face: &FaceRecord) -> Result<Option<f64>, KernelRefusal> {
     let edge_by_id = source
         .edges
         .iter()
@@ -1047,9 +1364,9 @@ pub(super) fn outward_carrier_extension(
     source_faces: &[&FaceRecord],
     opening_set: &HashSet<u64>,
     amount: f64,
-) -> Result<crate::CarrierExtension, String> {
-    let [u0, u1] = face.surface.domain_u()?;
-    let [v0, v1] = face.surface.domain_v()?;
+) -> Result<crate::CarrierExtension, KernelRefusal> {
+    let [u0, u1] = face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = face.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
     let edge_by_id = source
         .edges
         .iter()
@@ -1075,15 +1392,16 @@ pub(super) fn outward_carrier_extension(
         {
             continue;
         }
-        let [p0, p1] = coedge.pcurve.domain()?;
+        let [p0, p1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
         let samples = (0..=24)
             .map(|sample| {
                 coedge
                     .pcurve
                     .evaluate(p0 + (p1 - p0) * sample as f64 / 24.0)
                     .map(|uv| Vec2 { x: uv.x, y: uv.y })
+                    .or_refuse(KernelStage::Refine, "evaluate")
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, KernelRefusal>>()?;
         for uv in &samples {
             low.x = low.x.min(uv.x);
             low.y = low.y.min(uv.y);
@@ -1174,13 +1492,43 @@ pub(super) fn outward_wall_pad(
     source_faces: &[&FaceRecord],
     opening_set: &HashSet<u64>,
     amount: f64,
-) -> Result<f64, String> {
+) -> Result<f64, KernelRefusal> {
+    let (worst, _) =
+        opening_wall_extension_factor(source, opening, source_faces, opening_set, true)?;
+    Ok(amount * outward_miter_scale(worst))
+}
+
+/// An inward offset at a REFLEX opening rim crosses beyond the original
+/// opening by d/sin(theta). Grow its construction plane past that intersection,
+/// including perpendicular rims, so the cut is interior to the wall carrier.
+/// Convex-only openings retain their original trims. As for the offset
+/// carriers, cap the extension at 12d near tangency.
+pub(super) fn inward_wall_pad(
+    source: &BrepSolid,
+    opening: &FaceRecord,
+    source_faces: &[&FaceRecord],
+    opening_set: &HashSet<u64>,
+    amount: f64,
+) -> Result<Option<(f64, HashSet<u64>)>, KernelRefusal> {
+    let (worst, neighbors) =
+        opening_wall_extension_factor(source, opening, source_faces, opening_set, false)?;
+    Ok(worst.map(|scale| (amount * (scale * 1.5).min(12.0), neighbors)))
+}
+
+fn opening_wall_extension_factor(
+    source: &BrepSolid,
+    opening: &FaceRecord,
+    source_faces: &[&FaceRecord],
+    opening_set: &HashSet<u64>,
+    convex: bool,
+) -> Result<(Option<f64>, HashSet<u64>), KernelRefusal> {
     let edge_by_id = source
         .edges
         .iter()
         .map(|edge| (edge.id, edge))
         .collect::<HashMap<_, _>>();
     let mut worst: Option<f64> = None;
+    let mut neighbors = HashSet::default();
     for coedge in opening
         .loops
         .iter()
@@ -1198,17 +1546,18 @@ pub(super) fn outward_wall_pad(
             continue;
         };
         for station in junction_stations(opening, coedge, edge, mate)? {
-            if !station.is_convex() {
+            if station.is_convex() != convex {
                 continue;
             }
             let sin_dihedral = station.normal.cross(station.mate_normal).length();
             if sin_dihedral <= 1e-6 {
                 continue;
             }
+            neighbors.insert(mate.id);
             worst = Some(worst.unwrap_or(0.0).max(1.0 / sin_dihedral));
         }
     }
-    Ok(amount * outward_miter_scale(worst))
+    Ok((worst, neighbors))
 }
 
 /// A curved opening face whose surface is RULED along v — a degree-1 net with
@@ -1216,10 +1565,10 @@ pub(super) fn outward_wall_pad(
 /// revolved or swept straight profile edge makes (a cone, a cylinder) — over a
 /// single loop. An outward shell builds such an opening's wall by
 /// [`extended_ruled_wall`].
-pub(super) fn ruled_opening(face: &FaceRecord) -> Result<bool, String> {
+pub(super) fn ruled_opening(face: &FaceRecord) -> Result<bool, KernelRefusal> {
     let surface = &face.surface;
     Ok(face.loops.len() == 1
-        && !surface.is_affine()?
+        && !surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")?
         && surface.degree_v == 1
         && surface.control_points.len() >= 3
         && surface.control_points.iter().all(|row| row.len() == 2))
@@ -1256,11 +1605,11 @@ pub(super) fn extended_ruled_wall(
     face: &FaceRecord,
     pad: f64,
     tolerance: f64,
-) -> Result<Result<RuledWall, String>, String> {
+) -> Result<Result<RuledWall, String>, KernelRefusal> {
     use crate::{NurbsSurface, SurfaceSide};
     let surface = &face.surface;
-    let [u0, u1] = surface.domain_u()?;
-    let [v0, v1] = surface.domain_v()?;
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
     let loops = face
         .loops
         .iter()
@@ -1279,11 +1628,11 @@ pub(super) fn extended_ruled_wall(
     if wall.edges.iter().any(|edge| edge.degenerate) {
         return Ok(Err("the opening has a degenerate edge".into()));
     }
-    let (closed_u, closed_v) = surface.closed_directions()?;
+    let (closed_u, closed_v) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
     const STATIONS: usize = 8;
     // The largest distance, over stations across the side, between a point on
     // the old boundary and the point `delta` past it: the side's growth.
-    let side_growth = |grown: &NurbsSurface, side: SurfaceSide, delta: f64| -> Result<f64, String> {
+    let side_growth = |grown: &NurbsSurface, side: SurfaceSide, delta: f64| -> Result<f64, KernelRefusal> {
         let mut least = f64::INFINITY;
         for index in 0..=STATIONS {
             let fraction = index as f64 / STATIONS as f64;
@@ -1301,8 +1650,8 @@ pub(super) fn extended_ruled_wall(
                     ((u, v), (u, v + step))
                 }
             };
-            let from = grown.evaluate(old.0, old.1)?;
-            let to = grown.evaluate(new.0, new.1)?;
+            let from = grown.evaluate(old.0, old.1).or_refuse(KernelStage::Refine, "evaluate")?;
+            let to = grown.evaluate(new.0, new.1).or_refuse(KernelStage::Refine, "evaluate")?;
             least = least.min(to.sub(from).length());
         }
         Ok(least)
@@ -1333,7 +1682,7 @@ pub(super) fn extended_ruled_wall(
                 SurfaceSide::VMin => (u0 + (u1 - u0) * fraction, v0),
                 SurfaceSide::VMax => (u0 + (u1 - u0) * fraction, v1),
             };
-            let derivatives = surface.derivatives(u, v, 1)?;
+            let derivatives = surface.derivatives(u, v, 1).or_refuse(KernelStage::Refine, "derivatives")?;
             let along = if side.is_u() { derivatives[1][0] } else { derivatives[0][1] };
             speed = speed.min(along.length());
         }
@@ -1394,7 +1743,7 @@ pub(super) fn extended_ruled_wall(
         remap(&grown.knots_u, u0 - deltas[0], u1 + deltas[1], u0, u1),
         remap(&grown.knots_v, v0 - deltas[2], v1 + deltas[3], v0, v1),
         grown.control_points.clone(),
-    )?;
+    ).or_refuse(KernelStage::Refine, "new")?;
     // Every edge and vertex is the image of the same pcurves on the grown
     // sheet. An edge runs from its start vertex to its end; a pcurve runs in
     // its coedge's direction, which is the edge's exactly when `forward`.
@@ -1410,19 +1759,19 @@ pub(super) fn extended_ruled_wall(
         let Some(coedge) = uses.iter().find(|coedge| coedge.edge_id == edge.id) else {
             continue;
         };
-        let image = crate::image_curve(&surface, &coedge.pcurve, tolerance, "offset_shell ruled wall")?;
+        let image = crate::image_curve(&surface, &coedge.pcurve, tolerance, "offset_shell ruled wall").or_refuse(KernelStage::Refine, "image_curve")?;
         let (mut first, mut last) = (image.t0, image.t1);
         if !coedge.forward {
             std::mem::swap(&mut first, &mut last);
         }
         let mut curve = image.curve;
         if first > last {
-            let [start, end] = curve.domain()?;
-            curve = curve.reversed()?;
+            let [start, end] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+            curve = curve.reversed().or_refuse(KernelStage::Refine, "reversed")?;
             first = start + end - first;
             last = start + end - last;
         }
-        let (start_point, end_point) = (curve.evaluate(first)?, curve.evaluate(last)?);
+        let (start_point, end_point) = (curve.evaluate(first).or_refuse(KernelStage::Refine, "evaluate")?, curve.evaluate(last).or_refuse(KernelStage::Refine, "evaluate")?);
         for vertex in &mut wall.vertices {
             if vertex.id == edge.start_vertex_id {
                 vertex.point = start_point;
@@ -1470,9 +1819,9 @@ pub(super) struct RuledWall {
 pub(super) fn outward_fold_the_carve_missed(
     face: &FaceRecord,
     distance: f64,
-) -> Result<Option<crate::offset_regularity::FoldSample>, String> {
+) -> Result<Option<crate::offset_regularity::FoldSample>, KernelRefusal> {
     use crate::offset_regularity::{fold_sample_at, scan_offset_regularity, TrimRegion};
-    if distance >= 0.0 || face.surface.is_affine()? {
+    if distance >= 0.0 || face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
         return Ok(None);
     }
     let region = TrimRegion::from_face(face)?;
@@ -1563,8 +1912,8 @@ pub(super) fn fallshort_opening_reach(
     source_faces: &[&FaceRecord],
     opening_set: &HashSet<u64>,
     distance: f64,
-) -> Result<Option<(bool, f64)>, String> {
-    if distance <= 0.0 || face.surface.is_affine()? {
+) -> Result<Option<(bool, f64)>, KernelRefusal> {
+    if distance <= 0.0 || face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
         return Ok(None);
     }
     let surface = &face.surface;
@@ -1572,8 +1921,8 @@ pub(super) fn fallshort_opening_reach(
     if surface.degree_v != 1 || surface.control_points.iter().any(|row| row.len() != 2) {
         return Ok(None);
     }
-    let [u0, u1] = surface.domain_u()?;
-    let [v0, v1] = surface.domain_v()?;
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
     let edge_by_id = source
         .edges
         .iter()
@@ -1597,18 +1946,18 @@ pub(super) fn fallshort_opening_reach(
         if !surface_is_planar(&opening.surface, 1e-6 * crate::solid_scale(source).max(1.0))? {
             continue;
         }
-        let [ou0, ou1] = opening.surface.domain_u()?;
-        let [ov0, ov1] = opening.surface.domain_v()?;
+        let [ou0, ou1] = opening.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+        let [ov0, ov1] = opening.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
         let (ou, ov) = ((ou0 + ou1) * 0.5, (ov0 + ov1) * 0.5);
-        let plane_point = opening.surface.evaluate(ou, ov)?;
+        let plane_point = opening.surface.evaluate(ou, ov).or_refuse(KernelStage::Refine, "evaluate")?;
         // A pole or an apex has no readable normal, and neither has an offset
         // ruling to walk: such a station is skipped, not refused.
         let Ok(plane_normal) = face_normal(opening, ou, ov) else {
             continue;
         };
-        let [p0, p1] = coedge.pcurve.domain()?;
+        let [p0, p1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
         for index in 0..=8 {
-            let uv = coedge.pcurve.evaluate(p0 + (p1 - p0) * index as f64 / 8.0)?;
+            let uv = coedge.pcurve.evaluate(p0 + (p1 - p0) * index as f64 / 8.0).or_refuse(KernelStage::Refine, "evaluate")?;
             // Which v end of the trim this rim sits at, and the ruling that
             // leaves the trim there.
             let at_v_max = (uv.y - v1).abs() < (uv.y - v0).abs();
@@ -1659,7 +2008,7 @@ pub(super) fn offset_falls_short_of_curved_opening(
     source_faces: &[&FaceRecord],
     opening_set: &HashSet<u64>,
     distance: f64,
-) -> Result<Option<(u64, f64)>, String> {
+) -> Result<Option<(u64, f64)>, KernelRefusal> {
     if distance <= 0.0 {
         return Ok(None);
     }
@@ -1688,13 +2037,13 @@ pub(super) fn offset_falls_short_of_curved_opening(
         if surface_is_planar(&opening.surface, band)? {
             continue;
         }
-        let [p0, p1] = coedge.pcurve.domain()?;
+        let [p0, p1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
         for index in 0..=8 {
-            let uv = coedge.pcurve.evaluate(p0 + (p1 - p0) * index as f64 / 8.0)?;
+            let uv = coedge.pcurve.evaluate(p0 + (p1 - p0) * index as f64 / 8.0).or_refuse(KernelStage::Refine, "evaluate")?;
             let Ok(image) = offsets.at(uv.x, uv.y, -distance) else {
                 continue;
             };
-            let gap = project_point_to_surface(&opening.surface, image.point)?.distance;
+            let gap = project_point_to_surface(&opening.surface, image.point).or_refuse(KernelStage::Refine, "project_point_to_surface")?.distance;
             if gap > band && worst.is_none_or(|(_, seen)| gap > seen) {
                 worst = Some((opening.id, gap));
             }
@@ -1723,7 +2072,7 @@ pub(super) fn opening_wall_seeds(
     source: &BrepSolid,
     opening_set: &HashSet<u64>,
     distance: f64,
-) -> Result<Vec<Vec2>, String> {
+) -> Result<Vec<Vec2>, KernelRefusal> {
     let source_faces = source
         .shells
         .iter()
@@ -1747,29 +2096,291 @@ pub(super) fn opening_wall_seeds(
         }) else {
             continue;
         };
-        let [opening_start, opening_end] = opening_use.pcurve.domain()?;
+        let [opening_start, opening_end] = opening_use.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
         let opening_uv = opening_use
             .pcurve
-            .evaluate((opening_start + opening_end) * 0.5)?;
-        let original = opening.surface.evaluate(opening_uv.x, opening_uv.y)?;
-        let [neighbor_start, neighbor_end] = neighbor_use.pcurve.domain()?;
+            .evaluate((opening_start + opening_end) * 0.5).or_refuse(KernelStage::Refine, "evaluate")?;
+        let original = opening.surface.evaluate(opening_uv.x, opening_uv.y).or_refuse(KernelStage::Refine, "evaluate")?;
+        let [neighbor_start, neighbor_end] = neighbor_use.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
         let neighbor_uv = neighbor_use
             .pcurve
-            .evaluate((neighbor_start + neighbor_end) * 0.5)?;
+            .evaluate((neighbor_start + neighbor_end) * 0.5).or_refuse(KernelStage::Refine, "evaluate")?;
         // The opening point stepped off along the NEIGHBOUR's offset direction:
         // the shared evaluator's normal, but anchored at a point on a different
         // face, so only the direction is borrowed.
         let expected = original.add(
             face_offsets(neighbor)
-                .normal(neighbor_uv.x, neighbor_uv.y)?
+                .normal(neighbor_uv.x, neighbor_uv.y).or_refuse(KernelStage::Refine, "normal")?
                 .scale(-distance),
         );
         let halfway = original.add(expected.sub(original).scale(0.5));
-        let projection = project_point_to_surface(&carrier.surface, halfway)?;
+        let projection = project_point_to_surface(&carrier.surface, halfway).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
         seeds.push(Vec2 {
             x: projection.u,
             y: projection.v,
         });
     }
     Ok(seeds)
+}
+
+/// SHARP-SIDE lane: a curved retained face whose u-side meets a retained
+/// neighbour at a SHARP junction, in an OUTWARD shell, has its offset carrier
+/// built over its surface CONTINUED past that side, so the two offsets meet
+/// at their mitre. Returns the source with that face so rebuilt, for the
+/// carrier to be built over (the cut-rim lane's substitution), `Ok(None)`
+/// where the lane does not apply, or `Err` naming why the continuation
+/// cannot be built.
+///
+/// An outward shell's offsets meet at a SHARP convex corner past both source
+/// rims: that is the L∞ convention `l-step-open-bottom` reads. A plane's
+/// carrier grows there by sliding its net, but a curved carrier's
+/// u-extension is a no-op (`offset_surface_constructed` grows only along
+/// v rulings). A circle-segment D (a line closed by a circular arc) shelled
+/// outward therefore refused with "connector edge left its plane" at every
+/// distance (2026-09-26): the offset cylinder stopped at the arc's end ray,
+/// short of the offset plane.
+///
+/// The continuation is `NurbsSurface::extend_natural`: the analytic
+/// continuation of the terminal Bézier span in homogeneous coordinates. It is
+/// EXACT on a conic, because a rational arc's continuation stays on its
+/// circle, and on a plane or a ruling. On a polynomial free-form wall it is an
+/// extrapolation, which the mitre is then defined on. Either way it is bounded:
+/// each side grows by `1.5 ×` the extension the pipeline asked of it (headroom
+/// so the crossing lands inside the trim, not on it). `extend_natural` refuses
+/// a weight root, a fold or excessive growth, and the grown strip's offset
+/// image must advance MONOTONICALLY across it (a regular offset, no cusp).
+/// Each is a refusal by name, not the connector's symptom. Nothing inside
+/// the original domain moves, so every `(u, v)` still names the same point.
+///
+/// Qualification, narrow: an outward shell; a curved (non-affine) face, not
+/// u-closed; one loop of exactly four uses, one along each domain isoline (a
+/// full-rectangle trim, every extruded wall's); and a u-side the pipeline
+/// asked to grow whose mate is RETAINED and meets it at a sharp junction. The
+/// loop is edited IN PLACE: use `i` stays the same side, so
+/// `carrier_use_imaging`'s equal-count shortcut still images a tangent
+/// v-side neighbour correctly.
+pub(super) fn sharp_side_continued_source(
+    source: &BrepSolid,
+    face: &FaceRecord,
+    source_faces: &[&FaceRecord],
+    opening_set: &HashSet<u64>,
+    distance: f64,
+    extension: &crate::CarrierExtension,
+) -> Result<Option<BrepSolid>, KernelRefusal> {
+    use crate::SurfaceSide;
+    if distance >= 0.0 || face.loops.len() != 1 || face.loops[0].coedges.len() != 4 {
+        return Ok(None);
+    }
+    if extension.u_min <= 0.0 && extension.u_max <= 0.0 {
+        return Ok(None);
+    }
+    let surface = &face.surface;
+    if surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
+        return Ok(None);
+    }
+    let (closed_u, _) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
+    if closed_u {
+        return Ok(None);
+    }
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    let band_u = 1e-9 * (u1 - u0).abs().max(1.0);
+    let band_v = 1e-9 * (v1 - v0).abs().max(1.0);
+    // Which domain side each use runs along: 0 u0, 1 u1, 2 v0, 3 v1.
+    let mut sides = [usize::MAX; 4];
+    for (index, coedge) in face.loops[0].coedges.iter().enumerate() {
+        let [q0, q1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let mut on = [true; 4];
+        for sample in 0..=8 {
+            let uv = coedge.pcurve.evaluate(q0 + (q1 - q0) * sample as f64 / 8.0).or_refuse(KernelStage::Refine, "evaluate")?;
+            on[0] &= (uv.x - u0).abs() <= band_u;
+            on[1] &= (uv.x - u1).abs() <= band_u;
+            on[2] &= (uv.y - v0).abs() <= band_v;
+            on[3] &= (uv.y - v1).abs() <= band_v;
+        }
+        let Some(side) = on.iter().position(|hit| *hit) else {
+            return Ok(None);
+        };
+        sides[index] = side;
+    }
+    let mut seen = sides;
+    seen.sort_unstable();
+    if seen != [0, 1, 2, 3] {
+        return Ok(None);
+    }
+    // The u-sides to continue: asked to grow, mate retained, junction sharp.
+    let mut grow = [0.0f64; 2];
+    for (index, coedge) in face.loops[0].coedges.iter().enumerate() {
+        let side = sides[index];
+        if side > 1 {
+            continue;
+        }
+        let asked = if side == 0 { extension.u_min } else { extension.u_max };
+        if asked <= 0.0 {
+            continue;
+        }
+        let Some((mate, mate_use)) = junction_mate(source_faces, face, coedge.edge_id) else {
+            continue;
+        };
+        if opening_set.contains(&mate.id) || uses_are_tangent(face, coedge, mate, mate_use)? {
+            continue;
+        }
+        grow[side] = asked * 1.5;
+    }
+    if grow == [0.0, 0.0] {
+        return Ok(None);
+    }
+    const STATIONS: usize = 8;
+    let mut grown = surface.clone();
+    let mut reach = [u0, u1];
+    for (slot, side) in [SurfaceSide::UMin, SurfaceSide::UMax].into_iter().enumerate() {
+        let wanted = grow[slot];
+        if wanted <= 0.0 {
+            continue;
+        }
+        let u_end = if slot == 0 { u0 } else { u1 };
+        let sense = if slot == 0 { -1.0 } else { 1.0 };
+        let mut speed = f64::INFINITY;
+        for index in 0..=STATIONS {
+            let v = v0 + (v1 - v0) * index as f64 / STATIONS as f64;
+            speed = speed.min(surface.derivatives(u_end, v, 1).or_refuse(KernelStage::Refine, "derivatives")?[1][0].length());
+        }
+        if !(speed > 0.0) {
+            return Err(KernelRefusal::unsupported(KernelStage::Refine, refusals::SHARP_SIDE_CONTINUATION, format!(
+                "offset_shell: source face {}'s offset carrier cannot be built past its sharp {side:?} \
+                 side: the side has no speed to continue along",
+                face.id
+            )));
+        }
+        let mut delta = wanted / speed;
+        let mut accepted = None;
+        for _ in 0..8 {
+            let candidate = grown.extend_natural(side, delta).map_err(|refusal| {
+                KernelRefusal::unsupported(
+                    KernelStage::Refine,
+                    refusals::SHARP_SIDE_CONTINUATION,
+                    format!(
+                        "offset_shell: source face {}'s offset carrier cannot be built past its sharp \
+                         {side:?} side by {wanted:.6}: {refusal}",
+                        face.id
+                    ),
+                )
+            })?;
+            // The OFFSET image's travel across the strip, the least over the
+            // stations, and that it advances monotonically at each.
+            let offsets = crate::OffsetEvaluator::new(
+                "offset_shell",
+                &candidate,
+                crate::OffsetNormal::Face { same_sense: face.same_sense },
+            );
+            let mut least = f64::INFINITY;
+            for index in 0..=STATIONS {
+                let v = v0 + (v1 - v0) * index as f64 / STATIONS as f64;
+                let start = offsets.at(u_end, v, -distance).or_refuse(KernelStage::Refine, "at")?.point;
+                let far = offsets.at(u_end + sense * delta, v, -distance).or_refuse(KernelStage::Refine, "at")?.point;
+                let direction = far.sub(start);
+                let mut previous = start;
+                for step in 1..=16 {
+                    let point = offsets.at(u_end + sense * delta * step as f64 / 16.0, v, -distance).or_refuse(KernelStage::Refine, "at")?.point;
+                    if point.sub(previous).dot(direction) <= 0.0 {
+                        return Err(KernelRefusal::unsupported(KernelStage::Refine, refusals::SHARP_SIDE_CONTINUATION, format!(
+                            "offset_shell: source face {}'s offset carrier cannot be built past its \
+                             sharp {side:?} side: the continued surface's offset turns back \
+                             {:.3} of the way across the strip (a cusp of the offset)",
+                            face.id,
+                            step as f64 / 16.0
+                        )));
+                    }
+                    previous = point;
+                }
+                least = least.min(direction.length());
+            }
+            if least >= wanted * (1.0 - 1e-9) {
+                accepted = Some(candidate);
+                break;
+            }
+            delta *= (wanted / least.max(wanted * 1e-3)) * 1.05;
+        }
+        let Some(candidate) = accepted else {
+            return Err(KernelRefusal::unsupported(KernelStage::Refine, refusals::SHARP_SIDE_CONTINUATION, format!(
+                "offset_shell: source face {}'s offset carrier cannot be built past its sharp {side:?} \
+                 side: its offset does not travel {wanted:.6} within eight refinements",
+                face.id
+            )));
+        };
+        grown = candidate;
+        reach[slot] = u_end + sense * delta;
+    }
+    // The loop, edited in place: the same four uses in the same order and
+    // sense, each now running along its side of the continued rectangle.
+    let mut solid = source.clone();
+    let mut next_id = solid
+        .vertices
+        .iter()
+        .map(|vertex| vertex.id)
+        .chain(solid.edges.iter().map(|edge| edge.id))
+        .chain(solid.shells.iter().flat_map(|shell| &shell.faces).flat_map(|face| {
+            face.loops
+                .iter()
+                .flat_map(|loop_record| loop_record.coedges.iter().map(|coedge| coedge.id).chain([loop_record.id]))
+        }))
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let [ua, ub] = reach;
+    let corners = [(ua, v0), (ub, v0), (ub, v1), (ua, v1)];
+    let mut corner_ids = [0u64; 4];
+    for (slot, (u, v)) in corners.into_iter().enumerate() {
+        solid.vertices.push(VertexRecord { id: next_id, point: grown.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")? });
+        corner_ids[slot] = next_id;
+        next_id += 1;
+    }
+    // Each side's isoline in increasing parameter, with its corner vertices.
+    let side_edge = |side: usize| -> Result<(crate::NurbsCurve, u64, u64, Vec3, Vec3), KernelRefusal> {
+        let flat = |u: f64, v: f64| Vec3::new(u, v, 0.0);
+        Ok(match side {
+            0 => (grown.iso_curve_u(ua).or_refuse(KernelStage::Refine, "iso_curve_u")?, corner_ids[0], corner_ids[3], flat(ua, v0), flat(ua, v1)),
+            1 => (grown.iso_curve_u(ub).or_refuse(KernelStage::Refine, "iso_curve_u")?, corner_ids[1], corner_ids[2], flat(ub, v0), flat(ub, v1)),
+            2 => (grown.iso_curve_v(v0).or_refuse(KernelStage::Refine, "iso_curve_v")?, corner_ids[0], corner_ids[1], flat(ua, v0), flat(ub, v0)),
+            _ => (grown.iso_curve_v(v1).or_refuse(KernelStage::Refine, "iso_curve_v")?, corner_ids[3], corner_ids[2], flat(ua, v1), flat(ub, v1)),
+        })
+    };
+    let mut rebuilt = face.clone();
+    rebuilt.surface = grown.clone();
+    for (index, coedge) in rebuilt.loops[0].coedges.iter_mut().enumerate() {
+        let (curve, start, end, from, to) = side_edge(sides[index])?;
+        // The old use's own sense along its isoline.
+        let [q0, q1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let (a, b) = (coedge.pcurve.evaluate(q0).or_refuse(KernelStage::Refine, "evaluate")?, coedge.pcurve.evaluate(q1).or_refuse(KernelStage::Refine, "evaluate")?);
+        let increasing = if sides[index] <= 1 { b.y > a.y } else { b.x > a.x };
+        let [t0, t1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let edge_id = next_id;
+        next_id += 1;
+        solid.edges.push(EdgeRecord {
+            id: edge_id,
+            curve,
+            t0,
+            t1,
+            start_vertex_id: start,
+            end_vertex_id: end,
+            degenerate: false,
+            name: None,
+        });
+        coedge.edge_id = edge_id;
+        coedge.forward = increasing;
+        coedge.pcurve = if increasing { crate::make_line(from, to).or_refuse(KernelStage::Refine, "make_line")? } else { crate::make_line(to, from).or_refuse(KernelStage::Refine, "make_line")? };
+    }
+    for shell in &mut solid.shells {
+        for existing in &mut shell.faces {
+            if existing.id == face.id {
+                *existing = rebuilt.clone();
+            }
+        }
+    }
+    os_debug!(
+        "sharp-side lane: source face {} continued to u = [{ua:.6}, {ub:.6}] from [{u0:.6}, {u1:.6}] for its \
+         sharp outward corner(s)",
+        face.id
+    );
+    Ok(Some(solid))
 }

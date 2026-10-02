@@ -32,6 +32,10 @@ struct SolidBuilder<'a> {
     /// What the supplied-pcurve lane did on this body, reported under
     /// `BREP_DEBUG_SUPPLIED_PCURVE`.
     supplied_report: SuppliedReport,
+    /// Every derived trim accepted at a residual over the fit's bar because
+    /// the file's curve is not on its carrier (`readings::BoundedTrim`);
+    /// returned beside the solid and named on the import report.
+    bounded: Vec<builder::readings::BoundedTrim>,
     /// Per-edge provenance for [`crate::import_step_trim_readings`]; `None` on
     /// every ordinary import.
     readings: Option<readings::TrimCapture>,
@@ -93,7 +97,7 @@ mod supplied_fit;
 mod seams;
 pub(in crate::step_import) mod planar_split;
 mod rims;
-mod loops;
+pub(in crate::step_import) mod loops;
 mod solids;
 
 pub(super) use solids::*;

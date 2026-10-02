@@ -27,58 +27,82 @@ pub fn extrude_profile_brep_draft(
     distance: f64,
     draft_angle_rad: f64,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     // The builder carries no face names; accept `name` for ABI symmetry with
     // the other builders (the app stamps names onto the emitted face order).
     let _ = name;
     let tolerance = 1e-6;
     if profile.len() < 2 {
-        return Err("draftExtrude: profile needs at least 2 curves forming a closed loop".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "profile_count",
+            "draftExtrude: profile needs at least 2 curves forming a closed loop",
+        ));
     }
     if distance.abs() <= 1e-12 {
-        return Err("draftExtrude: distance must be non-zero".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "distance",
+            "draftExtrude: distance must be non-zero",
+        ));
     }
-    let axis = direction
-        .normalized()
-        .map_err(|_| "draftExtrude: direction is degenerate".to_string())?;
+    let axis = direction.normalized().map_err(|_| {
+        KernelRefusal::input(
+            KernelStage::Collect,
+            "direction",
+            "draftExtrude: direction is degenerate",
+        )
+    })?;
 
     // --- 1. Validate the profile: closed + planar; derive origin O + normal np.
     let mut samples = Vec::new();
     for (index, curve) in profile.iter().enumerate() {
-        let [start, end] = curve.domain()?;
+        let [start, end] = curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
         let next = &profile[(index + 1) % profile.len()];
-        let next_start = next.domain()?[0];
+        let next_start = next.domain().or_refuse(KernelStage::Fragment, "domain")?[0];
         if curve
-            .evaluate(end)?
-            .sub(next.evaluate(next_start)?)
+            .evaluate(end).or_refuse(KernelStage::Fragment, "evaluate")?
+            .sub(next.evaluate(next_start).or_refuse(KernelStage::Fragment, "evaluate")?)
             .length()
             > tolerance
         {
-            return Err(format!(
-                "draftExtrude: profile is not closed at curve {index}"
+            return Err(KernelRefusal::input(
+                KernelStage::Collect,
+                "profile_closed",
+                format!("draftExtrude: profile is not closed at curve {index}"),
             ));
         }
         for sample in 0..16 {
-            samples.push(curve.evaluate(start + (end - start) * sample as f64 / 16.0)?);
+            samples.push(curve.evaluate(start + (end - start) * sample as f64 / 16.0).or_refuse(KernelStage::Fragment, "evaluate")?);
         }
     }
     let normal = crate::polygon::newell_normal(&samples);
     let centroid = samples.iter().fold(Vec3::default(), |sum, &point| sum.add(point));
-    let np = normal
-        .normalized()
-        .map_err(|_| "draftExtrude: profile is degenerate (zero enclosed area)".to_string())?;
+    let np = normal.normalized().map_err(|_| {
+        KernelRefusal::input(
+            KernelStage::Collect,
+            "profile_area",
+            "draftExtrude: profile is degenerate (zero enclosed area)",
+        )
+    })?;
     let origin = centroid.scale(1.0 / samples.len() as f64);
     if samples
         .iter()
         .any(|point| point.sub(origin).dot(np).abs() > tolerance * 100.0)
     {
-        return Err("draftExtrude: profile is not planar".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "profile_planar",
+            "draftExtrude: profile is not planar",
+        ));
     }
     // A straight draft-extrude runs along the profile normal.
     if np.dot(axis).abs() < 0.999 {
-        return Err(
-            "draftExtrude: extrude direction must be parallel to the profile normal".into(),
-        );
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "oblique_draft",
+            "draftExtrude: extrude direction must be parallel to the profile normal",
+        ));
     }
 
     // --- 2. Normalize the loop CCW about the EXTRUDE direction and derive the
@@ -88,18 +112,18 @@ pub fn extrude_profile_brep_draft(
     //     winding·distance·tanθ law about the Newell normal, for either profile
     //     winding and either extrude side.
     let displacement = axis.scale(distance);
-    let zh = displacement.normalized()?;
+    let zh = displacement.normalized().or_refuse(KernelStage::Fragment, "normalized")?;
     let height = displacement.length();
-    let x_axis = zh.perpendicular()?;
-    let y_axis = zh.cross(x_axis).normalized()?;
+    let x_axis = zh.perpendicular().or_refuse(KernelStage::Fragment, "perpendicular")?;
+    let y_axis = zh.cross(x_axis).normalized().or_refuse(KernelStage::Fragment, "normalized")?;
     let mut curves: Vec<NurbsCurve> = profile.to_vec();
-    let reversed_winding = profile_area(&curves, origin, x_axis, y_axis)? < 0.0;
+    let reversed_winding = profile_area(&curves, origin, x_axis, y_axis).or_refuse(KernelStage::Fragment, "profile_area")? < 0.0;
     if reversed_winding {
         curves = curves
             .iter()
             .rev()
             .map(NurbsCurve::reversed)
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<_, _>>().or_refuse(KernelStage::Fragment, "collect")?;
     }
     let signed_d = distance * draft_angle_rad.tan();
 
@@ -107,7 +131,8 @@ pub fn extrude_profile_brep_draft(
     //     original vertices (offset 0), the mid-height offsets (d/2, the conic
     //     shoulder witnesses), and the far offsets (d, raised by the extrude
     //     vector).  Every station is an exact offset-primitive intersection.
-    let segs = classify_profile_segments(&curves, zh).map_err(|e| format!("draftExtrude: {e}"))?;
+    let segs = classify_profile_segments(&curves, zh)
+        .map_err(|e| e.with_message(|e| format!("draftExtrude: {e}")))?;
     let count = segs.len();
     let mut bottom_junctions = Vec::with_capacity(count);
     let mut top_junctions = Vec::with_capacity(count);
@@ -115,15 +140,18 @@ pub fn extrude_profile_brep_draft(
     for index in 0..count {
         let prev = &segs[(index + count - 1) % count];
         let next = &segs[index];
-        bottom_junctions.push(offset_junction(prev, next, zh, 0.0).map_err(|e| format!("draftExtrude: {e}"))?);
+        bottom_junctions.push(
+            offset_junction(prev, next, zh, 0.0)
+                .map_err(|e| e.with_message(|e| format!("draftExtrude: {e}")))?,
+        );
         top_junctions.push(
             offset_junction(prev, next, zh, signed_d)
-                .map_err(|e| format!("draftExtrude: {e}"))?
+                .map_err(|e| e.with_message(|e| format!("draftExtrude: {e}")))?
                 .add(displacement),
         );
         mid_junctions.push(
             offset_junction(prev, next, zh, signed_d * 0.5)
-                .map_err(|e| format!("draftExtrude: {e}"))?
+                .map_err(|e| e.with_message(|e| format!("draftExtrude: {e}")))?
                 .add(displacement.scale(0.5)),
         );
     }
@@ -173,14 +201,20 @@ pub fn extrude_profile_brep_draft(
                 let ey = up
                     .sub(dir.scale(up.dot(*dir)))
                     .normalized()
-                    .map_err(|_| "draftExtrude: wall plane frame is degenerate".to_string())?;
+                    .map_err(|_| {
+                        KernelRefusal::internal(
+                            KernelStage::Fragment,
+                            "wall_frame",
+                            "draftExtrude: wall plane frame is degenerate",
+                        )
+                    })?;
                 // Patch extent: the four junctions plus BOTH side curves'
                 // control points (a conic bulges past its chord; the control
                 // polygon's convex hull bounds it).
                 let mut points = vec![a0, a1, b0, b1];
                 for side in [&side_curves[index], &side_curves[next_index]] {
                     for control in &side.control_points {
-                        points.push(control.point()?);
+                        points.push(control.point().or_refuse(KernelStage::Fragment, "control_point")?);
                     }
                 }
                 let mut min_x = f64::INFINITY;
@@ -204,14 +238,14 @@ pub fn extrude_profile_brep_draft(
                     ey,
                     max_x - min_x + 2.0 * padding,
                     max_y - min_y + 2.0 * padding,
-                )?);
+                ).or_refuse(KernelStage::Fragment, "make_plane")?);
                 wall_kinds.push(WallSurface::Plane {
                     origin: patch_origin,
                     ex: *dir,
                     ey,
                 });
-                bottom_curves.push(make_line(a0, a1)?);
-                top_curves.push(make_line(b0, b1)?);
+                bottom_curves.push(make_line(a0, a1).or_refuse(KernelStage::Fragment, "make_line")?);
+                top_curves.push(make_line(b0, b1).or_refuse(KernelStage::Fragment, "make_line")?);
             }
             SegGeom::Arc {
                 center,
@@ -224,8 +258,8 @@ pub fn extrude_profile_brep_draft(
                     let rel = p.sub(*center);
                     rel.sub(zh.scale(rel.dot(zh)))
                 };
-                let ax = in_plane(a0).normalized()?;
-                let ay = arc_normal.cross(ax).normalized()?;
+                let ax = in_plane(a0).normalized().or_refuse(KernelStage::Fragment, "normalized")?;
+                let ay = arc_normal.cross(ax).normalized().or_refuse(KernelStage::Fragment, "normalized")?;
                 let angle_near = |p: Vec3, near: f64| {
                     let ve = in_plane(p);
                     let mut angle = ve.dot(ay).atan2(ve.dot(ax));
@@ -246,20 +280,23 @@ pub fn extrude_profile_brep_draft(
                 let theta_lo = 0.0_f64.min(phi0);
                 let theta_hi = sweep.max(phi1);
                 if theta_hi - theta_lo > std::f64::consts::TAU {
-                    return Err(
-                        "draftExtrude: a drafted arc's trimmed window exceeds a full circle".into(),
-                    );
+                    return Err(KernelRefusal::internal(
+                        KernelStage::Fragment,
+                        "arc_window",
+                        "draftExtrude: a drafted arc's trimmed window exceeds a full circle",
+                    ));
                 }
                 let r_offset = radius - signed_d * turn;
                 if r_offset <= tolerance {
-                    return Err(
-                        "draftExtrude: offset: distance is too large — a concave arc collapses"
-                            .into(),
-                    );
+                    return Err(KernelRefusal::input(
+                        KernelStage::Classify,
+                        "arc_collapse",
+                        "draftExtrude: offset: distance is too large — a concave arc collapses",
+                    ));
                 }
-                let row_bottom = make_arc(*center, ax, ay, *radius, theta_lo, theta_hi)?;
+                let row_bottom = make_arc(*center, ax, ay, *radius, theta_lo, theta_hi).or_refuse(KernelStage::Fragment, "make_arc")?;
                 let row_top =
-                    make_arc(center.add(displacement), ax, ay, r_offset, theta_lo, theta_hi)?;
+                    make_arc(center.add(displacement), ax, ay, r_offset, theta_lo, theta_hi).or_refuse(KernelStage::Fragment, "make_arc")?;
                 wall_surfaces.push(ruled_between(&row_bottom, &row_top)?);
                 wall_kinds.push(WallSurface::Cone);
                 bottom_curves.push(arc_window_subrange(&row_bottom, a0, a1)?);
@@ -287,7 +324,7 @@ pub fn extrude_profile_brep_draft(
     }
     let mut edges = Vec::with_capacity(3 * count);
     for index in 0..count {
-        let [b_start, b_end] = bottom_curves[index].domain()?;
+        let [b_start, b_end] = bottom_curves[index].domain().or_refuse(KernelStage::Fragment, "domain")?;
         edges.push(EdgeRecord {
             id: 10 + index as u64,
             curve: bottom_curves[index].clone(),
@@ -298,7 +335,7 @@ pub fn extrude_profile_brep_draft(
             degenerate: false,
             name: None,
         });
-        let [t_start, t_end] = top_curves[index].domain()?;
+        let [t_start, t_end] = top_curves[index].domain().or_refuse(KernelStage::Fragment, "domain")?;
         edges.push(EdgeRecord {
             id: 10 + count as u64 + index as u64,
             curve: top_curves[index].clone(),
@@ -309,7 +346,7 @@ pub fn extrude_profile_brep_draft(
             degenerate: false,
             name: None,
         });
-        let [s_start, s_end] = side_curves[index].domain()?;
+        let [s_start, s_end] = side_curves[index].domain().or_refuse(KernelStage::Fragment, "domain")?;
         edges.push(EdgeRecord {
             id: 10 + 2 * count as u64 + index as u64,
             curve: side_curves[index].clone(),
@@ -331,19 +368,19 @@ pub fn extrude_profile_brep_draft(
         // side_this down] on this wall's surface.
         let (pc_bottom, pc_side_up, pc_top, pc_side_down) = match &wall_kinds[index] {
             WallSurface::Plane { origin, ex, ey } => (
-                curve_to_plane_parameters(&bottom_curves[index], *origin, *ex, *ey)?,
-                curve_to_plane_parameters(&side_curves[next_index], *origin, *ex, *ey)?,
-                curve_to_plane_parameters(&top_curves[index], *origin, *ex, *ey)?.reversed()?,
-                curve_to_plane_parameters(&side_curves[index], *origin, *ex, *ey)?.reversed()?,
+                curve_to_plane_parameters(&bottom_curves[index], *origin, *ex, *ey).or_refuse(KernelStage::Fragment, "plane_parameters")?,
+                curve_to_plane_parameters(&side_curves[next_index], *origin, *ex, *ey).or_refuse(KernelStage::Fragment, "plane_parameters")?,
+                curve_to_plane_parameters(&top_curves[index], *origin, *ex, *ey).or_refuse(KernelStage::Fragment, "plane_parameters")?.reversed().or_refuse(KernelStage::Fragment, "reversed")?,
+                curve_to_plane_parameters(&side_curves[index], *origin, *ex, *ey).or_refuse(KernelStage::Fragment, "plane_parameters")?.reversed().or_refuse(KernelStage::Fragment, "reversed")?,
             ),
             WallSurface::Cone => {
-                let [b0, b1] = bottom_curves[index].domain()?;
-                let [t0, t1] = top_curves[index].domain()?;
+                let [b0, b1] = bottom_curves[index].domain().or_refuse(KernelStage::Fragment, "domain")?;
+                let [t0, t1] = top_curves[index].domain().or_refuse(KernelStage::Fragment, "domain")?;
                 (
-                    parameter_line(b0, 0.0, b1, 0.0)?,
-                    build_pcurve_on_surface(surface, &side_curves[next_index])?,
-                    parameter_line(t1, 1.0, t0, 1.0)?,
-                    build_pcurve_on_surface(surface, &side_curves[index])?.reversed()?,
+                    parameter_line(b0, 0.0, b1, 0.0).or_refuse(KernelStage::Fragment, "parameter_line")?,
+                    build_pcurve_on_surface(surface, &side_curves[next_index]).or_refuse(KernelStage::Fragment, "pcurve")?,
+                    parameter_line(t1, 1.0, t0, 1.0).or_refuse(KernelStage::Fragment, "parameter_line")?,
+                    build_pcurve_on_surface(surface, &side_curves[index]).or_refuse(KernelStage::Fragment, "pcurve")?.reversed().or_refuse(KernelStage::Fragment, "reversed")?,
                 )
             }
         };
@@ -397,16 +434,16 @@ pub fn extrude_profile_brep_draft(
                    edge_base: u64,
                    forward: bool,
                    next_id: &mut u64|
-     -> Result<FaceRecord, String> {
+     -> Result<FaceRecord, KernelRefusal> {
         let mut min_x = f64::INFINITY;
         let mut min_y = f64::INFINITY;
         let mut max_x = f64::NEG_INFINITY;
         let mut max_y = f64::NEG_INFINITY;
         let mut plane_point = None;
         for curve in curves {
-            let [start, end] = curve.domain()?;
+            let [start, end] = curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
             for sample in 0..=16 {
-                let point = curve.evaluate(start + (end - start) * sample as f64 / 16.0)?;
+                let point = curve.evaluate(start + (end - start) * sample as f64 / 16.0).or_refuse(KernelStage::Fragment, "evaluate")?;
                 let anchor = *plane_point.get_or_insert(point);
                 let delta = point.sub(anchor);
                 min_x = min_x.min(delta.dot(x_axis));
@@ -415,7 +452,13 @@ pub fn extrude_profile_brep_draft(
                 max_y = max_y.max(delta.dot(y_axis));
             }
         }
-        let anchor = plane_point.ok_or("draftExtrude: cap has no boundary samples")?;
+        let anchor = plane_point.ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Fragment,
+                "cap_samples",
+                "draftExtrude: cap has no boundary samples",
+            )
+        })?;
         let padding = (max_x - min_x).max(max_y - min_y) * 0.05 + 1e-6;
         let cap_origin = anchor
             .add(x_axis.scale(min_x - padding))
@@ -427,7 +470,7 @@ pub fn extrude_profile_brep_draft(
                     id: *next_id,
                     edge_id: edge_base + index as u64,
                     forward: true,
-                    pcurve: curve_to_plane_parameters(curve, cap_origin, x_axis, y_axis)?,
+                    pcurve: curve_to_plane_parameters(curve, cap_origin, x_axis, y_axis).or_refuse(KernelStage::Fragment, "plane_parameters")?,
                 });
                 *next_id += 1;
             }
@@ -437,8 +480,8 @@ pub fn extrude_profile_brep_draft(
                     id: *next_id,
                     edge_id: edge_base + index as u64,
                     forward: false,
-                    pcurve: curve_to_plane_parameters(&curves[index], cap_origin, x_axis, y_axis)?
-                        .reversed()?,
+                    pcurve: curve_to_plane_parameters(&curves[index], cap_origin, x_axis, y_axis).or_refuse(KernelStage::Fragment, "plane_parameters")?
+                        .reversed().or_refuse(KernelStage::Fragment, "reversed")?,
                 });
                 *next_id += 1;
             }
@@ -454,7 +497,7 @@ pub fn extrude_profile_brep_draft(
                 y_axis,
                 max_x - min_x + 2.0 * padding,
                 max_y - min_y + 2.0 * padding,
-            )?,
+            ).or_refuse(KernelStage::Fragment, "make_plane")?,
             same_sense: forward,
             loops: vec![LoopRecord {
                 id: loop_id,
@@ -467,6 +510,7 @@ pub fn extrude_profile_brep_draft(
     faces.push(cap(&top_curves, 10 + count as u64, true, &mut next_id)?);
 
     let solid = BrepSolid {
+        mass_properties_cache: Default::default(),
         id: next_id + 1,
         vertices,
         edges,
@@ -477,8 +521,10 @@ pub fn extrude_profile_brep_draft(
     if issues.is_empty() {
         Ok(solid)
     } else {
-        Err(format!(
-            "Rust draft-extrude builder produced invalid topology: {issues:?}"
+        Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "validate",
+            format!("Rust draft-extrude builder produced invalid topology: {issues:?}"),
         ))
     }
 }

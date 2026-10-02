@@ -180,7 +180,7 @@ impl BrepSolid {
                                 continue;
                             }
                         };
-                        match adaptive_coedge_error(
+                        match coedge_error_floored(
                             &surface,
                             &pcurve,
                             &curve,
@@ -616,7 +616,105 @@ pub(crate) fn adaptive_coedge_error(
         )?);
         previous = next;
     }
+    // This pass refines only while the band it is given says to, so on a part
+    // whose band is slack it stops at its 33 uniform stations and a pcurve
+    // exact at its own nodes and wrong between them reads as exact (measured
+    // 2026-09-18 over 54556 imported pcurves: more than 2x low on 2204). The
+    // band-free floor is [`coedge_error_floored`]; `validate` reads through
+    // it, the boolean's repair decisions do not yet.
     Ok(maximum)
+}
+
+/// [`adaptive_coedge_error`] with the band-free floor: the midpoint of every
+/// knot span of the pcurve and of the edge curve, read whatever the band. This
+/// is what `validate` and the offset family's measured tolerance read. The
+/// boolean's repair decisions (`csg/boolean/assemble/finalize.rs`,
+/// `refusal_welds.rs`) and the healing coalesce keep the band-steered reading
+/// above: read through the floor, the zero-clearance ball-and-stick joint
+/// gains an edge and a vertex at its crotch ((5, 9, 6) against (5, 8, 5),
+/// `tests/suites/tangent_node_assembly.rs`, 2026-09-26) — a consumer that
+/// depends on its instrument's coarseness, named for its own slice.
+pub(crate) fn coedge_error_floored(
+    surface: &NurbsSurface,
+    pcurve: &NurbsCurve,
+    curve: &NurbsCurve,
+    edge: &EdgeRecord,
+    forward: bool,
+    tolerance: f64,
+) -> Result<f64, String> {
+    let steered = adaptive_coedge_error(surface, pcurve, curve, edge, forward, tolerance)?;
+    Ok(steered.max(knot_span_midpoint_error(surface, pcurve, curve, edge, forward)?))
+}
+
+/// `BREP_DEBUG_COEDGE_FLOOR`: trace every knot-span midpoint the floor reads
+/// over 1e-3, once per process (the floor runs per span of every coedge of
+/// every `validate()`, so the environment is not read per sample).
+fn coedge_floor_tracing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BREP_DEBUG_COEDGE_FLOOR").is_some())
+}
+
+/// `‖S(q(s)) − c(t(s))‖` at the midpoint of every knot span of `pcurve` and of
+/// every knot span of `curve` inside the edge's `[t0, t1]`, both mapped to the
+/// coedge fraction `adaptive_coedge_error` samples on — no tolerance steers
+/// where it looks. The pcurve half is the one no other pass takes: a fitted
+/// pcurve interpolates at its nodes and misses between them, and its nodes
+/// are its own knots, not the edge curve's.
+fn knot_span_midpoint_error(
+    surface: &NurbsSurface,
+    pcurve: &NurbsCurve,
+    curve: &NurbsCurve,
+    edge: &EdgeRecord,
+    forward: bool,
+) -> Result<f64, String> {
+    let mut worst = 0.0_f64;
+    let [q0, q1] = pcurve.domain()?;
+    if q1 > q0 {
+        let mut previous = q0;
+        for &knot in pcurve.knots.iter().chain(std::iter::once(&q1)) {
+            if knot > previous && knot <= q1 {
+                let fraction = ((previous + knot) * 0.5 - q0) / (q1 - q0);
+                let sample = coedge_sample(surface, pcurve, curve, edge, forward, fraction)?;
+                if coedge_floor_tracing() && sample.0 > 1e-3 {
+                    let uv = pcurve.evaluate(q0 + (q1 - q0) * fraction)?;
+                    let ([u0, u1], [v0, v1]) = (surface.domain_u()?, surface.domain_v()?);
+                    eprintln!(
+                        "COEDGE-FLOOR edge {} pcurve-span midpoint fraction {fraction:.6}: miss {:.4e} at uv ({:.6}, {:.6}) domain u[{u0},{u1}] v[{v0},{v1}] closed {:?} analytic {:?} degree {} knots {} cps {}",
+                        edge.id, sample.0, uv.x, uv.y, surface.closed_directions()?, surface.analytic().map(|_| "yes"), pcurve.degree, pcurve.knots.len(), pcurve.control_points.len()
+                    );
+                }
+                worst = worst.max(sample.0);
+                previous = knot;
+            }
+        }
+    }
+    let span = edge.t1 - edge.t0;
+    if span.is_finite() && span != 0.0 {
+        let low = edge.t0.min(edge.t1);
+        let high = edge.t0.max(edge.t1);
+        let mut previous = low;
+        for &knot in curve.knots.iter().chain(std::iter::once(&high)) {
+            if knot > previous && knot <= high {
+                let midpoint = (previous + knot) * 0.5;
+                let fraction = if forward {
+                    (midpoint - edge.t0) / span
+                } else {
+                    (edge.t1 - midpoint) / span
+                };
+                let sample = coedge_sample(surface, pcurve, curve, edge, forward, fraction)?;
+                if coedge_floor_tracing() && sample.0 > 1e-3 {
+                    let uv = pcurve.evaluate(q0 + (q1 - q0) * fraction)?;
+                    eprintln!(
+                        "COEDGE-FLOOR edge {} edge-span midpoint fraction {fraction:.6}: miss {:.4e} at uv ({:.6}, {:.6})",
+                        edge.id, sample.0, uv.x, uv.y
+                    );
+                }
+                worst = worst.max(sample.0);
+                previous = knot;
+            }
+        }
+    }
+    Ok(worst)
 }
 
 fn segments_cross(a: Vec2, b: Vec2, c: Vec2, d: Vec2, tolerance: f64) -> bool {

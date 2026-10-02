@@ -8,7 +8,9 @@ use super::*;
 /// (closed); the section-0 curves themselves serve as the doubled v-seam
 /// edges and the corner rings (one closed curve through every section at each
 /// section corner) are shared between adjacent skins.
-pub fn loft_profile_brep_closed(input_sections: &[Vec<NurbsCurve>]) -> Result<BrepSolid, String> {
+pub fn loft_profile_brep_closed(
+    input_sections: &[Vec<NurbsCurve>],
+) -> Result<BrepSolid, KernelRefusal> {
     loft_profile_brep_closed_shifted(input_sections, 0)
 }
 
@@ -44,17 +46,25 @@ const MAX_SHIFTED_COLUMN_STATIONS: usize = 1024;
 pub(crate) fn loft_profile_brep_closed_shifted(
     input_sections: &[Vec<NurbsCurve>],
     shift: usize,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let tolerance = 1e-6;
     let section_count = input_sections.len();
     if section_count < 4 {
-        return Err("loftSolid: a closed loft needs at least 4 sections".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "section_count",
+            "loftSolid: a closed loft needs at least 4 sections",
+        ));
     }
     let sections = input_sections.to_vec();
     let curve_count = validate_sections(&sections, tolerance, "loftSolid", false)?;
     if shift >= curve_count {
-        return Err(format!(
-            "loftSolid: a closed loft's seam shift {shift} must be below its {curve_count} curves"
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "seam_shift",
+            format!(
+                "loftSolid: a closed loft's seam shift {shift} must be below its {curve_count} curves"
+            ),
         ));
     }
     // The curve each one flows into across the seam.
@@ -71,10 +81,14 @@ pub(crate) fn loft_profile_brep_closed_shifted(
                 .zip(&to.control_points)
                 .any(|(a, b)| (a.w - b.w).abs() > 1e-12 * a.w.abs().max(1.0))
         {
-            return Err(format!(
-                "loftSolid: curve {curve_index} flows across the seam into curve {}, and the two \
-                 are not representation-compatible",
-                landing(curve_index)
+            return Err(KernelRefusal::input(
+                KernelStage::Collect,
+                "seam_compatibility",
+                format!(
+                    "loftSolid: curve {curve_index} flows across the seam into curve {}, and the two \
+                     are not representation-compatible",
+                    landing(curve_index)
+                ),
             ));
         }
     }
@@ -88,8 +102,9 @@ pub(crate) fn loft_profile_brep_closed_shifted(
             let mut chords = vec![0.0; section_count + 1];
             let mut total = 0.0;
             for station in 1..=section_count {
-                let previous =
-                    sections[station - 1][curve_index].control_points[control_index].point()?;
+                let previous = sections[station - 1][curve_index].control_points[control_index]
+                    .point()
+                    .or_refuse(KernelStage::Refine, "control_point")?;
                 let across = if station == section_count {
                     landing(curve_index)
                 } else {
@@ -97,7 +112,8 @@ pub(crate) fn loft_profile_brep_closed_shifted(
                 };
                 let current = sections[station % section_count][across].control_points
                     [control_index]
-                    .point()?;
+                    .point()
+                    .or_refuse(KernelStage::Refine, "control_point")?;
                 total += current.sub(previous).length();
                 chords[station] = total;
             }
@@ -111,7 +127,11 @@ pub(crate) fn loft_profile_brep_closed_shifted(
         }
     }
     if columns == 0 {
-        return Err("loftSolid: sections coincide".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Classify,
+            "coincident_sections",
+            "loftSolid: sections coincide",
+        ));
     }
     let mut parameters = vec![0.0; section_count + 1];
     for station in 0..=section_count {
@@ -120,7 +140,11 @@ pub(crate) fn loft_profile_brep_closed_shifted(
     parameters[0] = 0.0;
     parameters[section_count] = 1.0;
     if parameters.windows(2).any(|pair| pair[1] <= pair[0] + 1e-9) {
-        return Err("loftSolid: closed sections are not strictly ordered".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Classify,
+            "section_order",
+            "loftSolid: closed sections are not strictly ordered",
+        ));
     }
 
     let mut skins = Vec::with_capacity(curve_count);
@@ -133,8 +157,10 @@ pub(crate) fn loft_profile_brep_closed_shifted(
                 let points = sections
                     .iter()
                     .map(|section| section[curve_index].control_points[control_index].point())
-                    .collect::<Result<Vec<_>, _>>()?;
-                let interpolated = crate::interpolate_curve_closed(&points, &parameters)?;
+                    .collect::<Result<Vec<_>, String>>()
+                    .or_refuse(KernelStage::Refine, "control_point")?;
+                let interpolated = crate::interpolate_curve_closed(&points, &parameters)
+                    .or_refuse(KernelStage::Refine, "interpolate_closed")?;
                 knots_v = interpolated.knots.clone();
                 let weight = reference.control_points[control_index].w;
                 grid.push(
@@ -151,7 +177,8 @@ pub(crate) fn loft_profile_brep_closed_shifted(
                 reference.knots.clone(),
                 knots_v,
                 grid,
-            )?);
+            )
+            .or_refuse(KernelStage::Fragment, "skin")?);
         }
     } else {
         skins = shifted_skins(&sections, &parameters, curve_count, shift)?;
@@ -172,10 +199,16 @@ pub(crate) fn loft_profile_brep_closed_shifted(
     let mut ring_edge_ids = Vec::with_capacity(curve_count);
     let mut seam_edge_ids = Vec::with_capacity(curve_count);
     for index in 0..curve_count {
-        let [u_start, u_end] = sections[0][index].domain()?;
+        let [u_start, u_end] = sections[0][index]
+            .domain()
+            .or_refuse(KernelStage::Fragment, "domain")?;
         let _ = u_end;
-        let ring = skins[index].iso_curve_u(u_start)?;
-        let [ring_start, ring_end] = ring.domain()?;
+        let ring = skins[index]
+            .iso_curve_u(u_start)
+            .or_refuse(KernelStage::Fragment, "iso_curve")?;
+        let [ring_start, ring_end] = ring
+            .domain()
+            .or_refuse(KernelStage::Fragment, "domain")?;
         let ring_id = 100 + index as u64;
         ring_edge_ids.push(ring_id);
         edges.push(EdgeRecord {
@@ -189,7 +222,9 @@ pub(crate) fn loft_profile_brep_closed_shifted(
             name: None,
         });
         let seam = sections[0][index].clone();
-        let [seam_start, seam_end] = seam.domain()?;
+        let [seam_start, seam_end] = seam
+            .domain()
+            .or_refuse(KernelStage::Fragment, "domain")?;
         let seam_id = 100 + curve_count as u64 + index as u64;
         seam_edge_ids.push(seam_id);
         edges.push(EdgeRecord {
@@ -207,7 +242,9 @@ pub(crate) fn loft_profile_brep_closed_shifted(
     let mut next_id = 1000u64;
     let mut faces = Vec::with_capacity(curve_count);
     for index in 0..curve_count {
-        let [u_start, u_end] = sections[0][index].domain()?;
+        let [u_start, u_end] = sections[0][index]
+            .domain()
+            .or_refuse(KernelStage::Fragment, "domain")?;
         // Cylinder-wall rectangle: seam at v=0 forward, next corner ring up,
         // seam at v=1 backward, own corner ring down. On a SHIFTED ring the seam
         // at v=1 is the curve this one lands on.
@@ -216,25 +253,29 @@ pub(crate) fn loft_profile_brep_closed_shifted(
                 id: next_id,
                 edge_id: seam_edge_ids[index],
                 forward: true,
-                pcurve: parameter_line(u_start, 0.0, u_end, 0.0)?,
+                pcurve: parameter_line(u_start, 0.0, u_end, 0.0)
+                    .or_refuse(KernelStage::Fragment, "pcurve")?,
             },
             CoedgeRecord {
                 id: next_id + 1,
                 edge_id: ring_edge_ids[(index + 1) % curve_count],
                 forward: true,
-                pcurve: parameter_line(u_end, 0.0, u_end, 1.0)?,
+                pcurve: parameter_line(u_end, 0.0, u_end, 1.0)
+                    .or_refuse(KernelStage::Fragment, "pcurve")?,
             },
             CoedgeRecord {
                 id: next_id + 2,
                 edge_id: seam_edge_ids[landing(index)],
                 forward: false,
-                pcurve: parameter_line(u_end, 1.0, u_start, 1.0)?,
+                pcurve: parameter_line(u_end, 1.0, u_start, 1.0)
+                    .or_refuse(KernelStage::Fragment, "pcurve")?,
             },
             CoedgeRecord {
                 id: next_id + 3,
                 edge_id: ring_edge_ids[index],
                 forward: false,
-                pcurve: parameter_line(u_start, 1.0, u_start, 0.0)?,
+                pcurve: parameter_line(u_start, 1.0, u_start, 0.0)
+                    .or_refuse(KernelStage::Fragment, "pcurve")?,
             },
         ];
         next_id += 4;
@@ -255,6 +296,7 @@ pub(crate) fn loft_profile_brep_closed_shifted(
     }
 
     let mut solid = BrepSolid {
+        mass_properties_cache: Default::default(),
         id: next_id,
         vertices,
         edges,
@@ -266,14 +308,20 @@ pub(crate) fn loft_profile_brep_closed_shifted(
     };
     let issues = solid.validate();
     if !issues.is_empty() {
-        return Err(format!(
-            "loftSolid: closed loft failed validation: {issues:?}"
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "validate",
+            format!(
+                "loftSolid: closed loft failed validation: {issues:?}"
+            ),
         ));
     }
     // The ring's outward side depends on the sections' winding; the signed
     // volume is the arbiter.
-    if crate::solid_signed_volume(&solid)? < 0.0 {
-        crate::offset_shell::flip_all_faces(&mut solid)?;
+    if crate::solid_signed_volume(&solid).or_refuse(KernelStage::Validate, "signed_volume")? < 0.0
+    {
+        crate::offset_shell::flip_all_faces(&mut solid)
+            ?;
     }
     // A ring carried round a path too tight for its own profile closes through
     // itself, and neither the validation above nor the signed volume can see
@@ -289,7 +337,7 @@ fn shifted_skins(
     parameters: &[f64],
     curve_count: usize,
     shift: usize,
-) -> Result<Vec<NurbsSurface>, String> {
+) -> Result<Vec<NurbsSurface>, KernelRefusal> {
     let section_count = sections.len();
     let gcd = |mut a: usize, mut b: usize| {
         while b != 0 {
@@ -299,11 +347,17 @@ fn shifted_skins(
     };
     let laps = curve_count / gcd(curve_count, shift);
     if laps * section_count > MAX_SHIFTED_COLUMN_STATIONS {
-        return Err(format!(
-            "loftSolid: a ring whose curves land {shift} along after one lap runs each skin \
-             through {laps} laps of {section_count} stations, {} in all, past the \
-             {MAX_SHIFTED_COLUMN_STATIONS}-station cap the loft's dense column solve can carry",
-            laps * section_count
+        // Refused before any solve runs — a size the lane declines by name, not
+        // a budget that ran out, so it is a deferral rather than a non-convergence.
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Collect,
+            "station_cap",
+            format!(
+                "loftSolid: a ring whose curves land {shift} along after one lap runs each skin \
+                 through {laps} laps of {section_count} stations, {} in all, past the \
+                 {MAX_SHIFTED_COLUMN_STATIONS}-station cap the loft's dense column solve can carry",
+                laps * section_count
+            ),
         ));
     }
     // The knots every face shares in v: one lap's periodic interpolation, clamped.
@@ -335,13 +389,20 @@ fn shifted_skins(
             let mut points = Vec::with_capacity(laps * section_count);
             for &curve_index in &cycle {
                 for section in sections {
-                    points.push(section[curve_index].control_points[control_index].point()?);
+                    points.push(
+                        section[curve_index].control_points[control_index]
+                            .point()
+                            .or_refuse(KernelStage::Refine, "control_point")?,
+                    );
                 }
             }
-            let mut rest = crate::interpolate_curve_closed(&points, &lap_parameters)?;
+            let mut rest = crate::interpolate_curve_closed(&points, &lap_parameters)
+                .or_refuse(KernelStage::Refine, "interpolate_closed")?;
             for (lap, &curve_index) in cycle.iter().enumerate() {
                 let piece = if lap + 1 < laps {
-                    let (piece, remainder) = rest.split((lap + 1) as f64)?;
+                    let (piece, remainder) = rest
+                        .split((lap + 1) as f64)
+                        .or_refuse(KernelStage::Refine, "split")?;
                     rest = remainder;
                     piece
                 } else {
@@ -354,9 +415,13 @@ fn shifted_skins(
                         .zip(&lap_knots)
                         .any(|(knot, own)| (knot - lap as f64 - own).abs() > 1e-9)
                 {
-                    return Err(format!(
-                        "loftSolid: lap {lap} of a shifted ring's column did not split onto the \
-                         lap's own knots"
+                    return Err(KernelRefusal::internal(
+                        KernelStage::Refine,
+                        "lap_split",
+                        format!(
+                            "loftSolid: lap {lap} of a shifted ring's column did not split onto the \
+                             lap's own knots"
+                        ),
                     ));
                 }
                 let weight = sections[0][curve_index].control_points[control_index].w;
@@ -364,7 +429,8 @@ fn shifted_skins(
                     .control_points
                     .iter()
                     .map(|point| Ok(Vec4::from_point(point.point()?, weight)))
-                    .collect::<Result<Vec<_>, String>>()?;
+                    .collect::<Result<Vec<_>, String>>()
+                    .or_refuse(KernelStage::Refine, "control_point")?;
             }
         }
     }
@@ -374,5 +440,6 @@ fn shifted_skins(
         .map(|(reference, grid)| {
             NurbsSurface::new(reference.degree, 3, reference.knots.clone(), lap_knots.clone(), grid)
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()
+        .or_refuse(KernelStage::Fragment, "skin")
 }

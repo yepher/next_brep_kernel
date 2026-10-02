@@ -154,7 +154,7 @@
 //! the end caps are coincident annuli, including in assemblies with junctions.
 
 use crate::feature_pipeline::features::common;
-use crate::feature_pipeline::{FeatureContext, FeatureResult};
+use crate::feature_pipeline::{FeatureContext, FeatureRefusal, FeatureResult};
 use crate::{
     extrude_profile_brep, make_arc, make_cylinder_brep, make_line, make_sphere_brep_framed,
     revolve_profile_brep_named, sew_solid, sweep_profile_along_chain_with_stations,
@@ -218,7 +218,7 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     }
 }
 
-fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     let radius = ctx.number("radius")?;
     if !(radius > 0.0) {
         return Err("tube: requires a positive radius".into());
@@ -231,7 +231,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         return Err(format!(
             "tube: a bend radius of {bend} is not larger than the tube radius {radius}; the \
              section would sweep back through itself at the corner"
-        ));
+        ).into());
     }
     let inner = common::number_or_default(ctx, "innerRadius", 0.0);
     if inner < 0.0 {
@@ -310,8 +310,8 @@ fn assemble_component(
     inner: f64,
     bend: f64,
     name: &str,
-) -> Result<BrepSolid, String> {
-    let mut last: Option<String> = None;
+) -> Result<BrepSolid, FeatureRefusal> {
+    let mut last: Option<FeatureRefusal> = None;
     for (rung, &clearance) in JOINT_CLEARANCE_LADDER.iter().enumerate() {
         let exact_only = rung + 1 < JOINT_CLEARANCE_LADDER.len();
         let attempt = (|| {
@@ -327,7 +327,11 @@ fn assemble_component(
                 exact_only, bend,
             )?;
             common::subtract_solid(outer, cutter)
-                .map_err(|error| format!("tube: hollow subtract (outer − inner) failed: {error}"))
+                .map_err(|error| {
+                    FeatureRefusal::from(error.with_message(|error| {
+                        format!("tube: hollow subtract (outer − inner) failed: {error}")
+                    }))
+                })
         })();
         match attempt {
             Ok(solid) => return Ok(solid),
@@ -364,7 +368,7 @@ fn build_assembly(
     clearance: f64,
     exact_only: bool,
     bend: f64,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, FeatureRefusal> {
     if component.is_empty() {
         return Err("tube: internal error — empty component".into());
     }
@@ -388,9 +392,9 @@ fn build_assembly(
 
     // One chain and no joint left: the whole component is one swept body.
     if chains.len() == 1 {
-        return named_chain_or_segment(
+        return Ok(named_chain_or_segment(
             &chains[0], segments, nodes, edge_nodes, radius, bend, name, suffix, 0,
-        );
+        )?);
     }
 
     // Stable joint numbering per junction node.
@@ -742,7 +746,7 @@ fn chain_path(
             return Err(format!(
                 "tube: the path doubles back on itself at ({:.4}, {:.4}, {:.4}); a bend needs                  two distinct directions",
                 nodes[node].x, nodes[node].y, nodes[node].z
-            ));
+            ).into());
         }
         let half = angle / 2.0;
         let distance = bend / half.tan();
@@ -787,7 +791,7 @@ fn chain_path(
                  corners; use a smaller bend radius, or 0 to join with a ball instead",
                 head + tail,
                 span
-            ));
+            ).into());
         }
         let direction = along.normalized().map_err(|_| {
             "tube: degenerate (zero-length) path edge".to_string()
@@ -1084,7 +1088,7 @@ fn named_chain(
             "tube: swept chain produced {faces} faces, expected {} ({} sides + 2 caps)",
             profile.len() + 2,
             profile.len()
-        ));
+        ).into());
     }
     let side = format!("{name}{suffix}_Seg{local}_S");
     name_faces(
@@ -1485,7 +1489,7 @@ fn named_swept(
             "tube: swept curved segment produced {faces} faces, expected {} ({} sides + 2 caps)",
             profile.len() + 2,
             profile.len()
-        ));
+        ).into());
     }
     let side = format!("{name}{suffix}_Seg{local}_S");
     name_faces(
@@ -1593,7 +1597,7 @@ fn resolve_path_edges(ctx: &FeatureContext) -> Result<Vec<NurbsCurve>, String> {
         }
         return Err(format!(
             "tube: path '{name}' not found (no sketch path or resident edge)"
-        ));
+        ).into());
     }
     Ok(curves)
 }
@@ -1683,7 +1687,7 @@ fn refuse_fold_over(curve: &NurbsCurve, radius: f64) -> Result<(), String> {
         return Err(format!(
             "tube: radius {radius} reaches the path's curvature radius {tightest:.6} — the tube \
              would fold through itself; use a smaller radius or a gentler path"
-        ));
+        ).into());
     }
     Ok(())
 }

@@ -1,14 +1,20 @@
 use super::*;
 
-fn edge_and_faces<'a>(
+pub(super) fn edge_and_faces<'a>(
     solid: &'a BrepSolid,
     edge_id: u64,
-) -> Result<(&'a EdgeRecord, Vec<&'a FaceRecord>), String> {
+) -> Result<(&'a EdgeRecord, Vec<&'a FaceRecord>), KernelRefusal> {
     let edge = solid
         .edges
         .iter()
         .find(|edge| edge.id == edge_id)
-        .ok_or_else(|| format!("fillet: edge {edge_id} not found"))?;
+        .ok_or_else(|| {
+            KernelRefusal::input(
+                KernelStage::Collect,
+                "edge_id",
+                format!("fillet: edge {edge_id} not found"),
+            )
+        })?;
     let mut faces = Vec::new();
     for shell in &solid.shells {
         for face in &shell.faces {
@@ -26,9 +32,16 @@ fn edge_and_faces<'a>(
     Ok((edge, faces))
 }
 
-fn face_plane_normal(face: &FaceRecord, near: Vec3) -> Result<(Vec3, Vec3), String> {
-    let projection = crate::project_point_to_surface(&face.surface, near)?;
-    let normal = face.surface.normal(projection.u, projection.v)?;
+pub(super) fn face_plane_normal(
+    face: &FaceRecord,
+    near: Vec3,
+) -> Result<(Vec3, Vec3), KernelRefusal> {
+    let projection = crate::project_point_to_surface(&face.surface, near)
+        .or_refuse(KernelStage::Classify, "face_projection")?;
+    let normal = face
+        .surface
+        .normal(projection.u, projection.v)
+        .or_refuse(KernelStage::Classify, "face_normal")?;
     let outward = if face.same_sense {
         normal
     } else {
@@ -50,14 +63,21 @@ pub(crate) fn into_face_direction(
     probe_point: Vec3,
     probe_tangent: Vec3,
     probe_step: f64,
-) -> Result<Vec3, String> {
+) -> Result<Vec3, KernelRefusal> {
     let (_, probe_outward) = face_plane_normal(face, probe_point)?;
-    let probe_candidate = probe_outward.cross(probe_tangent).normalized()?;
+    let probe_candidate = probe_outward
+        .cross(probe_tangent)
+        .normalized()
+        .or_refuse(KernelStage::Classify, "probe_candidate")?;
     let (_, construct_outward) = face_plane_normal(face, construct_point)?;
-    let construct_candidate = construct_outward.cross(construct_tangent).normalized()?;
+    let construct_candidate = construct_outward
+        .cross(construct_tangent)
+        .normalized()
+        .or_refuse(KernelStage::Classify, "construct_candidate")?;
     for sign in [1.0, -1.0] {
         let probe = probe_point.add(probe_candidate.scale(sign * probe_step));
-        let projection = crate::project_point_to_surface(&face.surface, probe)?;
+        let projection = crate::project_point_to_surface(&face.surface, probe)
+            .or_refuse(KernelStage::Classify, "probe_projection")?;
         // The in-plane probe leaves a CURVED carrier by the sagitta
         // (~step²·curvature); the trim classification below is what
         // actually decides the side, so the distance gate only rejects
@@ -70,16 +90,28 @@ pub(crate) fn into_face_direction(
                     y: projection.v,
                 },
                 1e-6,
-            )?;
+            )
+            .or_refuse(KernelStage::Classify, "probe_trim_class")?;
             if class == crate::PolygonClass::Inside {
                 return Ok(construct_candidate.scale(sign));
             }
         }
     }
-    Err(format!(
-        "fillet: could not orient the support direction into face {}",
-        face.id
-    ))
+    Err(support_direction_refusal(face))
+}
+
+/// Neither in-plane probe landed inside the face's trim, so the side the
+/// material is on could not be read: the geometry at this station does not
+/// decide it, and the direction is refused rather than guessed.
+fn support_direction_refusal(face: &FaceRecord) -> KernelRefusal {
+    KernelRefusal::ill_posed(
+        KernelStage::Classify,
+        "support_direction",
+        format!(
+            "fillet: could not orient the support direction into face {}",
+            face.id
+        ),
+    )
 }
 
 /// Probe stations, as edge fractions and in the order tried, for fixing a
@@ -109,9 +141,9 @@ fn into_face_direction_probed(
     face: &FaceRecord,
     construct_point: Vec3,
     construct_tangent: Vec3,
-    station: &dyn Fn(f64) -> Result<(Vec3, Vec3), String>,
+    station: &dyn Fn(f64) -> Result<(Vec3, Vec3), KernelRefusal>,
     probe_step: f64,
-) -> Result<Vec3, String> {
+) -> Result<Vec3, KernelRefusal> {
     let mut refusal = None;
     for fraction in SIGN_PROBE_FRACTIONS {
         let Ok((probe_point, probe_tangent)) = station(fraction) else {
@@ -129,12 +161,7 @@ fn into_face_direction_probed(
             Err(error) => refusal = Some(error),
         }
     }
-    Err(refusal.unwrap_or_else(|| {
-        format!(
-            "fillet: could not orient the support direction into face {}",
-            face.id
-        )
-    }))
+    Err(refusal.unwrap_or_else(|| support_direction_refusal(face)))
 }
 
 pub(super) enum EdgePath {
@@ -161,15 +188,27 @@ pub(super) struct EdgeCross {
     pub(super) convex: bool,
 }
 
-pub(super) fn analyze_edge(solid: &BrepSolid, edge_id: u64, radius: f64) -> Result<EdgeCross, String> {
+pub(super) fn analyze_edge(
+    solid: &BrepSolid,
+    edge_id: u64,
+    radius: f64,
+) -> Result<EdgeCross, KernelRefusal> {
     if !(radius > 0.0) || !radius.is_finite() {
-        return Err("fillet: radius must be positive".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "radius",
+            "fillet: radius must be positive",
+        ));
     }
     let (edge, faces) = edge_and_faces(solid, edge_id)?;
     if faces.len() != 2 {
-        return Err(format!(
-            "fillet: edge {edge_id} borders {} faces (expected 2)",
-            faces.len()
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "edge_faces",
+            format!(
+                "fillet: edge {edge_id} borders {} faces (expected 2)",
+                faces.len()
+            ),
         ));
     }
     if faces.iter().all(|face| {
@@ -181,11 +220,20 @@ pub(super) fn analyze_edge(solid: &BrepSolid, edge_id: u64, radius: f64) -> Resu
         // The local tangent-line wedge used by the exact tool has conical
         // side walls, so it is not cosurface with a spherical meridian.  Send
         // this pair through the shared rolling-ball strip + direct trim path.
-        return Err("fillet: spherical meridians require the general blend surgery".into());
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "spherical_meridians",
+            "fillet: spherical meridians require the general blend surgery",
+        ));
     }
-    let start = edge.curve.evaluate(edge.t0)?;
-    let end = edge.curve.evaluate(edge.t1)?;
-    let middle = edge.curve.evaluate((edge.t0 + edge.t1) * 0.5)?;
+    let evaluate = |t: f64| {
+        edge.curve
+            .evaluate(t)
+            .or_refuse(KernelStage::Classify, "edge_evaluate")
+    };
+    let start = evaluate(edge.t0)?;
+    let end = evaluate(edge.t1)?;
+    let middle = evaluate((edge.t0 + edge.t1) * 0.5)?;
     let chord = end.sub(start);
     // Straightness is a GEOMETRIC property: every point lies on the chord
     // line, regardless of parameterization. Checking only the parameter-
@@ -215,24 +263,38 @@ pub(super) fn analyze_edge(solid: &BrepSolid, edge_id: u64, radius: f64) -> Resu
     } else {
         // Circular edge (full circle when start == end): fit the circle
         // through three samples and verify the rest lie on it.
-        let quarter = edge.curve.evaluate(edge.t0 + (edge.t1 - edge.t0) * 0.25)?;
+        let quarter = evaluate(edge.t0 + (edge.t1 - edge.t0) * 0.25)?;
         let center = crate::analytic_surface::circumcenter(start, quarter, middle)
-            .ok_or("fillet: edge is neither straight nor circular")?;
+            .ok_or_else(|| {
+                KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "edge_path_fit",
+                    "fillet: edge is neither straight nor circular",
+                )
+            })?;
         let radius = start.sub(center).length();
         let axis = quarter
             .sub(center)
             .cross(middle.sub(center))
             .normalized()
-            .map_err(|_| "fillet: circular edge axis is degenerate".to_string())?;
+            .map_err(|_| {
+                KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "circular_axis",
+                    "fillet: circular edge axis is degenerate",
+                )
+            })?;
         for index in 0..=16 {
-            let point = edge
-                .curve
-                .evaluate(edge.t0 + (edge.t1 - edge.t0) * index as f64 / 16.0)?;
+            let point = evaluate(edge.t0 + (edge.t1 - edge.t0) * index as f64 / 16.0)?;
             let radial = point.sub(center);
             if (radial.length() - radius).abs() > 1e-6 * (1.0 + radius)
                 || radial.dot(axis).abs() > 1e-6 * (1.0 + radius)
             {
-                return Err("fillet: edge is neither straight nor circular".into());
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "edge_path_samples",
+                    "fillet: edge is neither straight nor circular",
+                ));
             }
         }
         let closed = start.sub(end).length() <= 1e-6 * (1.0 + radius);
@@ -288,23 +350,31 @@ pub(super) fn analyze_edge(solid: &BrepSolid, edge_id: u64, radius: f64) -> Resu
             _ => false,
         };
         if !supported {
-            return Err(
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "exact_tool_carriers",
                 "fillet: edge/face combination not supported by the exact tool (straight edges \
                  need planar faces; circular edges need straight-meridian faces rotationally \
-                 symmetric about the edge axis)"
-                    .into(),
-            );
+                 symmetric about the edge axis)",
+            ));
         }
     }
     let (_, first_outward) = face_plane_normal(faces[0], start)?;
     let (_, second_outward) = face_plane_normal(faces[1], start)?;
     if first_outward.cross(second_outward).length() <= 1e-6 {
-        return Err("fillet: faces are tangent along the edge".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Classify,
+            "tangent_faces",
+            "fillet: faces are tangent along the edge",
+        ));
     }
-    let tangent_at = |point: Vec3| -> Result<Vec3, String> {
+    let tangent_at = |point: Vec3| -> Result<Vec3, KernelRefusal> {
         match &path {
             EdgePath::Straight { direction, .. } => Ok(*direction),
-            EdgePath::Circular { center, axis, .. } => axis.cross(point.sub(*center)).normalized(),
+            EdgePath::Circular { center, axis, .. } => axis
+                .cross(point.sub(*center))
+                .normalized()
+                .or_refuse(KernelStage::Classify, "edge_tangent"),
         }
     };
     let scale = match &path {
@@ -313,10 +383,8 @@ pub(super) fn analyze_edge(solid: &BrepSolid, edge_id: u64, radius: f64) -> Resu
     };
     let probe_step = (scale * 0.05).min(radius * 0.5).max(1e-6);
     let start_tangent = tangent_at(start)?;
-    let station = |fraction: f64| -> Result<(Vec3, Vec3), String> {
-        let point = edge
-            .curve
-            .evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction)?;
+    let station = |fraction: f64| -> Result<(Vec3, Vec3), KernelRefusal> {
+        let point = evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction)?;
         Ok((point, tangent_at(point)?))
     };
     let into_first =
@@ -397,12 +465,16 @@ impl DihedralProfile {
 pub(crate) fn scan_dihedral(
     solid: &BrepSolid,
     edge_id: u64,
-) -> Result<DihedralProfile, String> {
+) -> Result<DihedralProfile, KernelRefusal> {
     let (edge, faces) = edge_and_faces(solid, edge_id)?;
     if faces.len() != 2 {
-        return Err(format!(
-            "dihedral scan: edge {edge_id} borders {} faces (expected 2)",
-            faces.len()
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "scan_edge_faces",
+            format!(
+                "dihedral scan: edge {edge_id} borders {} faces (expected 2)",
+                faces.len()
+            ),
         ));
     }
     let angular = crate::KernelTolerances::for_solid(solid, 1e-7).angular;
@@ -410,36 +482,48 @@ pub(crate) fn scan_dihedral(
     // The edge's unit tangent, read as the one-sided limit where its
     // parameterization is stationary (`NurbsCurve::unit_tangent`); the extended
     // sibling keeps the extended read this scan always made.
-    let tangent_at = |t: f64| -> Result<Vec3, String> {
+    let tangent_at = |t: f64| -> Result<Vec3, KernelRefusal> {
         edge.curve
             .point_and_unit_tangent_extended(t, edge.t0, edge.t1)
             .map(|(_, tangent)| tangent)
-            .map_err(|error| format!("dihedral scan: edge {edge_id}: {error}"))
+            .map_err(|error| {
+                KernelRefusal::internal(
+                    KernelStage::Classify,
+                    "scan_tangent",
+                    format!("dihedral scan: edge {edge_id}: {error}"),
+                )
+            })
+    };
+    let evaluate = |t: f64| {
+        edge.curve
+            .evaluate(t)
+            .or_refuse(KernelStage::Classify, "scan_evaluate")
     };
     // Fix each face's into-material sign ONCE, at the parameter midpoint, with
     // the trim probe.  `into_face_direction` wants a construct point and a
     // separate probe point; the midpoint serves as both here because a scan has
     // no seam convention to respect.
     let middle_t = edge.t0 + span * 0.5;
-    let middle = edge.curve.evaluate(middle_t)?;
+    let middle = evaluate(middle_t)?;
     let middle_tangent = tangent_at(middle_t)?;
-    let scale = edge
-        .curve
-        .evaluate(edge.t0)?
-        .sub(edge.curve.evaluate(edge.t1)?)
+    let scale = evaluate(edge.t0)?
+        .sub(evaluate(edge.t1)?)
         .length()
         .max(1.0);
     let probe_step = (scale * 0.05).max(1e-6);
-    let station = |fraction: f64| -> Result<(Vec3, Vec3), String> {
+    let station = |fraction: f64| -> Result<(Vec3, Vec3), KernelRefusal> {
         let t = edge.t0 + span * fraction;
-        Ok((edge.curve.evaluate(t)?, tangent_at(t)?))
+        Ok((evaluate(t)?, tangent_at(t)?))
     };
     let mut signs = [1.0f64; 2];
     for (index, face) in faces.iter().enumerate() {
         let into =
             into_face_direction_probed(face, middle, middle_tangent, &station, probe_step)?;
         let (_, outward) = face_plane_normal(face, middle)?;
-        let candidate = outward.cross(middle_tangent).normalized()?;
+        let candidate = outward
+            .cross(middle_tangent)
+            .normalized()
+            .or_refuse(KernelStage::Classify, "scan_candidate")?;
         signs[index] = if candidate.dot(into) >= 0.0 { 1.0 } else { -1.0 };
     }
     const SAMPLES: usize = 32;
@@ -515,10 +599,14 @@ pub(crate) fn scan_dihedral(
     // trusts a `Mixed` verdict (`BRepOffset_Analyse.cxx:263-266`); the same
     // rule keeps a scan that mostly failed to evaluate from naming a class.
     if profile.samples * 2 < SAMPLES {
-        return Err(format!(
-            "dihedral scan: only {} of {} stations on edge {edge_id} could be evaluated",
-            profile.samples,
-            SAMPLES + 1
+        return Err(KernelRefusal::internal(
+            KernelStage::Classify,
+            "scan_coverage",
+            format!(
+                "dihedral scan: only {} of {} stations on edge {edge_id} could be evaluated",
+                profile.samples,
+                SAMPLES + 1
+            ),
         ));
     }
     Ok(profile)
@@ -533,25 +621,29 @@ pub(super) fn check_mixed_concavity(
     solid: &BrepSolid,
     edge_id: u64,
     entry: &str,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let Ok(profile) = scan_dihedral(solid, edge_id) else {
         return Ok(());
     };
     if !profile.is_mixed() {
         return Ok(());
     }
-    Err(format!(
-        "{entry}: edge {edge_id} has MIXED concavity — its interior angle runs from {:.3}° to \
-         {:.3}° and crosses flat{}, so it is convex along part of its length and concave along \
-         the rest. A rolling ball would have to pass from inside the material to outside it \
-         partway along, so no single blend serves this edge: split it where the faces become \
-         tangent and blend the parts separately.",
-        profile.min_angle.to_degrees(),
-        profile.max_angle.to_degrees(),
-        profile
-            .flip_fraction
-            .map(|fraction| format!(" at about {:.0}% along", fraction * 100.0))
-            .unwrap_or_default(),
+    Err(KernelRefusal::ill_posed(
+        KernelStage::Classify,
+        "mixed_concavity",
+        format!(
+            "{entry}: edge {edge_id} has MIXED concavity — its interior angle runs from {:.3}° to \
+             {:.3}° and crosses flat{}, so it is convex along part of its length and concave along \
+             the rest. A rolling ball would have to pass from inside the material to outside it \
+             partway along, so no single blend serves this edge: split it where the faces become \
+             tangent and blend the parts separately.",
+            profile.min_angle.to_degrees(),
+            profile.max_angle.to_degrees(),
+            profile
+                .flip_fraction
+                .map(|fraction| format!(" at about {:.0}% along", fraction * 100.0))
+                .unwrap_or_default(),
+        ),
     ))
 }
 
@@ -729,7 +821,7 @@ pub(super) fn check_support_extent(
     edge_id: u64,
     size: f64,
     entry: &str,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let Ok(cross) = analyze_edge(solid, edge_id, size) else {
         return Ok(());
     };
@@ -851,15 +943,19 @@ pub(super) fn check_support_extent(
             if reach <= extent + crate::blend::consumed_band(solid) {
                 continue;
             }
-            return Err(format!(
-                "{entry}: {size} is too large for the faces it must lie on — the blend would \
-                 meet face {} at {reach:.6} from the edge (reach = size·cot(φ/2), φ = {:.3}°), \
-                 but that face only reaches {extent:.6} there. A rolling ball that cannot touch \
-                 both supports is tangent to neither, so what would be built is not a blend of \
-                 this edge: reduce the size, or select the neighbouring faces' edges too so the \
-                 blend has somewhere to run.",
-                face.id,
-                phi.to_degrees(),
+            return Err(KernelRefusal::input(
+                KernelStage::Classify,
+                "support_extent",
+                format!(
+                    "{entry}: {size} is too large for the faces it must lie on — the blend would \
+                     meet face {} at {reach:.6} from the edge (reach = size·cot(φ/2), φ = {:.3}°), \
+                     but that face only reaches {extent:.6} there. A rolling ball that cannot touch \
+                     both supports is tangent to neither, so what would be built is not a blend of \
+                     this edge: reduce the size, or select the neighbouring faces' edges too so the \
+                     blend has somewhere to run.",
+                    face.id,
+                    phi.to_degrees(),
+                ),
             ));
         }
     }
@@ -927,7 +1023,7 @@ pub(super) fn check_blend_interference(
     result: &BrepSolid,
     edge_ids: &[u64],
     entry: &str,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     use crate::{parameter_point_in_face, PointClass, PolygonClass, SolidClassifier, Vec2};
 
     if edge_ids.is_empty() || !original.validate().is_empty() {
@@ -968,25 +1064,32 @@ pub(super) fn check_blend_interference(
     }
 
     let policy = crate::KernelTolerances::for_solid(original, 1e-7);
-    let report = |label: String, violations: &[Vec3], sampled: usize, what: &str| -> String {
+    let report = |label: String, violations: &[Vec3], sampled: usize, what: &str| -> KernelRefusal {
         let side = if forbidden == PointClass::Out {
             "outside the material it was cut from"
         } else {
             "inside material that was already there"
         };
         let sample = violations[0];
-        format!(
-            "{entry}: the blend is not trimmed where it meets the rest of the solid — {} of {} \
-             samples {what} {label} lie {side} (e.g. ({:.6}, {:.6}, {:.6})). The rolling-ball \
-             surgery re-trims only the blend's two MATING faces, so a third face crossing the \
-             swept volume leaves the blend running through it and the result self-intersecting. \
-             Those faces have to be split along their intersection and the fragments in the \
-             void discarded.",
-            violations.len(),
-            sampled,
-            sample.x,
-            sample.y,
-            sample.z,
+        // The trim that would answer this — splitting the crossing faces
+        // and dropping the fragments in the void — is a construction the
+        // surgery does not perform: a named deferral, read at `Validate`.
+        KernelRefusal::unsupported(
+            KernelStage::Validate,
+            "blend_interference",
+            format!(
+                "{entry}: the blend is not trimmed where it meets the rest of the solid — {} of {} \
+                 samples {what} {label} lie {side} (e.g. ({:.6}, {:.6}, {:.6})). The rolling-ball \
+                 surgery re-trims only the blend's two MATING faces, so a third face crossing the \
+                 swept volume leaves the blend running through it and the result self-intersecting. \
+                 Those faces have to be split along their intersection and the fragments in the \
+                 void discarded.",
+                violations.len(),
+                sampled,
+                sample.x,
+                sample.y,
+                sample.z,
+            ),
         )
     };
 
@@ -1010,7 +1113,10 @@ pub(super) fn check_blend_interference(
         .collect();
     let skin = match fresh.is_empty() {
         true => None,
-        false => Some(SolidClassifier::new(original, policy.pcurve_consistency / 10.0)?),
+        false => Some(
+            SolidClassifier::new(original, policy.pcurve_consistency / 10.0)
+                .or_refuse(KernelStage::Validate, "edge_classifier")?,
+        ),
     };
     for edge in fresh {
         let Some(skin) = skin.as_ref() else { break };
@@ -1046,7 +1152,8 @@ pub(super) fn check_blend_interference(
     if grown.is_empty() {
         return Ok(());
     }
-    let classifier = SolidClassifier::new(original, policy.intersection_fit)?;
+    let classifier = SolidClassifier::new(original, policy.intersection_fit)
+        .or_refuse(KernelStage::Validate, "face_classifier")?;
     const GRID: usize = 9;
     for face in grown {
         let (Ok([u0, u1]), Ok([v0, v1])) = (face.surface.domain_u(), face.surface.domain_v())
@@ -1133,32 +1240,41 @@ fn face_sample_uv_band(face: &FaceRecord, u: f64, v: f64, spatial: f64) -> f64 {
 /// does not construct, and returning the bowtie reports success for a
 /// different result. The message names the face and the two edges, because the
 /// question a caller then has is WHICH wall ran off WHICH face.
-pub(super) fn check_loop_self_crossings(result: &BrepSolid, entry: &str) -> Result<(), String> {
+pub(super) fn check_loop_self_crossings(
+    result: &BrepSolid,
+    entry: &str,
+) -> Result<(), KernelRefusal> {
     let report = crate::loop_self_crossings(result);
     let Some(crossing) = report.crossings.first() else {
         return Ok(());
     };
-    Err(format!(
-        "{entry}: the result's face {}{} has a loop that CROSSES ITSELF at \
-         ({:.6}, {:.6}, {:.6}) — its edges {} and {} cross in the face's own parameter \
-         domain{}. A blend wall whose contact rail runs off the end of its own face is not \
-         trimmed to it, and the face that comes back is wrong in AREA where its volume is \
-         not; `validate()` cannot see it. Blend the edges that need the runout separately.",
-        crossing.face,
-        crossing
-            .face_name
-            .as_ref()
-            .map(|name| format!(" '{name}'"))
-            .unwrap_or_default(),
-        crossing.point.x,
-        crossing.point.y,
-        crossing.point.z,
-        crossing.edge_a,
-        crossing.edge_b,
-        if report.crossings.len() > 1 {
-            format!(" ({} crossings in all)", report.crossings.len())
-        } else {
-            String::new()
-        },
+    // The runout trim that would clip the rail to its face is a construction
+    // this lane does not perform (see the header): a named deferral.
+    Err(KernelRefusal::unsupported(
+        KernelStage::Validate,
+        "loop_self_crossing",
+        format!(
+            "{entry}: the result's face {}{} has a loop that CROSSES ITSELF at \
+             ({:.6}, {:.6}, {:.6}) — its edges {} and {} cross in the face's own parameter \
+             domain{}. A blend wall whose contact rail runs off the end of its own face is not \
+             trimmed to it, and the face that comes back is wrong in AREA where its volume is \
+             not; `validate()` cannot see it. Blend the edges that need the runout separately.",
+            crossing.face,
+            crossing
+                .face_name
+                .as_ref()
+                .map(|name| format!(" '{name}'"))
+                .unwrap_or_default(),
+            crossing.point.x,
+            crossing.point.y,
+            crossing.point.z,
+            crossing.edge_a,
+            crossing.edge_b,
+            if report.crossings.len() > 1 {
+                format!(" ({} crossings in all)", report.crossings.len())
+            } else {
+                String::new()
+            },
+        ),
     ))
 }

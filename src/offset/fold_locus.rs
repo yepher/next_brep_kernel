@@ -61,6 +61,7 @@
 use crate::offset_regularity::{
     fold_sample_at, refine_between_nodes, region_grid, ScanBudget, TrimRegion,
 };
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use crate::{interpolate_curve, interpolate_curve_closed, NurbsCurve, NurbsSurface, Vec3};
 
 /// Newton's target on `g`. The field is dimensionless and O(1) near a fold, and
@@ -195,17 +196,17 @@ pub(crate) fn fit_locus_pcurve(
     level: f64,
     stations: &[[f64; 2]],
     closed: bool,
-) -> Result<(NurbsCurve, f64), String> {
+) -> Result<(NurbsCurve, f64), KernelRefusal> {
     let floor = if closed { 4 } else { 2 };
     if stations.len() < floor {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "fold_locus_not_a_curve", format!(
             "fold locus: a {} branch of {} point(s) is not a curve",
             if closed { "closed" } else { "open" },
             stations.len()
-        ));
+        )));
     }
-    let [u0, u1] = surface.domain_u()?;
-    let [v0, v1] = surface.domain_v()?;
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
     let bounds = [u0, u1, v0, v1];
 
     // COARSE FIRST. The march places a station every half grid cell because that
@@ -247,7 +248,7 @@ pub(crate) fn fit_locus_pcurve(
         for span in 0..spans {
             refined.push(chosen[span]);
             let middle = 0.5 * (parameters[span] + parameters[span + 1]);
-            let point = curve.evaluate(middle)?;
+            let point = curve.evaluate(middle).or_refuse(KernelStage::Refine, "evaluate")?;
             let seed = [point.x, point.y];
             if let Some(corrected) = correct_uv(surface, displacements, level, seed, bounds) {
                 refined.push(corrected);
@@ -301,7 +302,7 @@ fn measure_against_locus(
     curve: &NurbsCurve,
     stations: &[[f64; 2]],
     closed: bool,
-) -> Result<f64, String> {
+) -> Result<f64, KernelRefusal> {
     let parameters = station_parameters(stations, closed);
     let spans = if closed { stations.len() } else { stations.len() - 1 };
     let mut worst = 0.0f64;
@@ -310,7 +311,7 @@ fn measure_against_locus(
     for span in 0..spans {
         for fraction in [0.25, 0.5, 0.75] {
             let t = parameters[span] + (parameters[span + 1] - parameters[span]) * fraction;
-            let point = curve.evaluate(t)?;
+            let point = curve.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?;
             if let Some(sample) = fold_sample_at(surface, point.x, point.y, displacements) {
                 let miss = (sample.factor - level).abs();
                 if miss > worst {
@@ -356,16 +357,16 @@ fn station_parameters(stations: &[[f64; 2]], closed: bool) -> Vec<f64> {
     parameters
 }
 
-fn interpolate_stations(stations: &[[f64; 2]], closed: bool) -> Result<NurbsCurve, String> {
+fn interpolate_stations(stations: &[[f64; 2]], closed: bool) -> Result<NurbsCurve, KernelRefusal> {
     let points = stations
         .iter()
         .map(|point| Vec3::new(point[0], point[1], 0.0))
         .collect::<Vec<_>>();
     let parameters = station_parameters(stations, closed);
     if closed {
-        return interpolate_curve_closed(&points, &parameters);
+        return interpolate_curve_closed(&points, &parameters).or_refuse(KernelStage::Refine, "interpolate_curve_closed");
     }
-    interpolate_curve(&points, 3.min(points.len() - 1), &parameters)
+    interpolate_curve(&points, 3.min(points.len() - 1), &parameters).or_refuse(KernelStage::Refine, "interpolate_curve")
 }
 
 impl FoldCurve {
@@ -383,7 +384,7 @@ impl FoldCurve {
         surface: &NurbsSurface,
         displacements: &[f64],
         level: f64,
-    ) -> Result<(NurbsCurve, f64), String> {
+    ) -> Result<(NurbsCurve, f64), KernelRefusal> {
         fit_locus_pcurve(
             surface,
             displacements,
@@ -523,21 +524,21 @@ impl Field<'_> {
 /// Returns `Err` when the bracket is a JUMP rather than a crossing: the segment
 /// shrinks to machine width with `|g|` still large on both sides, which is what
 /// a knot line carrying a curvature discontinuity does to a sign test.
-fn bisect(field: &Field, mut lo: [f64; 2], mut hi: [f64; 2]) -> Result<[f64; 2], String> {
+fn bisect(field: &Field, mut lo: [f64; 2], mut hi: [f64; 2]) -> Result<[f64; 2], KernelRefusal> {
     let (Some(mut value_lo), Some(mut value_hi)) = (field.at(lo), field.at(hi)) else {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Refine, "fold_factor_unreadable", format!(
             "fold locus: the fold factor is unreadable between {} and {}",
             field.report(lo),
             field.report(hi)
-        ));
+        )));
     };
     for _ in 0..80 {
         let mid = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5];
         let Some(value_mid) = field.at(mid) else {
-            return Err(format!(
+            return Err(KernelRefusal::internal(KernelStage::Refine, "fold_factor_unreadable", format!(
                 "fold locus: the fold factor is unreadable at {}",
                 field.report(mid)
-            ));
+            )));
         };
         if value_mid.abs() <= CORRECTOR_TOLERANCE {
             return Ok(mid);
@@ -556,14 +557,14 @@ fn bisect(field: &Field, mut lo: [f64; 2], mut hi: [f64; 2]) -> Result<[f64; 2],
     }
     let residual = value_lo.abs().min(value_hi.abs());
     if residual > CORRECTOR_STALL_CEILING {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "fold_factor_jump", format!(
             "fold locus: the fold factor JUMPS across {} (from {:+.6e} to {:+.6e} over a \
              machine-width interval) — that sign change is a curvature discontinuity, a knot \
              line the surface is only C⁰ across, not a crossing of 1 − δ·κ = 0",
             field.report(lo),
             value_lo,
             value_hi
-        ));
+        )));
     }
     Ok(if value_lo.abs() <= value_hi.abs() { lo } else { hi })
 }
@@ -578,15 +579,15 @@ pub(crate) fn trace_fold_locus(
     displacements: &[f64],
     level: f64,
     budget: ScanBudget,
-) -> Result<FoldLocus, String> {
+) -> Result<FoldLocus, KernelRefusal> {
     let bounds = region.bounds();
     if !(bounds[1] > bounds[0]) || !(bounds[3] > bounds[2]) {
-        return Err("fold locus: the region's parameter box is degenerate".into());
+        return Err(KernelRefusal::internal(KernelStage::Refine, "fold_region_box", "fold locus: the region's parameter box is degenerate"));
     }
     let reach = displacements
         .iter()
         .fold(0.0f64, |worst, distance| worst.max(distance.abs()));
-    if reach == 0.0 || surface.is_affine()? {
+    if reach == 0.0 || surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
         return Ok(FoldLocus::default());
     }
     let field = Field {
@@ -597,11 +598,11 @@ pub(crate) fn trace_fold_locus(
     };
     let grid = region_grid(surface, bounds, reach, budget);
     if grid.samples_u.len() < 2 || grid.samples_v.len() < 2 {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "fold_grid_coarse", format!(
             "fold locus: the region's sample grid is {}×{} — too coarse to bracket a fold",
             grid.samples_u.len(),
             grid.samples_v.len()
-        ));
+        )));
     }
     let nodes: Vec<Vec<[f64; 2]>> = grid
         .samples_u
@@ -716,7 +717,7 @@ impl FoldCurve {
 }
 
 /// Follow the branch through `seed`, forward then backward.
-fn march(field: &Field, seed: [f64; 2], step: f64) -> Result<FoldCurve, String> {
+fn march(field: &Field, seed: [f64; 2], step: f64) -> Result<FoldCurve, KernelRefusal> {
     let (forward, closed) = follow(field, seed, step, 1.0)?;
     if closed {
         return Ok(FoldCurve {
@@ -743,7 +744,7 @@ fn follow(
     seed: [f64; 2],
     step: f64,
     direction: f64,
-) -> Result<(Vec<[f64; 2]>, bool), String> {
+) -> Result<(Vec<[f64; 2]>, bool), KernelRefusal> {
     let mut points = vec![seed];
     let mut previous_tangent: Option<[f64; 2]> = None;
     for _ in 0..MAX_MARCH_STEPS {
@@ -753,16 +754,16 @@ fn follow(
                 "fold locus: the fold factor is unreadable at {}",
                 field.report(current)
             )
-        })?;
+        }).or_refuse(KernelStage::Refine, "fold_factor_unreadable")?;
         let length = gradient[0].hypot(gradient[1]);
         if length <= GRADIENT_FLOOR {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(KernelStage::Refine, "fold_stationary", format!(
                 "fold locus: the fold factor is STATIONARY at {} (|∇(1 − δ·κ)| = {length:.3e} \
                  over the region's own parameter box) — the fold is not a curve there. A torus \
                  offset past its tube radius does this: the meridian branch 1 − δ/r is constant, \
                  so the region folds everywhere or nowhere and there is nothing to split",
                 field.report(current)
-            ));
+            )));
         }
         // Tangent to the level set, oriented to continue the march rather than
         // double back at an inflection.
@@ -821,14 +822,14 @@ fn follow(
             attempt *= 0.5;
         }
         let Some(next) = advanced else {
-            return Err(format!(
+            return Err(KernelRefusal::non_convergence(KernelStage::Refine, "fold_corrector", format!(
                 "fold locus: the corrector did not return to 1 − δ·κ = {:.3e} beyond {} after {} \
                  halvings of a {:.3e} step",
                 field.level,
                 field.report(current),
                 PREDICTOR_HALVINGS,
                 step
-            ));
+            )));
         };
         previous_tangent = Some(tangent);
         // Closure: back within one step of the seed, having gone far enough
@@ -838,12 +839,12 @@ fn follow(
         }
         points.push(next);
     }
-    Err(format!(
+    Err(KernelRefusal::non_convergence(KernelStage::Refine, "fold_march", format!(
         "fold locus: the march neither closed nor left the region's parameter box within {} \
          steps — lost at {}",
         MAX_MARCH_STEPS,
         field.report(*points.last().unwrap())
-    ))
+    )))
 }
 
 /// The point where the branch leaves the parameter box, placed exactly on the
@@ -853,7 +854,7 @@ fn follow(
 /// only within a step of the locus; the trim split needs a boundary point the
 /// locus actually passes through, because that point becomes a VERTEX of the
 /// carved loop.
-fn leave_box(field: &Field, from: [f64; 2], tangent: [f64; 2]) -> Result<[f64; 2], String> {
+fn leave_box(field: &Field, from: [f64; 2], tangent: [f64; 2]) -> Result<[f64; 2], KernelRefusal> {
     // Distance to each of the four walls along the tangent; the nearest is the
     // one the branch leaves through.
     //
@@ -882,10 +883,10 @@ fn leave_box(field: &Field, from: [f64; 2], tangent: [f64; 2]) -> Result<[f64; 2
         }
     }
     let Some((distance, axis, wall)) = best else {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Refine, "fold_march_exit", format!(
             "fold locus: the march left the parameter box at {} along no axis",
             field.report(from)
-        ));
+        )));
     };
     let free = 1 - axis;
     let mut exit = [0.0; 2];

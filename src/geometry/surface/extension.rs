@@ -202,6 +202,38 @@ impl std::fmt::Display for ExtendRefusal {
     }
 }
 
+impl NurbsCurve {
+    /// Continue this curve past its low (`low`) or high end by `delta_param`,
+    /// as the analytic continuation of its own terminal Bézier span: the curve
+    /// analogue of [`NurbsSurface::extend_natural`], through the same knot
+    /// and control-point construction, so a surface's isoline and the
+    /// continued isoline agree. Everything over the original domain survives.
+    /// A rational continuation whose appended weights are not positive is
+    /// refused; the caller samples the span where it needs more than that.
+    pub fn extend_natural(&self, low: bool, delta_param: f64) -> Result<NurbsCurve, ExtendRefusal> {
+        if !delta_param.is_finite() || delta_param <= KNOT_IDENTITY_TOL {
+            return Err(ExtendRefusal::DegenerateIncrement { delta: delta_param });
+        }
+        let knots = extend_knots(&self.knots, self.degree, low, delta_param)?;
+        let strip = extrapolate_line(&self.control_points, &self.knots, self.degree, low, delta_param)?;
+        if let Some(bad) = strip.iter().find(|point| !(point.w > 0.0)) {
+            return Err(ExtendRefusal::Failed(format!(
+                "NurbsCurve::extend_natural: an appended weight is {:.3e}",
+                bad.w
+            )));
+        }
+        let mut points = Vec::with_capacity(self.control_points.len() + self.degree);
+        if low {
+            points.extend_from_slice(&strip);
+            points.extend_from_slice(&self.control_points);
+        } else {
+            points.extend_from_slice(&self.control_points);
+            points.extend_from_slice(&strip);
+        }
+        NurbsCurve::new(self.degree, knots, points).map_err(ExtendRefusal::Failed)
+    }
+}
+
 impl NurbsSurface {
     /// Continue this surface past one boundary of its parameter square by
     /// `delta_param`, as the analytic continuation of its own terminal Bézier

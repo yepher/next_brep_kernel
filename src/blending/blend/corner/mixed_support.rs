@@ -61,24 +61,34 @@ pub(super) fn curved_wall_ball_candidates(
     axis_dir: Vec3,
     cyl_radius: f64,
     outward_away: bool,
-) -> Result<Vec<(Vec3, Vec3)>, String> {
+) -> Result<Vec<(Vec3, Vec3)>, KernelRefusal> {
     // Three offset carriers, all through the shared closed forms (audit §11):
     // the ball centre sits at the CONVEX offset `−r` — inside the material —
     // from both planar walls and from the cylindrical one. Offsetting the
     // cylinder first keeps this refusal ahead of the wall-pair solve, as it was.
     let rho = offset_cylinder_radius(cyl_radius, outward_away, -radius).map_err(|_| {
-        format!("corner ball radius {radius} swallows the cylindrical wall (radius {cyl_radius})")
+        KernelRefusal::input(
+            KernelStage::Classify,
+            "radius_swallows_wall",
+            format!("corner ball radius {radius} swallows the cylindrical wall (radius {cyl_radius})"),
+        )
     })?;
     // The two `−r`-offset planes meet in a LINE, anchored at the foot of the
     // perpendicular from the corner.
     let line = offset_plane_pair(corner, n1, -radius, n2, -radius).map_err(|why| match why {
-        OffsetPairDegeneracy::ParallelPlanes => {
-            "the two planar walls at the corner are parallel".to_string()
-        }
+        OffsetPairDegeneracy::ParallelPlanes => KernelRefusal::ill_posed(
+            KernelStage::Classify,
+            "parallel_walls",
+            "the two planar walls at the corner are parallel",
+        ),
         // The pre-slice line was `solve_small(..)?`, so this refusal text was
         // `solve_small`'s own. Kept verbatim rather than improved: it is
         // unreachable above the parallel gate, and this slice moves no message.
-        _ => "solve_small: singular matrix".to_string(),
+        _ => KernelRefusal::internal(
+            KernelStage::Classify,
+            "wall_pair_singular",
+            "solve_small: singular matrix",
+        ),
     })?;
     offset_pair_diag::plane_pair(
         "mixed_support::wall_pair_line",
@@ -104,11 +114,17 @@ pub(super) fn curved_wall_ball_candidates(
         roots.as_ref().ok(),
     );
     let roots = roots.map_err(|why| match why {
-        OffsetPairDegeneracy::LineParallelToAxis => {
-            "the wall-intersection line is parallel to the cylindrical wall's axis".to_string()
-        }
-        _ => format!(
-            "no ball of radius {radius} is tangent to both planar walls and the cylindrical wall"
+        OffsetPairDegeneracy::LineParallelToAxis => KernelRefusal::ill_posed(
+            KernelStage::Classify,
+            "line_along_axis",
+            "the wall-intersection line is parallel to the cylindrical wall's axis",
+        ),
+        _ => KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "no_curved_wall_ball",
+            format!(
+                "no ball of radius {radius} is tangent to both planar walls and the cylindrical wall"
+            ),
         ),
     })?;
     let mut candidates = Vec::with_capacity(2);
@@ -161,22 +177,34 @@ pub(super) fn locate_mixed_junction_arc(
     wid: u64,
     centre: Vec3,
     radius: f64,
-) -> Result<u64, String> {
-    let point_of = |id: u64| -> Result<Vec3, String> {
+) -> Result<u64, KernelRefusal> {
+    let point_of = |id: u64| -> Result<Vec3, KernelRefusal> {
         solid
             .vertices
             .iter()
             .find(|v| v.id == id)
             .map(|v| v.point)
-            .ok_or_else(|| format!("{ctx}: junction vertex {id} vanished"))
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Collect,
+                    "junction_vertex",
+                    format!("{ctx}: junction vertex {id} vanished"),
+                )
+            })
     };
     let vpt = point_of(vid)?;
     let wpt = point_of(wid)?;
     let mid_dir = vpt
         .sub(centre)
-        .normalized()?
-        .add(wpt.sub(centre).normalized()?)
-        .normalized()?;
+        .normalized()
+        .or_refuse(KernelStage::Classify, "normalized")?
+        .add(
+            wpt.sub(centre)
+                .normalized()
+                .or_refuse(KernelStage::Classify, "normalized")?,
+        )
+        .normalized()
+        .or_refuse(KernelStage::Classify, "normalized")?;
     let expected_mid = centre.add(mid_dir.scale(radius));
     solid
         .edges
@@ -191,9 +219,13 @@ pub(super) fn locate_mixed_junction_arc(
         })
         .map(|e| e.id)
         .ok_or_else(|| {
-            format!(
-                "{ctx}: no junction arc between vertices {vid} and \
+            KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "junction_arc",
+                format!(
+                    "{ctx}: no junction arc between vertices {vid} and \
                  {wid} (expected a radius-{radius} arc centred at {centre:?})"
+                ),
             )
         })
 }
@@ -206,7 +238,7 @@ pub(super) fn coedge_sense_on(
     ctx: &str,
     face_id: u64,
     edge_id: u64,
-) -> Result<bool, String> {
+) -> Result<bool, KernelRefusal> {
     solid
         .shells
         .iter()
@@ -215,7 +247,13 @@ pub(super) fn coedge_sense_on(
         .flat_map(|f| f.loops.iter().flat_map(|l| &l.coedges))
         .find(|co| co.edge_id == edge_id)
         .map(|co| co.forward)
-        .ok_or_else(|| format!("{ctx}: junction coedge vanished"))
+        .ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Collect,
+                "junction_coedge",
+                format!("{ctx}: junction coedge vanished"),
+            )
+        })
 }
 
 /// Rebuild one face's loop for the mixed-corner surgeries: replace its
@@ -243,12 +281,16 @@ pub(super) fn rebuild_mixed_corner_run(
     vpoint: &rustc_hash::FxHashMap<u64, Vec3>,
     edge_ends: &rustc_hash::FxHashMap<u64, (u64, u64)>,
     next_id: &mut dyn FnMut() -> u64,
-) -> Result<(Vec<CoedgeRecord>, EdgeRecord), String> {
+) -> Result<(Vec<CoedgeRecord>, EdgeRecord), KernelRefusal> {
     let coedges = &face.loops[0].coedges;
     let n = coedges.len();
-    let anchor = (0..n)
-        .find(|&i| !is_corner[i])
-        .ok_or_else(|| format!("{ctx}: face {} is all corner-end", face.id))?;
+    let anchor = (0..n).find(|&i| !is_corner[i]).ok_or_else(|| {
+        KernelRefusal::unsupported(
+            KernelStage::Fragment,
+            "all_corner_end",
+            format!("{ctx}: face {} is all corner-end", face.id),
+        )
+    })?;
     let order: Vec<usize> = (0..n).map(|k| (anchor + k) % n).collect();
     let mut prefix: Vec<CoedgeRecord> = Vec::new();
     let mut suffix: Vec<CoedgeRecord> = Vec::new();
@@ -265,26 +307,50 @@ pub(super) fn rebuild_mixed_corner_run(
         }
     }
     if run == 0 {
-        return Err(format!("{ctx}: face {} has no corner-end coedge", face.id));
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Fragment,
+            "no_corner_run",
+            format!("{ctx}: face {} has no corner-end coedge", face.id),
+        ));
     }
-    let before = prefix
-        .last()
-        .ok_or_else(|| format!("{ctx}: face {} corner run has no predecessor", face.id))?;
+    let before = prefix.last().ok_or_else(|| {
+        KernelRefusal::internal(
+            KernelStage::Fragment,
+            "run_predecessor",
+            format!("{ctx}: face {} corner run has no predecessor", face.id),
+        )
+    })?;
     let (bs, be) = *edge_ends.get(&before.edge_id).unwrap();
     let t_a = if before.forward { be } else { bs };
-    let uv_a = before.pcurve.evaluate(1.0)?;
+    let uv_a = before
+        .pcurve
+        .evaluate(1.0)
+        .or_refuse(KernelStage::Fragment, "evaluate")?;
     let after = suffix
         .first()
         .or_else(|| prefix.first())
-        .ok_or_else(|| format!("{ctx}: face {} corner run has no successor", face.id))?;
+        .ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Fragment,
+                "run_successor",
+                format!("{ctx}: face {} corner run has no successor", face.id),
+            )
+        })?;
     let (as_, ae) = *edge_ends.get(&after.edge_id).unwrap();
     let t_b = if after.forward { as_ } else { ae };
-    let uv_b = after.pcurve.evaluate(0.0)?;
+    let uv_b = after
+        .pcurve
+        .evaluate(0.0)
+        .or_refuse(KernelStage::Fragment, "evaluate")?;
     if !(expected_ends.contains(&t_a) && expected_ends.contains(&t_b)) || t_a == t_b {
-        return Err(format!(
-            "{ctx}: face {} corner run ends ({t_a},{t_b}) are not \
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Fragment,
+            "run_ends",
+            format!(
+                "{ctx}: face {} corner run ends ({t_a},{t_b}) are not \
              the expected boundary vertices {expected_ends:?}",
-            face.id
+                face.id
+            ),
         ));
     }
     // Fresh arc T_a→T_b about `arc_centre` (standard construction, so its
@@ -292,18 +358,30 @@ pub(super) fn rebuild_mixed_corner_run(
     // torus patch's revolution parameter — pcurves stay parameter lines).
     let ta_pt = *vpoint.get(&t_a).unwrap();
     let tb_pt = *vpoint.get(&t_b).unwrap();
-    let x_axis = ta_pt.sub(arc_centre).normalized()?;
+    let x_axis = ta_pt
+        .sub(arc_centre)
+        .normalized()
+        .or_refuse(KernelStage::Fragment, "normalized")?;
     let rb = tb_pt.sub(arc_centre);
-    let y_axis = rb.sub(x_axis.scale(rb.dot(x_axis))).normalized()?;
-    let sweep = x_axis.dot(rb.normalized()?).clamp(-1.0, 1.0).acos();
-    let curve = crate::make_arc(arc_centre, x_axis, y_axis, arc_radius, 0.0, sweep)?;
+    let y_axis = rb
+        .sub(x_axis.scale(rb.dot(x_axis)))
+        .normalized()
+        .or_refuse(KernelStage::Fragment, "normalized")?;
+    let sweep = x_axis
+        .dot(rb.normalized().or_refuse(KernelStage::Fragment, "normalized")?)
+        .clamp(-1.0, 1.0)
+        .acos();
+    let curve = crate::make_arc(arc_centre, x_axis, y_axis, arc_radius, 0.0, sweep)
+        .or_refuse(KernelStage::Fragment, "make_arc")?;
     let pcurve = if matches!(
         face.surface.analytic(),
         Some(crate::AnalyticSurface::Plane { .. })
     ) {
-        crate::pcurve::build_pcurve_on_surface(&face.surface, &curve)?
+        crate::pcurve::build_pcurve_on_surface(&face.surface, &curve)
+            .or_refuse(KernelStage::Fragment, "build_pcurve")?
     } else if face.surface.analytic().is_some() {
-        crate::sweep_topology::parameter_line(uv_a.x, uv_a.y, uv_b.x, uv_b.y)?
+        crate::sweep_topology::parameter_line(uv_a.x, uv_a.y, uv_b.x, uv_b.y)
+            .or_refuse(KernelStage::Fragment, "parameter_line")?
     } else {
         crate::pcurve::build_pcurve_on_surface_range(
             &face.surface,
@@ -312,7 +390,8 @@ pub(super) fn rebuild_mixed_corner_run(
             1.0,
             true,
             1e-9 * (1.0 + arc_radius),
-        )?
+        )
+        .or_refuse(KernelStage::Fragment, "build_pcurve")?
     };
     let edge = EdgeRecord {
         id: next_id(),
@@ -363,10 +442,16 @@ pub(super) fn build_mixed_sector_patch(
     radius: f64,
     name: Option<&str>,
     next_id: &mut dyn FnMut() -> u64,
-) -> Result<FaceRecord, String> {
+) -> Result<FaceRecord, KernelRefusal> {
     let q_v = axis_point.add(axis_dir.scale(v_a.1.sub(axis_point).dot(axis_dir)));
-    let da = a_axis_closest.sub(q_v).normalized()?;
-    let db = b_axis_closest.sub(q_v).normalized()?;
+    let da = a_axis_closest
+        .sub(q_v)
+        .normalized()
+        .or_refuse(KernelStage::Fragment, "normalized")?;
+    let db = b_axis_closest
+        .sub(q_v)
+        .normalized()
+        .or_refuse(KernelStage::Fragment, "normalized")?;
     // A regular mixed trihedral has two distinct inner-equator vertices.
     // The two-stripe re-entrant rim closure is the horn-torus limit: both
     // inner vertices collapse to the same pole on the revolution axis.  In
@@ -375,14 +460,19 @@ pub(super) fn build_mixed_sector_patch(
     let rb = v_b.1.sub(q_v).normalized().unwrap_or(db);
     let sweep = ra.dot(rb).clamp(-1.0, 1.0).acos();
     if sweep < 1e-9 {
-        return Err(format!("{ctx}: degenerate sector sweep"));
+        return Err(KernelRefusal::internal(
+            KernelStage::Fragment,
+            "sector_sweep",
+            format!("{ctx}: degenerate sector sweep"),
+        ));
     }
     let revolve_axis = if ra.cross(rb).dot(axis_dir) > 0.0 {
         axis_dir
     } else {
         axis_dir.scale(-1.0)
     };
-    let surface = crate::make_revolution(axis_point, revolve_axis, &arc_a.curve, sweep)?;
+    let surface = crate::make_revolution(axis_point, revolve_axis, &arc_a.curve, sweep)
+        .or_refuse(KernelStage::Fragment, "make_revolution")?;
 
     // v-parameters of the V (inner) and W (cap) boundary levels on the
     // generatrix, and the arc_a traversal direction.
@@ -394,8 +484,10 @@ pub(super) fn build_mixed_sector_patch(
 
     // Patch boundary traversal is forced by the neighbours: opposite sense on
     // each shared edge.  Chain the four sides into a closed loop.
-    let pl =
-        |u0: f64, v0: f64, u1: f64, v1: f64| crate::sweep_topology::parameter_line(u0, v0, u1, v1);
+    let pl = |u0: f64, v0: f64, u1: f64, v1: f64| {
+        crate::sweep_topology::parameter_line(u0, v0, u1, v1)
+            .or_refuse(KernelStage::Fragment, "parameter_line")
+    };
     let patch_a_forward = !cyl_a_forward;
     let patch_b_forward = !cyl_b_forward;
     // arc_a runs along u=0; its pcurve follows the traversal direction.
@@ -424,7 +516,8 @@ pub(super) fn build_mixed_sector_patch(
         arc_b.t0.max(arc_b.t1),
         patch_b_forward,
         fit_tol,
-    )?;
+    )
+    .or_refuse(KernelStage::Fragment, "build_pcurve")?;
     let b_start = if patch_b_forward {
         arc_b.start_vertex_id
     } else {
@@ -516,13 +609,23 @@ pub(super) fn build_mixed_sector_patch(
     for _ in 0..3 {
         let next_side = (0..4)
             .find(|&s| !used[s] && sides[s].start == cursor)
-            .ok_or_else(|| format!("{ctx}: torus patch boundary does not chain"))?;
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Fragment,
+                    "sector_chain",
+                    format!("{ctx}: torus patch boundary does not chain"),
+                )
+            })?;
         used[next_side] = true;
         cursor = sides[next_side].end;
         order.push(next_side);
     }
     if cursor != sides[0].start {
-        return Err(format!("{ctx}: torus patch boundary is not closed"));
+        return Err(KernelRefusal::internal(
+            KernelStage::Fragment,
+            "sector_loop",
+            format!("{ctx}: torus patch boundary is not closed"),
+        ));
     }
     let coedges: Vec<CoedgeRecord> = order
         .iter()
@@ -537,11 +640,23 @@ pub(super) fn build_mixed_sector_patch(
     // same_sense: outward = away from the rolling ball's centre at the
     // sector midpoint.
     let v_mid = 0.5 * (arc_a.t0 + arc_a.t1);
-    let mid_point = surface.evaluate(0.5, v_mid)?;
+    let mid_point = surface
+        .evaluate(0.5, v_mid)
+        .or_refuse(KernelStage::Fragment, "evaluate")?;
     let major_radius = a_axis_closest.sub(q_v).length();
-    let mid_centre = q_v.add(da.add(db).normalized()?.scale(major_radius));
-    let outward = mid_point.sub(mid_centre).normalized()?;
-    let surface_normal = surface.normal(0.5, v_mid)?;
+    let mid_centre = q_v.add(
+        da.add(db)
+            .normalized()
+            .or_refuse(KernelStage::Fragment, "normalized")?
+            .scale(major_radius),
+    );
+    let outward = mid_point
+        .sub(mid_centre)
+        .normalized()
+        .or_refuse(KernelStage::Fragment, "normalized")?;
+    let surface_normal = surface
+        .normal(0.5, v_mid)
+        .or_refuse(KernelStage::Fragment, "normal")?;
     let same_sense = surface_normal.dot(outward) > 0.0;
     let loop_id = next_id();
     Ok(FaceRecord {

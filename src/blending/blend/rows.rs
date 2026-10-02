@@ -1,4 +1,4 @@
-use crate::{NurbsCurve, NurbsSurface};
+use crate::{KernelRefusal, KernelStage, NurbsCurve, NurbsSurface, OrRefuse};
 
 pub(super) fn cross_section_basis(chamfer: bool) -> (usize, Vec<f64>) {
     if chamfer {
@@ -17,7 +17,7 @@ pub(super) fn surface_from_rows(
     second: &NurbsCurve,
     middle: Option<&NurbsCurve>,
     closed: bool,
-) -> Result<NurbsSurface, String> {
+) -> Result<NurbsSurface, KernelRefusal> {
     let rows = first.control_points.len();
     let mut control = Vec::with_capacity(rows);
     for index in 0..rows {
@@ -36,5 +36,6 @@ pub(super) fn surface_from_rows(
     }
     let (degree_v, knots_v) = cross_section_basis(middle.is_none());
     NurbsSurface::new(degree, degree_v, first.knots.clone(), knots_v, control)
+        .or_refuse(KernelStage::Refine, "surface_new")
 }
 

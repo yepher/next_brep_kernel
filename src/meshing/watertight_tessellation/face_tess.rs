@@ -241,6 +241,7 @@ pub(super) fn tessellate_face_watertight(
     // PROTOTYPE (BREP_CDT): the outer + hole loops of a generic (non-seam-special)
     // face, captured before bridging so a constrained-Delaunay path can consume
     // them directly. `None` for the periodic-handler branches (phase 2).
+    let mut defer_cdt = false;
     let mut cdt_input: Option<(Vec<FaceVertex>, Vec<Vec<FaceVertex>>)> = None;
     // A singly-periodic full-wrap wall pierced by a hole that STRADDLES the seam
     // (ABC 00000333 interlocking rings): rebuild it as a seam-cut rectangle whose
@@ -590,13 +591,13 @@ pub(super) fn tessellate_face_watertight(
         // fold/fill class, e.g. the embossed-pocket faces). A single SIMPLE outer
         // loop with no holes — a clean planar patch, or a full-wrap periodic
         // surface whose only boundary is the seam rectangle (untrimmed torus /
-        // sphere) — ear-clips faithfully and symmetrically; routing it through the
-        // Delaunay only perturbs its vertex distribution (biasing a downstream
-        // least-squares carrier fit) for no correctness gain. The CDT wants CCW
-        // outer / CW holes, exactly the orientation established just above.
-        if !holes.is_empty() || !polygon_is_simple(&outer) {
-            cdt_input = Some((outer.clone(), holes.clone()));
-        }
+        // sphere) — normally ear-clips faithfully and symmetrically. Preserve
+        // that distribution unless the ear clip produces an inverted triangle;
+        // a nearly collinear rim can stall it and leave curved slivers that fold
+        // during refinement. Keep the original loops for a validated CDT retry.
+        // The CDT wants CCW outer / CW holes, as established just above.
+        defer_cdt = holes.is_empty() && polygon_is_simple(&outer);
+        cdt_input = Some((outer.clone(), holes.clone()));
         bridge_holes(outer, holes)
     };
     if vertices.len() < 3 {
@@ -628,7 +629,7 @@ pub(super) fn tessellate_face_watertight(
     // constraint-preserving CDT is strictly safer than bridge_holes' spanning
     // bridges (which cause the domain-spraying double-cover on periodic faces).
     // BREP_NO_CDT is an escape hatch that restores the pure ear-clip path.
-    let cdt = if std::env::var("BREP_NO_CDT").is_ok() {
+    let cdt = if defer_cdt || std::env::var("BREP_NO_CDT").is_ok() {
         None
     } else {
         cdt_input.as_ref().and_then(|(o, h)| surface_cdt(o, h, scale))
@@ -699,7 +700,25 @@ pub(super) fn tessellate_face_watertight(
                 triangles.len()
             );
         }
-        (vertices, triangles, boundary_pairs, false)
+        // A stalled ear clip may emit inverted slivers along a nearly
+        // collinear rim. Refining those folds a curved surface back over
+        // itself. Retry with the constraint-preserving triangulator before
+        // seeding or splitting any interior edge.
+        let recovered = if defer_cdt
+            && std::env::var("BREP_NO_CDT").is_err()
+            && triangles.iter().any(|&[a, b, c]| {
+                triangle_area(vertices[a].uv, vertices[b].uv, vertices[c].uv) < 0.0
+            })
+        {
+            cdt_input.as_ref().and_then(|(o, h)| surface_cdt(o, h, scale))
+        } else {
+            None
+        };
+        if let Some(m) = recovered {
+            (m.vertices, m.triangles, m.boundary_pairs, true)
+        } else {
+            (vertices, triangles, boundary_pairs, false)
+        }
     };
     // A SHORT seam straddle is boundary-only (its interior stations would
     // evaluate out of domain). A TALL helical ribbon is refined with the

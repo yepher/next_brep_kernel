@@ -61,6 +61,10 @@ pub struct ShellRecord {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BrepSolid {
+    /// Content-checked measurements; cloned with this solid, never serialized.
+    /// Initialize with `Default::default()` when constructing a solid.
+    #[serde(skip)]
+    pub mass_properties_cache: crate::MassPropertiesCache,
     pub id: u64,
     pub vertices: Vec<VertexRecord>,
     pub edges: Vec<EdgeRecord>,
@@ -145,6 +149,6 @@ pub use seam::{
     analyze_doubly_periodic_seam_band, loop_seam_offsets, seam_band_uv_polygon, seam_band_uv_polygon_with,
 };
 pub(crate) use seam::doubly_periodic_has_only_collapsed_loops;
-pub(crate) use validate::adaptive_coedge_error;
+pub(crate) use validate::{adaptive_coedge_error, coedge_error_floored};
 pub use primitives::{make_box_brep, make_cylinder_brep, make_pyramid_brep};
 

@@ -454,34 +454,60 @@ pub(super) fn fit_cone(
     }
 
     let mut angle_sum = 0.0;
+    let mut angle_count = 0usize;
     for &vid in vert_ids {
         let d = data.verts[vid].sub(apex);
         let h = d.dot(axis);
         if h < -tol_abs {
             return None; // Points behind the apex: not one cone nappe.
         }
+        // A pointed cone's apex vertex has no direction to measure.
+        if d.length() <= tol_abs {
+            continue;
+        }
         let radial = d.sub(axis.scale(h)).length();
         angle_sum += radial.atan2(h.max(0.0));
+        angle_count += 1;
     }
-    let half_angle = angle_sum / vert_ids.len() as f64;
+    if angle_count == 0 {
+        return None;
+    }
+    let half_angle = angle_sum / angle_count as f64;
     if !(half_angle > 1e-4) || half_angle > std::f64::consts::FRAC_PI_2 - 1e-4 {
         return None;
     }
-    let (apex, axis, half_angle) = refine_cone(data, vert_ids, apex, axis, half_angle);
-    if !(half_angle > 1e-4) || half_angle > std::f64::consts::FRAC_PI_2 - 1e-4 {
-        return None;
-    }
+    let deviations = |apex: Vec3, axis: Vec3, half_angle: f64| -> Vec<f64> {
+        let (sin_a, cos_a) = half_angle.sin_cos();
+        vert_ids
+            .iter()
+            .map(|&vid| {
+                let d = data.verts[vid].sub(apex);
+                let h = d.dot(axis);
+                let radial = d.sub(axis.scale(h)).length();
+                radial * cos_a - h * sin_a
+            })
+            .collect()
+    };
+    let seed = (apex, axis, half_angle);
+    let refined = refine_cone(data, vert_ids, apex, axis, half_angle);
+    // The polish is rank deficient when the vertices span a single ring
+    // (a pointed cone: one ring plus its apex), and an ill-conditioned step
+    // can throw a tangent-plane seed that already fits away.  Keep whichever
+    // fits the vertices better.
+    let seed_devs = deviations(seed.0, seed.1, seed.2);
+    let refined_devs = deviations(refined.0, refined.1, refined.2);
+    let seed_stats = deviation_stats(&seed_devs);
+    let refined_stats = deviation_stats(&refined_devs);
+    let refined_is_better = refined.2 > 1e-4
+        && refined.2 <= std::f64::consts::FRAC_PI_2 - 1e-4
+        && refined_stats.0.is_finite()
+        && refined_stats.0 <= seed_stats.0;
+    let ((apex, axis, half_angle), (max_dev, rms_dev)) = if refined_is_better {
+        (refined, refined_stats)
+    } else {
+        (seed, seed_stats)
+    };
     let (sin_a, cos_a) = half_angle.sin_cos();
-    let devs: Vec<f64> = vert_ids
-        .iter()
-        .map(|&vid| {
-            let d = data.verts[vid].sub(apex);
-            let h = d.dot(axis);
-            let radial = d.sub(axis.scale(h)).length();
-            radial * cos_a - h * sin_a
-        })
-        .collect();
-    let (max_dev, rms_dev) = deviation_stats(&devs);
     let cone_normal = |tri: &TriData| -> Option<Vec3> {
         let d = tri.centroid.sub(apex);
         let radial = d.sub(axis.scale(d.dot(axis)));
@@ -712,4 +738,201 @@ pub(super) fn fit_torus(data: &MeshData, tri_ids: &[u32], vert_ids: &[usize]) ->
         }
     }
     best
+}
+
+/// A plain seed fit further off than this fraction of its own tube radius, or
+/// than the cascade tolerance `gate`, is not a torus the vertex refinement
+/// would rescue; such a seed costs no more than it did before.
+const TUBE_SEED_FRACTION: f64 = 0.05;
+/// Most steps a vertex refinement takes; a converging fit stops long before.
+pub(super) const TORUS_REFINE_ITERATIONS: usize = 60;
+
+/// [`fit_torus`], then refined on the VERTICES. The normal-line axis is
+/// estimated from FACET normals at centroids, which a chordal tessellation
+/// tilts: good enough for the cascade's acceptance tolerance (which keeps
+/// the plain fit, so what the cascade accepts is unchanged), three orders
+/// short of the precision bar the tangent-compound peel judges a seed by (a
+/// quarter-tube fillet patch read 1.5e-2 against a 4e-4 bar). The vertices
+/// sit on the surface; the refinement is kept only when it is better.
+pub(super) fn fit_torus_refined(
+    data: &MeshData,
+    tri_ids: &[u32],
+    vert_ids: &[usize],
+    gate: f64,
+) -> Option<CandidateFit> {
+    let plain = fit_torus(data, tri_ids, vert_ids)?;
+    let tube = match plain.carrier {
+        RegionCarrier::Torus { minor_radius, .. } => minor_radius,
+        _ => return Some(plain),
+    };
+    if !(plain.max_dev <= gate) || !(plain.max_dev <= TUBE_SEED_FRACTION * tube) {
+        return Some(plain);
+    }
+    match refine_torus_carrier(data, tri_ids, vert_ids, &plain.carrier, TORUS_REFINE_ITERATIONS) {
+        Some(refined) if refined.max_dev < plain.max_dev => Some(refined),
+        _ => Some(plain),
+    }
+}
+
+/// The torus through `tri_ids`' vertices, refined from `prior` (a
+/// neighbouring group's carrier, or a plain fit): a warm start converges in a
+/// few steps where a cold fit per growth wave would not.
+pub(super) fn refine_torus_carrier(
+    data: &MeshData,
+    tri_ids: &[u32],
+    vert_ids: &[usize],
+    prior: &RegionCarrier,
+    iterations: usize,
+) -> Option<CandidateFit> {
+    let RegionCarrier::Torus { center, axis_dir, major_radius, minor_radius, .. } = *prior else {
+        return None;
+    };
+    let points = vert_ids.iter().map(|&vid| data.verts[vid]).collect::<Vec<_>>();
+    let (axis, point) = refine_torus_on_vertices(
+        &points,
+        center,
+        axis_dir,
+        major_radius,
+        minor_radius,
+        iterations,
+    )?;
+    torus_candidate(data, tri_ids, vert_ids, axis, point)
+}
+
+/// Levenberg–Marquardt on the seven torus parameters (centre, axis
+/// direction, major and minor radius), minimizing the vertices' distances
+/// to the tube, from a starting torus. Each step is linearized about the
+/// current torus with the analytic Jacobian (one pass over the vertices, not
+/// fourteen for central differences): with `d = p − c`, `z = d·a`, `ρ` the
+/// distance from the axis, `q` the distance from the tube's spine and `n` the
+/// unit vector from the spine to `p`, the residual `q − r` moves by `−n·e`
+/// for a centre shift along `e`, by `z (d·e) R / (ρ q)` for an axis tilt
+/// toward `e`, by `−(ρ − R)/q` for the major radius and by `−1` for the
+/// minor. Returns the refined axis and centre; the radii are re-fitted
+/// exactly by the caller's meridian circle fit.
+fn refine_torus_on_vertices(
+    points: &[Vec3],
+    center: Vec3,
+    axis: Vec3,
+    major_radius: f64,
+    minor_radius: f64,
+    iterations: usize,
+) -> Option<(Vec3, Vec3)> {
+    if points.len() < 7 {
+        return None;
+    }
+    #[derive(Clone, Copy)]
+    struct Torus {
+        center: Vec3,
+        axis: Vec3,
+        major: f64,
+        minor: f64,
+    }
+    let cost_of = |torus: &Torus| -> f64 {
+        points
+            .iter()
+            .map(|&p| {
+                let d = p.sub(torus.center);
+                let z = d.dot(torus.axis);
+                let rho = d.sub(torus.axis.scale(z)).length();
+                let residual = ((rho - torus.major).powi(2) + z * z).sqrt() - torus.minor;
+                residual * residual
+            })
+            .sum()
+    };
+    let mut torus = Torus {
+        center,
+        axis: axis.normalized().ok()?,
+        major: major_radius,
+        minor: minor_radius,
+    };
+    let scale = major_radius.abs().max(minor_radius.abs()).max(1e-12);
+    let mut current = cost_of(&torus);
+    let mut lambda = 1e-3;
+    // A seed that is not a torus stalls rather than converging; stop it
+    // after a few steps that each gain less than a percent.
+    let mut stalled = 0;
+    for _ in 0..iterations {
+        let e1 = torus.axis.perpendicular().ok()?;
+        let e2 = torus.axis.cross(e1);
+        let mut jtj = [[0.0_f64; 7]; 7];
+        let mut jtr = [0.0_f64; 7];
+        for &p in points {
+            let d = p.sub(torus.center);
+            let z = d.dot(torus.axis);
+            let radial = d.sub(torus.axis.scale(z));
+            let rho = radial.length();
+            let q = ((rho - torus.major).powi(2) + z * z).sqrt();
+            if !(rho > 1e-12 * scale) || !(q > 1e-12 * scale) {
+                continue;
+            }
+            let w = radial.scale(1.0 / rho);
+            let n = w.scale((rho - torus.major) / q).add(torus.axis.scale(z / q));
+            let tilt = z * torus.major / (rho * q);
+            let row = [
+                -n.dot(e1),
+                -n.dot(e2),
+                -n.dot(torus.axis),
+                tilt * d.dot(e1),
+                tilt * d.dot(e2),
+                -(rho - torus.major) / q,
+                -1.0,
+            ];
+            let residual = q - torus.minor;
+            for i in 0..7 {
+                jtr[i] -= row[i] * residual;
+                for j in 0..7 {
+                    jtj[i][j] += row[i] * row[j];
+                }
+            }
+        }
+        let mut improved = false;
+        for _ in 0..8 {
+            let mut damped = jtj;
+            for (i, row) in damped.iter_mut().enumerate() {
+                row[i] += lambda * jtj[i][i].max(1e-30);
+            }
+            let Ok(delta) = crate::fit::solve_small::<7>(damped, jtr, 7) else {
+                lambda *= 10.0;
+                continue;
+            };
+            let Ok(axis) = torus
+                .axis
+                .add(e1.scale(delta[3]))
+                .add(e2.scale(delta[4]))
+                .normalized()
+            else {
+                lambda *= 10.0;
+                continue;
+            };
+            let trial = Torus {
+                center: torus
+                    .center
+                    .add(e1.scale(delta[0]))
+                    .add(e2.scale(delta[1]))
+                    .add(torus.axis.scale(delta[2])),
+                axis,
+                major: torus.major + delta[5],
+                minor: torus.minor + delta[6],
+            };
+            let trial_cost = cost_of(&trial);
+            if trial_cost < current {
+                let step = delta.iter().map(|value| value.abs()).fold(0.0, f64::max);
+                stalled = if trial_cost > 0.99 * current { stalled + 1 } else { 0 };
+                torus = trial;
+                current = trial_cost;
+                lambda = (lambda * 0.3).max(1e-12);
+                improved = true;
+                if step < 1e-13 * scale {
+                    return Some((torus.axis, torus.center));
+                }
+                break;
+            }
+            lambda *= 10.0;
+        }
+        if !improved || stalled >= 3 {
+            break;
+        }
+    }
+    Some((torus.axis, torus.center))
 }

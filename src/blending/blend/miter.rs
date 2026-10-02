@@ -26,6 +26,7 @@
 //! mate face, from the exit point down to the sharp edge — which is a
 //! transversal level set (distance to that face) and marches the same way.
 
+use crate::{KernelRefusal, KernelStage, OrRefuse, RefusalClass};
 use crate::topology::{EdgeRecord, FaceRecord};
 use crate::Vec3;
 
@@ -99,15 +100,15 @@ impl MiterStripe<'_> {
         }
     }
 
-    fn point(&self, u: f64, fraction: f64) -> Result<Vec3, String> {
-        self.rows.surface.evaluate_extended(u, self.z(fraction))
+    fn point(&self, u: f64, fraction: f64) -> Result<Vec3, KernelRefusal> {
+        self.rows.surface.evaluate_extended(u, self.z(fraction)).or_refuse(KernelStage::Refine, "evaluate_extended")
     }
 
-    fn center(&self) -> Result<&crate::NurbsCurve, String> {
+    fn center(&self) -> Result<&crate::NurbsCurve, KernelRefusal> {
         self.rows
             .center
             .as_ref()
-            .ok_or_else(|| "miter: stripe rows carry no centre path".to_string())
+            .ok_or_else(|| "miter: stripe rows carry no centre path".to_string()).or_refuse(KernelStage::Refine, "ok_or_else")
     }
 }
 
@@ -166,8 +167,8 @@ pub(super) enum MiterClosure {
 /// every sample its march had put on both carriers read 0.303 off them by
 /// projection distance, and 1.1e-12 at its samples (9.8e-7 between them) by
 /// this.
-fn off_surface(surface: &crate::NurbsSurface, point: Vec3) -> Result<f64, String> {
-    let foot = crate::project_point_to_surface(surface, point)?;
+fn off_surface(surface: &crate::NurbsSurface, point: Vec3) -> Result<f64, KernelRefusal> {
+    let foot = crate::project_point_to_surface(surface, point).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
     let normal = raw_normal(surface, foot.u, foot.v)?;
     Ok(point.sub(foot.point).dot(normal).abs())
 }
@@ -190,10 +191,10 @@ fn off_surface(surface: &crate::NurbsSurface, point: Vec3) -> Result<f64, String
 /// distance to the whole plane wherever `q` landed on it.  Off a planar
 /// support the clamp bounds the level's reach, which the marched rows'
 /// overshoot already covers.
-fn bevel_level(stripe: &MiterStripe<'_>, point: Vec3, scale: f64) -> Result<f64, String> {
-    let projection = crate::project_point_to_surface(&stripe.rows.surface, point)?;
+fn bevel_level(stripe: &MiterStripe<'_>, point: Vec3, scale: f64) -> Result<f64, KernelRefusal> {
+    let projection = crate::project_point_to_surface(&stripe.rows.surface, point).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
     let normal = raw_normal(&stripe.rows.surface, projection.u, projection.v)?;
-    let center = stripe.center()?.evaluate(projection.u)?;
+    let center = stripe.center()?.evaluate(projection.u).or_refuse(KernelStage::Refine, "evaluate")?;
     // The ball stands off its own chord by `r·cos(half the dihedral)`, which
     // only collapses on a knife edge.  Take the sign from that stand-off
     // rather than from the blend's own normal orientation, and refuse where
@@ -201,9 +202,8 @@ fn bevel_level(stripe: &MiterStripe<'_>, point: Vec3, scale: f64) -> Result<f64,
     let seated = center.sub(projection.point).dot(normal);
     if seated.abs() <= 1e-9 * (1.0 + scale) {
         return Err(
-            "miter: the chamfer's rolling ball sits on its own chord — the supports meet too \
-             sharply to sign the seam's level"
-                .into(),
+            KernelRefusal::unsupported(KernelStage::Refine, "miter_chord_seat", "miter: the chamfer's rolling ball sits on its own chord — the supports meet too \
+             sharply to sign the seam's level"),
         );
     }
     Ok(point.sub(projection.point).dot(normal) * -seated.signum())
@@ -214,9 +214,9 @@ fn bisect(
     mut low: f64,
     mut high: f64,
     mut f_low: f64,
-    f: &mut dyn FnMut(f64) -> Result<f64, String>,
+    f: &mut dyn FnMut(f64) -> Result<f64, KernelRefusal>,
     bar: f64,
-) -> Result<f64, String> {
+) -> Result<f64, KernelRefusal> {
     for _ in 0..80 {
         let mid = (low + high) * 0.5;
         if (high - low).abs() <= bar {
@@ -269,17 +269,17 @@ fn seam_spacing(step: usize, samples: usize) -> f64 {
 /// stands on its carriers.  Only [`MARCHED_FIT_OFF_CARRIERS`] climbs; any other
 /// failure, and the top rung's refusal, is returned as it came.
 fn fit_on_ladder(
-    march: &dyn Fn(usize) -> Result<MarchedCurve, String>,
+    march: &dyn Fn(usize) -> Result<MarchedCurve, KernelRefusal>,
     what: &str,
-    off_carriers: &dyn Fn(Vec3) -> Result<f64, String>,
+    off_carriers: &dyn Fn(Vec3) -> Result<f64, KernelRefusal>,
     tolerance: f64,
-) -> Result<(MarchedCurve, MarchedFit), String> {
+) -> Result<(MarchedCurve, MarchedFit), KernelRefusal> {
     let mut rung = 0;
     loop {
         let curve = march(rung)?;
         match fit_marched(&curve, what, off_carriers, tolerance) {
             Ok(fit) => return Ok((curve, fit)),
-            Err(error) if error.starts_with(MARCHED_FIT_OFF_CARRIERS) && rung + 1 < MARCH_RUNGS => {
+            Err(error) if is_marched_fit_off_carriers(&error) && rung + 1 < MARCH_RUNGS => {
                 rung += 1;
             }
             Err(error) => return Err(error),
@@ -301,7 +301,7 @@ pub(super) fn solve_miter(
     sharp: &EdgeRecord,
     scale: f64,
     fit_tolerance: f64,
-) -> Result<MiterClosure, String> {
+) -> Result<MiterClosure, KernelRefusal> {
     let [first, second] = stripes;
     // The bar the EXIT is bisected to, and the exit is an endpoint of the
     // fitted seam, so its error does not stay local — it tilts the whole curve
@@ -318,13 +318,13 @@ pub(super) fn solve_miter(
     // lies on stripe 1.  A CHAMFER's wall is the chord ruling INSIDE that
     // canal, not the canal, so the level asks the same question of the right
     // surface (§6.11) — see `bevel_level`.
-    let sibling_level = |point: Vec3| -> Result<f64, String> {
+    let sibling_level = |point: Vec3| -> Result<f64, KernelRefusal> {
         if chamfer {
             return bevel_level(second, point, scale);
         }
-        Ok(crate::project_point_to_curve(center_second, point)?.distance - radius)
+        Ok(crate::project_point_to_curve(center_second, point).or_refuse(KernelStage::Refine, "project_point_to_curve")?.distance - radius)
     };
-    let level = |u: f64, fraction: f64| -> Result<f64, String> {
+    let level = |u: f64, fraction: f64| -> Result<f64, KernelRefusal> {
         sibling_level(first.point(u, fraction)?)
     };
     // Where a point lands on the second stripe, as (u, fraction from the
@@ -332,8 +332,8 @@ pub(super) fn solve_miter(
     // point is ON stripe 1's canal by construction, so a non-zero distance is
     // the strip's own boundary: the point has run PAST a rail and the
     // projection clamped it back onto one.
-    let on_second = |point: Vec3| -> Result<([f64; 2], f64, f64), String> {
-        let projection = crate::project_point_to_surface(&second.rows.surface, point)?;
+    let on_second = |point: Vec3| -> Result<([f64; 2], f64, f64), KernelRefusal> {
+        let projection = crate::project_point_to_surface(&second.rows.surface, point).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
         Ok((
             [projection.u, projection.v],
             second.fraction_of_z(projection.v),
@@ -344,16 +344,16 @@ pub(super) fn solve_miter(
     // of that surface from the ball's own station outward: each continues from
     // the previous sample's foot. `on_second` stays the nearest-point question,
     // because the exit measure below is a level, not a sample.
-    let sample_second = |point: Vec3, seed: [f64; 2]| -> Result<[f64; 2], String> {
+    let sample_second = |point: Vec3, seed: [f64; 2]| -> Result<[f64; 2], KernelRefusal> {
         let projection =
-            crate::projection::project_point_to_surface_from_seed(&second.rows.surface, point, seed)?;
+            crate::projection::project_point_to_surface_from_seed(&second.rows.surface, point, seed).or_refuse(KernelStage::Refine, "project_point_to_surface_from_seed")?;
         Ok([projection.u, projection.v])
     };
     // Signed measure of stripe 1's far rail: negative while the seam is still
     // on the strip, zero on the rail, positive once it has run off.  The
     // fraction alone cannot say — it CLAMPS at 1 — so past the rail the
     // measure is the distance the projection clamped by.
-    let past_second = |point: Vec3| -> Result<f64, String> {
+    let past_second = |point: Vec3| -> Result<f64, KernelRefusal> {
         let (_, fraction, distance) = on_second(point)?;
         Ok(if fraction < 1.0 { fraction - 1.0 } else { distance })
     };
@@ -362,7 +362,7 @@ pub(super) fn solve_miter(
     let u_end = first.u_limit();
     let span = u_end - u_start;
     if !(span.abs() > 1e-9) {
-        return Err("miter: the ball station sits at the vertex end of the rows".into());
+        return Err(KernelRefusal::internal(KernelStage::Refine, "miter_vertex_station", "miter: the ball station sits at the vertex end of the rows"));
     }
     let du = span / SEAM_STEPS as f64;
 
@@ -373,14 +373,14 @@ pub(super) fn solve_miter(
     // One station of the seam: the fraction where the level crosses zero, or
     // `None` when the level is non-negative on the whole other-rail end (the
     // seam has already left this strip).
-    let station = |u: f64| -> Result<Option<(f64, Vec3)>, String> {
+    let station = |u: f64| -> Result<Option<(f64, Vec3)>, KernelRefusal> {
         let at_far = level(u, 1.0)?;
         if at_far >= 0.0 {
             return Ok(None);
         }
         let at_near = level(u, 0.0)?;
         if at_near <= 0.0 {
-            return Err("miter: the shared rail re-enters the sibling blend".into());
+            return Err(KernelRefusal::unsupported(KernelStage::Refine, "miter_rail_reentry", "miter: the shared rail re-enters the sibling blend"));
         }
         let fraction = bisect(0.0, 1.0, at_near, &mut |f| level(u, f), 1e-13)?;
         Ok(Some((fraction, first.point(u, fraction)?)))
@@ -388,7 +388,7 @@ pub(super) fn solve_miter(
     // The seam's own point at `u`, or — once stripe 0 has been left — the far
     // rail point the seam ran out through, so both exit measures stay defined
     // (and continuous) across each other's crossing.
-    let seam_point = |u: f64| -> Result<Vec3, String> {
+    let seam_point = |u: f64| -> Result<Vec3, KernelRefusal> {
         Ok(match station(u)? {
             Some((_, point)) => point,
             None => first.point(u, 1.0)?,
@@ -422,13 +422,13 @@ pub(super) fn solve_miter(
         let mut candidates: Vec<(usize, f64)> = Vec::new();
         if left_first {
             let mut predicate =
-                |candidate: f64| -> Result<f64, String> { level(candidate, 1.0) };
+                |candidate: f64| -> Result<f64, KernelRefusal> { level(candidate, 1.0) };
             let f_low = predicate(previous_u)?;
             candidates.push((0, bisect(previous_u, u, f_low, &mut predicate, bar)?));
         }
         if left_second {
             let mut predicate =
-                |candidate: f64| -> Result<f64, String> { past_second(seam_point(candidate)?) };
+                |candidate: f64| -> Result<f64, KernelRefusal> { past_second(seam_point(candidate)?) };
             let f_low = predicate(previous_u)?;
             candidates.push((1, bisect(previous_u, u, f_low, &mut predicate, bar)?));
         }
@@ -439,9 +439,8 @@ pub(super) fn solve_miter(
     }
     let Some((leaves_first, u_exit)) = exit else {
         return Err(
-            "miter: the seam does not leave either blend within the marched rows — the \
-             radius is too large for this corner"
-                .into(),
+            KernelRefusal::unsupported(KernelStage::Refine, "miter_radius_too_large", "miter: the seam does not leave either blend within the marched rows — the \
+             radius is too large for this corner"),
         );
     };
     // The exit point, and whether the other stripe leaves there too.  Its foot
@@ -454,7 +453,7 @@ pub(super) fn solve_miter(
         (point, [u_exit, first.z(1.0)], uv2, uv2[0])
     } else {
         let (fraction, point) = station(u_exit)?
-            .ok_or("miter: the exit station lost the seam")?;
+            .ok_or(KernelRefusal::internal(KernelStage::Refine, "miter_exit_seam", "miter: the exit station lost the seam"))?;
         let uv2 = sample_second(point, uv_second[uv_second.len() - 1])?;
         (point, [u_exit, first.z(fraction)], [uv2[0], second.z(1.0)], uv2[0])
     };
@@ -465,7 +464,7 @@ pub(super) fn solve_miter(
     // ~1e-4 off the cylinders at r = 1.  Sixty-four samples over the seam's
     // own length, crowded toward the exit (`seam_spacing`), bring that to the
     // fit's noise.
-    let resample = |rung: usize| -> Result<MarchedCurve, String> {
+    let resample = |rung: usize| -> Result<MarchedCurve, KernelRefusal> {
         let samples = SEAM_SAMPLES << rung;
         let mut points = vec![first.point(u_start, 0.0)?];
         let mut uv_first = vec![[u_start, first.z(0.0)]];
@@ -473,7 +472,7 @@ pub(super) fn solve_miter(
         for step in 1..samples {
             let u = u_start + (u_exit - u_start) * seam_spacing(step, samples);
             let Some((fraction, point)) = station(u)? else {
-                return Err("miter: the seam vanished while being resampled".into());
+                return Err(KernelRefusal::internal(KernelStage::Refine, "miter_seam_resample", "miter: the seam vanished while being resampled"));
             };
             let uv2 = sample_second(point, *uv_second.last().expect("a seeded sample"))?;
             points.push(point);
@@ -491,12 +490,12 @@ pub(super) fn solve_miter(
     };
     // The seam is evaluated on stripe 0's wall and bisected onto stripe 1's
     // level, so those are what its fit is read against.
-    let seam_off_carriers = |point: Vec3| -> Result<f64, String> {
+    let seam_off_carriers = |point: Vec3| -> Result<f64, KernelRefusal> {
         Ok(off_surface(&first.rows.surface, point)?.max(sibling_level(point)?.abs()))
     };
     let (seam, seam_fit) = fit_on_ladder(&resample, "seam", &seam_off_carriers, fit_tolerance)?;
 
-    let on_sharp = crate::project_point_to_curve(&sharp.curve, exit_point)?;
+    let on_sharp = crate::project_point_to_curve(&sharp.curve, exit_point).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
     let symmetric_bar = 1e-6 * (1.0 + radius);
     if on_sharp.distance <= symmetric_bar {
         return Ok(MiterClosure::Symmetric {
@@ -531,7 +530,7 @@ pub(super) fn solve_miter(
         )
     };
     // Evaluated on the follower's wall, bisected onto the leader's other face.
-    let connector_off_carriers = |point: Vec3| -> Result<f64, String> {
+    let connector_off_carriers = |point: Vec3| -> Result<f64, KernelRefusal> {
         Ok(off_surface(&follower.rows.surface, point)?
             .max(off_surface(&leader.other_face.surface, point)?))
     };
@@ -540,13 +539,13 @@ pub(super) fn solve_miter(
     let connector_end = *connector
         .points
         .last()
-        .ok_or("miter: the connector has no samples")?;
-    let on_sharp = crate::project_point_to_curve(&sharp.curve, connector_end)?;
+        .ok_or(KernelRefusal::internal(KernelStage::Refine, "miter_connector_samples", "miter: the connector has no samples"))?;
+    let on_sharp = crate::project_point_to_curve(&sharp.curve, connector_end).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
     if on_sharp.distance > 1e-5 * (1.0 + radius) {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Refine, "miter_connector_end", format!(
             "miter: the connector ends {:.3e} off the sharp edge",
             on_sharp.distance
-        ));
+        )));
     }
     let exit_follower = connector.uv_first.last().map(|uv| uv[0]).unwrap_or(0.0);
     Ok(MiterClosure::Asymmetric {
@@ -581,7 +580,7 @@ fn march_connector(
     start: Vec3,
     scale: f64,
     steps: usize,
-) -> Result<MarchedCurve, String> {
+) -> Result<MarchedCurve, KernelRefusal> {
     // `bisect` below converges an interval of the follower's ROW PARAMETER `u`,
     // and `station_parameters` normalises that parameter to [0, 1] (chord length
     // over the mean support polyline). So `u` is dimensionless and does not grow
@@ -603,8 +602,8 @@ fn march_connector(
     // dotted with a NORMALISED section tangent — so scaling those by model size
     // is a relative tolerance and correct.
     let bar = (1e-11 / (1.0 + scale)).max(1e-15);
-    let signed_distance = |point: Vec3| -> Result<f64, String> {
-        let projection = crate::project_point_to_surface(&face.surface, point)?;
+    let signed_distance = |point: Vec3| -> Result<f64, KernelRefusal> {
+        let projection = crate::project_point_to_surface(&face.surface, point).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
         let normal = raw_normal(&face.surface, projection.u, projection.v)?;
         Ok(point.sub(projection.point).dot(normal))
     };
@@ -613,7 +612,7 @@ fn march_connector(
     let u_end = follower.u_limit();
     let mut points = vec![start];
     let mut uv_follower = vec![[u0, follower.z(fraction0)]];
-    let first_projection = crate::project_point_to_surface(&face.surface, start)?;
+    let first_projection = crate::project_point_to_surface(&face.surface, start).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
     let mut uv_face = vec![[first_projection.u, first_projection.v]];
     let mut previous_u = u0;
     for step in 1..=steps {
@@ -621,7 +620,7 @@ fn march_connector(
         // Signed distance to the face along the station parameter at this
         // fraction; bracket from the previous station toward the row end and
         // back, whichever side changes sign.
-        let mut g = |u: f64| -> Result<f64, String> {
+        let mut g = |u: f64| -> Result<f64, KernelRefusal> {
             signed_distance(follower.point(u, fraction)?)
         };
         let g_prev = g(previous_u)?;
@@ -651,15 +650,15 @@ fn march_connector(
             Some(u) => u,
             None if g_prev.abs() <= 1e-9 * (1.0 + scale) => previous_u,
             None => {
-                return Err("miter: the connector left the face without crossing it".into())
+                return Err(KernelRefusal::internal(KernelStage::Refine, "miter_connector_face", "miter: the connector left the face without crossing it"))
             }
         };
         let point = follower.point(u, fraction)?;
         // The connector's pcurve on the face is ONE branch: each sample
         // continues from the previous sample's foot.
-        let seed = *uv_face.last().ok_or("miter: the connector has no face sample")?;
+        let seed = *uv_face.last().ok_or(KernelRefusal::internal(KernelStage::Refine, "miter_connector_samples", "miter: the connector has no face sample"))?;
         let projection =
-            crate::projection::project_point_to_surface_from_seed(&face.surface, point, seed)?;
+            crate::projection::project_point_to_surface_from_seed(&face.surface, point, seed).or_refuse(KernelStage::Refine, "project_point_to_surface_from_seed")?;
         points.push(point);
         uv_follower.push([u, follower.z(fraction)]);
         uv_face.push([projection.u, projection.v]);
@@ -772,6 +771,15 @@ fn line_deviation(points: &[Vec3], parameters: &[f64]) -> f64 {
 /// surfaces it was marched on.
 pub(crate) const MARCHED_FIT_OFF_CARRIERS: &str = "miter: a marched curve's fit leaves its carriers";
 
+/// The slug of that refusal (`NonConvergence`).
+pub(crate) const MARCHED_FIT_OFF_CARRIERS_WHAT: &str = "marched_fit_off_carriers";
+
+/// Is this the refusal of a marched fit that leaves its carriers ([`MARCHED_FIT_OFF_CARRIERS`])?
+/// Read off the class and its slug, which the mint site and this check share.
+pub(crate) fn is_marched_fit_off_carriers(refusal: &KernelRefusal) -> bool {
+    matches!(&refusal.class, RefusalClass::NonConvergence { what } if what == MARCHED_FIT_OFF_CARRIERS_WHAT)
+}
+
 /// Fit a marched curve and its two images with ONE chord-length
 /// parameterisation, so the pcurves reproduce the 3D curve parameter for
 /// parameter.  Returns (curve, first image, second image).
@@ -808,13 +816,13 @@ pub(crate) const MARCHED_FIT_OFF_CARRIERS: &str = "miter: a marched curve's fit 
 pub(super) fn fit_marched(
     curve: &MarchedCurve,
     what: &str,
-    off_carriers: &dyn Fn(Vec3) -> Result<f64, String>,
+    off_carriers: &dyn Fn(Vec3) -> Result<f64, KernelRefusal>,
     tolerance: f64,
-) -> Result<(crate::NurbsCurve, crate::NurbsCurve, crate::NurbsCurve), String> {
+) -> Result<(crate::NurbsCurve, crate::NurbsCurve, crate::NurbsCurve), KernelRefusal> {
     use crate::Vec4;
     let count = curve.points.len();
     if count < 2 {
-        return Err("miter: a marched curve needs at least two samples".into());
+        return Err(KernelRefusal::internal(KernelStage::Refine, "marched_samples", "miter: a marched curve needs at least two samples"));
     }
     let mut parameters = Vec::with_capacity(count);
     let mut accumulated = 0.0;
@@ -866,8 +874,8 @@ pub(super) fn fit_marched(
         );
     }
     let fitted = if straight.iter().all(|(deviation, bar)| deviation <= bar) {
-        let line = |points: &[Vec3]| -> Result<crate::NurbsCurve, String> {
-            crate::make_line(points[0], points[count - 1])
+        let line = |points: &[Vec3]| -> Result<crate::NurbsCurve, KernelRefusal> {
+            crate::make_line(points[0], points[count - 1]).or_refuse(KernelStage::Refine, "make_line")
         };
         (
             line(&curve.points)?,
@@ -876,9 +884,9 @@ pub(super) fn fit_marched(
         )
     } else {
         (
-            crate::fit::interpolate_homogeneous(&as_points(&curve.points), degree, &parameters)?,
-            crate::fit::interpolate_homogeneous(&as_points(&first_image), degree, &parameters)?,
-            crate::fit::interpolate_homogeneous(&as_points(&second_image), degree, &parameters)?,
+            crate::fit::interpolate_homogeneous(&as_points(&curve.points), degree, &parameters).or_refuse(KernelStage::Refine, "interpolate_homogeneous")?,
+            crate::fit::interpolate_homogeneous(&as_points(&first_image), degree, &parameters).or_refuse(KernelStage::Refine, "interpolate_homogeneous")?,
+            crate::fit::interpolate_homogeneous(&as_points(&second_image), degree, &parameters).or_refuse(KernelStage::Refine, "interpolate_homogeneous")?,
         )
     };
     // A NaN reading is the worst there is, and stays so.
@@ -887,7 +895,7 @@ pub(super) fn fit_marched(
     let mut worst_span = 0;
     for (span, pair) in parameters.windows(2).enumerate() {
         for fraction in [0.25, 0.5, 0.75] {
-            let off = off_carriers(fitted.0.evaluate(pair[0] + (pair[1] - pair[0]) * fraction)?)?;
+            let off = off_carriers(fitted.0.evaluate(pair[0] + (pair[1] - pair[0]) * fraction).or_refuse(KernelStage::Refine, "evaluate")?)?;
             if worse(worst, off) {
                 (worst, worst_span) = (off, span);
             }
@@ -913,11 +921,11 @@ pub(super) fn fit_marched(
         );
     }
     if !(worst <= tolerance) {
-        return Err(format!(
+        return Err(KernelRefusal::non_convergence(KernelStage::Refine, MARCHED_FIT_OFF_CARRIERS_WHAT, format!(
             "{MARCHED_FIT_OFF_CARRIERS}: the {what}'s fit stands {worst:.3e} off them between its \
              {count} samples (span {worst_span}; the samples themselves {at_samples:.3e}), over the \
              fit tolerance {tolerance:.3e}"
-        ));
+        )));
     }
     Ok(fitted)
 }

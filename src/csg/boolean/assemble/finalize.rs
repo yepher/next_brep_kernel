@@ -215,22 +215,43 @@ fn repair_edges_from_consistent_pcurves(
         ).or_refuse(KernelStage::Validate, "csg.boolean.assemble.finalize")?;
         let mut rebuilt_pcurves = false;
         if first_error.max(second_error) > pcurve_contract {
-            first_pcurve = build_pcurve_on_surface_range(
+            // A rebuilt trim off its bar is this candidate declining, not the
+            // boolean refusing: the builder now refuses a fit it cannot bring
+            // within its ask plus the curve's own standoff (2026-09-26), where
+            // it used to return the fit and let the contract check below skip
+            // the candidate. Same outcome, stated by the builder.
+            let rebuilt = crate::pcurve::build_pcurve_on_surface_range_classed(
                 &first_face.surface,
                 &curve,
                 candidate_t0,
                 candidate_t1,
                 first_coedge.forward,
                 repair_tolerance,
-            ).or_refuse(KernelStage::Validate, "csg.boolean.assemble.finalize")?;
-            second_pcurve = build_pcurve_on_surface_range(
-                &second_face.surface,
-                &curve,
-                candidate_t0,
-                candidate_t1,
-                second_coedge.forward,
-                repair_tolerance,
-            ).or_refuse(KernelStage::Validate, "csg.boolean.assemble.finalize")?;
+                KernelStage::Validate,
+                "csg.boolean.assemble.finalize",
+            )
+            .and_then(|first| {
+                crate::pcurve::build_pcurve_on_surface_range_classed(
+                    &second_face.surface,
+                    &curve,
+                    candidate_t0,
+                    candidate_t1,
+                    second_coedge.forward,
+                    repair_tolerance,
+                    KernelStage::Validate,
+                    "csg.boolean.assemble.finalize",
+                )
+                .map(|second| (first, second))
+            });
+            match rebuilt {
+                Ok((first, second)) => {
+                    first_pcurve = first;
+                    second_pcurve = second;
+                }
+                // Dispatched on the CLASS the builder mints, not its text.
+                Err(refusal) if crate::pcurve::is_pcurve_off_bar(&refusal) => continue,
+                Err(refusal) => return Err(refusal),
+            }
             first_error = adaptive_coedge_error(
                 &first_face.surface,
                 &first_pcurve,

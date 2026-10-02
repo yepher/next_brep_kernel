@@ -238,7 +238,7 @@ fn loop_members(doc: &serde_json::Value) -> Option<Vec<Vec<(u64, Option<u64>)>>>
     let geometries = doc.get("geometries")?.as_array()?;
     let mut loops: Vec<Vec<(u64, Option<u64>)>> = Vec::new();
     // (gid, stored, endpoint a, endpoint b) for the chainable segments.
-    let mut segments: Vec<(u64, Option<u64>, u64, u64)> = Vec::new();
+    let mut segments: Vec<(u64, Option<u64>, String, String)> = Vec::new();
     for geometry in geometries {
         if geometry.get("construction").and_then(serde_json::Value::as_bool) == Some(true) {
             continue;
@@ -251,21 +251,25 @@ fn loop_members(doc: &serde_json::Value) -> Option<Vec<Vec<(u64, Option<u64>)>>>
             .get("type")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        let points: Vec<u64> = geometry
+        let points: Vec<String> = geometry
             .get("points")
             .and_then(serde_json::Value::as_array)
-            .map(|ids| ids.iter().filter_map(numeric).collect())
+            .map(|ids| ids.iter().map(point_key).collect())
             .unwrap_or_default();
         match geom_type {
             // Self-contained loops.
             "circle" | "ellipse" => loops.push(vec![(gid, stored)]),
             // `[start, end]`.
-            "line" if points.len() == 2 => segments.push((gid, stored, points[0], points[1])),
+            "line" if points.len() == 2 => {
+                segments.push((gid, stored, points[0].clone(), points[1].clone()))
+            }
             // `[center, start, end]`.
-            "arc" if points.len() == 3 => segments.push((gid, stored, points[1], points[2])),
+            "arc" if points.len() == 3 => {
+                segments.push((gid, stored, points[1].clone(), points[2].clone()))
+            }
             // `[p0, …, pn]` — the spline's endpoints are its first and last.
             "bezier" if points.len() >= 2 => {
-                segments.push((gid, stored, points[0], points[points.len() - 1]))
+                segments.push((gid, stored, points[0].clone(), points[points.len() - 1].clone()))
             }
             _ => {}
         }
@@ -277,10 +281,10 @@ fn loop_members(doc: &serde_json::Value) -> Option<Vec<Vec<(u64, Option<u64>)>>>
         if visited[start] {
             continue;
         }
-        let (_, _, first_point, _) = segments[start];
+        let first_point = segments[start].2.clone();
         let mut chain = vec![start];
         visited[start] = true;
-        let mut tail = segments[start].3;
+        let mut tail = segments[start].3.clone();
         loop {
             if tail == first_point {
                 // Closed: a chain of one segment closes only if it is a loop on
@@ -300,13 +304,24 @@ fn loop_members(doc: &serde_json::Value) -> Option<Vec<Vec<(u64, Option<u64>)>>>
             visited[next] = true;
             chain.push(next);
             tail = if segments[next].2 == tail {
-                segments[next].3
+                segments[next].3.clone()
             } else {
-                segments[next].2
+                segments[next].2.clone()
             };
         }
     }
     Some(loops)
+}
+
+/// A POINT id as a join key: a numeric id (number or numeric string) by its
+/// number, so `3` and `"3"` meet as [`numeric`] reads them, and any other id —
+/// the part-origin reference point's `"origin"` — by its JSON text, which no
+/// number can spell.
+fn point_key(value: &serde_json::Value) -> String {
+    match numeric(value) {
+        Some(number) => number.to_string(),
+        None => value.to_string(),
+    }
 }
 
 /// A JSON id as a number (a numeric string counts) — the write-back's copy of the

@@ -99,6 +99,7 @@ use crate::{
     PolygonClass, Vec2,
 };
 use crate::curve::parameter_line;
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 
 const OP: &str = "move_faces(re-cut)";
 
@@ -124,7 +125,7 @@ pub fn recut_moved_planes(
     solid: &BrepSolid,
     moved: &[u64],
     translation: Vec3,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     recut_moved_planes_rigid(solid, moved, None, translation)
 }
 
@@ -179,21 +180,32 @@ pub fn recut_moved_planes_rigid(
     moved: &[u64],
     rotation: Option<(Vec3, Vec3, f64)>,
     translation: Vec3,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let scale = solid_model_scale(solid);
     let tolerance = (scale * 1e-7).max(1e-9);
     let moved_set: HashSet<u64> = moved.iter().copied().collect();
     if moved_set.is_empty() {
-        return Err(format!("{OP}: no face was selected"));
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "selection",
+            format!("{OP}: no face was selected"),
+        ));
     }
     let motion = Motion {
         rotation: match rotation {
             None => None,
             Some((point, axis, angle)) => {
-                let axis = axis
-                    .normalized()
-                    .map_err(|_| format!("{OP}: the rotation axis has zero length"))?;
-                Some(super::face_rotate::rotation_about(point, axis, angle)?)
+                let axis = axis.normalized().map_err(|_| {
+                    KernelRefusal::input(
+                        KernelStage::Collect,
+                        "rotation_axis",
+                        format!("{OP}: the rotation axis has zero length"),
+                    )
+                })?;
+                Some(
+                    super::face_rotate::rotation_about(point, axis, angle)
+                        .or_input(KernelStage::Collect, "rotation")?,
+                )
             }
         },
         translation,
@@ -207,9 +219,13 @@ pub fn recut_moved_planes_rigid(
         let face = face_by_id(solid, id)?;
         let plane = plane_of_surface(&face.surface, tolerance.max(1e-9) * 10.0, OP).map_err(
             |error| {
-                format!(
-                    "{error} — this road sweeps a PLANE's slab, so face {id}{} cannot take it",
-                    named(face)
+                KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "curved_carrier",
+                    format!(
+                        "{error} — this road sweeps a PLANE's slab, so face {id}{} cannot take it",
+                        named(face)
+                    ),
                 )
             },
         )?;
@@ -241,22 +257,30 @@ pub fn recut_moved_planes_rigid(
             let (moved_normal, moved_offset) = motion.plane(normal, offset);
             let facing = moved_normal.dot(normal);
             if facing <= 1e-6 {
-                return Err(format!(
-                    "{OP}: the motion turns face {id}{} through a right angle or more, so its \
-                     new carrier does not face the way the old one did and there is no wedge \
-                     between them for a tool to fill; refusing",
-                    named(face_by_id(solid, id)?)
+                return Err(KernelRefusal::ill_posed(
+                    KernelStage::Classify,
+                    "turned_past_right_angle",
+                    format!(
+                        "{OP}: the motion turns face {id}{} through a right angle or more, so its \
+                         new carrier does not face the way the old one did and there is no wedge \
+                         between them for a tool to fill; refusing",
+                        named(face_by_id(solid, id)?)
+                    ),
                 ));
             }
             let reach = (moved_offset - moved_normal.dot(seat)) / facing;
             let unturned = moved_normal.sub(normal).length() <= 1e-12;
             if reach.abs() <= motion_floor && !unturned {
-                return Err(format!(
-                    "{OP}: the motion turns face {id}{} about a line through its own trim, so \
-                     part of it moves into the body and part out of it; one tool would add \
-                     material where the other takes it away, and this road refuses rather than \
-                     choosing",
-                    named(face_by_id(solid, id)?)
+                return Err(KernelRefusal::ill_posed(
+                    KernelStage::Classify,
+                    "turned_through_trim",
+                    format!(
+                        "{OP}: the motion turns face {id}{} about a line through its own trim, so \
+                         part of it moves into the body and part out of it; one tool would add \
+                         material where the other takes it away, and this road refuses rather than \
+                         choosing",
+                        named(face_by_id(solid, id)?)
+                    ),
                 ));
             }
             reach
@@ -267,20 +291,28 @@ pub fn recut_moved_planes_rigid(
         contributors.push((id, normal, offset, delta, seat));
     }
     if contributors.is_empty() {
-        return Err(format!(
-            "{OP}: every selected face slides inside its own carrier (the motion has no \
-             component along any of their normals), so there is no material for a re-cut to \
-             move"
+        return Err(KernelRefusal::input(
+            KernelStage::Classify,
+            "in_plane_motion",
+            format!(
+                "{OP}: every selected face slides inside its own carrier (the motion has no \
+                 component along any of their normals), so there is no material for a re-cut to \
+                 move"
+            ),
         ));
     }
     let adds = contributors[0].3 > 0.0;
     if contributors.iter().any(|entry| (entry.3 > 0.0) != adds) {
-        return Err(format!(
-            "{OP}: the selection moves {} face(s) OUT along their own normals and {} face(s) IN, \
-             so one tool would add material where another takes it away and the order they are \
-             applied in would decide the answer; refusing rather than picking one",
-            contributors.iter().filter(|entry| entry.3 > 0.0).count(),
-            contributors.iter().filter(|entry| entry.3 < 0.0).count(),
+        return Err(KernelRefusal::ill_posed(
+            KernelStage::Classify,
+            "mixed_directions",
+            format!(
+                "{OP}: the selection moves {} face(s) OUT along their own normals and {} face(s) IN, \
+                 so one tool would add material where another takes it away and the order they are \
+                 applied in would decide the answer; refusing rather than picking one",
+                contributors.iter().filter(|entry| entry.3 > 0.0).count(),
+                contributors.iter().filter(|entry| entry.3 < 0.0).count(),
+            ),
         ));
     }
 
@@ -358,11 +390,15 @@ pub fn recut_moved_planes_rigid(
             let face = face_by_id(solid, neighbour)?;
             let plane = plane_of_surface(&face.surface, tolerance.max(1e-9) * 10.0, OP).map_err(
                 |error| {
-                    format!(
-                        "{error} — face {id}{} is bounded by face {neighbour}{}, and this road \
-                         needs every bounding carrier as a half-space",
-                        named(face_by_id(solid, id).unwrap_or(face)),
-                        named(face)
+                    KernelRefusal::unsupported(
+                        KernelStage::Classify,
+                        "curved_neighbour",
+                        format!(
+                            "{error} — face {id}{} is bounded by face {neighbour}{}, and this road \
+                             needs every bounding carrier as a half-space",
+                            named(face_by_id(solid, id).unwrap_or(face)),
+                            named(face)
+                        ),
                     )
                 },
             )?;
@@ -389,10 +425,14 @@ pub fn recut_moved_planes_rigid(
             };
             let reach = normal_g.dot(probe) - offset_g;
             if reach.abs() <= tolerance {
-                return Err(format!(
-                    "{OP}: the probe point for face {id} lies ON the carrier of its neighbour \
-                     {neighbour} ({reach:.3e} from it), so which side of that carrier the tool \
-                     is on is not decided by the geometry; refusing rather than choosing"
+                return Err(KernelRefusal::ill_posed(
+                    KernelStage::Classify,
+                    "probe_on_carrier",
+                    format!(
+                        "{OP}: the probe point for face {id} lies ON the carrier of its neighbour \
+                         {neighbour} ({reach:.3e} from it), so which side of that carrier the tool \
+                         is on is not decided by the geometry; refusing rather than choosing"
+                    ),
                 ));
             }
             if reach > 0.0 {
@@ -420,7 +460,11 @@ pub fn recut_moved_planes_rigid(
         }
 
         tools.push(convex_solid(&spaces, probe, tolerance).map_err(|error| {
-            format!("{OP}: the tool for face {id} could not be built — {error}")
+            KernelRefusal::internal(
+                KernelStage::Fragment,
+                "tool_polytope",
+                format!("{OP}: the tool for face {id} could not be built — {error}"),
+            )
         })?);
     }
 
@@ -428,9 +472,13 @@ pub fn recut_moved_planes_rigid(
     // residue when they are applied one at a time.
     let mut tool = tools.remove(0);
     for next in tools {
+        // The boolean's own class rides through: a degeneracy inside the
+        // union is still a degeneracy at this road's boundary.
         tool = boolean_operation(&tool, &next, BooleanOperation::Union, &BooleanOptions::default())
             .map_err(|error| {
-                format!("{OP}: the tools could not be unioned into one — {}", error.message)
+                error.with_message(|message| {
+                    format!("{OP}: the tools could not be unioned into one — {message}")
+                })
             })?;
     }
     let operation = if adds {
@@ -440,11 +488,12 @@ pub fn recut_moved_planes_rigid(
     };
     let cut = boolean_operation(solid, &tool, operation, &BooleanOptions::default()).map_err(
         |error| {
-            format!(
-                "{OP}: the re-cut's {} refused — {}",
-                if adds { "union" } else { "subtract" },
-                error.message
-            )
+            error.with_message(|message| {
+                format!(
+                    "{OP}: the re-cut's {} refused — {message}",
+                    if adds { "union" } else { "subtract" },
+                )
+            })
         },
     )?;
     Ok(restamp(cut, solid, &moved_set, &motion, tolerance))
@@ -462,7 +511,7 @@ fn one_way_only(
     other: [HalfSpace; 2],
     tolerance: f64,
     name: impl Fn() -> String,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let band = tolerance.max(1e-9) * 10.0;
     let spaces: Vec<HalfSpace> = clip.iter().chain(sides).chain(&other).copied().collect();
     let mut depth = 0.0f64;
@@ -488,12 +537,16 @@ fn one_way_only(
         }
     }
     if depth > band * 1e3 {
-        return Err(format!(
-            "{OP}: the motion turns face {id}{} so that the line its old and new carriers meet \
-             in crosses its own bounds — part of the face moves into the body and part out of it \
-             (the other wedge reaches {depth:.3e} past them), so one tool would add material \
-             where the other takes it away; refusing rather than choosing",
-            name()
+        return Err(KernelRefusal::ill_posed(
+            KernelStage::Classify,
+            "one_way_only",
+            format!(
+                "{OP}: the motion turns face {id}{} so that the line its old and new carriers meet \
+                 in crosses its own bounds — part of the face moves into the body and part out of it \
+                 (the other wedge reaches {depth:.3e} past them), so one tool would add material \
+                 where the other takes it away; refusing rather than choosing",
+                name()
+            ),
         ));
     }
     Ok(())
@@ -528,7 +581,7 @@ fn contains_its_own_trim(
     id: u64,
     at_home: &[HalfSpace],
     scale: f64,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     // The trim's boundary lies ON these carriers, so the reading is an equality
     // and the band only has to absorb the residual a built body carries. Every
     // violation this is here to catch is of the order of the feature's own size.
@@ -554,26 +607,36 @@ fn contains_its_own_trim(
         }
     }
     if worst > band {
-        return Err(format!(
-            "{OP}: face {id}{} has a boundary point {worst:.3e} outside one of its own \
-             bounding carriers, so its trim is not the region its bounding carriers \
-             enclose — their intersection is the trim's CONVEX CORE, and the tool this \
-             road would build is that core rather than all the material the motion \
-             moves. Refusing rather than cutting some of it",
-            named(face)
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "reflex_trim",
+            format!(
+                "{OP}: face {id}{} has a boundary point {worst:.3e} outside one of its own \
+                 bounding carriers, so its trim is not the region its bounding carriers \
+                 enclose — their intersection is the trim's CONVEX CORE, and the tool this \
+                 road would build is that core rather than all the material the motion \
+                 moves. Refusing rather than cutting some of it",
+                named(face)
+            ),
         ));
     }
     Ok(())
 }
 
 /// The face record, by id.
-fn face_by_id(solid: &BrepSolid, id: u64) -> Result<&FaceRecord, String> {
+fn face_by_id(solid: &BrepSolid, id: u64) -> Result<&FaceRecord, KernelRefusal> {
     solid
         .shells
         .iter()
         .flat_map(|shell| &shell.faces)
         .find(|face| face.id == id)
-        .ok_or_else(|| format!("{OP}: no face with id {id} on this solid"))
+        .ok_or_else(|| {
+            KernelRefusal::input(
+                KernelStage::Collect,
+                "face_id",
+                format!("{OP}: no face with id {id} on this solid"),
+            )
+        })
 }
 
 fn named(face: &FaceRecord) -> String {
@@ -618,10 +681,10 @@ fn neighbours_of(solid: &BrepSolid, id: u64) -> Vec<u64> {
 /// too, so a face whose trim is not convex cannot hand back a point outside it
 /// — it falls back to the single sample furthest from the trim's boundary
 /// samples instead.
-fn interior_point(solid: &BrepSolid, id: u64, tolerance: f64) -> Result<Vec3, String> {
+fn interior_point(solid: &BrepSolid, id: u64, tolerance: f64) -> Result<Vec3, KernelRefusal> {
     let face = face_by_id(solid, id)?;
-    let [u0, u1] = face.surface.domain_u()?;
-    let [v0, v1] = face.surface.domain_v()?;
+    let [u0, u1] = face.surface.domain_u().or_refuse(KernelStage::Classify, "domain")?;
+    let [v0, v1] = face.surface.domain_v().or_refuse(KernelStage::Classify, "domain")?;
     let mut inside: Vec<Vec2> = Vec::new();
     for iu in 1..PROBE_STATIONS {
         for iv in 1..PROBE_STATIONS {
@@ -638,10 +701,14 @@ fn interior_point(solid: &BrepSolid, id: u64, tolerance: f64) -> Result<Vec3, St
         }
     }
     if inside.is_empty() {
-        return Err(format!(
-            "{OP}: no point of a {PROBE_STATIONS}x{PROBE_STATIONS} lattice over face {id}'s \
-             parameter square lands inside its trim, so this road has no seat to read the tool's \
-             side from"
+        return Err(KernelRefusal::non_convergence(
+            KernelStage::Classify,
+            "seat_lattice",
+            format!(
+                "{OP}: no point of a {PROBE_STATIONS}x{PROBE_STATIONS} lattice over face {id}'s \
+                 parameter square lands inside its trim, so this road has no seat to read the tool's \
+                 side from"
+            ),
         ));
     }
     let mean = Vec2 {
@@ -674,13 +741,19 @@ fn interior_point(solid: &BrepSolid, id: u64, tolerance: f64) -> Result<Vec3, St
             })
             .expect("the list is not empty")
     };
-    face.surface.evaluate(seat.x, seat.y)
+    face.surface
+        .evaluate(seat.x, seat.y)
+        .or_refuse(KernelStage::Classify, "evaluate")
 }
 
 /// The body's axis-aligned bounds, from its vertices.
-fn solid_bounds(solid: &BrepSolid) -> Result<(Vec3, Vec3), String> {
+fn solid_bounds(solid: &BrepSolid) -> Result<(Vec3, Vec3), KernelRefusal> {
     if solid.vertices.is_empty() {
-        return Err(format!("{OP}: the solid has no vertices to bound"));
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "empty_solid",
+            format!("{OP}: the solid has no vertices to bound"),
+        ));
     }
     let mut low = Vec3::new(f64::MAX, f64::MAX, f64::MAX);
     let mut high = Vec3::new(f64::MIN, f64::MIN, f64::MIN);
@@ -821,6 +894,7 @@ fn convex_solid(
     let shell_id = next_id + 1;
     let solid_id = next_id + 2;
     let solid = BrepSolid {
+        mass_properties_cache: Default::default(),
         id: solid_id,
         vertices,
         edges,

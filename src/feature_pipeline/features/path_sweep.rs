@@ -119,7 +119,7 @@
 //! sketch is consumed (`common::consume_sketch`).
 
 use crate::feature_pipeline::features::common;
-use crate::feature_pipeline::{FeatureContext, FeatureResult, SketchProfile};
+use crate::feature_pipeline::{FeatureContext, FeatureRefusal, FeatureResult, SketchProfile};
 use crate::sweep_profile_along_chain;
 
 pub fn execute(ctx: &FeatureContext) -> FeatureResult {
@@ -129,7 +129,7 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     }
 }
 
-fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // --- Profile: resolve the SKETCH profile from the scene by name.
     // Normalize a `{sketch}:FACE` display-sheet pick to the sketch profile base.
     let profile_name = common::normalize_profile_alias(
@@ -153,7 +153,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                 None => {
                     return Err(format!(
                         "path sweep: profile '{profile_name}' not found (no sketch profile or resident face)"
-                    ));
+                    ).into());
                 }
             },
         };
@@ -216,7 +216,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
             return Err(format!(
                 "path sweep: requires a closed profile with at least two boundary curves, got {}",
                 outer.curves.len()
-            ));
+            ).into());
         }
         // Region 0 places on its OWN centroid; every later region rides region
         // 0's anchor so its in-plane offset survives (the same rule hole loops
@@ -241,7 +241,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                  be trimmed against the outer one, which nothing solves. Sweep the outer loop \
                  alone, or ease the bend",
                 region_index + 1
-            ));
+            ).into());
         }
         let mut solid = sweep_profile_along_chain(
             &outer.curves,
@@ -330,7 +330,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                 },
                 if mitred { "mitred walls" } else { "sides" },
                 if path.closed { "no caps (a closed path)" } else { "2 caps" }
-            ));
+            ).into());
         }
         for (face, name) in faces.iter_mut().zip(&face_names) {
             face.name = Some(name.clone());

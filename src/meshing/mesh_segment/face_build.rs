@@ -1,4 +1,5 @@
 use super::*;
+use crate::{circle_angle_to_parameter, KNOT_IDENTITY_TOL};
 
 /// Axis/radius description shared by the cylinder and cone wall builders:
 /// `station(p)` is the axial coordinate, `radius_at(s)` the wall radius.
@@ -312,8 +313,8 @@ enum PatchRole {
 }
 
 /// Partial cylinder patch (fillet blend): one loop of two axis-perpendicular
-/// arcs joined by two straight rulings, rebuilt as the exact extrusion of
-/// the bottom arc along the axis with iso-parameter edges.
+/// arcs joined by two straight rulings, rebuilt on a full-sweep cylinder
+/// carrier with iso-parameter edges over the patch's u range.
 fn build_cylinder_patch_face(
     builder: &mut RegionBrepBuilder,
     region: &MeshRegion,
@@ -415,55 +416,54 @@ fn build_cylinder_patch_face(
             region.id
         ));
     }
-    let y_axis = if swept >= 0.0 {
-        y_ccw
-    } else {
-        y_ccw.scale(-1.0)
-    };
-    let arc_along_chain = make_arc(center, x_axis, y_axis, radius, 0.0, swept.abs())?;
-
-    // Orient the profile so the extrusion normal (tangent × direction)
-    // matches the mesh's outward side of the carrier.
-    let direction = info.axis.scale(s1 - s0);
-    let mid = arc_along_chain.derivatives(0.5, 1)?;
-    let outward = info.radial(mid[0]).normalized()?.scale(info.sense as f64);
-    let along = mid[1].cross(direction).dot(outward) > 0.0;
-    let profile = if along {
-        arc_along_chain
-    } else {
-        arc_along_chain.reversed()?
-    };
-    let surface = make_extrusion(&profile, direction)?;
-
-    // Edges: bottom/top arcs (iso v) and the two rulings (iso u).
+    // The patch lies on a FULL-sweep cylinder carrier, trimmed by its four
+    // edges — the carrier the hybrid builder and a revolved feature use, so it
+    // recognizes as a cylinder and writes to STEP as CYLINDRICAL_SURFACE. (An
+    // extruded arc is the same point set but recognizes as a partial-sweep
+    // revolution, which reads "surface of revolution" and exports as a
+    // B-spline.) The u = 0 meridian is the arc end from which the
+    // counter-clockwise turn about the axis covers the patch, so the patch is
+    // u in [0, u_end] and no edge crosses the seam.
     let bottom_first = builder.chains[bottom_chain].vertices[0];
     let bottom_last = *builder.chains[bottom_chain].vertices.last().unwrap();
-    let (bottom_start_welded, bottom_end_welded) = if along {
+    let start_is_chain_first = swept >= 0.0;
+    let (start_welded, end_welded) = if start_is_chain_first {
         (bottom_first, bottom_last)
     } else {
         (bottom_last, bottom_first)
     };
+    let meridian = info
+        .radial(builder.data.verts[start_welded])
+        .normalized()?;
+    let generatrix = make_line(
+        center.add(meridian.scale(radius)),
+        info.axis_point_at(s1).add(meridian.scale(radius)),
+    )?;
+    let surface = make_revolution(center, info.axis, &generatrix, std::f64::consts::TAU)?;
+    let spans = distinct_interior_knots(&surface.knots_u) + 1;
+    let u_end = circle_angle_to_parameter(spans, std::f64::consts::TAU, swept.abs());
+    let bottom_curve = sub_curve(&surface.iso_curve_v(0.0)?, 0.0, u_end)?;
+    let top_curve = sub_curve(&surface.iso_curve_v(1.0)?, 0.0, u_end)?;
+    let ruling_line_u0 = surface.iso_curve_u(0.0)?;
+    let ruling_line_u1 = surface.iso_curve_u(u_end)?;
+
     let geometry_tolerance = builder.tol.max(1e-9 * builder.data.diag);
-    let profile_start = profile.evaluate(0.0)?;
-    let profile_end = profile.evaluate(1.0)?;
+    let profile_start = bottom_curve.evaluate(0.0)?;
+    let profile_end = bottom_curve.evaluate(1.0)?;
     if profile_start
-        .sub(builder.data.verts[bottom_start_welded])
+        .sub(builder.data.verts[start_welded])
         .length()
         > geometry_tolerance
-        || profile_end
-            .sub(builder.data.verts[bottom_end_welded])
-            .length()
-            > geometry_tolerance
+        || profile_end.sub(builder.data.verts[end_welded]).length() > geometry_tolerance
     {
         return Err(format!(
             "mesh_regions_to_brep: region {} exact arc misses its mesh corners",
             region.id
         ));
     }
-    let top_curve = translate_curve(&profile, direction)?;
     let top_first = builder.chains[top_chain].vertices[0];
     let top_last = *builder.chains[top_chain].vertices.last().unwrap();
-    let top_start_point = profile_start.add(direction);
+    let top_start_point = top_curve.evaluate(0.0)?;
     let top_along =
         if builder.data.verts[top_first].sub(top_start_point).length() <= geometry_tolerance {
             true
@@ -481,7 +481,7 @@ fn build_cylinder_patch_face(
         (top_last, top_first)
     };
 
-    // Match each ruling chain to u=0 (profile start) or u=1 (profile end).
+    // Match each ruling chain to u=0 (arc start) or u=u_end (arc end).
     let ruling_of = |chain_id: usize| -> Result<(PatchRole, usize, usize), String> {
         let chain = &builder.chains[chain_id];
         let first = chain.vertices[0];
@@ -543,10 +543,10 @@ fn build_cylinder_patch_face(
     register(
         builder,
         bottom_chain,
-        profile.clone(),
-        bottom_start_welded,
-        bottom_end_welded,
-        along,
+        bottom_curve,
+        start_welded,
+        end_welded,
+        start_is_chain_first,
     );
     register(
         builder,
@@ -556,8 +556,6 @@ fn build_cylinder_patch_face(
         top_end_welded,
         top_along,
     );
-    let ruling_line_u0 = make_line(profile_start, profile_start.add(direction))?;
-    let ruling_line_u1 = make_line(profile_end, profile_end.add(direction))?;
     let (u0_chain, u0_bottom, u0_top, u1_chain, u1_bottom, u1_top) =
         if matches!(role_a, PatchRole::RulingU0) {
             (
@@ -615,35 +613,16 @@ fn build_cylinder_patch_face(
             .expect("patch chains registered above");
         let forward = traversal.forward_along_chain == infoc.curve_along_chain;
         let edge_id = infoc.edge_id;
-        let pcurve = match role_of(traversal.chain) {
-            PatchRole::BottomArc => {
-                if forward {
-                    parameter_segment(0.0, 0.0, 1.0, 0.0)?
-                } else {
-                    parameter_segment(1.0, 0.0, 0.0, 0.0)?
-                }
-            }
-            PatchRole::TopArc => {
-                if forward {
-                    parameter_segment(0.0, 1.0, 1.0, 1.0)?
-                } else {
-                    parameter_segment(1.0, 1.0, 0.0, 1.0)?
-                }
-            }
-            PatchRole::RulingU0 => {
-                if forward {
-                    parameter_segment(0.0, 0.0, 0.0, 1.0)?
-                } else {
-                    parameter_segment(0.0, 1.0, 0.0, 0.0)?
-                }
-            }
-            PatchRole::RulingU1 => {
-                if forward {
-                    parameter_segment(1.0, 0.0, 1.0, 1.0)?
-                } else {
-                    parameter_segment(1.0, 1.0, 1.0, 0.0)?
-                }
-            }
+        let (from, to) = match role_of(traversal.chain) {
+            PatchRole::BottomArc => ((0.0, 0.0), (u_end, 0.0)),
+            PatchRole::TopArc => ((0.0, 1.0), (u_end, 1.0)),
+            PatchRole::RulingU0 => ((0.0, 0.0), (0.0, 1.0)),
+            PatchRole::RulingU1 => ((u_end, 0.0), (u_end, 1.0)),
+        };
+        let pcurve = if forward {
+            parameter_segment(from.0, from.1, to.0, to.1)?
+        } else {
+            parameter_segment(to.0, to.1, from.0, from.1)?
         };
         coedges.push(CoedgeRecord {
             id: builder.allocate_id(),
@@ -654,16 +633,50 @@ fn build_cylinder_patch_face(
     }
     let loop_id = builder.allocate_id();
     let face_id = builder.allocate_id();
+    // The revolved carrier's normal is radial outward; a concave patch
+    // (cavity side, sense -1) takes the face's reversed sense.
     Ok(FaceRecord {
         id: face_id,
         surface,
-        same_sense: true,
+        same_sense: info.sense == 1,
         loops: vec![LoopRecord {
             id: loop_id,
             coedges,
         }],
         name: None,
     })
+}
+
+/// Distinct knot values strictly inside a clamped knot vector.
+fn distinct_interior_knots(knots: &[f64]) -> usize {
+    let (Some(&first), Some(&last)) = (knots.first(), knots.last()) else {
+        return 0;
+    };
+    let mut count = 0;
+    let mut previous = first;
+    for &knot in knots {
+        if knot - previous > KNOT_IDENTITY_TOL && last - knot > KNOT_IDENTITY_TOL {
+            count += 1;
+            previous = knot;
+        }
+    }
+    count
+}
+
+/// The exact piece of `curve` over `[t0, t1]` (inside its [0, 1] domain),
+/// reparameterized affinely onto [0, 1]: `piece(s) = curve(t0 + s·(t1 − t0))`.
+fn sub_curve(curve: &NurbsCurve, t0: f64, t1: f64) -> Result<NurbsCurve, String> {
+    let [start, end] = curve.domain()?;
+    let mut piece = curve.clone();
+    if t1 < end - KNOT_IDENTITY_TOL {
+        piece = piece.split(t1)?.0;
+    }
+    if t0 > start + KNOT_IDENTITY_TOL {
+        piece = piece.split(t0)?.1;
+    }
+    let span = t1 - t0;
+    let knots = piece.knots.iter().map(|knot| (knot - t0) / span).collect();
+    NurbsCurve::new(piece.degree, knots, piece.control_points.clone())
 }
 
 /// Planar region: one trimmed plane face; loops come from the region's

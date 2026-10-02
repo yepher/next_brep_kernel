@@ -1,3 +1,4 @@
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 
 /// Piece of a support rim assigned to one mate face.
@@ -20,13 +21,13 @@ pub fn blend_smooth_chain(
     radius: f64,
     chamfer: bool,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     if !(radius > 0.0) || !radius.is_finite() {
-        return Err("blend: radius must be positive".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "radius", "blend: radius must be positive"));
     }
     let chain = collect_smooth_chain(solid, seed_edge_id)?;
     if chain.segments.len() < 2 {
-        return Err("blend: chain collapsed to a single segment".into());
+        return Err(KernelRefusal::internal(KernelStage::Refine, "chain_single_segment", "blend: chain collapsed to a single segment"));
     }
     if chain.closed {
         blend_closed_smooth_chain(solid, &chain.segments, radius, chamfer, name)
@@ -47,19 +48,18 @@ pub fn blend_smooth_chain_if_closed(
     radius: f64,
     chamfer: bool,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     if !(radius > 0.0) || !radius.is_finite() {
-        return Err("blend: radius must be positive".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "radius", "blend: radius must be positive"));
     }
     let chain = collect_smooth_chain(solid, seed_edge_id)?;
     if chain.segments.len() < 2 {
-        return Err("blend: chain collapsed to a single segment".into());
+        return Err(KernelRefusal::internal(KernelStage::Refine, "chain_single_segment", "blend: chain collapsed to a single segment"));
     }
     if !chain.closed {
         return Err(
-            "blend: the edge is one arc of an OPEN tangent chain; the unselected \
-             continuation is capped, not blended"
-                .into(),
+            KernelRefusal::unsupported(KernelStage::Classify, "open_tangent_chain", "blend: the edge is one arc of an OPEN tangent chain; the unselected \
+             continuation is capped, not blended"),
         );
     }
     blend_closed_smooth_chain(solid, &chain.segments, radius, chamfer, name)
@@ -81,7 +81,7 @@ fn blend_closed_smooth_chain(
     radius: f64,
     chamfer: bool,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let bar = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
     // The plain collar climbs the same measured ladder the carve does, from the
     // same first rung: a budget picked once is a resolution request in disguise.
@@ -104,12 +104,12 @@ fn blend_closed_smooth_chain(
                      {deviation:.6e} from the rolling ball, against {bar:.3e}"
                 ));
                 if per_segment * 2 > CHAIN_CARVE_MAX_PER_SEGMENT {
-                    return Err(format!(
+                    return Err(KernelRefusal::non_convergence(KernelStage::Refine, "chain_ladder_top", format!(
                         "blend: at {per_segment} stations per segment — the top of the chain's \
                          ladder — this collar's fitted rails are still {deviation:.6e} from the \
                          rolling ball's own contacts against a bar of {bar:.3e}, so there is no \
                          wall accurate enough to build"
-                    ));
+                    )));
                 }
                 per_segment *= 2;
             }
@@ -124,7 +124,7 @@ fn blend_closed_smooth_chain(
     match first {
         Ok(Rung::Built(built)) => Ok(built),
         Ok(Rung::TooCoarse { .. }) => {
-            Err("blend: the chain ladder left an accuracy rung unhandled".into())
+            Err(KernelRefusal::internal(KernelStage::Refine, "chain_ladder_rung", "blend: the chain ladder left an accuracy rung unhandled"))
         }
         // A fold that reaches a RAIL is not a lens: every section of that wall
         // is singular somewhere between its contacts, so there is nothing to cut
@@ -147,11 +147,14 @@ fn blend_closed_smooth_chain(
                     if crate::blend::is_wall_fold(&carve_error) {
                         carve_error
                     } else {
-                        format!(
-                            "{} {} fits this edge: the wall folds, and the fold band could not \
-                             be carved — {carve_error}",
-                            crate::blend::WALL_FOLDS,
-                            radius.abs()
+                        crate::blend::fold::wall_fold_refusal(
+                            Vec::new(),
+                            format!(
+                                "{} {} fits this edge: the wall folds, and the fold band could not \
+                                 be carved — {carve_error}",
+                                crate::blend::WALL_FOLDS,
+                                radius.abs()
+                            ),
                         )
                     }
                 })
@@ -175,7 +178,7 @@ fn carve_ladder(
     radius: f64,
     name: Option<&str>,
     bar: f64,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let mut per_segment = CHAIN_PER_SEGMENT;
     loop {
         match build_closed_smooth_chain(
@@ -201,13 +204,16 @@ fn carve_ladder(
                      {deviation:.6e} from the rolling ball, against {bar:.3e}"
                 ));
                 if per_segment * 2 > CHAIN_CARVE_MAX_PER_SEGMENT {
-                    return Err(format!(
-                        "{} {} fits this edge: the wall folds, and at {per_segment} stations \
-                         per segment — the top of the carve's ladder — its fitted rails are \
-                         still {deviation:.6e} from the rolling ball's own contacts against a \
-                         bar of {bar:.3e}, so there is no wall accurate enough to carve",
-                        crate::blend::WALL_FOLDS,
-                        radius.abs()
+                    return Err(crate::blend::fold::wall_fold_refusal(
+                        Vec::new(),
+                        format!(
+                            "{} {} fits this edge: the wall folds, and at {per_segment} stations \
+                             per segment — the top of the carve's ladder — its fitted rails are \
+                             still {deviation:.6e} from the rolling ball's own contacts against a \
+                             bar of {bar:.3e}, so there is no wall accurate enough to carve",
+                            crate::blend::WALL_FOLDS,
+                            radius.abs()
+                        ),
                     ));
                 }
                 per_segment *= 2;
@@ -249,22 +255,22 @@ fn rail_deviation(
     cs: &NurbsCurve,
     fit_low: f64,
     fit_range: f64,
-) -> Result<f64, String> {
+) -> Result<f64, KernelRefusal> {
     let parameter_of = |segment: usize, position: isize| -> Option<f64> {
         samples
             .iter()
             .find(|sample| sample.segment == segment && sample.position == position)
             .map(|sample| sample.parameter)
     };
-    let closest = |curve: &NurbsCurve, target: Vec3, seed: f64, reach: f64| -> Result<f64, String> {
-        let [low, high] = curve.domain()?;
-        let distance = |u: f64| -> Result<f64, String> {
-            Ok(curve.derivatives_extended(u, 0)?[0].sub(target).length())
+    let closest = |curve: &NurbsCurve, target: Vec3, seed: f64, reach: f64| -> Result<f64, KernelRefusal> {
+        let [low, high] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let distance = |u: f64| -> Result<f64, KernelRefusal> {
+            Ok(curve.derivatives_extended(u, 0).or_refuse(KernelStage::Refine, "derivatives_extended")?[0].sub(target).length())
         };
         let mut u = seed.clamp(low, high);
         let mut best = distance(u)?;
         for _ in 0..40 {
-            let derivatives = curve.derivatives_extended(u, 2)?;
+            let derivatives = curve.derivatives_extended(u, 2).or_refuse(KernelStage::Refine, "derivatives_extended")?;
             let offset = derivatives[0].sub(target);
             let slope = offset.dot(derivatives[1]);
             let curvature = derivatives[1].dot(derivatives[1]) + offset.dot(derivatives[2]);
@@ -342,7 +348,7 @@ fn build_closed_smooth_chain(
     per_segment: usize,
     fold: FoldPolicy,
     bar: f64,
-) -> Result<Rung, String> {
+) -> Result<Rung, KernelRefusal> {
     let samples = march_chain(segments, radius, false, per_segment, fold)?;
 
     // Global rows from the in-segment samples (wrapped-overlap closed fit).
@@ -392,10 +398,10 @@ fn build_closed_smooth_chain(
         .collect();
     let seam_low = (0.0 - low) / range;
     let seam_high = (1.0 - low) / range;
-    let fit_row = |row: &[Vec4]| -> Result<NurbsCurve, String> {
-        let curve = fit::interpolate_homogeneous(row, degree, &normalized)?;
-        let (_, tail) = curve.split(seam_low)?;
-        let (middle, _) = tail.split(seam_high)?;
+    let fit_row = |row: &[Vec4]| -> Result<NurbsCurve, KernelRefusal> {
+        let curve = fit::interpolate_homogeneous(row, degree, &normalized).or_refuse(KernelStage::Refine, "interpolate_homogeneous")?;
+        let (_, tail) = curve.split(seam_low).or_refuse(KernelStage::Refine, "split")?;
+        let (middle, _) = tail.split(seam_high).or_refuse(KernelStage::Refine, "split")?;
         Ok(middle)
     };
     let cr = fit_row(&samples_cr)?;
@@ -405,7 +411,7 @@ fn build_closed_smooth_chain(
     } else {
         Some(fit_row(&samples_mid)?)
     };
-    let u_domain = cr.domain()?;
+    let u_domain = cr.domain().or_refuse(KernelStage::Refine, "domain")?;
     let surface = crate::blend::rows::surface_from_rows(degree, &cr, &cs, mid.as_ref(), true)?;
 
     // The CARVE.  A wall that folds carries a lens of parameter inside the
@@ -440,9 +446,9 @@ fn build_closed_smooth_chain(
         // the case either way.
         let bar = crate::KernelTolerances::for_solid(solid, 1e-7).pcurve_consistency;
         let Some(carved) = crate::blend::carve::trace_wall_crease(&surface, radius.abs())? else {
-            return Err(format!(
+            return Err(KernelRefusal::internal(KernelStage::Refine, "carve_no_fold", format!(
                 "blend carve: the wall re-marched at {per_segment} stations per segment carries                  no fold to carve, but the march at {CHAIN_PER_SEGMENT} refused one"
-            ));
+            )));
         };
         Some(crate::blend::carve::fit_crease(&surface, &carved, bar)?)
     } else {
@@ -505,7 +511,7 @@ fn build_closed_smooth_chain(
             .iter()
             .map(|parameter| (parameter - low) / (high - low))
             .collect();
-        let fit_uv = |select: &dyn Fn(&Station) -> [f64; 2]| -> Result<NurbsCurve, String> {
+        let fit_uv = |select: &dyn Fn(&Station) -> [f64; 2]| -> Result<NurbsCurve, KernelRefusal> {
             let points: Vec<Vec4> = window
                 .iter()
                 .map(|sample| {
@@ -513,7 +519,7 @@ fn build_closed_smooth_chain(
                     Vec4::from_point(Vec3::new(uv[0], uv[1], 0.0), 1.0)
                 })
                 .collect();
-            let curve = fit::interpolate_homogeneous(&points, degree, &normalized)?;
+            let curve = fit::interpolate_homogeneous(&points, degree, &normalized).or_refuse(KernelStage::Refine, "interpolate_homogeneous")?;
             // Re-express in GLOBAL parameters: the curve's [0,1] domain
             // corresponds to [low, high]; keep as-is and remember the
             // affine map through the window bounds.
@@ -572,7 +578,7 @@ impl ChainRows {
 /// Extract the pcurve portion for a global window [a, b] from a
 /// segment's fitted uv curve, re-parameterised so its domain maps
 /// affinely onto the portion (matching the split support edge).
-pub(super) fn pcurve_portion(fitted: &(f64, f64, NurbsCurve), a: f64, b: f64) -> Result<NurbsCurve, String> {
+pub(super) fn pcurve_portion(fitted: &(f64, f64, NurbsCurve), a: f64, b: f64) -> Result<NurbsCurve, KernelRefusal> {
     let (low, high, curve) = fitted;
     // The chain parameterisation wraps with period 1; pick the period
     // copy of the window that overlaps this segment's fit range.
@@ -593,7 +599,7 @@ pub(super) fn pcurve_portion(fitted: &(f64, f64, NurbsCurve), a: f64, b: f64) ->
     }
     let epsilon = 1e-9;
     let (_, tail) = if local_a > epsilon {
-        curve.split(local_a)?
+        curve.split(local_a).or_refuse(KernelStage::Refine, "split")?
     } else {
         (curve.clone(), curve.clone())
     };
@@ -603,7 +609,7 @@ pub(super) fn pcurve_portion(fitted: &(f64, f64, NurbsCurve), a: f64, b: f64) ->
         curve.clone()
     };
     let portion = if local_b < 1.0 - epsilon {
-        tail.split(local_b)?.0
+        tail.split(local_b).or_refuse(KernelStage::Refine, "split")?.0
     } else {
         tail
     };
@@ -624,9 +630,9 @@ pub(super) fn cross_edge_at(
     vertex: u64,
     before_edge: u64,
     after_edge: u64,
-) -> Result<Option<u64>, String> {
+) -> Result<Option<u64>, KernelRefusal> {
     let mut found: Option<u64> = None;
-    let mut consider = |face: &FaceRecord, loop_index: usize| -> Result<(), String> {
+    let mut consider = |face: &FaceRecord, loop_index: usize| -> Result<(), KernelRefusal> {
         for coedge in &face.loops[loop_index].coedges {
             if coedge.edge_id == before_edge || coedge.edge_id == after_edge {
                 continue;
@@ -635,10 +641,10 @@ pub(super) fn cross_edge_at(
                 .edges
                 .iter()
                 .find(|edge| edge.id == coedge.edge_id)
-                .ok_or("blend: loop references missing edge")?;
+                .ok_or(KernelRefusal::internal(KernelStage::Refine, "missing_edge", "blend: loop references missing edge"))?;
             if edge.start_vertex_id == vertex || edge.end_vertex_id == vertex {
                 if found.is_some() && found != Some(edge.id) {
-                    return Err("blend: multiple cross edges at a chain vertex".into());
+                    return Err(KernelRefusal::unsupported(KernelStage::Classify, "chain_cross_edges", "blend: multiple cross edges at a chain vertex"));
                 }
                 found = Some(edge.id);
             }
@@ -681,13 +687,13 @@ pub(super) fn project_piece_pcurve(
     surface: &NurbsSurface,
     start_is_crossing: bool,
     end_is_crossing: bool,
-) -> Result<NurbsCurve, String> {
-    let [u0, u1] = surface.domain_u()?;
-    let [v0, v1] = surface.domain_v()?;
-    let (_, closed_v) = surface.closed_directions()?;
+) -> Result<NurbsCurve, KernelRefusal> {
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    let (_, closed_v) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
     let period = u1 - u0;
     let period_v = v1 - v0;
-    let [d0, d1] = piece.domain()?;
+    let [d0, d1] = piece.domain().or_refuse(KernelStage::Refine, "domain")?;
     // Dense reference projection; the pcurve is fit from an adaptively
     // thinned subset kept as coarse as tolerance allows.
     //
@@ -709,10 +715,10 @@ pub(super) fn project_piece_pcurve(
     let mut feet: Vec<[f64; 2]> = Vec::with_capacity(dense + 1);
     for section in 0..=dense {
         let t = d0 + (d1 - d0) * section as f64 / dense as f64;
-        let point = piece.evaluate(t)?;
+        let point = piece.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?;
         let projection = match previous_foot {
-            None => crate::project_point_to_surface(surface, point)?,
-            Some(seed) => crate::projection::project_point_to_surface_from_seed(surface, point, seed)?,
+            None => crate::project_point_to_surface(surface, point).or_refuse(KernelStage::Refine, "project_point_to_surface")?,
+            Some(seed) => crate::projection::project_point_to_surface_from_seed(surface, point, seed).or_refuse(KernelStage::Refine, "project_point_to_surface_from_seed")?,
         };
         previous_foot = Some([projection.u, projection.v]);
         feet.push([projection.u, projection.v]);
@@ -769,16 +775,16 @@ pub(super) fn project_piece_pcurve(
                   neighbour: usize,
                   proj_u: &[f64],
                   proj_v: &[f64]|
-     -> Result<(f64, f64), String> {
+     -> Result<(f64, f64), KernelRefusal> {
         let point = point3[index];
         let u_error = surface
-            .evaluate(seam_u, proj_v[index])?
+            .evaluate(seam_u, proj_v[index]).or_refuse(KernelStage::Refine, "evaluate")?
             .sub(point)
             .length();
         if closed_v {
             let seam_v = nearest_seam_image(proj_v[neighbour], v0, v1);
             let v_error = surface
-                .evaluate(proj_u[index], seam_v)?
+                .evaluate(proj_u[index], seam_v).or_refuse(KernelStage::Refine, "evaluate")?
                 .sub(point)
                 .length();
             if v_error < u_error {
@@ -869,13 +875,13 @@ pub(super) fn project_piece_pcurve(
     // each of them reaches the floor. What still misses is a rail the march tore
     // (2.7 to 3.3 on the oversized radii, a body refused or rejected anyway).
     if !fit.on_floor {
-        return Err(format!(
+        return Err(KernelRefusal::non_convergence(KernelStage::Refine, "chain_pcurve_floor", format!(
             "{} a closed chain's support piece misses its pcurve by {:.3e} at {} samples, \
              against a floor of {tolerance:.1e}",
             crate::blend::PCURVE_OFF_FLOOR,
             fit.miss,
             fit.samples
-        ));
+        )));
     }
     Ok(fit.curve)
 }

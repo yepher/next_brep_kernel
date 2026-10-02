@@ -54,7 +54,7 @@ fn emit_face_line(
 
 pub fn solid_mass_properties(solid: &BrepSolid) -> Result<MassProperties, String> {
     let token = super::profile::begin("solid_mass_properties");
-    let result = solid_mass_properties_inner(solid);
+    let result = solid_mass_properties_cached(solid);
     super::profile::end(token);
     if let (Some(dump), Ok(properties)) = (super::profile::identity_dump(), result.as_ref()) {
         super::profile::emit_identity(
@@ -68,6 +68,30 @@ pub fn solid_mass_properties(solid: &BrepSolid) -> Result<MassProperties, String
         );
     }
     result
+}
+
+/// Validate the memo against the current geometry on EVERY read: topology
+/// records are publicly editable, and copies may have been transformed or healed.
+fn solid_mass_properties_cached(solid: &BrepSolid) -> Result<MassProperties, String> {
+    let identity = face_set_identity(solid);
+    if let Some((cached_identity, properties)) = solid.mass_properties_cache.entry.get() {
+        if cached_identity == identity {
+            if super::profile::mass_profile_enabled() {
+                let measured = solid_mass_properties_inner(solid)?;
+                assert_eq!(properties.volume.to_bits(), measured.volume.to_bits(),
+                    "mass cache changed volume");
+                assert_eq!(properties.surface_area.to_bits(), measured.surface_area.to_bits(),
+                    "mass cache changed area");
+                eprintln!("mass.cache hit faces={} verified=true", identity.faces);
+            }
+            return Ok(properties);
+        }
+    }
+    // Never retain a failed computation, nor an old entry for modified geometry.
+    solid.mass_properties_cache.entry.set(None);
+    let properties = solid_mass_properties_inner(solid)?;
+    solid.mass_properties_cache.entry.set(Some((identity, properties)));
+    Ok(properties)
 }
 
 fn solid_mass_properties_inner(solid: &BrepSolid) -> Result<MassProperties, String> {
@@ -148,25 +172,40 @@ fn solid_mass_properties_inner(solid: &BrepSolid) -> Result<MassProperties, Stri
     Ok(properties)
 }
 
-/// Exact signed volume only — same per-face integration paths as
-/// `solid_mass_properties` but without the surface-area pass. The boolean
-/// assembly orientation gate consumes only the volume sign, and the area
-/// integral costs as much again as the volume one.
+/// Exact signed volume. A single nonempty shell shares its area/volume
+/// measurement with subsequent property queries. Multiple shells retain the
+/// original per-shell compensated sum: substituting the across-face sum can
+/// change the last bits and an orientation gate must not change its answer.
 pub fn solid_signed_volume(solid: &BrepSolid) -> Result<f64, String> {
     let token = super::profile::begin("solid_signed_volume");
+    let result = if solid.shells.len() == 1 && !solid.shells[0].faces.is_empty() {
+        match solid_mass_properties_cached(solid) {
+            Ok(properties) => {
+                if super::profile::mass_profile_enabled() {
+                    let original = solid_signed_volume_uncached(solid)
+                        .expect("shared mass measurement changed a signed-volume refusal");
+                    assert_eq!(properties.volume.to_bits(), original.to_bits(),
+                        "shared mass measurement changed signed volume");
+                }
+                Ok(properties.volume)
+            }
+            // Area computation must not introduce a new signed-volume refusal.
+            Err(_) => solid_signed_volume_uncached(solid),
+        }
+    } else {
+        solid_signed_volume_uncached(solid)
+    };
+    super::profile::end(token);
+    if let (Some(dump), Ok(volume)) = (super::profile::identity_dump(), result.as_ref()) {
+        super::profile::emit_identity(dump, "solid_signed_volume", solid, &[("signed_bits", *volume)]);
+    }
+    result
+}
+
+fn solid_signed_volume_uncached(solid: &BrepSolid) -> Result<f64, String> {
     let mut volume = 0.0;
     for shell in &solid.shells {
-        volume += match shell_signed_volume(shell) {
-            Ok(value) => value,
-            Err(error) => {
-                super::profile::end(token);
-                return Err(error);
-            }
-        };
-    }
-    super::profile::end(token);
-    if let Some(dump) = super::profile::identity_dump() {
-        super::profile::emit_identity(dump, "solid_signed_volume", solid, &[("signed_bits", volume)]);
+        volume += shell_signed_volume(shell)?;
     }
     Ok(volume)
 }
@@ -533,3 +572,4 @@ fn solid_mass_properties_full_moments(
         principal_axes,
     })
 }
+

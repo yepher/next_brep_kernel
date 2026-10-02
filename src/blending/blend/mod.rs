@@ -32,22 +32,63 @@ mod stations;
 mod rows;
 mod track_fit;
 
+thread_local! {
+    static REFINE_OFF_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the open march's local station refinement runs. Escape hatch
+/// `BREP_BLEND_REFINE=0` restores the uniform ladder exactly; a test turns it
+/// off for its own thread with `set_refinement_off_for_test`.
+pub(crate) fn station_refinement_on() -> bool {
+    std::env::var("BREP_BLEND_REFINE").as_deref() != Ok("0")
+        && !REFINE_OFF_FOR_TEST.with(|off| off.get())
+}
+
+thread_local! {
+    static BLEND_NOTES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record what a blend that SHIPS needs its feature to say about it — today,
+/// a march whose rails still stand off their carriers after its station
+/// ladder and local refinement ran out. Drained per feature by the history
+/// loop ([`take_blend_notes`]), beside the soundness acceptance's repairs.
+pub(crate) fn record_blend_note(note: String) {
+    BLEND_NOTES.with(|notes| notes.borrow_mut().push(note));
+}
+
+/// Take every blend note recorded on this thread since the last call.
+/// Blending runs on the feature's own thread (no parallel march), so the
+/// history loop's drain sees every note its feature recorded.
+pub fn take_blend_notes() -> Vec<String> {
+    BLEND_NOTES.with(|notes| std::mem::take(&mut *notes.borrow_mut()))
+}
+
+/// The ledger's length, and a way back to it: a lane that refuses takes back
+/// the notes it recorded, so a note never describes a wall that did not ship.
+pub(crate) fn blend_notes_mark() -> usize {
+    BLEND_NOTES.with(|notes| notes.borrow().len())
+}
+
+pub(crate) fn blend_notes_truncate(mark: usize) {
+    BLEND_NOTES.with(|notes| notes.borrow_mut().truncate(mark));
+}
+
 
 pub use chain::{blend_smooth_chain, blend_smooth_chain_if_closed};
 pub(crate) use corner::round_concave_chain_corner;
 pub use corner::round_convex_corner;
 pub use edge::{blend_closed_edge, blend_edge_variable, blend_open_edge};
-pub(crate) use collapse::FULL_WIDTH_COLLAPSE_UNSOUND;
+pub(crate) use collapse::is_full_width_collapse;
 pub(crate) use planar_chart::{
-    fit_planar_charts_to_trims, PLANAR_CHART_EDGE_OFF_PLANE, PLANAR_CHART_WIDEN_UNSOUND,
+    fit_planar_charts_to_trims, is_planar_chart_refusal,
 };
 pub(crate) use track_fit::PCURVE_OFF_FLOOR;
-pub(crate) use edge::{consumed_band, CONSUMED_SNAP_UNSOUND, RAIL_COLLAPSE_UNSUPPORTED};
+pub(crate) use edge::{consumed_band, is_consumed_snap, is_rail_collapse};
 pub(crate) use network::{
     blend_star_network, degenerate_corner_setbacks, mixed_convexity_corner, DegenerateSetback,
     MixedCorner,
 };
-pub(crate) use miter::MARCHED_FIT_OFF_CARRIERS;
+pub(crate) use miter::is_marched_fit_off_carriers;
 pub(crate) use runout::{plan_runout, RunoutPlan};
 pub(crate) use fold::{is_wall_fold, WALL_FOLDS};
-pub(crate) use stations::BALL_OFF_CARRIER;
+pub(crate) use stations::is_ball_off_carrier;

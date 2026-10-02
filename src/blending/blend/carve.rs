@@ -51,6 +51,7 @@
 //! pcurves cannot be brought inside the caller's tolerance — each with the
 //! number it saw.
 
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use crate::{fit, NurbsCurve, NurbsSurface, Vec3};
 
 /// `BREP_BLEND_CARVE_TRACE=1` prints the marched crease and the fit measured on
@@ -118,12 +119,16 @@ pub(super) struct CarvedCrease {
 
 /// The refusal prefix for a fold band this construction cannot carve. Composed
 /// under [`super::fold::WALL_FOLDS`] so every caller that already treats a fold
-/// as terminal keeps treating this one that way.
-pub(super) fn band_refusal(radius: f64, reason: &str) -> String {
-    format!(
-        "{} {radius} fits this edge: the fold band {reason}, which is a runout rather than \
-         a crease — the wall does not close on itself there",
-        super::fold::WALL_FOLDS
+/// as terminal keeps treating this one that way, and minted as the fold's own
+/// class ([`super::fold::wall_fold_refusal`]); the band has no faces yet.
+pub(super) fn band_refusal(radius: f64, reason: &str) -> KernelRefusal {
+    super::fold::wall_fold_refusal(
+        Vec::new(),
+        format!(
+            "{} {radius} fits this edge: the fold band {reason}, which is a runout rather than \
+             a crease — the wall does not close on itself there",
+            super::fold::WALL_FOLDS
+        ),
     )
 }
 
@@ -131,17 +136,17 @@ pub(super) fn band_refusal(radius: f64, reason: &str) -> String {
 /// points. A CHAMFER section is straight and has none; that is an error here
 /// rather than a fallback, because everything below reads the sign of a
 /// Jacobian against this point.
-fn section_centre(surface: &NurbsSurface, u: f64) -> Result<Vec3, String> {
-    let [v0, v1] = surface.domain_v()?;
-    let a = surface.evaluate(u, v0)?;
-    let b = surface.evaluate(u, 0.5 * (v0 + v1))?;
-    let c = surface.evaluate(u, v1)?;
+fn section_centre(surface: &NurbsSurface, u: f64) -> Result<Vec3, KernelRefusal> {
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Sew, "domain_v")?;
+    let a = surface.evaluate(u, v0).or_refuse(KernelStage::Sew, "evaluate")?;
+    let b = surface.evaluate(u, 0.5 * (v0 + v1)).or_refuse(KernelStage::Sew, "evaluate")?;
+    let c = surface.evaluate(u, v1).or_refuse(KernelStage::Sew, "evaluate")?;
     let first = b.sub(a);
     let second = c.sub(a);
     let cross = first.cross(second);
     let denominator = 2.0 * cross.dot(cross);
     if !(denominator > 0.0) || !denominator.is_finite() {
-        return Err("blend carve: the section is straight — a chamfer has no ball centre".into());
+        return Err(KernelRefusal::internal(KernelStage::Sew, "straight_section", "blend carve: the section is straight — a chamfer has no ball centre"));
     }
     let to_centre = second
         .cross(cross)
@@ -153,14 +158,14 @@ fn section_centre(surface: &NurbsSurface, u: f64) -> Result<Vec3, String> {
 
 /// `-rho^2 (1 - rho kappa cos psi)` read off the surface: negative on the
 /// regular part of a wall built this way, positive inside the fold.
-fn jacobian(surface: &NurbsSurface, u: f64, v: f64) -> Result<f64, String> {
+fn jacobian(surface: &NurbsSurface, u: f64, v: f64) -> Result<f64, KernelRefusal> {
     jacobian_about(surface, u, v, section_centre(surface, u)?)
 }
 
 /// The same, with the section's centre already in hand: it depends on `u`
 /// alone, so a scan down one section pays for it once.
-fn jacobian_about(surface: &NurbsSurface, u: f64, v: f64, centre: Vec3) -> Result<f64, String> {
-    let derivatives = surface.derivatives(u, v, 1)?;
+fn jacobian_about(surface: &NurbsSurface, u: f64, v: f64, centre: Vec3) -> Result<f64, KernelRefusal> {
+    let derivatives = surface.derivatives(u, v, 1).or_refuse(KernelStage::Sew, "derivatives")?;
     let point = derivatives[0][0];
     let du = derivatives[1][0];
     let dv = derivatives[0][1];
@@ -168,7 +173,7 @@ fn jacobian_about(surface: &NurbsSurface, u: f64, v: f64, centre: Vec3) -> Resul
 }
 
 
-fn jacobian_du(surface: &NurbsSurface, u: f64, v: f64, step: f64) -> Result<f64, String> {
+fn jacobian_du(surface: &NurbsSurface, u: f64, v: f64, step: f64) -> Result<f64, KernelRefusal> {
     Ok((jacobian(surface, u + step, v)? - jacobian(surface, u - step, v)?) / (2.0 * step))
 }
 
@@ -179,7 +184,7 @@ fn swallowtail(
     seed: [f64; 2],
     step: f64,
     bounds: [f64; 4],
-) -> Result<[f64; 2], String> {
+) -> Result<[f64; 2], KernelRefusal> {
     let mut point = seed;
     for _ in 0..60 {
         let residual = [
@@ -205,7 +210,7 @@ fn swallowtail(
         }
         let determinant = matrix[0][0] * matrix[1][1] - matrix[0][1] * matrix[1][0];
         if !(determinant.abs() > 0.0) || !determinant.is_finite() {
-            return Err("blend carve: the fold lens has no isolated extremal-v point".into());
+            return Err(KernelRefusal::internal(KernelStage::Sew, "fold_lens_extremum", "blend carve: the fold lens has no isolated extremal-v point"));
         }
         let delta = [
             (-residual[0] * matrix[1][1] + residual[1] * matrix[0][1]) / determinant,
@@ -220,7 +225,7 @@ fn swallowtail(
         }
     }
     if jacobian(surface, point[0], point[1])?.abs() > 1e-6 * scale_of(surface)? {
-        return Err("blend carve: the fold lens end did not converge".into());
+        return Err(KernelRefusal::non_convergence(KernelStage::Sew, "fold_lens_end", "blend carve: the fold lens end did not converge"));
     }
     Ok(point)
 }
@@ -228,9 +233,9 @@ fn swallowtail(
 /// A magnitude to judge the Jacobian residual against: its own worst value
 /// over the wall, so the test is relative to the surface rather than to a
 /// model size this module never sees.
-fn scale_of(surface: &NurbsSurface) -> Result<f64, String> {
-    let [u0, u1] = surface.domain_u()?;
-    let [v0, v1] = surface.domain_v()?;
+fn scale_of(surface: &NurbsSurface) -> Result<f64, KernelRefusal> {
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Sew, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Sew, "domain_v")?;
     let mut worst: f64 = 0.0;
     for index in 0..8 {
         let u = u0 + (u1 - u0) * (index as f64 + 0.5) / 8.0;
@@ -248,14 +253,14 @@ fn crease_at(
     v: f64,
     seed: [f64; 3],
     bounds: [f64; 4],
-) -> Result<Option<[f64; 3]>, String> {
+) -> Result<Option<[f64; 3]>, KernelRefusal> {
     // Unknowns: u1, u2, v2.
     let mut point = seed;
     let step = 1e-7 * (bounds[1] - bounds[0]).max(bounds[3] - bounds[2]);
-    let residual = |value: [f64; 3]| -> Result<Vec3, String> {
+    let residual = |value: [f64; 3]| -> Result<Vec3, KernelRefusal> {
         Ok(surface
-            .evaluate(value[0], v)?
-            .sub(surface.evaluate(value[1], value[2])?))
+            .evaluate(value[0], v).or_refuse(KernelStage::Sew, "evaluate")?
+            .sub(surface.evaluate(value[1], value[2]).or_refuse(KernelStage::Sew, "evaluate")?))
     };
     for _ in 0..80 {
         let r = residual(point)?;
@@ -341,9 +346,9 @@ fn solve3(mut matrix: [[f64; 3]; 3], mut rhs: [f64; 3]) -> Option<[f64; 3]> {
 pub(super) fn trace_wall_crease(
     surface: &NurbsSurface,
     radius: f64,
-) -> Result<Option<WallCarve>, String> {
-    let [u0, u1] = surface.domain_u()?;
-    let [v0, v1] = surface.domain_v()?;
+) -> Result<Option<WallCarve>, KernelRefusal> {
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Sew, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Sew, "domain_v")?;
     let bounds = [u0, u1, v0, v1];
     let step = 1e-6 * (u1 - u0);
 
@@ -439,14 +444,14 @@ pub(super) fn trace_wall_crease(
         });
     }
     let Some([lens_low, lens_high]) = span else {
-        return Err("blend carve: the fold lens has no width at its own middle".into());
+        return Err(KernelRefusal::internal(KernelStage::Sew, "fold_lens_width", "blend carve: the fold lens has no width at its own middle"));
     };
     // The crease is OUTSIDE the singular lens, so seed the two feet a lens
     // width beyond each side and let Newton pull them in.
     let width = lens_high - lens_low;
     let seed = [lens_low - width, lens_high + width, middle];
     let Some(centre) = crease_at(surface, middle, seed, bounds)? else {
-        return Err("blend carve: the crease did not solve at the lens's own middle".into());
+        return Err(KernelRefusal::non_convergence(KernelStage::Sew, "crease_middle", "blend carve: the crease did not solve at the lens's own middle"));
     };
 
     let samples = march_crease(
@@ -480,7 +485,7 @@ fn march_crease(
     centre: [f64; 3],
     bounds: [f64; 4],
     count: usize,
-) -> Result<Vec<CreaseSample>, String> {
+) -> Result<Vec<CreaseSample>, KernelRefusal> {
     let (v_low, v_high) = (ends[0][1], ends[1][1]);
     let middle = 0.5 * (v_low + v_high);
     let half = 0.5 * (v_high - v_low);
@@ -495,7 +500,7 @@ fn march_crease(
                 break;
             };
             seed = solved;
-            let point = surface.evaluate(solved[0], v)?;
+            let point = surface.evaluate(solved[0], v).or_refuse(KernelStage::Sew, "evaluate")?;
             let sample = CreaseSample {
                 first: [solved[0], v],
                 second: [solved[1], solved[2]],
@@ -510,11 +515,11 @@ fn march_crease(
     }
     let forward_len = forward.len();
     let mut samples = Vec::with_capacity(forward.len() + backward.len() + 3);
-    let end_point = |uv: [f64; 2]| -> Result<CreaseSample, String> {
+    let end_point = |uv: [f64; 2]| -> Result<CreaseSample, KernelRefusal> {
         Ok(CreaseSample {
             first: uv,
             second: uv,
-            point: surface.evaluate(uv[0], uv[1])?,
+            point: surface.evaluate(uv[0], uv[1]).or_refuse(KernelStage::Sew, "evaluate")?,
         })
     };
     samples.push(end_point(ends[0])?);
@@ -523,7 +528,7 @@ fn march_crease(
     samples.push(CreaseSample {
         first: [centre[0], 0.5 * (v_low + v_high)],
         second: [centre[1], centre[2]],
-        point: surface.evaluate(centre[0], 0.5 * (v_low + v_high))?,
+        point: surface.evaluate(centre[0], 0.5 * (v_low + v_high)).or_refuse(KernelStage::Sew, "evaluate")?,
     });
     samples.extend(forward);
     samples.push(end_point(ends[1])?);
@@ -556,7 +561,7 @@ pub(super) fn fit_crease(
     surface: &NurbsSurface,
     carve: &WallCarve,
     tolerance: f64,
-) -> Result<CarvedCrease, String> {
+) -> Result<CarvedCrease, KernelRefusal> {
     let mut samples = carve.samples.clone();
     let mut count = CREASE_SAMPLES;
     let mut best: Option<(usize, CarvedCrease)> = None;
@@ -590,13 +595,13 @@ pub(super) fn fit_crease(
             // The interpolant is what becomes the trim boundary, so a fit that
             // does not name the crease is not shipped with a note — it is the
             // refusal, with the number it reached.
-            return Err(format!(
+            return Err(KernelRefusal::non_convergence(KernelStage::Sew, "crease_fit", format!(
                 "blend carve: the crease's pcurves stay {:.6e} from the crease curve at \
                  {} marched sample(s), against a bar of {tolerance:.6e} — the fold band is \
                  not resolved well enough to trim along",
                 best_fit.residual,
                 best_count
-            ));
+            )));
         }
         count = (count - 1) * 2 + 1;
         samples = march_crease(
@@ -604,10 +609,10 @@ pub(super) fn fit_crease(
             carve.ends,
             carve.centre,
             [
-                surface.domain_u()?[0],
-                surface.domain_u()?[1],
-                surface.domain_v()?[0],
-                surface.domain_v()?[1],
+                surface.domain_u().or_refuse(KernelStage::Sew, "domain_u")?[0],
+                surface.domain_u().or_refuse(KernelStage::Sew, "domain_u")?[1],
+                surface.domain_v().or_refuse(KernelStage::Sew, "domain_v")?[0],
+                surface.domain_v().or_refuse(KernelStage::Sew, "domain_v")?[1],
             ],
             count,
         )?;
@@ -618,12 +623,12 @@ fn fit_once(
     surface: &NurbsSurface,
     samples: &[CreaseSample],
     _tolerance: f64,
-) -> Result<CarvedCrease, String> {
+) -> Result<CarvedCrease, KernelRefusal> {
     if samples.len() < 4 {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Sew, "crease_points", format!(
             "blend carve: a crease of {} point(s) is not a curve",
             samples.len()
-        ));
+        )));
     }
     let points: Vec<Vec3> = samples.iter().map(|sample| sample.point).collect();
     // PARAMETERISE BY THE PARAMETER ARC, NOT THE 3-D ONE. The crease is a
@@ -649,16 +654,16 @@ fn fit_once(
         parameters.push(running);
     }
     if !(running > 0.0) {
-        return Err("blend carve: the crease has no length".into());
+        return Err(KernelRefusal::internal(KernelStage::Sew, "crease_length", "blend carve: the crease has no length"));
     }
     for parameter in parameters.iter_mut() {
         *parameter /= running;
     }
     if parameters.windows(2).any(|pair| pair[1] <= pair[0]) {
-        return Err("blend carve: the crease doubles back on itself".into());
+        return Err(KernelRefusal::internal(KernelStage::Sew, "crease_doubles_back", "blend carve: the crease doubles back on itself"));
     }
     let degree = 3.min(points.len() - 1);
-    let curve = fit::interpolate_curve(&points, degree, &parameters)?;
+    let curve = fit::interpolate_curve(&points, degree, &parameters).or_refuse(KernelStage::Sew, "interpolate_curve")?;
     let first = fit::interpolate_curve(
         &samples
             .iter()
@@ -666,7 +671,7 @@ fn fit_once(
             .collect::<Vec<_>>(),
         degree,
         &parameters,
-    )?;
+    ).or_refuse(KernelStage::Sew, "interpolate_curve")?;
     let second = fit::interpolate_curve(
         &samples
             .iter()
@@ -674,16 +679,16 @@ fn fit_once(
             .collect::<Vec<_>>(),
         degree,
         &parameters,
-    )?;
+    ).or_refuse(KernelStage::Sew, "interpolate_curve")?;
     // The measurement: does the FITTED pcurve still trace the FITTED curve?
     let mut residual: f64 = 0.0;
     let dense = (samples.len() * 4).max(64);
     for index in 0..=dense {
         let t = index as f64 / dense as f64;
-        let target = curve.evaluate(t)?;
+        let target = curve.evaluate(t).or_refuse(KernelStage::Sew, "evaluate")?;
         for pcurve in [&first, &second] {
-            let uv = pcurve.evaluate(t)?;
-            residual = residual.max(surface.evaluate(uv.x, uv.y)?.sub(target).length());
+            let uv = pcurve.evaluate(t).or_refuse(KernelStage::Sew, "evaluate")?;
+            residual = residual.max(surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Sew, "evaluate")?.sub(target).length());
         }
     }
     Ok(CarvedCrease {

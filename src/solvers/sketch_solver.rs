@@ -88,6 +88,19 @@ impl Default for SketchSolverSettings {
     }
 }
 
+/// The reserved id of every sketch's PART ORIGIN reference point: world
+/// `(0, 0, 0)` projected onto the sketch plane. The editor adds it on entry as
+/// a fixed, grounded, construction external reference, so geometry can be
+/// constrained to the origin. The sketch feature re-projects it onto the
+/// resolved frame before solving and never publishes it — it exists only
+/// inside the sketch (no scene point, no hole center, no 3D display).
+pub const SKETCH_ORIGIN_POINT_ID: &str = "origin";
+
+/// Whether a sketch point id is the reserved [`SKETCH_ORIGIN_POINT_ID`].
+pub fn is_sketch_origin_point_id(id: &Value) -> bool {
+    id.as_str() == Some(SKETCH_ORIGIN_POINT_ID)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SolveSketchRequest {
     pub sketch: Value,

@@ -69,7 +69,7 @@ pub(in crate::blend) fn detect_mixed_concave_curved_corner(
     cyl_axis_dir: Vec3,
     cyl_radius: f64,
     cyl_outward_away: bool,
-) -> Result<MixedCurvedCorner, String> {
+) -> Result<MixedCurvedCorner, KernelRefusal> {
     let find_vertex = |ideal: Vec3| -> Option<(u64, Vec3)> {
         solid
             .vertices
@@ -285,10 +285,14 @@ pub(in crate::blend) fn detect_mixed_concave_curved_corner(
             });
         }
     }
-    Err(format!(
-        "no supported mixed-convexity curved-wall (plane×cylinder concave edge) \
+    Err(KernelRefusal::unsupported(
+        KernelStage::Classify,
+        "mixed_curved_config",
+        format!(
+            "no supported mixed-convexity curved-wall (plane×cylinder concave edge) \
          configuration: {}",
-        reasons.join("; ")
+            reasons.join("; ")
+        ),
     ))
 }
 
@@ -334,7 +338,7 @@ pub(super) fn round_mixed_concave_curved_corner(
     cyl_radius: f64,
     cyl_outward_away: bool,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
     const CTX: &str = "round_mixed_concave_curved_corner";
 
@@ -410,7 +414,11 @@ pub(super) fn round_mixed_concave_curved_corner(
             let at_v_a = touches(face, mcc.v_a.0);
             if at_v_a && touches(face, mcc.v_b.0) {
                 if q_face_id.is_some() {
-                    return Err(format!("{CTX}: multiple concave-blend candidates"));
+                    return Err(KernelRefusal::ill_posed(
+                        KernelStage::Classify,
+                        "concave_candidates",
+                        format!("{CTX}: multiple concave-blend candidates"),
+                    ));
                 }
                 q_face_id = Some(face.id);
                 q_shell = si;
@@ -425,8 +433,10 @@ pub(super) fn round_mixed_concave_curved_corner(
                 cyl_b_face_id = Some(face.id);
             } else if at_v_a {
                 if cyl_a_face_id.is_some() {
-                    return Err(format!(
-                        "{CTX}: ambiguous wall-side cap fillet at the corner"
+                    return Err(KernelRefusal::ill_posed(
+                        KernelStage::Classify,
+                        "cap_fillet_a",
+                        format!("{CTX}: ambiguous wall-side cap fillet at the corner"),
                     ));
                 }
                 cyl_a_face_id = Some(face.id);
@@ -434,16 +444,29 @@ pub(super) fn round_mixed_concave_curved_corner(
         }
     }
     let q_face_id = q_face_id.ok_or_else(|| {
-        format!(
-            "{CTX}: concave blend face not found (no non-planar face touches both \
+        KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "concave_face",
+            format!(
+                "{CTX}: concave blend face not found (no non-planar face touches both \
              tangency vertices)"
+            ),
         )
     })?;
     let cyl_b_face_id = cyl_b_face_id.ok_or_else(|| {
-        format!("{CTX}: cylinder-cap rim fillet does not end on its junction arc")
+        KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "cap_fillet_b",
+            format!("{CTX}: cylinder-cap rim fillet does not end on its junction arc"),
+        )
     })?;
-    let cyl_a_face_id = cyl_a_face_id
-        .ok_or_else(|| format!("{CTX}: wall-side cap fillet not found at its tangency vertex"))?;
+    let cyl_a_face_id = cyl_a_face_id.ok_or_else(|| {
+        KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "cap_fillet_a_missing",
+            format!("{CTX}: wall-side cap fillet not found at its tangency vertex"),
+        )
+    })?;
     let cyl_b_forward = coedge_sense_on(&result, CTX, cyl_b_face_id, arc_b_id)?;
 
     // id allocator across the whole solid's shared id space.
@@ -506,11 +529,15 @@ pub(super) fn round_mixed_concave_curved_corner(
             break;
         }
         let Some((split_edge, t_at, old_vertex)) = split else {
-            return Err(format!(
-                "{CTX}: the wall-side cap fillet neither ends on its junction arc nor \
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "composition_order",
+                format!(
+                    "{CTX}: the wall-side cap fillet neither ends on its junction arc nor \
                  crosses the ideal W_A {:?} with its cap-contact edge (unsupported \
                  fillet composition order)",
-                mcc.w_a_point
+                    mcc.w_a_point
+                ),
             ));
         };
         let id = next_id();
@@ -557,10 +584,14 @@ pub(super) fn round_mixed_concave_curved_corner(
             .find(|f| f.id == q_face_id)
             .unwrap();
         if face.loops.len() != 1 {
-            return Err(format!(
-                "{CTX}: concave blend face {} has {} loops",
-                face.id,
-                face.loops.len()
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Fragment,
+                "multi_loop",
+                format!(
+                    "{CTX}: concave blend face {} has {} loops",
+                    face.id,
+                    face.loops.len()
+                ),
             ));
         }
         let is_corner: Vec<bool> = face.loops[0]
@@ -600,10 +631,14 @@ pub(super) fn round_mixed_concave_curved_corner(
             .find(|f| f.id == cyl_a_face_id)
             .unwrap();
         if face.loops.len() != 1 {
-            return Err(format!(
-                "{CTX}: wall-side cap fillet {} has {} loops",
-                face.id,
-                face.loops.len()
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Fragment,
+                "multi_loop_a",
+                format!(
+                    "{CTX}: wall-side cap fillet {} has {} loops",
+                    face.id,
+                    face.loops.len()
+                ),
             ));
         }
         let a_side =
@@ -684,7 +719,11 @@ pub(super) fn round_mixed_concave_curved_corner(
                 continue; // untouched cap region, or all-junk face handled below
             }
             if cap_rebuilt {
-                return Err(format!("{CTX}: multiple cap faces carry a corner run"));
+                return Err(KernelRefusal::ill_posed(
+                    KernelStage::Classify,
+                    "cap_faces",
+                    format!("{CTX}: multiple cap faces carry a corner run"),
+                ));
             }
             let (rebuilt, edge) = rebuild_mixed_corner_run(
                 CTX,
@@ -703,8 +742,13 @@ pub(super) fn round_mixed_concave_curved_corner(
             cap_rebuilt = true;
         }
     }
-    let fresh_w_arc =
-        fresh_w_arc.ok_or_else(|| format!("{CTX}: no cap face carries the corner run"))?;
+    let fresh_w_arc = fresh_w_arc.ok_or_else(|| {
+        KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "cap_run",
+            format!("{CTX}: no cap face carries the corner run"),
+        )
+    })?;
 
     // ---- 7. Leftover notch junk: planar faces whose EVERY loop vertex lies
     //         in the corner wedge (the two fillet end bulkheads and the
@@ -826,7 +870,11 @@ pub(super) fn round_mixed_concave_curved_corner(
     // ---- 10. Validate; surface the issues to the caller if any.
     let issues = result.validate();
     if !issues.is_empty() {
-        return Err(format!("{CTX}: {issues:?}"));
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "validate",
+            format!("{CTX}: {issues:?}"),
+        ));
     }
     Ok(result)
 }

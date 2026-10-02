@@ -35,10 +35,10 @@
 //! the TARGET solid's name and the target goes in `removed`; `move_faces`
 //! preserves every face name, so names are collected, never re-stamped.
 //!
-//! Multi-loop planar faces (SM0, synchronous-modeling.md): a planar carrier's normal is
-//! constant across its whole domain, so a face with internal loops (a plate with a pocket or
-//! a drilled-then-capped hole) pushes exactly like a single-loop one — `move_faces` already
-//! iterates every loop and `retrim_planar_face` already re-trims all of them. Supported.
+//! Multi-loop planar faces (SM0): a planar carrier's normal is constant across its whole
+//! domain, so a face with internal loops (a plate with a pocket or a drilled-then-capped
+//! hole) pushes exactly like a single-loop one — `move_faces` already iterates every loop
+//! and `retrim_planar_face` already re-trims all of them. Supported.
 //!
 //! Curved carriers use dedicated offset paths rather than translating a
 //! midpoint normal: exact paths for cylinders/cones, spheres, and full tori;
@@ -47,7 +47,7 @@
 use std::collections::HashSet;
 
 use crate::feature_pipeline::features::common;
-use crate::feature_pipeline::{AddedSolid, FeatureContext, FeatureResult};
+use crate::feature_pipeline::{AddedSolid, FeatureContext, FeatureRefusal, FeatureResult};
 use crate::{move_faces, AnalyticSurface, BrepSolid, Vec3};
 
 pub fn execute(ctx: &FeatureContext) -> FeatureResult {
@@ -57,7 +57,7 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     }
 }
 
-fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     let mut result = FeatureResult::empty(ctx.id.clone(), ctx.feature_type.clone());
 
     // `faces` is a reference_selection of FACE names (contract rule 1).
@@ -93,6 +93,10 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     if !distance.is_finite() || distance.abs() <= 1e-12 {
         return Ok(result);
     }
+    // From here the feature PROCEEDS on the faces that resolved: a miss is
+    // reported as a typed partial fulfilment beside `unresolved`, never
+    // silently. (Not before the distance guard: a no-op applies nothing.)
+    result.note_partial_resolution(&names);
 
     // Dedup face ids preserving order (a name listed twice, or two names → one id).
     let mut seen: HashSet<u64> = HashSet::new();

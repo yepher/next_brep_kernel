@@ -1136,7 +1136,7 @@ impl<'a> Resolver<'a> {
                 loops: Vec::new(),
                 name: None,
             };
-            return offset_surface(&carrier, -distance, 0.0);
+            return offset_surface(&carrier, -distance, 0.0).map_err(String::from);
         }
         if let Some(surface) = self.analytic_surface(entity, samples, sphere_seam)? {
             return Ok(surface);

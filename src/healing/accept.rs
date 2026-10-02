@@ -148,6 +148,7 @@
 //! point reads only the band it falls in, for the same answer at `hole
 //! points × segments per band`.
 
+use crate::{KernelRefusal, KernelStage, OrRefuse, SoundnessDefect};
 use crate::topology::{BrepSolid, LoopRecord};
 use crate::{solid_self_intersections, SelfIntersectionOptions, SelfIntersectionReport};
 
@@ -156,14 +157,14 @@ use crate::{solid_self_intersections, SelfIntersectionOptions, SelfIntersectionR
 ///
 /// `entry` is the lane's own name, so the refusal reads as that lane's
 /// refusal rather than as a soundness module's.
-pub fn accept_sound(solid: BrepSolid, entry: &str) -> Result<BrepSolid, String> {
+pub fn accept_sound(solid: BrepSolid, entry: &str) -> Result<BrepSolid, KernelRefusal> {
     let report = scan(&solid, entry)?;
     if !report.is_flagged() {
         return accept_or_break_out(solid, entry);
     }
     dump_flagged(&solid, entry);
-    if let Some(message) = fold_refusal(&report, entry) {
-        return Err(message);
+    if let Some(refusal) = fold_refusal(&report, entry) {
+        return Err(refusal);
     }
     // Two faces crossing: try to split and trim before refusing.
     let repaired = match resolve_face_crossing(&solid) {
@@ -195,7 +196,7 @@ pub fn accept_sound(solid: BrepSolid, entry: &str) -> Result<BrepSolid, String> 
                 }
             }
         }
-        Err(reason) => return Err(crossing_refusal(&report, entry, &reason)),
+        Err(reason) => return Err(crossing_refusal(&report, entry, &reason.message)),
     };
     let after = scan(&repaired, entry)?;
     if after.is_flagged() {
@@ -247,7 +248,7 @@ const MAX_BREAKOUT_ROUNDS: usize = 4;
 /// declines, and the refusal names each face it tried and the distance it
 /// tried it at. That is measured, not assumed, by
 /// `a_mouth_that_has_left_the_body_reaches_the_migration_route_and_is_refused_by_name`.
-fn accept_or_break_out(solid: BrepSolid, entry: &str) -> Result<BrepSolid, String> {
+fn accept_or_break_out(solid: BrepSolid, entry: &str) -> Result<BrepSolid, KernelRefusal> {
     if refuse_holes_leaving_their_faces(&solid, entry).is_ok() {
         return Ok(solid);
     }
@@ -263,31 +264,43 @@ fn accept_or_break_out(solid: BrepSolid, entry: &str) -> Result<BrepSolid, Strin
 /// standing where the material is not. So an intermediate round is allowed to
 /// be flagged; the END of it is not. Nothing is returned that would not have
 /// been accepted had it been built that way in the first place.
-fn break_out_until_contained(solid: BrepSolid, entry: &str) -> Result<BrepSolid, String> {
+fn break_out_until_contained(solid: BrepSolid, entry: &str) -> Result<BrepSolid, KernelRefusal> {
     let mut current = solid;
     for _ in 0..MAX_BREAKOUT_ROUNDS {
         let Some(breach) = first_hole_breach(&current) else {
             // Contained. It still has to be SOUND to be returned.
             let report = scan(&current, entry)?;
             if report.is_flagged() {
-                return Err(format!(
-                    "{entry}: the breakout repair built a body and it SELF-INTERSECTS — {}",
-                    report.summary().unwrap_or_else(|| "no summary".into()),
+                return Err(KernelRefusal::unsound(
+                    KernelStage::Validate,
+                    SoundnessDefect::Crossing,
+                    crossing_faces(&report),
+                    format!(
+                        "{entry}: the breakout repair built a body and it SELF-INTERSECTS — {}",
+                        report.summary().unwrap_or_else(|| "no summary".into()),
+                    ),
                 ));
             }
             return Ok(current);
         };
+        // The floor's refusal is the primary one; the breakout's decline is
+        // context appended to it, and the class stays the floor's.
         let floor = hole_breach_refusal(&current, &breach, entry);
         current = repair_hole_breakout(&current, &breach).map_err(|reason| {
-            format!("{floor}. The breakout repair was offered this body and declined it: {reason}")
+            floor.with_message(|floor| {
+                format!("{floor}. The breakout repair was offered this body and declined it: {reason}")
+            })
         })?;
     }
     let breach = first_hole_breach(&current).expect("the loop only falls through on a breach");
-    Err(format!(
-        "{}. {MAX_BREAKOUT_ROUNDS} breakouts were built and a hole is still off its face, so \
-         this stops rather than repairing a body into one nobody asked for",
-        hole_breach_refusal(&current, &breach, entry),
-    ))
+    Err(
+        hole_breach_refusal(&current, &breach, entry).with_message(|floor| {
+            format!(
+                "{floor}. {MAX_BREAKOUT_ROUNDS} breakouts were built and a hole is still off its face, so \
+                 this stops rather than repairing a body into one nobody asked for"
+            )
+        }),
+    )
 }
 
 /// [`accept_sound`] for a lane whose INPUTS may themselves self-intersect.
@@ -301,7 +314,7 @@ pub fn accept_sound_against(
     inputs: &[&BrepSolid],
     solid: BrepSolid,
     entry: &str,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let report = scan(&solid, entry)?;
     if !report.is_flagged() {
         return Ok(solid);
@@ -318,17 +331,36 @@ pub fn accept_sound_against(
 
 /// The scan, with a read failure reported as a refusal rather than swallowed:
 /// a result that could not be scanned is not a result that scanned clean.
-fn scan(solid: &BrepSolid, entry: &str) -> Result<SelfIntersectionReport, String> {
+fn scan(solid: &BrepSolid, entry: &str) -> Result<SelfIntersectionReport, KernelRefusal> {
     let options = SelfIntersectionOptions::for_solid(solid);
-    solid_self_intersections(solid, options)
-        .map_err(|message| format!("{entry}: the soundness scan could not run: {message}"))
+    solid_self_intersections(solid, options).map_err(|message| {
+        KernelRefusal::internal(
+            KernelStage::Validate,
+            "soundness_scan",
+            format!("{entry}: the soundness scan could not run: {message}"),
+        )
+    })
+}
+
+/// The faces the scan's confirmed crossings name, each once, in report order.
+fn crossing_faces(report: &SelfIntersectionReport) -> Vec<u64> {
+    let mut faces = Vec::new();
+    for crossing in &report.confirmed {
+        for face in [crossing.face_a, crossing.face_b] {
+            if !faces.contains(&face) {
+                faces.push(face);
+            }
+        }
+    }
+    faces
 }
 
 /// The refusal for a face folded through itself — named, with both feet, the
 /// point and the margins, and pointing at the lane that owns the fix.
-fn fold_refusal(report: &SelfIntersectionReport, entry: &str) -> Option<String> {
+fn fold_refusal(report: &SelfIntersectionReport, entry: &str) -> Option<KernelRefusal> {
     let fold = report.folds.first()?;
-    Some(format!(
+    let faces = report.folds.iter().map(|fold| fold.face).collect();
+    let message = format!(
         "{entry}: the result's face {}{} FOLDS THROUGH ITSELF in 3D — its surface carries \
          ({:.6}, {:.6}) and ({:.6}, {:.6}), {:.3e} apart in its own domain and both inside \
          its trim, to the same point ({:.4}, {:.4}, {:.4}) (residual {:.3e}, branches {:.1} \
@@ -356,12 +388,18 @@ fn fold_refusal(report: &SelfIntersectionReport, entry: &str) -> Option<String> 
         } else {
             String::new()
         },
+    );
+    Some(KernelRefusal::unsound(
+        KernelStage::Validate,
+        SoundnessDefect::Fold,
+        faces,
+        message,
     ))
 }
 
 /// The refusal for two faces crossing, naming every pair and why the repair
 /// did not take it.
-fn crossing_refusal(report: &SelfIntersectionReport, entry: &str, reason: &str) -> String {
+fn crossing_refusal(report: &SelfIntersectionReport, entry: &str, reason: &str) -> KernelRefusal {
     let pairs = report
         .confirmed
         .iter()
@@ -379,11 +417,16 @@ fn crossing_refusal(report: &SelfIntersectionReport, entry: &str, reason: &str) 
         })
         .collect::<Vec<_>>()
         .join("; ");
-    format!(
-        "{entry}: the result SELF-INTERSECTS — {pairs}. The enclosed space can still measure \
-         right, so neither a volume oracle nor `validate()` would have caught this. The repair \
-         that splits both faces along their carriers' intersection and drops the enclosed \
-         material did not take it: {reason}"
+    KernelRefusal::unsound(
+        KernelStage::Validate,
+        SoundnessDefect::Crossing,
+        crossing_faces(report),
+        format!(
+            "{entry}: the result SELF-INTERSECTS — {pairs}. The enclosed space can still measure \
+             right, so neither a volume oracle nor `validate()` would have caught this. The repair \
+             that splits both faces along their carriers' intersection and drops the enclosed \
+             material did not take it: {reason}"
+        ),
     )
 }
 
@@ -398,7 +441,7 @@ const LOOP_SAMPLES_PER_SPAN: usize = 32;
 
 /// A loop of a face as a closed polyline in that face's own parameter plane,
 /// traced coedge by coedge along each pcurve (already oriented to its coedge).
-fn loop_parameter_polyline(loop_record: &LoopRecord) -> Result<Vec<(f64, f64)>, String> {
+fn loop_parameter_polyline(loop_record: &LoopRecord) -> Result<Vec<(f64, f64)>, KernelRefusal> {
     pcurve_polyline(loop_record.coedges.iter().map(|coedge| &coedge.pcurve))
 }
 
@@ -407,16 +450,16 @@ fn loop_parameter_polyline(loop_record: &LoopRecord) -> Result<Vec<(f64, f64)>, 
 /// same loop traced by the containment floor are the same polyline.
 fn fragment_loop_polyline(
     fragment_loop: &crate::fragment::FragmentLoop,
-) -> Result<Vec<(f64, f64)>, String> {
+) -> Result<Vec<(f64, f64)>, KernelRefusal> {
     pcurve_polyline(fragment_loop.coedges.iter().map(|coedge| &coedge.pcurve))
 }
 
 fn pcurve_polyline<'a>(
     pcurves: impl Iterator<Item = &'a crate::NurbsCurve>,
-) -> Result<Vec<(f64, f64)>, String> {
+) -> Result<Vec<(f64, f64)>, KernelRefusal> {
     let mut points = Vec::new();
     for pcurve in pcurves {
-        let [d0, d1] = pcurve.domain()?;
+        let [d0, d1] = pcurve.domain().or_refuse(KernelStage::Validate, "domain")?;
         let steps = if pcurve.degree <= 1 && pcurve.control_points.len() == 2 {
             1
         } else {
@@ -429,7 +472,7 @@ fn pcurve_polyline<'a>(
             spans.max(1) * LOOP_SAMPLES_PER_SPAN
         };
         for step in 0..steps {
-            let uv = pcurve.evaluate(d0 + (d1 - d0) * (step as f64 / steps as f64))?;
+            let uv = pcurve.evaluate(d0 + (d1 - d0) * (step as f64 / steps as f64)).or_refuse(KernelStage::Validate, "evaluate")?;
             points.push((uv.x, uv.y));
         }
     }
@@ -665,7 +708,7 @@ impl<'a> BoundaryBands<'a> {
 /// This runs at the END of [`accept_sound`], on the body the repair left, so a
 /// crossing the repair can take is still taken — the reason an earlier
 /// primitive-level copy of this floor was removed.
-fn refuse_holes_leaving_their_faces(solid: &BrepSolid, entry: &str) -> Result<(), String> {
+fn refuse_holes_leaving_their_faces(solid: &BrepSolid, entry: &str) -> Result<(), KernelRefusal> {
     match first_hole_breach(solid) {
         Some(breach) => Err(hole_breach_refusal(solid, &breach, entry)),
         None => Ok(()),
@@ -708,7 +751,7 @@ fn first_hole_breach(solid: &BrepSolid) -> Option<HoleBreach> {
                 .loops
                 .iter()
                 .map(loop_parameter_polyline)
-                .collect::<Result<Vec<_>, String>>()
+                .collect::<Result<Vec<_>, KernelRefusal>>()
                 // A loop this cannot be traced from is not a loop this can
                 // convict: the acceptance's own floors already ran.
                 .unwrap_or_default();
@@ -765,7 +808,7 @@ fn boundary_tolerance(outer: &[(f64, f64)]) -> f64 {
 }
 
 /// The floor's refusal, written off the breach it convicted.
-fn hole_breach_refusal(solid: &BrepSolid, breach: &HoleBreach, entry: &str) -> String {
+fn hole_breach_refusal(solid: &BrepSolid, breach: &HoleBreach, entry: &str) -> KernelRefusal {
     let face = solid
         .shells
         .iter()
@@ -780,16 +823,21 @@ fn hole_breach_refusal(solid: &BrepSolid, breach: &HoleBreach, entry: &str) -> S
         .and_then(|face| face.surface.evaluate(u, v).ok())
         .map(|point| format!(" — ({:.4}, {:.4}, {:.4}) in space", point.x, point.y, point.z))
         .unwrap_or_default();
-    format!(
-        "{entry}: hole loop {} of {label} has LEFT that face — it runs outside the \
-         face's own outer boundary, at ({u:.6}, {v:.6}) in the face's parameters{}. \
-         A hole is a hole IN a face; this one bounds a wall that no longer opens \
-         through it, so the right body needs the hole to break through a \
-         neighbouring face, a topology change this operation does not make. \
-         `validate()` cannot see it (every incidence is intact), the \
-         self-intersection scan cannot (nothing crosses), and the volume need not \
-         change at all — refusing rather than returning the wrong body",
-        breach.loop_id, where_in_space,
+    KernelRefusal::unsound(
+        KernelStage::Validate,
+        SoundnessDefect::HoleBreach,
+        vec![breach.face],
+        format!(
+            "{entry}: hole loop {} of {label} has LEFT that face — it runs outside the \
+             face's own outer boundary, at ({u:.6}, {v:.6}) in the face's parameters{}. \
+             A hole is a hole IN a face; this one bounds a wall that no longer opens \
+             through it, so the right body needs the hole to break through a \
+             neighbouring face, a topology change this operation does not make. \
+             `validate()` cannot see it (every incidence is intact), the \
+             self-intersection scan cannot (nothing crosses), and the volume need not \
+             change at all — refusing rather than returning the wrong body",
+            breach.loop_id, where_in_space,
+        ),
     )
 }
 
@@ -820,17 +868,17 @@ struct BreakoutPair {
 /// all (it has left the face's own parameter patch entirely — the runaway), and
 /// a hole crossing into MORE THAN ONE neighbour, which is a breakout over a
 /// corner and needs both re-trims resolved together rather than one at a time.
-fn breakout_pair(solid: &BrepSolid, breach: &HoleBreach) -> Result<BreakoutPair, String> {
+fn breakout_pair(solid: &BrepSolid, breach: &HoleBreach) -> Result<BreakoutPair, KernelRefusal> {
     let wall = breakout_wall(solid, breach)?;
     match breakout_neighbours_crossed(solid, breach, wall)?[..] {
         [neighbour] => Ok(BreakoutPair { wall, neighbour }),
-        [] => Err(NOT_A_STRADDLE.to_string()),
-        ref many => Err(format!(
+        [] => Err(KernelRefusal::unsupported(KernelStage::Validate, NOT_A_STRADDLE_WHAT, NOT_A_STRADDLE)),
+        ref many => Err(KernelRefusal::unsupported(KernelStage::Validate, "breakout.pair", format!(
             "the runaway hole crosses into {} neighbouring faces at once ({many:?}) — a \
              breakout over a corner, where the two re-trims bound each other and resolving one \
              at a time is a different problem from resolving both",
             many.len(),
-        )),
+        ))),
     }
 }
 
@@ -839,9 +887,22 @@ fn breakout_pair(solid: &BrepSolid, breach: &HoleBreach) -> Result<BreakoutPair,
 /// body; [`repair_hole_breakout`] tells those apart, by trying.
 const NOT_A_STRADDLE: &str = "the hole does not straddle its own face's boundary";
 
+/// The slug [`breakout_pair`] mints [`NOT_A_STRADDLE`] under
+/// (`UnsupportedGeometry`), shared with [`is_not_a_straddle`].
+const NOT_A_STRADDLE_WHAT: &str = "breakout.not_a_straddle";
+
+/// Is this [`breakout_pair`]'s non-straddle answer? Read off the class and
+/// slug, so the route's decision does not follow the sentence.
+fn is_not_a_straddle(refusal: &KernelRefusal) -> bool {
+    matches!(
+        &refusal.class,
+        crate::RefusalClass::UnsupportedGeometry { what } if what == NOT_A_STRADDLE_WHAT
+    )
+}
+
 /// The face the convicted hole loop BOUNDS — the moved carrier, for a bore the
 /// bore's own wall. Exactly one other face may answer for its edges.
-fn breakout_wall(solid: &BrepSolid, breach: &HoleBreach) -> Result<u64, String> {
+fn breakout_wall(solid: &BrepSolid, breach: &HoleBreach) -> Result<u64, KernelRefusal> {
     let face = face_by_id(solid, breach.face)?;
     let mut walls: Vec<u64> = Vec::new();
     for coedge in &face.loops[breach.loop_index].coedges {
@@ -861,24 +922,26 @@ fn breakout_wall(solid: &BrepSolid, breach: &HoleBreach) -> Result<u64, String> 
     }
     match walls[..] {
         [wall] => Ok(wall),
-        _ => Err(format!(
+        _ => Err(KernelRefusal::unsupported(KernelStage::Validate, "breakout.wall_count", format!(
             "the runaway hole loop bounds {} face(s) ({walls:?}); this route re-trims ONE moved \
              carrier against the body and cannot decide which of several is the one that moved",
             walls.len(),
-        )),
+        ))),
     }
 }
 
 fn face_by_id<'a>(
     solid: &'a BrepSolid,
     id: u64,
-) -> Result<&'a crate::FaceRecord, String> {
+) -> Result<&'a crate::FaceRecord, KernelRefusal> {
     solid
         .shells
         .iter()
         .flat_map(|shell| &shell.faces)
         .find(|face| face.id == id)
-        .ok_or_else(|| format!("face {id} is not on the body"))
+        .ok_or_else(|| {
+            KernelRefusal::internal(KernelStage::Validate, "face_by_id", format!("face {id} is not on the body"))
+        })
 }
 
 /// The neighbours the hole has run out ONTO, read as segment crossings in the
@@ -894,14 +957,16 @@ fn breakout_neighbours_crossed(
     solid: &BrepSolid,
     breach: &HoleBreach,
     wall: u64,
-) -> Result<Vec<u64>, String> {
+) -> Result<Vec<u64>, KernelRefusal> {
     let face = face_by_id(solid, breach.face)?;
     let polylines = face
         .loops
         .iter()
         .map(loop_parameter_polyline)
-        .collect::<Result<Vec<_>, String>>()
-        .map_err(|error| format!("the breached face's loops could not be traced: {error}"))?;
+        .collect::<Result<Vec<_>, KernelRefusal>>()
+        .map_err(|error| {
+            error.with_message(|error| format!("the breached face's loops could not be traced: {error}"))
+        })?;
     let outer_index = (0..polylines.len())
         .max_by(|&a, &b| {
             polyline_area(&polylines[a])
@@ -910,14 +975,14 @@ fn breakout_neighbours_crossed(
         })
         .unwrap_or(0);
     if outer_index == breach.loop_index {
-        return Err("the convicted loop is the face's own outer loop".to_string());
+        return Err(KernelRefusal::internal(KernelStage::Validate, "breakout.outer_loop", "the convicted loop is the face's own outer loop"));
     }
     let hole = &polylines[breach.loop_index];
 
     let mut neighbours: Vec<u64> = Vec::new();
     for coedge in &face.loops[outer_index].coedges {
         let side = coedge_parameter_polyline(coedge)
-            .map_err(|error| format!("an outer coedge could not be traced: {error}"))?;
+            .map_err(|error| error.with_message(|error| format!("an outer coedge could not be traced: {error}")))?;
         if !polylines_cross(hole, &side) {
             continue;
         }
@@ -950,13 +1015,13 @@ fn faces_over_the_outer_boundary(
     solid: &BrepSolid,
     breach: &HoleBreach,
     wall: u64,
-) -> Result<Vec<u64>, String> {
+) -> Result<Vec<u64>, KernelRefusal> {
     let face = face_by_id(solid, breach.face)?;
     let polylines = face
         .loops
         .iter()
         .map(loop_parameter_polyline)
-        .collect::<Result<Vec<_>, String>>()
+        .collect::<Result<Vec<_>, KernelRefusal>>()
         .unwrap_or_default();
     let outer_index = (0..polylines.len())
         .max_by(|&a, &b| {
@@ -991,9 +1056,9 @@ fn faces_over_the_outer_boundary(
 /// the next coedge's start; a single coedge asked about on its own has no next.
 fn coedge_parameter_polyline(
     coedge: &crate::topology::CoedgeRecord,
-) -> Result<Vec<(f64, f64)>, String> {
+) -> Result<Vec<(f64, f64)>, KernelRefusal> {
     let pcurve = &coedge.pcurve;
-    let [d0, d1] = pcurve.domain()?;
+    let [d0, d1] = pcurve.domain().or_refuse(KernelStage::Validate, "domain")?;
     let steps = if pcurve.degree <= 1 && pcurve.control_points.len() == 2 {
         1
     } else {
@@ -1007,7 +1072,7 @@ fn coedge_parameter_polyline(
     };
     let mut points = Vec::with_capacity(steps + 1);
     for step in 0..=steps {
-        let uv = pcurve.evaluate(d0 + (d1 - d0) * (step as f64 / steps as f64))?;
+        let uv = pcurve.evaluate(d0 + (d1 - d0) * (step as f64 / steps as f64)).or_refuse(KernelStage::Validate, "evaluate")?;
         points.push((uv.x, uv.y));
     }
     Ok(points)
@@ -1060,7 +1125,7 @@ fn segments_cross(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) ->
 /// [`breakout_pair`] finds no neighbour and this refuses before a single face
 /// is split; and even given a pair, the imprint of a carrier that misses the
 /// body cuts neither trim and [`split_and_drop`] declines on its own terms.
-fn repair_hole_breakout(solid: &BrepSolid, breach: &HoleBreach) -> Result<BrepSolid, String> {
+fn repair_hole_breakout(solid: &BrepSolid, breach: &HoleBreach) -> Result<BrepSolid, KernelRefusal> {
     let origin = || RepairOrigin::Breakout {
         face: breach.face,
         loop_id: breach.loop_id,
@@ -1071,7 +1136,15 @@ fn repair_hole_breakout(solid: &BrepSolid, breach: &HoleBreach) -> Result<BrepSo
         Ok(BreakoutPair { wall, neighbour }) => {
             return split_and_drop(solid, wall, neighbour, origin())
         }
-        Err(reason) if reason != NOT_A_STRADDLE => return Err(reason),
+        // Every refusal but the non-straddle is this route's own, classed as it
+        // always was here; the non-straddle is read off its slug, not its text.
+        Err(reason) if !is_not_a_straddle(&reason) => {
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Validate,
+                "breakout.pair",
+                reason.message,
+            ))
+        }
         Err(_) => {}
     }
 
@@ -1092,10 +1165,19 @@ fn repair_hole_breakout(solid: &BrepSolid, breach: &HoleBreach) -> Result<BrepSo
     // More than one candidate building is not an answer: the mouth would be on
     // two faces at once with no reason to prefer either, and choosing would be
     // the guess this module exists not to make.
-    let wall = breakout_wall(solid, breach)?;
-    let mut candidates = faces_over_the_outer_boundary(solid, breach, wall)?;
+    let wall = breakout_wall(solid, breach).map_err(|refusal| {
+        KernelRefusal::internal(KernelStage::Validate, "breakout.wall", refusal.message)
+    })?;
+    let mut candidates = faces_over_the_outer_boundary(solid, breach, wall)
+        .map_err(|refusal| {
+            KernelRefusal::internal(KernelStage::Validate, "breakout.candidates", refusal.message)
+        })?;
     if candidates.is_empty() {
-        return Err(RUNAWAY.to_string());
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Validate,
+            "breakout.runaway",
+            RUNAWAY,
+        ));
     }
 
     // WHICH face the mouth moved onto, when its own face's parameter plane can
@@ -1110,19 +1192,31 @@ fn repair_hole_breakout(solid: &BrepSolid, breach: &HoleBreach) -> Result<BrepSo
     // A TIE is refused rather than broken. Two faces the same distance from the
     // mouth means the mouth sits on the edge between them, which is a corner
     // breakout — the case whose two re-trims bound each other.
-    let mouth = hole_loop_in_space(solid, breach)?;
+    let mouth = hole_loop_in_space(solid, breach).map_err(|refusal| {
+        KernelRefusal::internal(KernelStage::Validate, "breakout.mouth", refusal.message)
+    })?;
     let scale = crate::solid_scale(solid);
     let mut ranked: Vec<(f64, u64)> = Vec::new();
     for candidate in candidates.drain(..) {
-        ranked.push((distance_to_face(solid, candidate, &mouth)?, candidate));
+        ranked.push((
+            distance_to_face(solid, candidate, &mouth)
+                .map_err(|refusal| {
+                    KernelRefusal::internal(KernelStage::Validate, "breakout.distance", refusal.message)
+                })?,
+            candidate,
+        ));
     }
     ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
     if ranked.len() > 1 && (ranked[1].0 - ranked[0].0).abs() <= scale * 1e-9 {
-        return Err(format!(
-            "the migrated mouth is the same distance ({:.6}) from faces {} and {}, so the body \
-             does not say which of them it moved onto — a breakout over the corner between \
-             them, where the two re-trims bound each other",
-            ranked[0].0, ranked[0].1, ranked[1].1,
+        return Err(KernelRefusal::ill_posed(
+            KernelStage::Validate,
+            "breakout.corner_tie",
+            format!(
+                "the migrated mouth is the same distance ({:.6}) from faces {} and {}, so the body \
+                 does not say which of them it moved onto — a breakout over the corner between \
+                 them, where the two re-trims bound each other",
+                ranked[0].0, ranked[0].1, ranked[1].1,
+            ),
         ));
     }
 
@@ -1143,10 +1237,14 @@ fn repair_hole_breakout(solid: &BrepSolid, breach: &HoleBreach) -> Result<BrepSo
         }
     }
     restore_repairs(carried);
-    Err(format!(
-        "{RUNAWAY} — the moved carrier was offered every face across that boundary, nearest \
-         first, and cut none of them ({})",
-        declined.join(" | ")
+    Err(KernelRefusal::unsupported(
+        KernelStage::Validate,
+        "breakout.runaway",
+        format!(
+            "{RUNAWAY} — the moved carrier was offered every face across that boundary, nearest \
+             first, and cut none of them ({})",
+            declined.join(" | ")
+        ),
     ))
 }
 
@@ -1154,13 +1252,14 @@ fn repair_hole_breakout(solid: &BrepSolid, breach: &HoleBreach) -> Result<BrepSo
 /// own parameters, so they are read back through that face's surface — the same
 /// road the floor takes, and the reason the floor was never wrong about where a
 /// loop is.
-fn hole_loop_in_space(solid: &BrepSolid, breach: &HoleBreach) -> Result<Vec<crate::Vec3>, String> {
+fn hole_loop_in_space(solid: &BrepSolid, breach: &HoleBreach) -> Result<Vec<crate::Vec3>, KernelRefusal> {
     let face = face_by_id(solid, breach.face)?;
     let uv = loop_parameter_polyline(&face.loops[breach.loop_index])?;
     uv.into_iter()
         .map(|(u, v)| face.surface.evaluate(u, v))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("the convicted hole loop could not be read in space: {error}"))
+        .or_refuse(KernelStage::Validate, "evaluate")
 }
 
 /// The least distance from a set of points to a face's own TRIM — sampled, in
@@ -1170,14 +1269,14 @@ fn distance_to_face(
     solid: &BrepSolid,
     face_id: u64,
     points: &[crate::Vec3],
-) -> Result<f64, String> {
+) -> Result<f64, KernelRefusal> {
     const STATIONS: usize = 32;
     let face = face_by_id(solid, face_id)?;
     let polylines = face
         .loops
         .iter()
         .map(loop_parameter_polyline)
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, KernelRefusal>>()?;
     let outer_index = (0..polylines.len())
         .max_by(|&a, &b| {
             polyline_area(&polylines[a])
@@ -1252,7 +1351,7 @@ pub fn resolve_face_crossing_between(
     solid: &BrepSolid,
     face_a: u64,
     face_b: u64,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let report = scan(solid, "resolve_face_crossing_between")?;
     split_and_drop(solid, face_a, face_b, RepairOrigin::Scan(&report))
 }
@@ -1352,25 +1451,39 @@ const MAXIMUM_CROSSING_PIECES: usize = 8;
 /// [`over_used_edge`] refuses that candidate where the third use still exists,
 /// which is here. It is what stopped the turned-bore migration returning a body
 /// 23% out on area.
-pub fn resolve_face_crossing(solid: &BrepSolid) -> Result<BrepSolid, String> {
+pub fn resolve_face_crossing(solid: &BrepSolid) -> Result<BrepSolid, KernelRefusal> {
     let options = SelfIntersectionOptions::for_solid(solid);
-    let report = solid_self_intersections(solid, options)
-        .map_err(|message| format!("the soundness scan could not run: {message}"))?;
+    let report = solid_self_intersections(solid, options).map_err(|message| {
+        KernelRefusal::internal(
+            KernelStage::Validate,
+            "soundness_scan",
+            format!("the soundness scan could not run: {message}"),
+        )
+    })?;
     if let Some(fold) = report.folds.first() {
-        return Err(format!(
-            "face {} folds through ITSELF; a fold is a trim that was never constructed and \
-             belongs to the carrier carve, not to this repair",
-            fold.face
+        return Err(KernelRefusal::unsound(
+            KernelStage::Validate,
+            SoundnessDefect::Fold,
+            report.folds.iter().map(|fold| fold.face).collect(),
+            format!(
+                "face {} folds through ITSELF; a fold is a trim that was never constructed and \
+                 belongs to the carrier carve, not to this repair",
+                fold.face
+            ),
         ));
     }
     if report.confirmed.is_empty() {
         return Ok(solid.clone());
     }
     if report.confirmed.len() > 1 {
-        return Err(format!(
-            "{} crossing face pairs; each repair changes the faces the next would be measured \
-             against, so this repair takes one pair at a time",
-            report.confirmed.len()
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Validate,
+            "crossing.multiple_pairs",
+            format!(
+                "{} crossing face pairs; each repair changes the faces the next would be measured \
+                 against, so this repair takes one pair at a time",
+                report.confirmed.len()
+            ),
         ));
     }
     let crossing = &report.confirmed[0];
@@ -1384,7 +1497,7 @@ fn split_and_drop(
     face_a: u64,
     face_b: u64,
     origin: RepairOrigin<'_>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     use crate::fragment::fragment_solid;
     use crate::imprint::{FaceKey, ImprintOptions};
     use crate::{apply_edge_splits, build_imprints};
@@ -1422,8 +1535,9 @@ fn split_and_drop(
         ..ImprintOptions::default()
     };
     measured_fit_request(&mut request);
-    let mut imprint = build_imprints(&open_a, &open_b, &request)
-        .map_err(|error| format!("the two carriers could not be imprinted: {error}"))?;
+    let mut imprint = build_imprints(&open_a, &open_b, &request).map_err(|error| {
+        error.with_message(|error| format!("the two carriers could not be imprinted: {error}"))
+    })?;
 
     // Both faces belong to ONE body, so both sides of the imprint are rewritten
     // onto that body's operand. The face ids are the solid's own and cannot
@@ -1462,21 +1576,27 @@ fn split_and_drop(
         .iter()
         .any(|face| face.face_id == face_b && !face.piece_ids.is_empty());
     if !cut_a || !cut_b {
-        return Err(format!(
-            "the carriers' intersection reaches {} of the two trims, so there is no shared \
-             curve to split along",
-            match (cut_a, cut_b) {
-                (true, false) => format!("only face {face_a}"),
-                (false, true) => format!("only face {face_b}"),
-                _ => "neither".into(),
-            }
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Fragment,
+            "crossing.no_shared_curve",
+            format!(
+                "the carriers' intersection reaches {} of the two trims, so there is no shared \
+                 curve to split along",
+                match (cut_a, cut_b) {
+                    (true, false) => format!("only face {face_a}"),
+                    (false, true) => format!("only face {face_b}"),
+                    _ => "neither".into(),
+                }
+            ),
         ));
     }
 
-    let split = apply_edge_splits(solid, SELF_OPERAND, &imprint)
-        .map_err(|error| format!("the imprinted edge splits could not be applied: {error}"))?;
-    let fragments = fragment_solid(&split, SELF_OPERAND, &imprint)
-        .map_err(|error| format!("the split faces could not be fragmented: {error}"))?;
+    let split = apply_edge_splits(solid, SELF_OPERAND, &imprint).map_err(|error| {
+        error.with_message(|error| format!("the imprinted edge splits could not be applied: {error}"))
+    })?;
+    let fragments = fragment_solid(&split, SELF_OPERAND, &imprint).map_err(|error| {
+        error.with_message(|error| format!("the split faces could not be fragmented: {error}"))
+    })?;
 
     if trace_on() {
         trace_solid("split solid", &split);
@@ -1539,23 +1659,31 @@ fn split_and_drop(
         }
     };
     if pieces_a.len() < need_a || pieces_b.len() < need_b {
-        return Err(format!(
-            "the crossing cut face {face_a} into {} piece(s) and face {face_b} into {} — this \
-             repair resolves the case where the curve cuts BOTH trims, so one part of each is \
-             the tail that overshot",
-            pieces_a.len(),
-            pieces_b.len()
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Fragment,
+            "crossing.one_sided_cut",
+            format!(
+                "the crossing cut face {face_a} into {} piece(s) and face {face_b} into {} — this \
+                 repair resolves the case where the curve cuts BOTH trims, so one part of each is \
+                 the tail that overshot",
+                pieces_a.len(),
+                pieces_b.len()
+            ),
         ));
     }
     if pieces_a.len() + pieces_b.len() > MAXIMUM_CROSSING_PIECES {
-        return Err(format!(
-            "the crossing cut face {face_a} into {} piece(s) and face {face_b} into {}, which is \
-             {} pieces against this repair's budget of {MAXIMUM_CROSSING_PIECES} — every way to \
-             drop some of them is rebuilt and re-checked, so the enumeration is bounded rather \
-             than sampled",
-            pieces_a.len(),
-            pieces_b.len(),
-            pieces_a.len() + pieces_b.len(),
+        return Err(KernelRefusal::non_convergence(
+            KernelStage::Fragment,
+            "crossing.pieces",
+            format!(
+                "the crossing cut face {face_a} into {} piece(s) and face {face_b} into {}, which is \
+                 {} pieces against this repair's budget of {MAXIMUM_CROSSING_PIECES} — every way to \
+                 drop some of them is rebuilt and re-checked, so the enumeration is bounded rather \
+                 than sampled",
+                pieces_a.len(),
+                pieces_b.len(),
+                pieces_a.len() + pieces_b.len(),
+            ),
         ));
     }
 
@@ -1591,11 +1719,15 @@ fn split_and_drop(
     }
 
     if verified.len() > 1 {
-        return Err(format!(
-            "{} different drops of the crossing pieces all rebuilt into a sound body, so the \
-             result does not decide which material the crossing encloses; this repair answers \
-             only where one does",
-            verified.len()
+        return Err(KernelRefusal::ill_posed(
+            KernelStage::Select,
+            "crossing.ambiguous_drop",
+            format!(
+                "{} different drops of the crossing pieces all rebuilt into a sound body, so the \
+                 result does not decide which material the crossing encloses; this repair answers \
+                 only where one does",
+                verified.len()
+            ),
         ));
     }
     let Some(Candidate {
@@ -1613,24 +1745,32 @@ fn split_and_drop(
             .cloned()
             .collect::<Vec<_>>()
             .join(" | ");
-        return Err(format!(
-            "none of the {} ways of dropping the crossing pieces rebuilt into a sound body \
-             ({listed}{}); the worst crossing was {:.3e} past its band, so the overshoot is \
-             real and it is the SPLIT that did not resolve it",
-            refusals.len(),
-            if refusals.len() > 4 {
-                format!(" | and {} more", refusals.len() - 4)
-            } else {
-                String::new()
-            },
-            match &origin {
-                RepairOrigin::Scan(report) => report
-                    .confirmed
-                    .first()
-                    .map(|crossing| crossing.straddle)
-                    .unwrap_or_default(),
-                RepairOrigin::Breakout { .. } => 0.0,
-            }
+        // The candidate reasons (an over-used edge, a closure that consumed
+        // every face, a rebuild that declined) are CONTEXT inside this one
+        // refusal, whose class is minted here: the body still crosses itself.
+        return Err(KernelRefusal::unsound(
+            KernelStage::Sew,
+            SoundnessDefect::Crossing,
+            vec![face_a, face_b],
+            format!(
+                "none of the {} ways of dropping the crossing pieces rebuilt into a sound body \
+                 ({listed}{}); the worst crossing was {:.3e} past its band, so the overshoot is \
+                 real and it is the SPLIT that did not resolve it",
+                refusals.len(),
+                if refusals.len() > 4 {
+                    format!(" | and {} more", refusals.len() - 4)
+                } else {
+                    String::new()
+                },
+                match &origin {
+                    RepairOrigin::Scan(report) => report
+                        .confirmed
+                        .first()
+                        .map(|crossing| crossing.straddle)
+                        .unwrap_or_default(),
+                    RepairOrigin::Breakout { .. } => 0.0,
+                }
+            ),
         ));
     };
 
@@ -1895,7 +2035,7 @@ fn close_drop_set(
     retired: &mut Vec<u64>,
     touched: &rustc_hash::FxHashSet<u64>,
     degenerate: &rustc_hash::FxHashSet<EdgeKey>,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     use rustc_hash::FxHashMap as HashMap;
     loop {
         let mut uses: HashMap<EdgeKey, usize> = HashMap::default();
@@ -1942,11 +2082,11 @@ fn close_drop_set(
                 continue;
             }
             if !touched.contains(&fragment.source_face_id) {
-                return Err(format!(
+                return Err(KernelRefusal::internal(KernelStage::Validate, "retrim.uncut_face", format!(
                     "the re-trim reached face {}, which the imprint never cut — the drop has run \
                      past the material the crossing encloses",
                     fragment.source_face_id
-                ));
+                )));
             }
             dropped.push(index);
             grew = true;
@@ -1986,7 +2126,7 @@ fn retrim_drop_set(
     retired: &mut Vec<u64>,
     touched: &rustc_hash::FxHashSet<u64>,
     degenerate: &rustc_hash::FxHashSet<EdgeKey>,
-) -> Result<(Vec<crate::fragment::FaceFragmentRecord>, Vec<u64>), String> {
+) -> Result<(Vec<crate::fragment::FaceFragmentRecord>, Vec<u64>), KernelRefusal> {
     use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
     let mut working = fragments.to_vec();
@@ -2052,11 +2192,11 @@ fn retrim_drop_set(
             // see [`holds_only_stale_loops`].
             let stale = holds_only_stale_loops(&working[index], &unmatched, degenerate);
             if !touched.contains(&working[index].source_face_id) && !stale {
-                return Err(format!(
+                return Err(KernelRefusal::internal(KernelStage::Validate, "retrim.uncut_face", format!(
                     "the re-trim reached face {}, which the imprint never cut — the drop has run \
                      past the material the crossing encloses",
                     working[index].source_face_id
-                ));
+                )));
             }
             let face = working[index].source_face_id;
             match retrim_fragment(&working[index], &unmatched)? {
@@ -2095,7 +2235,7 @@ fn retrim_drop_set(
 fn retrim_fragment(
     fragment: &crate::fragment::FaceFragmentRecord,
     remove: &rustc_hash::FxHashSet<EdgeKey>,
-) -> Result<Option<crate::fragment::FaceFragmentRecord>, String> {
+) -> Result<Option<crate::fragment::FaceFragmentRecord>, KernelRefusal> {
     use crate::fragment::{FaceFragmentRecord, FragmentCoedge, FragmentLoop};
 
     let kept: Vec<FragmentCoedge> = fragment
@@ -2114,15 +2254,15 @@ fn retrim_fragment(
             let [t0, t1] = coedge.pcurve.domain()?;
             Ok((coedge.pcurve.evaluate(t0)?, coedge.pcurve.evaluate(t1)?))
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, String>>().or_refuse(KernelStage::Validate, "collect")?;
     // The domain's own diagonal sets the band a junction is matched in: a
     // plane's parameters are millimetres and a cylinder's are radians against
     // millimetres, so one fixed number would mean two different things on the
     // two carriers. The ends being matched were cut from ONE curve by the
     // imprint's own split, so they agree to the fit's precision and the band
     // only has to be small against the face.
-    let [u0, u1] = fragment.surface.domain_u()?;
-    let [v0, v1] = fragment.surface.domain_v()?;
+    let [u0, u1] = fragment.surface.domain_u().or_refuse(KernelStage::Validate, "domain_u")?;
+    let [v0, v1] = fragment.surface.domain_v().or_refuse(KernelStage::Validate, "domain_v")?;
     let tolerance = 1e-4 * (u1 - u0).hypot(v1 - v0);
     let mut used = vec![false; kept.len()];
     let mut loops: Vec<FragmentLoop> = Vec::new();
@@ -2142,11 +2282,11 @@ fn retrim_fragment(
                 .min_by(|left, right| left.1.total_cmp(&right.1))
                 .map(|(index, _)| index);
             let Some(next) = next else {
-                return Err(format!(
+                return Err(KernelRefusal::internal(KernelStage::Validate, "retrim.open_chain", format!(
                     "face {}'s re-trim left a chain open at ({:.6}, {:.6}) in its own parameter \
                      domain — what the drop took off it does not close into a loop",
                     fragment.source_face_id, cursor.x, cursor.y
-                ));
+                )));
             };
             used[next] = true;
             chain.push(next);
@@ -2284,7 +2424,7 @@ fn holds_only_stale_loops(
         .loops
         .iter()
         .map(fragment_loop_polyline)
-        .collect::<Result<Vec<_>, String>>()
+        .collect::<Result<Vec<_>, KernelRefusal>>()
     else {
         return false;
     };
@@ -2418,7 +2558,7 @@ fn rebuild(
     selected: Vec<crate::fragment::FaceFragmentRecord>,
     imprint: &crate::imprint::ImprintResultRecord,
     scale: f64,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     use crate::boolean::{assemble_open_fragments, finalize_assembled_solid};
     use rustc_hash::FxHashMap as HashMap;
 
@@ -2426,35 +2566,36 @@ fn rebuild(
     sources.insert(SELF_OPERAND, split);
     let assembly_tolerance = 2e-3f64.max(scale * 5e-5);
     let solid = assemble_open_fragments(selected, &sources, imprint, assembly_tolerance)
-        .map_err(|error| format!("the kept pieces did not assemble: {error}"))?;
+        .map_err(|error| error.with_message(|error| format!("the kept pieces did not assemble: {error}")))?;
     let solid = finalize_assembled_solid(solid, assembly_tolerance)
-        .map_err(|error| format!("the assembly did not finalize: {error}"))?;
+        .map_err(|error| error.with_message(|error| format!("the assembly did not finalize: {error}")))?;
 
     let issues = solid.validate();
     if !issues.is_empty() {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Validate, "rebuild.validate", format!(
             "the rebuilt body fails validate(): {}",
             issues[0].message
-        ));
+        )));
     }
     if crate::solid_connectivity(&solid).is_disconnected() {
-        return Err("the rebuilt body is not connected".into());
+        return Err(KernelRefusal::internal(KernelStage::Validate, "rebuild.connected", "the rebuilt body is not connected"));
     }
     let options = SelfIntersectionOptions::for_solid(&solid);
     let report = solid_self_intersections(&solid, options)
-        .map_err(|message| format!("the rebuilt body could not be scanned: {message}"))?;
+        .map_err(|message| format!("the rebuilt body could not be scanned: {message}"))
+        .or_refuse(KernelStage::Validate, "solid_self_intersections")?;
     if report.is_flagged() {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Validate, "rebuild.self_intersects", format!(
             "the rebuilt body still self-intersects: {}",
             report.summary().unwrap_or_else(|| "no summary".into())
-        ));
+        )));
     }
     Ok(solid)
 }
 
 /// One face of a body as its own open body, carrying the edges and vertices
 /// that face uses and nothing else.
-fn one_face_body(solid: &BrepSolid, face_id: u64) -> Result<BrepSolid, String> {
+fn one_face_body(solid: &BrepSolid, face_id: u64) -> Result<BrepSolid, KernelRefusal> {
     use crate::topology::ShellRecord;
     use rustc_hash::FxHashSet as HashSet;
 
@@ -2463,7 +2604,10 @@ fn one_face_body(solid: &BrepSolid, face_id: u64) -> Result<BrepSolid, String> {
         .iter()
         .flat_map(|shell| &shell.faces)
         .find(|face| face.id == face_id)
-        .ok_or_else(|| format!("face {face_id} is not in this body"))?
+        .ok_or_else(|| {
+            // The class its one caller gave it before this helper was typed.
+            KernelRefusal::internal(KernelStage::Fragment, "one_face_body", format!("face {face_id} is not in this body"))
+        })?
         .clone();
     let used: HashSet<u64> = face
         .loops
@@ -2482,6 +2626,7 @@ fn one_face_body(solid: &BrepSolid, face_id: u64) -> Result<BrepSolid, String> {
         .flat_map(|edge| [edge.start_vertex_id, edge.end_vertex_id])
         .collect();
     Ok(BrepSolid {
+        mass_properties_cache: Default::default(),
         id: solid.id,
         genus: 0,
         vertices: solid

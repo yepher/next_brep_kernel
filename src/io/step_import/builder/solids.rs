@@ -27,7 +27,7 @@ pub(in crate::step_import) fn build_solid(resolver: &Resolver, manifold_ref: usi
     if debug {
         eprintln!("SOLID #{manifold_ref} BEGIN");
     }
-    let result = build_solid_inner(resolver, manifold_ref, false).map(|(solid, _)| solid);
+    let result = build_solid_inner(resolver, manifold_ref, false).map(|(solid, _, _)| solid);
     if let Some(started) = started {
         eprintln!(
             "SOLID #{manifold_ref} END {:?} ok={}",
@@ -261,6 +261,7 @@ pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSo
         }
     }
     let outer = BrepSolid {
+        mass_properties_cache: Default::default(),
         id: solid.id,
         vertices: solid.vertices.clone(),
         edges: solid.edges.clone(),
@@ -383,7 +384,7 @@ pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSo
 }
 
 pub(in crate::step_import) fn build_brep_with_voids(resolver: &Resolver, body_ref: usize) -> Result<BrepSolid, String> {
-    build_brep_with_voids_captured(resolver, body_ref, false).map(|(solid, _)| solid)
+    build_brep_with_voids_captured(resolver, body_ref, false).map(|(solid, _, _)| solid)
 }
 
 /// [`build_brep_with_voids`], optionally carrying the per-edge capture.
@@ -391,7 +392,7 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
     resolver: &Resolver,
     body_ref: usize,
     capture: bool,
-) -> Result<(BrepSolid, Option<readings::TrimCapture>), String> {
+) -> Result<(BrepSolid, Option<readings::TrimCapture>, Vec<readings::BoundedTrim>), String> {
     let args = resolver
         .get(body_ref)?
         .find("BREP_WITH_VOIDS")
@@ -468,6 +469,7 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
         edge_index: HashMap::default(),
         curve_ref_of_edge: HashMap::default(),
         supplied_report: SuppliedReport::default(),
+        bounded: Vec::new(),
         readings: capture.then(readings::TrimCapture::default),
     };
     let mut shells = Vec::with_capacity(face_lists.len());
@@ -484,7 +486,9 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
     }
     let solid_id = builder.fresh();
     let captured = builder.readings.take();
+    let bounded = std::mem::take(&mut builder.bounded);
     let mut solid = BrepSolid {
+        mass_properties_cache: Default::default(),
         id: solid_id,
         vertices: builder.vertices,
         edges: builder.edges,
@@ -545,14 +549,14 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
         ));
     }
     solid.genus = euler_genus(&solid);
-    Ok((solid, captured))
+    Ok((solid, captured, bounded))
 }
 
 pub(in crate::step_import) fn build_solid_inner(
     resolver: &Resolver,
     manifold_ref: usize,
     capture: bool,
-) -> Result<(BrepSolid, Option<readings::TrimCapture>), String> {
+) -> Result<(BrepSolid, Option<readings::TrimCapture>, Vec<readings::BoundedTrim>), String> {
     let entity = resolver.get(manifold_ref)?;
     // MANIFOLD_SOLID_BREP(name, #shell) and FACETED_BREP(name, #shell) share the
     // same shape: a single CLOSED_SHELL as the second argument.
@@ -571,7 +575,7 @@ pub(in crate::step_import) fn build_solid_inner(
 /// reaches the same validation gate and is rejected there, so this stays safe to
 /// call on any shell reference.
 pub(in crate::step_import) fn build_solid_from_shell(resolver: &Resolver, shell_ref: usize) -> Result<BrepSolid, String> {
-    build_solid_from_shell_captured(resolver, shell_ref, false).map(|(solid, _)| solid)
+    build_solid_from_shell_captured(resolver, shell_ref, false).map(|(solid, _, _)| solid)
 }
 
 /// [`build_solid_from_shell`], optionally carrying what the importer did to
@@ -580,7 +584,7 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
     resolver: &Resolver,
     shell_ref: usize,
     capture: bool,
-) -> Result<(BrepSolid, Option<readings::TrimCapture>), String> {
+) -> Result<(BrepSolid, Option<readings::TrimCapture>, Vec<readings::BoundedTrim>), String> {
     let shell_entity = resolver.get(shell_ref)?;
     let face_refs = shell_entity
         .find("CLOSED_SHELL")
@@ -602,6 +606,7 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
         edge_index: HashMap::default(),
         curve_ref_of_edge: HashMap::default(),
         supplied_report: SuppliedReport::default(),
+        bounded: Vec::new(),
         readings: capture.then(readings::TrimCapture::default),
     };
 
@@ -659,7 +664,9 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
     let shell_id = builder.fresh();
     let solid_id = builder.fresh();
     let captured = builder.readings.take();
+    let bounded = std::mem::take(&mut builder.bounded);
     let mut solid = BrepSolid {
+        mass_properties_cache: Default::default(),
         id: solid_id,
         vertices: builder.vertices,
         edges: builder.edges,
@@ -703,7 +710,7 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
         let line: Vec<String> = laps.iter().map(|(name, ms)| format!("{name}={ms:.2}")).collect();
         eprintln!("step_import.profile shell=#{shell_ref} faces={} {}", face_refs.len(), line.join(" "));
     }
-    Ok((solid, captured))
+    Ok((solid, captured, bounded))
 }
 
 /// Debug escape hatch shared by BOTH validation gates: dump the invalid solid

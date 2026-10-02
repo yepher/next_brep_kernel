@@ -784,6 +784,43 @@ impl Default for SurfaceIntersectionOptions {
     }
 }
 
+/// Refine `seed` onto the intersection of `first_surface` and `second_surface`:
+/// the closest point on each carrier seeds the same Newton the march uses
+/// ([`refine_point`]), so the answer is an INTERSECTION point at the march's own
+/// residual (`tolerance * 0.01`), not a projection onto one surface — a point
+/// merely projected onto one carrier would carry the very bias a section
+/// refiner exists to remove (2026-09-26, the sphere/bore rim of `BadBoolean`).
+/// `None` when the Newton does not converge or lands further than `reach` from
+/// the seed: a refiner must not pull a station onto another branch.
+pub(crate) fn refine_to_intersection(
+    first_surface: &NurbsSurface,
+    second_surface: &NurbsSurface,
+    seed: Vec3,
+    tolerance: f64,
+    reach: f64,
+) -> Result<Option<Vec3>, String> {
+    let first = surface_info(first_surface)?;
+    let second = surface_info(second_surface)?;
+    let on_first = project_point_to_surface(first_surface, seed)?;
+    let on_second = project_point_to_surface(second_surface, seed)?;
+    let Some(refined) = refine_point(
+        first,
+        second,
+        on_first.u,
+        on_first.v,
+        on_second.u,
+        on_second.v,
+        tolerance,
+    )?
+    else {
+        return Ok(None);
+    };
+    if refined.point.sub(seed).length() > reach {
+        return Ok(None);
+    }
+    Ok(Some(refined.point))
+}
+
 pub fn intersect_surfaces(
     first_surface: &NurbsSurface,
     second_surface: &NurbsSurface,

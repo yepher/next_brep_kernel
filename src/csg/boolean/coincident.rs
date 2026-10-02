@@ -308,6 +308,16 @@ fn with_end(pcurve: &NurbsCurve, at_start: bool, uv: Vec3) -> Result<NurbsCurve,
     NurbsCurve::new(pcurve.degree, pcurve.knots.clone(), controls)
 }
 
+/// Adjacent pcurves in the same chart must share the repaired endpoint,
+/// including removal of their pre-existing fitting gap. A distant UV image
+/// of the same 3D junction (a seam or pole) instead follows the displacement
+/// in its own chart representation.
+fn followed_rim_end(surface: &NurbsSurface, at: Vec3, old: Vec3, new: Vec3, weld: f64) -> Vec3 {
+    let band = crate::classification::surface_uv_band(surface, old.x, old.y, weld);
+    let delta = Vec2 { x:at.x-old.x, y:at.y-old.y };
+    if delta.length() <= band { new } else { at.add(new.sub(old)) }
+}
+
 /// Re-sew every kept fragment's rim that a coincident copy of the other
 /// operand crosses (see the module's rims). Returns the rims moved.
 pub(super) fn resew_coincident_rims(
@@ -442,15 +452,16 @@ pub(super) fn resew_coincident_rims(
                                 .evaluate(if at_start { n0 } else { n1 })
                                 .or_refuse(KernelStage::Select, "evaluate")?;
                             // The neighbour's end is the rim's when the two
-                            // meet in 3D within the weld; it moves by the
-                            // rim's end's move, in its own chart.
+                            // meet in 3D within the weld. Nearby chart points
+                            // become one endpoint; distant seam/pole images
+                            // follow the displacement in their own chart.
                             let meets = match (fragment.surface.evaluate(at.x, at.y), fragment.surface.evaluate(old.x, old.y)) {
                                 (Ok(there), Ok(here)) => there.sub(here).length() <= weld,
                                 _ => false,
                             };
                             if meets {
                                 loop_record.coedges[neighbour].pcurve =
-                                    with_end(neighbour_pcurve, at_start, at.add(new.sub(old))).or_refuse(KernelStage::Select, "with_end")?;
+                                    with_end(neighbour_pcurve, at_start, followed_rim_end(&fragment.surface, at, old, new, weld)).or_refuse(KernelStage::Select, "with_end")?;
                             }
                         }
                     }
@@ -468,3 +479,4 @@ pub(super) fn resew_coincident_rims(
     }
     Ok(moved)
 }
+

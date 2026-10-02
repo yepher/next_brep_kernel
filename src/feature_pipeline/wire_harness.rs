@@ -1257,15 +1257,16 @@ fn build_bundles(
                     bundle.status = BundleStatus::Built;
                 }
                 Err(error) => {
-                    // Classified on the refusal's own published PREFIX, not on
-                    // free text: the sweep owns the sentence, this owns the
-                    // status, and neither has to guess at the other's wording.
-                    bundle.status = if error.starts_with(crate::SWEEP_TIGHT_BEND_REFUSAL) {
+                    // Classified on the refusal's own CLASS, minted where the
+                    // sweep decides the bend is too tight: the sweep owns the
+                    // sentence, this owns the status, and a rewording of the
+                    // one cannot move the other.
+                    bundle.status = if crate::is_sweep_tight_bend(&error) {
                         BundleStatus::TightBend
                     } else {
                         BundleStatus::BuildFailed
                     };
-                    bundle.error = error;
+                    bundle.error = error.message;
                 }
             }
         }
@@ -1277,18 +1278,26 @@ fn build_bundles(
 /// Sweep a circle of `radius` along the segment's chain: two half-arcs in the
 /// plane square to the chain's start tangent (a closed profile needs at least
 /// two curves), the station budget scaled with the chain's piece count.
-fn sweep_bundle(segment: &Segment, radius: f64, name: &str) -> Result<crate::BrepSolid, String> {
+fn sweep_bundle(
+    segment: &Segment,
+    radius: f64,
+    name: &str,
+) -> Result<crate::BrepSolid, crate::KernelRefusal> {
+    use crate::{KernelRefusal, KernelStage, OrRefuse};
     let start = segment.chain[0]
         .domain()
-        .and_then(|[t0, _]| segment.chain[0].evaluate(t0))?;
-    let tangent = end_tangent(&segment.chain, true)
-        .normalized()
-        .map_err(|_| "the chain starts with a zero tangent".to_string())?;
-    let x_axis = tangent.perpendicular()?;
-    let y_axis = tangent.cross(x_axis).normalized()?;
+        .and_then(|[t0, _]| segment.chain[0].evaluate(t0))
+        .or_refuse(KernelStage::Collect, "evaluate")?;
+    let tangent = end_tangent(&segment.chain, true).normalized().map_err(|_| {
+        KernelRefusal::input(KernelStage::Collect, "zero_tangent", "the chain starts with a zero tangent")
+    })?;
+    let x_axis = tangent.perpendicular().or_refuse(KernelStage::Collect, "perpendicular")?;
+    let y_axis = tangent.cross(x_axis).normalized().or_refuse(KernelStage::Collect, "normalized")?;
     let profile = vec![
-        make_arc(start, x_axis, y_axis, radius, 0.0, std::f64::consts::PI)?,
-        make_arc(start, x_axis, y_axis, radius, std::f64::consts::PI, std::f64::consts::TAU)?,
+        make_arc(start, x_axis, y_axis, radius, 0.0, std::f64::consts::PI)
+            .or_refuse(KernelStage::Fragment, "make_arc")?,
+        make_arc(start, x_axis, y_axis, radius, std::f64::consts::PI, std::f64::consts::TAU)
+            .or_refuse(KernelStage::Fragment, "make_arc")?,
     ];
     let names: Vec<String> = (0..segment.chain.len())
         .map(|index| format!("{}:piece{index}", segment.id))
@@ -1309,14 +1318,14 @@ fn sweep_bundle(segment: &Segment, radius: f64, name: &str) -> Result<crate::Bre
     let faces = &mut solid
         .shells
         .get_mut(0)
-        .ok_or("the sweep produced no shell")?
+        .ok_or_else(|| KernelRefusal::internal(KernelStage::Sew, "bundle_shell", "the sweep produced no shell"))?
         .faces;
     let expected = ["Wall0", "Wall1", "Start", "End"];
     if faces.len() != expected.len() {
-        return Err(format!(
-            "the sweep produced {} faces, expected {}",
-            faces.len(),
-            expected.len()
+        return Err(KernelRefusal::internal(
+            KernelStage::Sew,
+            "bundle_faces",
+            format!("the sweep produced {} faces, expected {}", faces.len(), expected.len()),
         ));
     }
     for (face, suffix) in faces.iter_mut().zip(expected) {

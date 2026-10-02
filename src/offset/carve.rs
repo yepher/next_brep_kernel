@@ -62,6 +62,7 @@
 //! the new boundaries themselves do not vote.  At least one piece of each kind
 //! has to appear.  A division the scan disagrees with is refused, not shipped.
 
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use crate::offset_fold_locus::{fit_locus_pcurve, trace_fold_locus, FoldCurve};
 use crate::offset_regularity::{
     fold_sample_at, region_grid, scan_offset_regularity, RegionGrid, ScanBudget, TrimRegion,
@@ -201,7 +202,7 @@ pub(crate) fn carve_folded_trim(
     displacements: &[f64],
     collapse_factor: f64,
     budget: ScanBudget,
-) -> Result<Option<CarvedTrim>, String> {
+) -> Result<Option<CarvedTrim>, KernelRefusal> {
     let region = TrimRegion::from_pcurve_loops(surface, loops)?;
     let scan = scan_offset_regularity(surface, &region, displacements, collapse_factor, budget)?;
     // Nothing to carve: no sample folds, not even between the nodes; or every
@@ -252,7 +253,7 @@ pub(crate) fn carve_folded_trim(
         .filter(|curve| curve.meets(&region))
         .collect::<Vec<_>>();
     if branches.is_empty() {
-        return Err(touching("no fold locus branch lies inside it"));
+        return Err(KernelRefusal::unsupported(KernelStage::Classify, "carve_touch", touching("no fold locus branch lies inside it")));
     }
     if let Some(closed) = branches.iter().find(|branch| branch.closed) {
         let centre = closed.points.iter().fold([0.0f64; 2], |sum, point| {
@@ -267,7 +268,7 @@ pub(crate) fn carve_folded_trim(
             });
             hi - lo
         };
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Classify, "carve_closed_branch", format!(
             "offset carve: a CLOSED fold locus branch lies inside the trim — {} stations around \
              (u={:.6}, v={:.6}), spanning {:.3e} × {:.3e} in (u, v) and not reaching the trim's \
              boundary — so the fold cuts a HOLE out of it rather than dividing it. The \
@@ -280,7 +281,7 @@ pub(crate) fn carve_folded_trim(
             centre[1],
             extent(0),
             extent(1)
-        ));
+        )));
     }
 
     let (target, ordered, chords) = chords_from_branches(
@@ -349,13 +350,13 @@ pub(crate) fn carve_folded_trim(
             }
         }
         if hosts.len() != 1 {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(KernelStage::Classify, "carve_hole_in_pieces", format!(
                 "offset carve: trim loop {loop_index} lies inside {} of the {} pieces the fold \
                  locus divides the trim into — a hole cut by the fold is more than a division \
                  and the carve refuses",
                 hosts.len(),
                 pieces.len()
-            ));
+            )));
         }
         pieces[hosts[0]].push(CarvedLoop::from_trim(loop_index, loop_curves));
     }
@@ -409,7 +410,7 @@ pub(crate) fn carve_folded_trim(
             (true, false) => kept.push(piece),
             (false, true) => dropped.push(piece),
             _ => {
-                return Err(format!(
+                return Err(KernelRefusal::ill_posed(KernelStage::Classify, "carve_mixed_piece", format!(
                     "offset carve: a piece of the division is neither wholly regular nor wholly \
                      folded — it reads {}/{} collapsed judged a band above the level (and {} more \
                      collapsed between the grid's nodes) and {}/{} judged a band below it (and {} \
@@ -429,12 +430,12 @@ pub(crate) fn carve_folded_trim(
                             worst.factor, worst.u, worst.v
                         ))
                         .unwrap_or_default()
-                ))
+                )))
             }
         }
     }
     if kept.is_empty() || dropped.is_empty() {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Classify, "carve_empty_division", format!(
             "offset carve: the division left {} regular piece(s) and {} folded one(s) — the scan \
              says the trim folds over {}/{} of its samples, so both counts must be at least one, \
              and a division that drops everything or keeps everything is refused",
@@ -442,7 +443,7 @@ pub(crate) fn carve_folded_trim(
             dropped.len(),
             scan.collapsed,
             scan.sampled
-        ));
+        )));
     }
 
     let kept_area = kept.iter().map(|piece| parameter_area(piece)).sum::<f64>();
@@ -464,7 +465,7 @@ fn boundary_crossings(
     loops: &[Vec<NurbsCurve>],
     displacements: &[f64],
     level: f64,
-) -> Result<(Vec<Crossing>, Option<Approach>), String> {
+) -> Result<(Vec<Crossing>, Option<Approach>), KernelRefusal> {
     let mut crossings = Vec::new();
     // The closest the boundary came to the level without crossing it. A locus
     // TANGENT to the trim boundary leaves no sign change to bracket, so the
@@ -473,14 +474,14 @@ fn boundary_crossings(
     let mut approach: Option<Approach> = None;
     for (loop_index, loop_curves) in loops.iter().enumerate() {
         for (coedge_index, pcurve) in loop_curves.iter().enumerate() {
-            let [t0, t1] = pcurve.domain()?;
+            let [t0, t1] = pcurve.domain().or_refuse(KernelStage::Classify, "domain")?;
             if !(t1 > t0) {
                 continue;
             }
             let spans = distinct_knots(&pcurve.knots, t0, t1).max(1);
             let steps = (32 * spans).clamp(64, 1024);
-            let factor_at = |t: f64| -> Result<Option<f64>, String> {
-                let uv = pcurve.evaluate(t)?;
+            let factor_at = |t: f64| -> Result<Option<f64>, KernelRefusal> {
+                let uv = pcurve.evaluate(t).or_refuse(KernelStage::Classify, "evaluate")?;
                 Ok(fold_sample_at(surface, uv.x, uv.y, displacements)
                     .map(|sample| sample.factor - level))
             };
@@ -492,7 +493,7 @@ fn boundary_crossings(
                     continue;
                 };
                 if approach.is_none_or(|best| value.abs() < best.factor.abs()) {
-                    let uv = pcurve.evaluate(t)?;
+                    let uv = pcurve.evaluate(t).or_refuse(KernelStage::Classify, "evaluate")?;
                     approach = Some(Approach {
                         uv: [uv.x, uv.y],
                         factor: value,
@@ -503,14 +504,14 @@ fn boundary_crossings(
                         let (parameter, residual) =
                             refine_crossing(&factor_at, previous_t, previous_value, t, value)?;
                         if residual.abs() > CROSSING_CEILING {
-                            return Err(format!(
+                            return Err(KernelRefusal::unsupported(KernelStage::Classify, "carve_factor_jump", format!(
                                 "offset carve: the fold factor JUMPS across t={parameter:.9} on \
                                  the trim boundary (residual {residual:+.3e}) — the trim crosses \
                                  a curvature discontinuity, not the fold locus, and there is no \
                                  point on 1 − δ·κ = {level:.3e} to split it at"
-                            ));
+                            )));
                         }
-                        let uv = pcurve.evaluate(parameter)?;
+                        let uv = pcurve.evaluate(parameter).or_refuse(KernelStage::Classify, "evaluate")?;
                         // A crossing AT a trim vertex cannot be split at: the
                         // piece on one side would have no length, and
                         // `NurbsCurve::split` refuses it with a message that
@@ -519,7 +520,7 @@ fn boundary_crossings(
                         // carved parallel itself (`thicken.rs`, fixture 20).
                         if parameter <= t0 + KNOT_IDENTITY_TOL || parameter >= t1 - KNOT_IDENTITY_TOL
                         {
-                            return Err(format!(
+                            return Err(KernelRefusal::unsupported(KernelStage::Classify, "carve_crossing_at_vertex", format!(
                                 "offset carve: the fold locus crosses the trim boundary AT a \
                                  vertex — (u={:.6}, v={:.6}), t={parameter:.12} on a pcurve over \
                                  [{t0}, {t1}] — so there is no boundary on either side of the \
@@ -527,7 +528,7 @@ fn boundary_crossings(
                                  {level:.3e} is refused rather than divided with a zero-length \
                                  piece",
                                 uv.x, uv.y
-                            ));
+                            )));
                         }
                         crossings.push(Crossing {
                             loop_index,
@@ -545,12 +546,12 @@ fn boundary_crossings(
 }
 
 fn refine_crossing(
-    factor_at: &dyn Fn(f64) -> Result<Option<f64>, String>,
+    factor_at: &dyn Fn(f64) -> Result<Option<f64>, KernelRefusal>,
     mut lo: f64,
     mut value_lo: f64,
     mut hi: f64,
     mut value_hi: f64,
-) -> Result<(f64, f64), String> {
+) -> Result<(f64, f64), KernelRefusal> {
     for _ in 0..100 {
         let mid = 0.5 * (lo + hi);
         let Some(value) = factor_at(mid)? else {
@@ -611,11 +612,11 @@ fn chords_from_branches(
     touching: &dyn Fn(&str) -> String,
     displacements: &[f64],
     level: f64,
-) -> Result<(usize, Vec<Crossing>, Vec<Chord>), String> {
+) -> Result<(usize, Vec<Crossing>, Vec<Chord>), KernelRefusal> {
     if crossings.is_empty() {
-        return Err(touching(
+        return Err(KernelRefusal::unsupported(KernelStage::Classify, "carve_touch", touching(
             "the fold factor never changes sign on the trim's own boundary",
-        ));
+        )));
     }
     // Which branch does each crossing belong to, and is the answer clear?
     let mut owner = Vec::with_capacity(crossings.len());
@@ -629,14 +630,14 @@ fn chords_from_branches(
         let (best, best_distance) = distances[0];
         if let Some(&(_, runner_up)) = distances.get(1) {
             if best_distance > runner_up * ASSOCIATION_MARGIN {
-                return Err(format!(
+                return Err(KernelRefusal::ill_posed(KernelStage::Classify, "carve_ambiguous_branch", format!(
                     "offset carve: the crossing at (u={:.6}, v={:.6}) is {best_distance:.3e} from \
                      one fold locus branch and {runner_up:.3e} from another — the two are not \
                      separated by the factor {ASSOCIATION_MARGIN} this needs to say which branch \
                      the trim boundary crosses there, and the carve refuses rather than bridge \
                      the wrong pair",
                     crossing.uv[0], crossing.uv[1]
-                ));
+                )));
             }
         }
         carve_debug!(
@@ -659,23 +660,23 @@ fn chords_from_branches(
     for (index, branch) in branches.iter().enumerate() {
         let count = owner.iter().filter(|&&which| which == index).count();
         if count < 2 || count % 2 != 0 {
-            return Err(format!(
+            return Err(KernelRefusal::ill_posed(KernelStage::Classify, "carve_odd_crossings", format!(
                 "offset carve: fold locus branch {index} ({} stations, {}) crosses the trim \
                  boundary {count} time(s). A branch enters and leaves, so the count has to be \
                  EVEN and at least two; an odd one is a crossing the sign change missed or a \
                  tangency counted once, and pairing them up would be a guess",
                 branch.points.len(),
                 if branch.closed { "closed" } else { "open" },
-            ));
+            )));
         }
     }
     if let Some(stray) = crossings.iter().find(|crossing| crossing.loop_index != target) {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Classify, "carve_changes_topology", format!(
             "offset carve: the fold locus crosses trim loop {target} and trim loop {} — it \
              separates a hole from its outer boundary, which changes the region's topology \
              rather than dividing it, and the carve refuses",
             stray.loop_index
-        ));
+        )));
     }
 
     // Cyclic order along the target loop is what the division walks.
@@ -749,7 +750,7 @@ fn chords_from_branches(
         }
         if let Some(loose) = bounded.iter().position(|&count| count != 1) {
             let crossing = ordered[along[loose].1];
-            return Err(if bounded[loose] == 0 {
+            return Err(KernelRefusal::ill_posed(KernelStage::Classify, "carve_crossing_pairing", if bounded[loose] == 0 {
                 format!(
                     "offset carve: crossing {} of fold locus branch {index}, at (u={:.6}, \
                      v={:.6}), bounds no stretch of it that lies inside the trim — the boundary \
@@ -772,7 +773,7 @@ fn chords_from_branches(
                     crossing.uv[0],
                     crossing.uv[1]
                 )
-            });
+            }));
         }
     }
     carve_debug!(
@@ -794,12 +795,12 @@ fn chords_from_branches(
                 (first.from < crossing) != (first.to < crossing)
             };
             if inside(second.from) != inside(second.to) {
-                return Err(format!(
+                return Err(KernelRefusal::ill_posed(KernelStage::Classify, "carve_branches_cross", format!(
                     "offset carve: two fold locus branches CROSS inside the trim — their \
                      crossings interleave along the boundary as {}..{} and {}..{} — so the level \
                      set has a saddle there and the division is ambiguous; the carve refuses",
                     first.from, first.to, second.from, second.to
-                ));
+                )));
             }
         }
     }
@@ -854,7 +855,7 @@ fn branch_point_at(branch: &FoldCurve, position: f64) -> [f64; 2] {
 
 /// The target loop as a cyclic sequence of boundary stretches, one between each
 /// pair of consecutive crossings.
-fn initial_cycle(loop_curves: &[NurbsCurve], ordered: &[Crossing]) -> Result<Vec<Arc>, String> {
+fn initial_cycle(loop_curves: &[NurbsCurve], ordered: &[Crossing]) -> Result<Vec<Arc>, KernelRefusal> {
     let count = ordered.len();
     let mut cycle = Vec::with_capacity(count);
     for index in 0..count {
@@ -882,7 +883,7 @@ fn initial_cycle(loop_curves: &[NurbsCurve], ordered: &[Crossing]) -> Result<Vec
 fn subdivide(
     cycle: Vec<Arc>,
     chords: &[&Chord],
-) -> Result<Vec<Vec<(NurbsCurve, Option<usize>)>>, String> {
+) -> Result<Vec<Vec<(NurbsCurve, Option<usize>)>>, KernelRefusal> {
     let Some((chord, rest)) = chords.split_first() else {
         return Ok(vec![cycle
             .into_iter()
@@ -892,12 +893,12 @@ fn subdivide(
     let count = cycle.len();
     let position = |crossing: usize| cycle.iter().position(|arc| arc.start == crossing);
     let (Some(at_from), Some(at_to)) = (position(chord.from), position(chord.to)) else {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Classify, "carve_chord_junctions", format!(
             "offset carve: a fold locus chord joins crossings {} and {}, which are not both \
              junctions of the piece being divided — the branches do not divide the trim into \
              nested pieces and the carve refuses",
             chord.from, chord.to
-        ));
+        )));
     };
     let span = |start: usize, end: usize| {
         let mut arcs = Vec::new();
@@ -913,7 +914,7 @@ fn subdivide(
     let mut near = span(at_from, at_to);
     near.push(Arc {
         start: chord.to,
-        pieces: vec![(chord.pcurve.reversed()?, None)],
+        pieces: vec![(chord.pcurve.reversed().or_refuse(KernelStage::Classify, "reversed")?, None)],
     });
     let mut far = span(at_to, at_from);
     far.push(Arc {
@@ -931,12 +932,12 @@ fn subdivide(
             (true, false) => near_chords.push(*chord),
             (false, true) => far_chords.push(*chord),
             _ => {
-                return Err(format!(
+                return Err(KernelRefusal::ill_posed(KernelStage::Classify, "carve_branches_cross", format!(
                     "offset carve: the fold locus chord joining crossings {} and {} straddles \
                      the division made by another branch — the branches CROSS inside the trim \
                      and the carve refuses rather than pick a division",
                     chord.from, chord.to
-                ))
+                )))
             }
         }
     }
@@ -951,38 +952,38 @@ fn boundary_chain(
     loop_curves: &[NurbsCurve],
     from: Crossing,
     to: Crossing,
-) -> Result<Vec<(NurbsCurve, usize)>, String> {
+) -> Result<Vec<(NurbsCurve, usize)>, KernelRefusal> {
     let count = loop_curves.len();
     let mut chain = Vec::new();
     if from.coedge_index == to.coedge_index {
         let pcurve = &loop_curves[from.coedge_index];
         if to.parameter > from.parameter {
             // Both crossings on one pcurve, the chain is the piece between.
-            let (_, after) = pcurve.split(from.parameter)?;
-            let (middle, _) = after.split(to.parameter)?;
+            let (_, after) = pcurve.split(from.parameter).or_refuse(KernelStage::Classify, "split")?;
+            let (middle, _) = after.split(to.parameter).or_refuse(KernelStage::Classify, "split")?;
             chain.push((middle, from.coedge_index));
             return Ok(chain);
         }
         // The chain wraps: the tail of this pcurve, every other pcurve, then
         // its head.
-        let (_, tail) = pcurve.split(from.parameter)?;
+        let (_, tail) = pcurve.split(from.parameter).or_refuse(KernelStage::Classify, "split")?;
         chain.push((tail, from.coedge_index));
         for offset in 1..count {
             let index = (from.coedge_index + offset) % count;
             chain.push((loop_curves[index].clone(), index));
         }
-        let (head, _) = pcurve.split(to.parameter)?;
+        let (head, _) = pcurve.split(to.parameter).or_refuse(KernelStage::Classify, "split")?;
         chain.push((head, to.coedge_index));
         return Ok(chain);
     }
-    let (_, tail) = loop_curves[from.coedge_index].split(from.parameter)?;
+    let (_, tail) = loop_curves[from.coedge_index].split(from.parameter).or_refuse(KernelStage::Classify, "split")?;
     chain.push((tail, from.coedge_index));
     let mut index = (from.coedge_index + 1) % count;
     while index != to.coedge_index {
         chain.push((loop_curves[index].clone(), index));
         index = (index + 1) % count;
     }
-    let (head, _) = loop_curves[to.coedge_index].split(to.parameter)?;
+    let (head, _) = loop_curves[to.coedge_index].split(to.parameter).or_refuse(KernelStage::Classify, "split")?;
     chain.push((head, to.coedge_index));
     Ok(chain)
 }
@@ -1000,7 +1001,7 @@ fn locus_bridge(
     level: f64,
     from: [f64; 2],
     to: [f64; 2],
-) -> Result<(NurbsCurve, f64), String> {
+) -> Result<(NurbsCurve, f64), KernelRefusal> {
     let nearest = |target: [f64; 2]| -> usize {
         let mut best = 0usize;
         let mut best_distance = f64::INFINITY;
@@ -1020,9 +1021,7 @@ fn locus_bridge(
         branch.points[end..=start].iter().rev().copied().collect()
     };
     if stations.len() < 2 {
-        return Err(
-            "offset carve: the fold locus between the two crossings is a single point".into(),
-        );
+        return Err(KernelRefusal::unsupported(KernelStage::Classify, "carve_single_point_locus", "offset carve: the fold locus between the two crossings is a single point"));
     }
     // REPLACE the end stations with the exact crossings; do not prepend them.
     //
@@ -1070,9 +1069,7 @@ fn locus_bridge(
         }
     }
     if cleaned.len() < 2 {
-        return Err(
-            "offset carve: the fold locus between the two crossings is a single point".into(),
-        );
+        return Err(KernelRefusal::unsupported(KernelStage::Classify, "carve_single_point_locus", "offset carve: the fold locus between the two crossings is a single point"));
     }
     fit_locus_pcurve(surface, displacements, level, &cleaned, false)
 }
@@ -1116,7 +1113,7 @@ pub(crate) fn dropped_sweep(
     dropped: &[Vec<CarvedLoop>],
     displacements: &[f64],
     budget: ScanBudget,
-) -> Result<Vec<SweptPoint>, String> {
+) -> Result<Vec<SweptPoint>, KernelRefusal> {
     const FRACTIONS: [f64; 5] = [0.2, 0.4, 0.6, 0.8, 1.0];
     let reach = displacements
         .iter()
@@ -1158,7 +1155,7 @@ pub(crate) fn dropped_sweep(
     Ok(swept)
 }
 
-fn region_of(surface: &NurbsSurface, side: &[CarvedLoop]) -> Result<TrimRegion, String> {
+fn region_of(surface: &NurbsSurface, side: &[CarvedLoop]) -> Result<TrimRegion, KernelRefusal> {
     let loops = side
         .iter()
         .map(|carved| carved.pcurves.clone())
@@ -1166,12 +1163,12 @@ fn region_of(surface: &NurbsSurface, side: &[CarvedLoop]) -> Result<TrimRegion, 
     TrimRegion::from_pcurve_loops(surface, &loops)
 }
 
-fn loop_sample(loop_curves: &[NurbsCurve]) -> Result<[f64; 2], String> {
+fn loop_sample(loop_curves: &[NurbsCurve]) -> Result<[f64; 2], KernelRefusal> {
     let pcurve = loop_curves
         .first()
-        .ok_or_else(|| "offset carve: an empty trim loop".to_string())?;
-    let [t0, t1] = pcurve.domain()?;
-    let point = pcurve.evaluate(0.5 * (t0 + t1))?;
+        .ok_or_else(|| "offset carve: an empty trim loop".to_string()).or_refuse(KernelStage::Classify, "carve_empty_loop")?;
+    let [t0, t1] = pcurve.domain().or_refuse(KernelStage::Classify, "domain")?;
+    let point = pcurve.evaluate(0.5 * (t0 + t1)).or_refuse(KernelStage::Classify, "evaluate")?;
     Ok([point.x, point.y])
 }
 

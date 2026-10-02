@@ -12,11 +12,16 @@
 //! `[t0, t1]` as-is, a reversed one contributes it reversed, and the chain is
 //! head-to-tail by construction.
 //!
-//! Loop convention (kernel-wide, asserted by `validate_uv_wire`): `loops[0]` is
-//! the OUTER boundary, later loops are holes; the outer loop traversed in coedge
-//! order runs CCW around the OUTWARD face normal for either `same_sense`, so the
-//! emitted profile winds positively about its `z_axis` and the consumers' name↔
-//! face alignment holds without a winding flip.
+//! Loop convention (kernel-wide): `loops[0]` is the OUTER boundary, later loops
+//! are holes; the outer loop traversed in coedge order runs CCW around the
+//! OUTWARD face normal for either `same_sense`, so the emitted profile winds
+//! positively about its `z_axis` and the consumers' name↔face alignment holds
+//! without a winding flip. Nothing asserts the ORDER on the way in:
+//! `validate_uv_wire` files its winding verdict under `wire_warnings`, which
+//! `validate()` does not return — so a producer that emits `[hole, outer]` is
+//! read here as an outer loop with a hole enclosing it (the offset shell's
+//! completion lane did, and a revolve about the ring's outer edge refused the
+//! "hole" for touching the axis; the producer now orders by area).
 //!
 //! Planar carriers only (the `common::face_frame` guard) — a curved face errors
 //! loudly, no fallback.

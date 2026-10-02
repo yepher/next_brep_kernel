@@ -1,5 +1,5 @@
-//! ACOMP — Assembly Component: one placed INSTANCE of a parts-library entry
-//! (assemblies build-spec §2.2 / §10 item 3). FULLY IMPLEMENTED.
+//! ACOMP — Assembly Component: one placed INSTANCE of a parts-library
+//! entry. FULLY IMPLEMENTED.
 //!
 //! `inputParams = { partName, transform, isFixed }` — a reference into the
 //! parts library (`parts_library.rs`) with NO embedded payload. `transform` is

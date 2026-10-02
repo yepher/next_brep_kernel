@@ -36,7 +36,7 @@
 //! the curvature direction IS inside the arc and the factor is
 //! `ρ/(R + ρ) < 1`; on a bore floor's it is outside it altogether.
 
-use crate::Vec3;
+use crate::{KernelRefusal, KernelStage, RefusalClass, SoundnessDefect, Vec3};
 
 /// `BREP_BLEND_STATION_TRACE=1` also prints what the fold probe could not
 /// measure. A skipped station is not a clean station: on a carrier that is a
@@ -49,14 +49,26 @@ fn fold_trace(message: std::fmt::Arguments<'_>) {
     }
 }
 
-/// Does this error carry a wall-fold refusal?
+/// Is this refusal a WALL FOLD — the march's verdict that the envelope folds
+/// through itself, minted only by [`wall_fold_refusal`]?
 ///
-/// `contains`, not `starts_with`: by the time a caller asks, the refusal may
-/// already have been composed into a longer message by a rung above, and a fold
-/// stays a fold whichever rung is quoting it. Nothing else in the kernel emits
-/// [`WALL_FOLDS`], so there is no other message this can match.
-pub(crate) fn is_wall_fold(error: &str) -> bool {
-    error.contains(WALL_FOLDS)
+/// Read off the class: `UnsoundResult { Fold }` at `Classify`, the stage that
+/// helper mints at. The healing acceptance mints the same defect at `Validate`
+/// for a BUILT result, and that conviction is deliberately not a wall fold: the
+/// fallbacks that stop here do so because every lane would build the same
+/// folding centre curve, which is not true of a multi-edge assembly that failed
+/// acceptance (a subset without the offending edge can be sound). The class
+/// survives every wrap (`with_message`), so a fold a rung above has composed
+/// into a longer message is still one, and a message that merely QUOTES the
+/// fold's text under another class is not.
+pub(crate) fn is_wall_fold(refusal: &KernelRefusal) -> bool {
+    matches!(
+        refusal.class,
+        RefusalClass::UnsoundResult {
+            defect: SoundnessDefect::Fold,
+            ..
+        }
+    ) && refusal.stage == KernelStage::Classify
 }
 
 /// The prefix of the refusal a march makes when the wall it would build folds
@@ -64,6 +76,17 @@ pub(crate) fn is_wall_fold(error: &str) -> bool {
 /// failed to converge: the fallbacks that answer a non-convergence build the
 /// same envelope with the same fold, so this one is reported as-is.
 pub(crate) const WALL_FOLDS: &str = "blend: no wall of radius";
+
+/// Mint a wall-fold refusal. The envelope this march would build carries one
+/// face of its own domain twice onto one 3-D point — the soundness defect
+/// `healing/accept.rs` convicts a BUILT face of — read here before the face
+/// exists, from the ball's centre curve; `faces` are the mates it was measured
+/// against (the one the fold reaches, or both). Every message composed under
+/// [`WALL_FOLDS`] is minted here so the class stays one across the carve's
+/// band refusals (`carve::band_refusal`) and the two verdicts below.
+pub(super) fn wall_fold_refusal(faces: Vec<u64>, message: String) -> KernelRefusal {
+    KernelRefusal::unsound(KernelStage::Classify, SoundnessDefect::Fold, faces, message)
+}
 
 /// How far either side of a station the tangency system is re-solved, as a
 /// fraction of the marched parameter span. The circumradius error is
@@ -95,7 +118,7 @@ pub(super) struct FoldSample {
 /// What a caller has to be able to do for one edge parameter: solve the
 /// tangency system there and hand back the ball centre and both contacts.
 pub(super) type SolveCentre<'a> =
-    &'a dyn Fn(f64, [f64; 4]) -> Result<([f64; 4], Vec3, Vec3, Vec3), String>;
+    &'a dyn Fn(f64, [f64; 4]) -> Result<([f64; 4], Vec3, Vec3, Vec3), KernelRefusal>;
 
 /// The circumcircle's curvature vector at `centre`, through the two probes.
 fn curvature_vector(before: Vec3, centre: Vec3, after: Vec3) -> Option<Vec3> {
@@ -217,8 +240,8 @@ fn worst_fold(
     span: f64,
     stations: &[(f64, [f64; 4])],
     solve: SolveCentre<'_>,
-    visit: &mut dyn FnMut(f64, &Probe) -> Result<(), String>,
-) -> Result<Option<FoldSample>, String> {
+    visit: &mut dyn FnMut(f64, &Probe) -> Result<(), KernelRefusal>,
+) -> Result<Option<FoldSample>, KernelRefusal> {
     let mut worst: Option<(usize, FoldSample)> = None;
     let mut unmeasured = 0usize;
     for (index, (t, seed)) in stations.iter().enumerate() {
@@ -270,9 +293,16 @@ fn worst_fold(
 /// between the rails, so a caller that would carve asks this first.
 pub(crate) const RAIL_FOLDS: &str = "along the ball's track on it";
 
-/// Does this error carry a fold that reaches the wall's rail?
-pub(crate) fn is_rail_fold(error: &str) -> bool {
-    is_wall_fold(error) && error.contains(RAIL_FOLDS)
+/// Does this refusal carry a fold that reaches the wall's rail?
+///
+/// The ONE fallback decision in the blending stack still read from text: a rail
+/// fold and a lens fold are the same class (`UnsoundResult { Fold }`), minted at
+/// the same stage by the same helper, so nothing but the marker tells them
+/// apart. The marker is [`RAIL_FOLDS`], the constant [`check_wall_fold`]'s rail
+/// verdict formats into its message, so an edit to the text moves the mint and
+/// this check together.
+pub(crate) fn is_rail_fold(refusal: &KernelRefusal) -> bool {
+    is_wall_fold(refusal) && refusal.message.contains(RAIL_FOLDS)
 }
 
 /// The normal curvature of `surface` at `uv`, toward the ball `centre`, in the
@@ -377,7 +407,7 @@ pub(super) fn check_wall_fold(
     edge: &crate::topology::EdgeRecord,
     mates: [&crate::topology::FaceRecord; 2],
     scale: f64,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     // A TAPERED ball is not measured, and that is a limitation rather than an
     // oversight.  `ρκ > 1` is the fold condition for a CONSTANT-radius canal
     // surface, where the characteristic circle lies in the centre curve's
@@ -399,7 +429,7 @@ pub(super) fn check_wall_fold(
         ));
         return Ok(());
     }
-    let mut rail = |radius: f64, probed: &Probe| -> Result<(), String> {
+    let mut rail = |radius: f64, probed: &Probe| -> Result<(), KernelRefusal> {
         for side in 0..2 {
             let travel = probed.after.0[side].sub(probed.before.0[side]);
             let Ok(travel) = travel.normalized() else {
@@ -429,7 +459,9 @@ pub(super) fn check_wall_fold(
                     .map(|name| format!(" `{name}`"))
                     .unwrap_or_default()
             };
-            return Err(format!(
+            return Err(wall_fold_refusal(
+                vec![face.id],
+                format!(
                 "{WALL_FOLDS} {radius} fits this edge: along edge {}{}, face {}{} turns tighter \
                  than the ball {RAIL_FOLDS} at ({:.6}, {:.6}, {:.6}) — radius of curvature \
                  {tighter:.6} against a blend radius of {radius} — so the contact there runs backward \
@@ -443,6 +475,7 @@ pub(super) fn check_wall_fold(
                 contact.x,
                 contact.y,
                 contact.z,
+            ),
             ));
         }
         Ok(())
@@ -454,7 +487,9 @@ pub(super) fn check_wall_fold(
         return Ok(());
     }
     let radius = radius_at(worst.t);
-    Err(format!(
+    Err(wall_fold_refusal(
+        vec![mates[0].id, mates[1].id],
+        format!(
         "{WALL_FOLDS} {radius} fits this edge: the rolling ball's centre curve turns tighter \
          than the ball at ({:.6}, {:.6}, {:.6}) — radius of curvature {:.6} against a blend \
          radius of {radius}, so the envelope's section sweeps back through itself there \
@@ -464,5 +499,6 @@ pub(super) fn check_wall_fold(
         worst.centre.z,
         worst.curvature_radius,
         worst.factor,
+    ),
     ))
 }

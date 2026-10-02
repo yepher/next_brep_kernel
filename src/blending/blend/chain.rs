@@ -18,6 +18,9 @@ pub use closed::{blend_smooth_chain, blend_smooth_chain_if_closed};
 
 use closed::{cross_edge_at, pcurve_portion, project_piece_pcurve, ChainRows, RimPiece};
 use closed_surgery::chain_surgery;
-use collect::{collect_smooth_chain, ChainSegment, SmoothChain};
-use march::{march_chain, ChainSample, FoldPolicy, CHAIN_CARVE_MAX_PER_SEGMENT, CHAIN_PER_SEGMENT};
+// The marches' own tests drive the chain march directly (`blend/tests`).
+pub(in crate::blend) use collect::collect_smooth_chain;
+use collect::{ChainSegment, SmoothChain};
+pub(in crate::blend) use march::{march_chain, ChainSample, FoldPolicy, CHAIN_PER_SEGMENT};
+use march::CHAIN_CARVE_MAX_PER_SEGMENT;
 use open::blend_open_smooth_chain;

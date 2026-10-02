@@ -1,4 +1,4 @@
-//! The per-document PARTS LIBRARY — assemblies build-spec §2.1 / §10 item 3.
+//! The per-document PARTS LIBRARY.
 //!
 //! Each unique part is stored ONCE per document: `{ sourceKey, sourceSignature,
 //! document (the embedded full sub-part history JSON), snapshot (the io/snapshot
@@ -54,8 +54,7 @@
 //! brackets the scene-metadata store (the sub-part's un-namespaced records must
 //! never touch the parent document's), pushes the sub-document's OWN
 //! `partsLibrary` as the active library (parent and child libraries are
-//! independent, spec §2.2), and frees every handle it registered before
-//! returning.
+//! independent), and frees every handle it registered before returning.
 
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -72,7 +71,7 @@ use wasm_bindgen::prelude::*;
 // The entry + the resident stores
 // ===========================================================================
 
-/// One unique part payload (spec §2.1). `dirty` is RESIDENT-ONLY state: set by
+/// One unique part payload. `dirty` is RESIDENT-ONLY state: set by
 /// [`refresh_library_entry`] (edit-in-context / update-components) when the
 /// new document builds differently, it forces the ACOMP self-heal lane on the
 /// next run even with a readable snapshot, and clears when the heal rewrites
@@ -115,6 +114,19 @@ pub struct PartsLibraryEntry {
     /// so the per-feature cache hook never re-hashes a large document.
     #[serde(skip)]
     pub doc_hash: u64,
+}
+
+impl PartsLibraryEntry {
+    /// Invalidate derived data when the document builds a different part.
+    /// `dirty` alone cannot carry this across a save or runner transfer: it is
+    /// serde-skipped, and a fresh receiver has no previous document to compare.
+    /// A blank snapshot makes that receiver take the self-heal lane too.
+    fn invalidate_snapshot(&mut self) {
+        self.snapshot.clear();
+        self.snapshot_producer.clear();
+        self.ports.clear();
+        self.dirty = true;
+    }
 }
 
 /// The library map shape as it travels in the history request / save file.
@@ -387,7 +399,7 @@ pub fn install_parts_library(incoming: &PartsLibraryMap) -> bool {
                 }
                 // Genuinely different content: replace, and force the self-heal
                 // lane so every instance follows the new document.
-                Some(_) => entry.dirty = true,
+                Some(_) => entry.invalidate_snapshot(),
                 None => {}
             }
             root.insert(name.clone(), entry);
@@ -766,7 +778,7 @@ fn stamp_document_loop_ids(document: &mut serde_json::Value) {
 /// name (the ACOMP `partName` the app must reference):
 ///
 /// - a live entry with the same `sourceKey` AND `sourceSignature` is reused
-///   verbatim (no re-execution — instant re-insert, spec §2.1);
+///   verbatim (no re-execution, instant re-insert);
 /// - same `sourceKey` but a DIFFERENT signature gets a fresh entry under a
 ///   disambiguated name (existing instances keep their version; the explicit
 ///   refresh lane is [`refresh_library_entry`]);
@@ -877,8 +889,7 @@ pub fn refresh_library_entry_impl(
         entry.doc_hash = stable_json_hash(&document);
         entry.document = document;
         if rebuild {
-            entry.ports.clear(); // the heal re-derives them from the new document
-            entry.dirty = true;
+            entry.invalidate_snapshot();
         }
         Ok(())
     })?;
@@ -923,9 +934,9 @@ fn build_identity(document: &serde_json::Value) -> Option<u64> {
     Some(stable_json_hash(&serde_json::to_value(&request).ok()?))
 }
 
-/// The current library in the `partsLibrary` block shape (spec §2.1) — what
-/// SAVE must serialize into the document (never the loaded block: this copy
-/// carries healed snapshots, refreshes, and GC).
+/// The current library in the `partsLibrary` block shape — what SAVE must
+/// serialize into the document (never the loaded block: this copy carries
+/// healed snapshots, refreshes, and GC).
 #[wasm_bindgen]
 pub fn parts_library_json() -> String {
     ROOT.with(|root| {

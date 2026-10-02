@@ -1,4 +1,4 @@
-//! The scene COMPONENT concept — assemblies build-spec §3 / §10 item 2.
+//! The scene COMPONENT concept.
 //!
 //! A component is a rigid group of solids inserted by an ACOMP feature (one per
 //! placed instance). Its record carries the owning feature id, the library part
@@ -28,7 +28,7 @@
 //! and a nested assembly's already-namespaced members chain naturally:
 //! `ACOMP1:Extrude1_top` wrapped by `ACOMP3` becomes `ACOMP3:ACOMP1:Extrude1_top`.
 //!
-//! # The feature fence (build-spec §3)
+//! # The feature fence
 //!
 //! Solids from ordinary modeling features never belong to a component and behave
 //! exactly as before. Component geometry is valid input for constraints and
@@ -325,11 +325,11 @@ pub fn update_component_transform(
     Ok(())
 }
 
-/// The feature fence (build-spec §3): fail with a clear message when any of
-/// `names` resolves to component-owned geometry. Modeling features that consume
-/// solids/faces/edges call this over their reference names before operating —
-/// cross-part feature linking is out of scope and must be rejected cleanly,
-/// never silently applied.
+/// The feature fence: fail with a clear message when any of `names` resolves to
+/// component-owned geometry. Modeling features that consume solids/faces/edges
+/// call this over their reference names before operating — cross-part feature
+/// linking is out of scope and must be rejected cleanly, never silently
+/// applied.
 pub fn reject_component_references<'a>(
     scene: &SceneMap,
     names: impl IntoIterator<Item = &'a str>,
@@ -352,17 +352,16 @@ pub fn reject_component_references<'a>(
 /// exact-matches a scene name. Any such string owned by a component fails the
 /// feature before it executes.
 ///
-/// Exempt (the two ALLOWED in-context uses, build-spec §3 — attach + project):
-/// SKETCH (plane attach + edge projection), DATUM/PLANE (a datum derived from
-/// component geometry), ACOMP itself (the component's own feature, wired by
-/// the parts-library lane), and the two wire-harness construction features —
+/// Exempt (the two ALLOWED in-context uses, attach + project): SKETCH (plane
+/// attach + edge projection), DATUM/PLANE (a datum derived from component
+/// geometry), ACOMP itself (the component's own feature, wired by the
+/// parts-library lane), and the two wire-harness construction features —
 /// WAYPOINT (its `directionRef` is a face on a placed component: the harness
 /// workbench's whole point) and SPLINE (its anchors attach to connection
-/// points).
-/// Assembly constraints are not history features, so they never reach this
-/// fence. The exemption is type-level, which is safe because none of the
-/// exempt types carries a `boolean` param or operand-solid references —
-/// re-examine if such a param is ever added to one of them.
+/// points). Assembly constraints are not history features, so they never
+/// reach this fence. The exemption is type-level, which is safe because none
+/// of the exempt types carries a `boolean` param or operand-solid references
+/// — re-examine if such a param is ever added to one of them.
 pub fn enforce_reference_fence(
     feature_type: &str,
     descriptor: &FeatureDescriptor,
@@ -450,7 +449,7 @@ impl SceneMap {
     /// The feature-fence predicate: does this entity name belong to a component?
     /// Cheap (one map probe + one prefix probe); the dispatch fence
     /// ([`enforce_reference_fence`]) uses it to REJECT component geometry as
-    /// modeling-feature input (build-spec §3).
+    /// modeling-feature input.
     pub fn is_component_owned(&self, name: &str) -> bool {
         self.owning_component(name).is_some()
     }

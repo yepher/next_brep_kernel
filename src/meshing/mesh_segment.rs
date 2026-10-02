@@ -38,7 +38,7 @@ use crate::topology::{
     BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, ShellRecord, VertexRecord,
 };
 use crate::{
-    interpolate_curve, make_arc, make_extrusion, make_line, make_plane, make_revolution,
+    interpolate_curve, make_line, make_plane, make_revolution,
     mesh_to_faceted_brep, solid_signed_volume, NurbsCurve, Vec3, Vec4,
 };
 use rustc_hash::FxHashMap as HashMap;

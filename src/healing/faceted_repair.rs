@@ -96,6 +96,9 @@ pub struct MeshRepairReport {
     /// Surplus coincident sheets pruned at edges used by three or more
     /// triangles.
     pub pruned_triangles: usize,
+    /// Triangles flipped so every edge-connected patch is wound one way
+    /// (an inverted end cap, say), and the patch encloses positive volume.
+    pub reoriented_triangles: usize,
     /// Boundary cycles closed with a fan.
     pub capped_loops: usize,
     /// Triangles the caps added.
@@ -105,7 +108,10 @@ pub struct MeshRepairReport {
 impl MeshRepairReport {
     /// Whether the repair changed the welded triangle set at all.
     pub fn changed(&self) -> bool {
-        self.dropped_triangles != 0 || self.pruned_triangles != 0 || self.capped_loops != 0
+        self.dropped_triangles != 0
+            || self.pruned_triangles != 0
+            || self.reoriented_triangles != 0
+            || self.capped_loops != 0
     }
 }
 
@@ -255,6 +261,8 @@ fn repair_soup(
             .collect();
     }
 
+    report.reoriented_triangles = orient_consistently(&points, &mut triangles)?;
+
     let mut directed_boundary = Vec::<(usize, usize)>::new();
     let mut counts = HashMap::<(usize, usize), usize>::default();
     for triangle in &triangles {
@@ -313,6 +321,111 @@ fn repair_soup(
     report.welded_vertices = points.len();
     report.triangles = triangles.len();
     Ok((points, triangles, report))
+}
+
+/// Make the winding agree across every two-use edge, and return how many
+/// triangles were flipped.
+///
+/// A shell exported with a patch wound the wrong way (a pipe whose end caps
+/// face inward) reaches here with edges used TWICE in the SAME direction:
+/// neither the sheet prune (three or more uses) nor the cap (one use) sees
+/// them, and the builder's validator refuses the result with "coedges with the
+/// same sense". Each edge-connected patch is walked breadth-first from its
+/// lowest triangle, flipping a neighbour whose shared edge runs the same way.
+/// A patch that needed any flip then takes the sign that makes its enclosed
+/// volume positive (measured about its own centroid, so an open patch reads
+/// the same wherever it sits), so the repaired shell ends outward whichever
+/// side the walk started on. A patch that was already consistent is left
+/// exactly as it came — its winding, inward or not, is the file's.
+///
+/// A patch whose walk meets itself with the opposite parity (a Möbius band,
+/// or a shell glued to itself) has no consistent winding; it is refused by
+/// name rather than guessed.
+fn orient_consistently(points: &[Vec3], triangles: &mut [[usize; 3]]) -> Result<usize, String> {
+    let mut edge_uses = HashMap::<(usize, usize), Vec<usize>>::default();
+    for (triangle_index, triangle) in triangles.iter().enumerate() {
+        for side in 0..3 {
+            edge_uses
+                .entry(edge_key(triangle[side], triangle[(side + 1) % 3]))
+                .or_default()
+                .push(triangle_index);
+        }
+    }
+    let runs_forward = |triangle: &[usize; 3], first: usize, second: usize| {
+        (0..3).any(|side| triangle[side] == first && triangle[(side + 1) % 3] == second)
+    };
+
+    let mut flip = vec![None::<bool>; triangles.len()];
+    let mut flipped = 0;
+    for seed in 0..triangles.len() {
+        if flip[seed].is_some() {
+            continue;
+        }
+        flip[seed] = Some(false);
+        let mut patch = vec![seed];
+        let mut queue = std::collections::VecDeque::from([seed]);
+        while let Some(current) = queue.pop_front() {
+            let current_flip = flip[current] == Some(true);
+            for side in 0..3 {
+                let first = triangles[current][side];
+                let second = triangles[current][(side + 1) % 3];
+                let uses = &edge_uses[&edge_key(first, second)];
+                if uses.len() != 2 {
+                    continue;
+                }
+                let neighbour = if uses[0] == current { uses[1] } else { uses[0] };
+                // After its own flip, `current` runs first→second exactly when
+                // it is not flipped; the neighbour must then run second→first.
+                let neighbour_same_way = runs_forward(&triangles[neighbour], first, second);
+                let wanted = neighbour_same_way != current_flip;
+                match flip[neighbour] {
+                    None => {
+                        flip[neighbour] = Some(wanted);
+                        patch.push(neighbour);
+                        queue.push_back(neighbour);
+                    }
+                    Some(assigned) if assigned != wanted => {
+                        return Err(format!(
+                            "mesh_to_faceted_brep: the shell through triangle {seed} cannot be \
+                             consistently oriented (non-orientable at the edge ({}, {}, {})–({}, {}, {}))",
+                            points[first].x, points[first].y, points[first].z,
+                            points[second].x, points[second].y, points[second].z
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        if patch.iter().all(|&index| flip[index] == Some(false)) {
+            continue;
+        }
+        for &index in &patch {
+            if flip[index] == Some(true) {
+                triangles[index].swap(1, 2);
+            }
+        }
+        let centroid = patch
+            .iter()
+            .flat_map(|&index| triangles[index])
+            .fold(Vec3::default(), |sum, corner| sum.add(points[corner]))
+            .scale(1.0 / (3 * patch.len()) as f64);
+        let volume = patch
+            .iter()
+            .map(|&index| {
+                let [a, b, c] = triangles[index].map(|corner| points[corner].sub(centroid));
+                a.dot(b.cross(c))
+            })
+            .sum::<f64>();
+        if volume < 0.0 {
+            for &index in &patch {
+                triangles[index].swap(1, 2);
+            }
+            flipped += patch.iter().filter(|&&index| flip[index] == Some(false)).count();
+        } else {
+            flipped += patch.iter().filter(|&&index| flip[index] == Some(true)).count();
+        }
+    }
+    Ok(flipped)
 }
 
 /// One planar face per repaired triangle, validated.
@@ -411,6 +524,7 @@ fn build_faceted_brep(points: &[Vec3], triangles: &[[usize; 3]]) -> Result<BrepS
         next_id += 1;
     }
     let mut result = BrepSolid {
+        mass_properties_cache: Default::default(),
         id: next_id + 1,
         vertices,
         edges,

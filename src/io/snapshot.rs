@@ -35,18 +35,17 @@
 //! re-snapshotting.
 //!
 //! **…except where the payload IS the document — a DURABILITY commitment.** A
-//! natively-imported part (`IMPORT3D` with `inputParams.nativeBrep`, kernel-plan
-//! `step-assembly-import.md` §3.2/§6) has NO parametric history behind it and
-//! does not retain the source file it was read from: this container holds the
-//! only copy of that geometry. There is nothing to self-heal FROM, so an
-//! unreadable payload there is LOST GEOMETRY, not a slow rebuild. This container
-//! and [`crate::SOLID_CODEC_VERSION`] are therefore a **durable format**, not a
-//! disposable cache: a version bump must ship a READER for the previous version
-//! (or a migration that rewrites old payloads), and a layout change that cannot
-//! be read forward is a breaking change to saved user documents. Cheap insurance
-//! while the format is at version 1; expensive to retrofit after the first field
-//! file. The clean-`Err` contract above still holds — it is the detection
-//! mechanism, no longer the whole answer.
+//! natively-imported part (`IMPORT3D` with `inputParams.nativeBrep`) has NO
+//! parametric history behind it and does not retain the source file it was read
+//! from: this container holds the only copy of that geometry. There is nothing
+//! to self-heal FROM, so an unreadable payload there is LOST GEOMETRY, not a
+//! slow rebuild. This container and [`crate::SOLID_CODEC_VERSION`] are therefore
+//! a **durable format**, not a disposable cache: a version bump must ship a
+//! READER for the previous version (or a migration that rewrites old payloads),
+//! and a layout change that cannot be read forward is a breaking change to saved
+//! user documents. Cheap insurance while the format is at version 1; expensive
+//! to retrofit after the first field file. The clean-`Err` contract above still
+//! holds — it is the detection mechanism, no longer the whole answer.
 //!
 //! **Metadata seam.** [`restore_solids`] RETURNS the captured metadata records
 //! without stamping them into the scene-metadata store: the ACOMP lane must

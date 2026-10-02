@@ -1,4 +1,5 @@
 use super::*;
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 
 // ---------------------------------------------------------------------------
 // §6.12 sibling operation: move a face group.
@@ -53,18 +54,28 @@ pub(super) fn cached_plane(
     face_lookup: &HashMap<u64, (usize, usize)>,
     face_id: u64,
     tolerance: f64,
-) -> Result<Plane, String> {
+) -> Result<Plane, KernelRefusal> {
     if let Some(plane) = cache.get(&face_id) {
         return Ok(*plane);
     }
-    let (shell_index, face_index) = *face_lookup
-        .get(&face_id)
-        .ok_or_else(|| format!("move_faces: missing face {face_id}"))?;
+    let (shell_index, face_index) = *face_lookup.get(&face_id).ok_or_else(|| {
+        KernelRefusal::internal(
+            KernelStage::Collect,
+            "face_lookup",
+            format!("move_faces: missing face {face_id}"),
+        )
+    })?;
+    // `plane_of_surface` answers "is this carrier a plane"; every caller here has
+    // already decided the face SHOULD be one, so its refusal is the planar lane's
+    // own deferral of a curved carrier.
     let plane = plane_of_surface(
         &solid.shells[shell_index].faces[face_index].surface,
         tolerance,
         "move_faces",
-    )?;
+    )
+    .map_err(|message| {
+        KernelRefusal::unsupported(KernelStage::Classify, "non_planar_carrier", message)
+    })?;
     cache.insert(face_id, plane);
     Ok(plane)
 }
@@ -110,15 +121,15 @@ fn unsupported_carrier(
     face_lookup: &HashMap<u64, (usize, usize)>,
     face_id: u64,
     role: &str,
-) -> String {
+) -> KernelRefusal {
     let kind = face_lookup
         .get(&face_id)
         .map(|&(shell, face)| carrier_kind_name(&solid.shells[shell].faces[face].surface))
         .unwrap_or("missing");
-    format!(
+    KernelRefusal::unsupported(KernelStage::Classify, "carrier_kind", format!(
         "move_faces: {role} (face {face_id}) is a {kind}; the plane push re-intersects only \
          planar and ruled (cylinder / cone) carriers here — refusing"
-    )
+    ))
 }
 
 /// Intersect three-or-more planes in one point: take the best-conditioned
@@ -171,34 +182,34 @@ fn plan_straight_rebuild(
     start_new: Vec3,
     end_new: Vec3,
     tolerance: f64,
-) -> Result<EdgeMoveAction, String> {
+) -> Result<EdgeMoveAction, KernelRefusal> {
     if edge.degenerate {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "degenerate_edge", format!(
             "move_faces: degenerate edge {} would need re-stretching (deferred)",
             edge.id
-        ));
+        )));
     }
     if edge.curve.straight_segment(tolerance).is_none() {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "curved_edge_rebuild", format!(
             "move_faces: edge {} must be re-stretched but is not a straight line \
              (curved re-intersection edges are deferred in this slice)",
             edge.id
-        ));
+        )));
     }
     let new_chord = end_new.sub(start_new);
     if new_chord.length() <= tolerance {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "edge_collapse", format!(
             "move_faces: the translation collapses edge {} to zero length (a moved \
              face lands exactly on its neighbour) — refusing",
             edge.id
-        ));
+        )));
     }
     if end_old.sub(start_old).dot(new_chord) <= 0.0 {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, EDGE_INVERSION, format!(
             "move_faces: the translation inverts edge {} (a moved face passes beyond \
              its neighbour) — refusing",
             edge.id
-        ));
+        )));
     }
     Ok(EdgeMoveAction::Rebuild {
         start: start_new,
@@ -451,7 +462,7 @@ fn rim_ruled_map(
     moved_plane: &Plane,
     translation: Vec3,
     tolerance: f64,
-) -> Result<AffineTransform, String> {
+) -> Result<AffineTransform, KernelRefusal> {
     let n = moved_plane.normal;
     let axis = frame.axis;
     let radius_scale = rho0.abs().max(rho1.abs()).max(1.0);
@@ -459,11 +470,9 @@ fn rim_ruled_map(
     if (rho1 - rho0).abs() <= 1e-9 * radius_scale {
         let axial_component = n.dot(axis);
         if axial_component.abs() <= 1e-9 {
-            return Err(
+            return Err(KernelRefusal::unsupported(KernelStage::Refine, "cap_parallel_to_axis",
                 "move_faces: the cap plane is parallel to the cylinder axis \
-                 (straight generatrix section) — refusing"
-                    .into(),
-            );
+                 (straight generatrix section) — refusing"));
         }
         let shift = axis.scale(n.dot(translation) / axial_component);
         return AffineTransform::new([
@@ -471,22 +480,21 @@ fn rim_ruled_map(
             0.0, 1.0, 0.0, shift.y, //
             0.0, 0.0, 1.0, shift.z, //
             0.0, 0.0, 0.0, 1.0,
-        ]);
+        ])
+        .or_refuse(KernelStage::Refine, "affine");
     }
     // Cone/frustum: homothety about the apex (where rho_at → 0).
     let z_apex = rho0 * height / (rho0 - rho1);
     let apex = frame.origin.add(axis.scale(z_apex));
     let d0 = n.dot(moved_plane.origin.sub(apex));
     if d0.abs() <= tolerance {
-        return Err("move_faces: the cap plane passes through the cone apex — refusing".into());
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "cap_through_apex", "move_faces: the cap plane passes through the cone apex — refusing"));
     }
     let lambda = 1.0 + n.dot(translation) / d0;
     if lambda <= tolerance {
-        return Err(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "push_past_apex",
             "move_faces: the push drives the cap to or past the cone apex \
-             (scale → 0) — refusing"
-                .into(),
-        );
+             (scale → 0) — refusing"));
     }
     // Y = apex + λ·(X − apex) = λ·X + (1−λ)·apex.
     let offset = apex.scale(1.0 - lambda);
@@ -496,6 +504,7 @@ fn rim_ruled_map(
         0.0, 0.0, lambda, offset.z, //
         0.0, 0.0, 0.0, 1.0,
     ])
+    .or_refuse(KernelStage::Refine, "affine")
 }
 
 /// The checked contract for SM1b (the user's "reapply the trimming" semantics):
@@ -513,23 +522,23 @@ fn verify_rim_on_carriers(
     moved_plane: &Plane,
     translation: Vec3,
     tolerance: f64,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let (origin, axis) = (frame.origin, frame.axis);
     let normal = moved_plane.normal;
     let plane_point = moved_plane.origin.add(translation);
     for step in 0..=8 {
         let t = edge.t0 + (edge.t1 - edge.t0) * (step as f64 / 8.0);
-        let mapped = map.point(edge.curve.evaluate(t)?);
+        let mapped = map.point(edge.curve.evaluate(t).or_refuse(KernelStage::Validate, "evaluate")?);
         let delta = mapped.sub(origin);
         let axial = delta.dot(axis);
         let radial = delta.sub(axis.scale(axial)).length();
         let off_ruled = (radial - rho_at(rho0, rho1, height, axial)).abs();
         let off_plane = mapped.sub(plane_point).dot(normal).abs();
         if off_ruled > 10.0 * tolerance || off_plane > 10.0 * tolerance {
-            return Err(format!(
+            return Err(KernelRefusal::internal(KernelStage::Validate, "rim_on_carriers", format!(
                 "move_faces: the re-intersected rim does not lie on both modified carriers \
                  (off ruled {off_ruled:.3e}, off plane {off_plane:.3e}) — refusing"
-            ));
+            )));
         }
     }
     Ok(())
@@ -580,7 +589,7 @@ fn moved_ruled_rim_map(
     fixed_plane: &Plane,
     translation: Vec3,
     tolerance: f64,
-) -> Result<AffineTransform, String> {
+) -> Result<AffineTransform, KernelRefusal> {
     let back = rim_ruled_map(
         frame,
         rho0,
@@ -595,7 +604,7 @@ fn moved_ruled_rim_map(
     elements[3] += translation.x;
     elements[7] += translation.y;
     elements[11] += translation.z;
-    AffineTransform::new(elements)
+    AffineTransform::new(elements).or_refuse(KernelStage::Refine, "affine")
 }
 
 /// The PUSHED ruled carrier of the one moved face at a corner, when that is
@@ -665,10 +674,14 @@ fn verify_chord_on_carrier(
     end: Vec3,
     carrier_shift: Option<Vec3>,
     tolerance: f64,
-) -> Result<(), String> {
-    let (shell, face) = *face_lookup
-        .get(&face_id)
-        .ok_or_else(|| format!("move_faces: missing face {face_id}"))?;
+) -> Result<(), KernelRefusal> {
+    let (shell, face) = *face_lookup.get(&face_id).ok_or_else(|| {
+        KernelRefusal::internal(
+            KernelStage::Collect,
+            "chord_face_lookup",
+            format!("move_faces: missing face {face_id}"),
+        )
+    })?;
     // Measure against the ANALYTIC (unbounded) carrier, not the trimmed NURBS
     // surface: the rebuilt chord routinely lands OUTSIDE the current v-domain
     // (the carrier is grown to cover it afterwards), so a domain-clamped
@@ -678,9 +691,9 @@ fn verify_chord_on_carrier(
     let Some((frame, rho0, rho1, height)) =
         ruled_revolution_carrier(&solid.shells[shell].faces[face].surface)
     else {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Classify, "ruled_carrier_expected", format!(
             "move_faces: chord-on-carrier check expects a ruled carrier (face {face_id})"
-        ));
+        )));
     };
     let origin = frame.origin.add(carrier_shift.unwrap_or_default());
     let axis = frame.axis;
@@ -693,11 +706,11 @@ fn verify_chord_on_carrier(
         // against rho_at(axial), not a fixed rho0 (which is cylinder-only).
         let radius = rho_at(rho0, rho1, height, axial);
         if (radial - radius).abs() > 10.0 * tolerance {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(KernelStage::Validate, "chord_off_carrier", format!(
                 "move_faces: rebuilt edge would leave its curved neighbour \
                  (face {face_id}, off by {:.3e}) — refusing",
                 (radial - radius).abs()
-            ));
+            )));
         }
     }
     Ok(())
@@ -723,21 +736,29 @@ pub(super) fn retrim_ruled_face(
     final_edges: &HashMap<u64, EdgeRecord>,
     tolerance: f64,
     op: &str,
-) -> Result<(), String> {
-    let (shell, face_pos) = find_face(solid, face_id)
-        .ok_or_else(|| format!("{op}: missing ruled face {face_id}"))?;
+) -> Result<(), KernelRefusal> {
+    let (shell, face_pos) = find_face(solid, face_id).ok_or_else(|| {
+        KernelRefusal::internal(
+            KernelStage::Sew,
+            "ruled_face_lookup",
+            format!("{op}: missing ruled face {face_id}"),
+        )
+    })?;
     retrim_face_in_solid(
         solid,
         shell,
         face_pos,
         final_edges,
         |solid, points| {
+            // The carrier helpers are typed; this retrim's closure is still
+            // the stringly shape its callee asks for (lossy exit).
             extend_ruled_neighbour_over(solid, face_id, points, tolerance)?;
-            extend_revolution_carrier_over(solid, face_id, points, tolerance)
+            Ok(extend_revolution_carrier_over(solid, face_id, points, tolerance)?)
         },
         tolerance,
         op,
     )
+    
 }
 
 /// The EXACT corner where a fixed PLANE, a fixed RULED carrier and the
@@ -762,16 +783,14 @@ pub(super) fn corner_on_plane_and_ruled(
     height: f64,
     old_corner: Vec3,
     tolerance: f64,
-) -> Result<Vec3, String> {
+) -> Result<Vec3, KernelRefusal> {
     let direction = fixed_plane.normal.cross(cap_normal);
     if direction.length() <= PARALLEL_EPS {
-        return Err(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "parallel_carriers",
             "move_faces: the pushed cap plane is parallel to a fixed planar neighbour \
-             (no corner) — refusing"
-                .into(),
-        );
+             (no corner) — refusing"));
     }
-    let direction = direction.normalized()?;
+    let direction = direction.normalized().or_refuse(KernelStage::Refine, "normalized")?;
     // A point on both planes, taken in the 2-D span of the two normals.
     let ca = fixed_plane.normal.dot(fixed_plane.origin);
     let naa = fixed_plane.normal.dot(fixed_plane.normal);
@@ -779,7 +798,7 @@ pub(super) fn corner_on_plane_and_ruled(
     let nbb = cap_normal.dot(cap_normal);
     let determinant = naa * nbb - nab * nab;
     if determinant.abs() <= PARALLEL_EPS {
-        return Err("move_faces: cannot place the corner's carrier line — refusing".into());
+        return Err(KernelRefusal::internal(KernelStage::Refine, "carrier_line", "move_faces: cannot place the corner's carrier line — refusing"));
     }
     let alpha = (ca * nbb - cap_c * nab) / determinant;
     let beta = (cap_c * naa - ca * nab) / determinant;
@@ -827,9 +846,12 @@ pub(super) fn corner_on_plane_and_ruled(
         }
     }
     let (corner, _) = best.ok_or_else(|| {
-        "move_faces: the pushed cap plane no longer meets the fixed ruled neighbour \
-         (the push drives the corner off the carrier) — refusing"
-            .to_string()
+        KernelRefusal::unsupported(
+            KernelStage::Refine,
+            "corner_off_carrier",
+            "move_faces: the pushed cap plane no longer meets the fixed ruled neighbour \
+         (the push drives the corner off the carrier) — refusing",
+        )
     })?;
     Ok(corner)
 }
@@ -889,7 +911,7 @@ pub(super) fn conic_arc_on_ruled(
     end: Vec3,
     forward_sweep: bool,
     tolerance: f64,
-) -> Result<NurbsCurve, String> {
+) -> Result<NurbsCurve, KernelRefusal> {
     let radius_scale = rho0.abs().max(rho1.abs()).max(1.0);
     let axis = frame.axis;
     // Azimuth is preserved by BOTH section constructions — a cone's central
@@ -915,11 +937,9 @@ pub(super) fn conic_arc_on_ruled(
         (azimuth(end), wrap(azimuth(start) - azimuth(end)), true)
     };
     if sweep <= 1e-9 || sweep >= tau - 1e-9 {
-        return Err(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "section_degenerate",
             "move_faces: the re-intersected arc degenerates to a point or a full turn \
-             — refusing"
-                .into(),
-        );
+             — refusing"));
     }
     if (rho1 - rho0).abs() <= 1e-9 * radius_scale {
         // A CYLINDER's plane section is an ellipse, built by the shared
@@ -938,9 +958,15 @@ pub(super) fn conic_arc_on_ruled(
             sweep,
             tolerance,
         )
-        .map_err(|error| error.replace("plane_ruled_section_arc:", "move_faces:"))?;
+        .map_err(|error| {
+            KernelRefusal::unsupported(
+                KernelStage::Refine,
+                "ruled_section",
+                error.replace("plane_ruled_section_arc:", "move_faces:"),
+            )
+        })?;
         if reverse {
-            curve = curve.reversed()?;
+            curve = curve.reversed().or_refuse(KernelStage::Refine, "reversed")?;
         }
         verify_section_between(&curve, frame, rho0, rho1, height, plane_normal, plane_c, start, end, tolerance)?;
         return Ok(curve);
@@ -950,7 +976,7 @@ pub(super) fn conic_arc_on_ruled(
         .add(axis.scale(rho0 * height / (rho0 - rho1)));
     let k = plane_c - plane_normal.dot(apex);
     if k.abs() <= tolerance {
-        return Err("move_faces: the section plane passes through the cone apex — refusing".into());
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "section_through_apex", "move_faces: the section plane passes through the cone apex — refusing"));
     }
     // Base circle at whichever end has the LARGER radius, so it never degenerates.
     let (reference_rho, reference_axial) = if rho0.abs() >= rho1.abs() {
@@ -959,7 +985,7 @@ pub(super) fn conic_arc_on_ruled(
         (rho1.abs(), height)
     };
     if reference_rho <= tolerance {
-        return Err("move_faces: the cone carrier degenerates to its apex — refusing".into());
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "degenerate_cone", "move_faces: the cone carrier degenerates to its apex — refusing"));
     }
     let circle = crate::make_arc(
         frame.origin.add(axis.scale(reference_axial)),
@@ -968,7 +994,7 @@ pub(super) fn conic_arc_on_ruled(
         reference_rho,
         start_angle,
         start_angle + sweep,
-    )?;
+    ).or_refuse(KernelStage::Refine, "make_arc")?;
     let mut mapped: Vec<crate::Vec4> = Vec::with_capacity(circle.control_points.len());
     let mut sign = 0.0f64;
     for control in &circle.control_points {
@@ -979,20 +1005,16 @@ pub(super) fn conic_arc_on_ruled(
         );
         let weight = relative.dot(plane_normal);
         if weight.abs() <= 1e-9 * radius_scale {
-            return Err(
+            return Err(KernelRefusal::unsupported(KernelStage::Refine, "asymptotic_ruling",
                 "move_faces: the re-intersected section runs along an asymptotic ruling \
-                 of the cone — refusing"
-                    .into(),
-            );
+                 of the cone — refusing"));
         }
         if sign == 0.0 {
             sign = weight.signum();
         } else if weight.signum() != sign {
-            return Err(
+            return Err(KernelRefusal::unsupported(KernelStage::Refine, "both_nappes",
                 "move_faces: the re-intersected section crosses the cone's apex plane \
-                 (both nappes) — refusing"
-                    .into(),
-            );
+                 (both nappes) — refusing"));
         }
         let scaled = relative.scale(k);
         mapped.push(crate::Vec4 {
@@ -1011,9 +1033,9 @@ pub(super) fn conic_arc_on_ruled(
             control.w = -control.w;
         }
     }
-    let mut curve = NurbsCurve::new(circle.degree, circle.knots.clone(), mapped)?;
+    let mut curve = NurbsCurve::new(circle.degree, circle.knots.clone(), mapped).or_refuse(KernelStage::Refine, "curve_new")?;
     if reverse {
-        curve = curve.reversed()?;
+        curve = curve.reversed().or_refuse(KernelStage::Refine, "reversed")?;
     }
     verify_section_between(
         &curve, frame, rho0, rho1, height, plane_normal, plane_c, start, end, tolerance,
@@ -1038,19 +1060,19 @@ pub(super) fn verify_section_between(
     start: Vec3,
     end: Vec3,
     tolerance: f64,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let axis = frame.axis;
-    let [d0, d1] = curve.domain()?;
+    let [d0, d1] = curve.domain().or_refuse(KernelStage::Validate, "domain")?;
     for (parameter, target) in [(d0, start), (d1, end)] {
-        let drift = curve.evaluate(parameter)?.sub(target).length();
+        let drift = curve.evaluate(parameter).or_refuse(KernelStage::Validate, "evaluate")?.sub(target).length();
         if drift > 10.0 * tolerance {
-            return Err(format!(
+            return Err(KernelRefusal::internal(KernelStage::Validate, "section_corner", format!(
                 "move_faces: the rebuilt section misses its corner by {drift:.3e} — refusing"
-            ));
+            )));
         }
     }
     for step in 0..=8 {
-        let point = curve.evaluate(d0 + (d1 - d0) * (step as f64 / 8.0))?;
+        let point = curve.evaluate(d0 + (d1 - d0) * (step as f64 / 8.0)).or_refuse(KernelStage::Validate, "evaluate")?;
         let delta = point.sub(frame.origin);
         let axial = delta.dot(axis);
         let off_ruled = (delta.sub(axis.scale(axial)).length()
@@ -1058,10 +1080,10 @@ pub(super) fn verify_section_between(
         .abs();
         let off_plane = (point.dot(plane_normal) - plane_c).abs();
         if off_ruled > 10.0 * tolerance || off_plane > 10.0 * tolerance {
-            return Err(format!(
+            return Err(KernelRefusal::internal(KernelStage::Validate, "section_on_carriers", format!(
                 "move_faces: the rebuilt section does not lie on both carriers \
                  (off ruled {off_ruled:.3e}, off plane {off_plane:.3e}) — refusing"
-            ));
+            )));
         }
     }
     Ok(())
@@ -1130,16 +1152,16 @@ pub(super) fn resolve_corner_on_fixed_edge(
     plane_normal: Vec3,
     plane_c: f64,
     tolerance: f64,
-) -> Result<Vec3, String> {
+) -> Result<Vec3, KernelRefusal> {
     let curve = &fixed_edge.curve;
     if let Some((p0, p1)) = curve.straight_segment(tolerance) {
         let dir = p1.sub(p0);
         let denom = plane_normal.dot(dir);
         if denom.abs() <= PARALLEL_EPS * (1.0 + dir.length()) {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(KernelStage::Refine, "edge_parallel_to_cap", format!(
                 "move_faces: fixed edge {} runs parallel to the cap plane (no crossing) — refusing",
                 fixed_edge.id
-            ));
+            )));
         }
         let s = (plane_c - plane_normal.dot(p0)) / denom;
         return Ok(p0.add(dir.scale(s)));
@@ -1147,8 +1169,8 @@ pub(super) fn resolve_corner_on_fixed_edge(
     // Curved (conic) fixed edge — closed-form-in-spirit numeric solve strictly
     // within the domain. `n·C(u) − c` has the sign of the numerator polynomial
     // (weights are strictly positive), so its roots are the crossings.
-    let [d0, d1] = curve.domain()?;
-    let f = |u: f64| -> Result<f64, String> { Ok(plane_normal.dot(curve.evaluate(u)?) - plane_c) };
+    let [d0, d1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let f = |u: f64| -> Result<f64, KernelRefusal> { Ok(plane_normal.dot(curve.evaluate(u).or_refuse(KernelStage::Refine, "evaluate")?) - plane_c) };
     const STEPS: usize = 96;
     let mut best: Option<(f64, f64)> = None;
     let mut prev_u = d0;
@@ -1181,13 +1203,13 @@ pub(super) fn resolve_corner_on_fixed_edge(
         prev_f = fu;
     }
     let (root, _) = best.ok_or_else(|| {
-        format!(
+        KernelRefusal::unsupported(KernelStage::Refine, "fixed_edge_span", format!(
             "move_faces: the pushed cap does not re-cross fixed edge {} within its span \
              (curved-fixed-edge extension deferred, or the push tears the face) — refusing",
             fixed_edge.id
-        )
+        ))
     })?;
-    curve.evaluate(root)
+    curve.evaluate(root).or_refuse(KernelStage::Refine, "evaluate")
 }
 
 /// Golovanov §6.12 direct editing — translate a group of faces rigidly and
@@ -1238,12 +1260,12 @@ pub fn move_faces(
     solid: &BrepSolid,
     face_ids: &[u64],
     translation: Vec3,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     if !(translation.x.is_finite() && translation.y.is_finite() && translation.z.is_finite()) {
-        return Err("move_faces: translation must be finite".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "translation", "move_faces: translation must be finite"));
     }
     if face_ids.is_empty() {
-        return Err("move_faces: no faces selected".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "selection", "move_faces: no faces selected"));
     }
     let moved: HashSet<u64> = face_ids.iter().copied().collect();
     // face id -> (shell, face) built once. move_faces never mutates `solid`,
@@ -1260,7 +1282,7 @@ pub fn move_faces(
     }
     for &face_id in face_ids {
         if !face_lookup.contains_key(&face_id) {
-            return Err(format!("move_faces: no face with id {face_id}"));
+            return Err(KernelRefusal::input(KernelStage::Collect, "face_id", format!("move_faces: no face with id {face_id}")));
         }
     }
 
@@ -1310,11 +1332,11 @@ pub fn move_faces(
             .unwrap_or(&[]);
         let expected = if edge.degenerate { 1 } else { 2 };
         if uses.len() != expected {
-            return Err(format!(
+            return Err(KernelRefusal::input(KernelStage::Collect, "non_manifold", format!(
                 "move_faces: edge {} is used {} times (non-manifold input)",
                 edge.id,
                 uses.len()
-            ));
+            )));
         }
     }
 
@@ -1514,7 +1536,7 @@ pub fn move_faces(
             // single image for the vertex. It refuses by name rather than
             // picking one.
             if fixed_at.len() != 1 {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Classify, "mirror_corner_flats", format!(
                     "move_faces: the corner at vertex {} where the MOVED {} meets its \
                      neighbours touches {} fixed faces (a pushed cylinder or cone is \
                      re-intersected against exactly one flat there) — refusing",
@@ -1524,7 +1546,7 @@ pub fn move_faces(
                             .surface
                     ),
                     fixed_at.len()
-                ));
+                )));
             }
             let fixed_face = fixed_at[0];
             let flat = cached_plane(&mut planes, solid, &face_lookup, fixed_face, plane_tolerance)
@@ -1547,11 +1569,11 @@ pub fn move_faces(
             // on the flat it must stay on, and on the carrier the push leaves.
             let off_flat = corner.sub(flat.origin).dot(flat.normal).abs();
             if off_flat > 10.0 * tolerance {
-                return Err(format!(
+                return Err(KernelRefusal::internal(KernelStage::Validate, "mirror_corner_on_flat", format!(
                     "move_faces: the re-solved corner at vertex {} left its fixed flat \
                      (off {off_flat:.3e}) — refusing",
                     vertex.id
-                ));
+                )));
             }
             let pushed = shift_ruled_frame(&frame, translation);
             let delta = corner.sub(pushed.origin);
@@ -1559,11 +1581,11 @@ pub fn move_faces(
             let radial = delta.sub(pushed.axis.scale(axial)).length();
             let off_carrier = (radial - rho_at(rho0, rho1, height, axial)).abs();
             if off_carrier > 10.0 * tolerance {
-                return Err(format!(
+                return Err(KernelRefusal::internal(KernelStage::Validate, "mirror_corner_on_carrier", format!(
                     "move_faces: the re-solved corner at vertex {} left the MOVED carrier \
                      (face {moved_face}, off {off_carrier:.3e}) — refusing",
                     vertex.id
-                ));
+                )));
             }
             new_vertex.insert(vertex.id, corner);
             continue;
@@ -1587,12 +1609,12 @@ pub fn move_faces(
                 .filter(|f| moved.contains(f))
                 .collect();
             if moved_here.len() != 1 {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Classify, "multi_rim_caps", format!(
                     "move_faces: corner at vertex {} touches {} moved faces against a ruled \
                      neighbour (single-cap multi-rim only) — refusing",
                     vertex.id,
                     moved_here.len()
-                ));
+                )));
             }
             let cap_plane =
                 cached_plane(&mut planes, solid, &face_lookup, moved_here[0], plane_tolerance)
@@ -1613,12 +1635,12 @@ pub fn move_faces(
                 })
                 .collect();
             if fixed_edges.len() != 1 {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Classify, "multi_rim_fixed_edges", format!(
                     "move_faces: corner at vertex {} rides {} fixed edges against a ruled \
                      neighbour (exactly one required) — refusing",
                     vertex.id,
                     fixed_edges.len()
-                ));
+                )));
             }
             let fixed_edge = fixed_edges[0];
             let seed = if fixed_edge.start_vertex_id == vertex.id {
@@ -1679,11 +1701,11 @@ pub fn move_faces(
                     let radial = delta.sub(frame.axis.scale(axial)).length();
                     let off = (radial - rho_at(rho0, rho1, height, axial)).abs();
                     if off > 10.0 * tolerance {
-                        return Err(format!(
+                        return Err(KernelRefusal::unsupported(KernelStage::Validate, "corner_off_ruled_neighbour", format!(
                             "move_faces: re-solved corner at vertex {} left its ruled neighbour \
                              (off {off:.3e}) — refusing",
                             vertex.id
-                        ));
+                        )));
                     }
                 } else {
                     let plane = cached_plane(&mut planes, solid, &face_lookup, f, plane_tolerance)
@@ -1696,11 +1718,11 @@ pub fn move_faces(
                             )
                         })?;
                     if corner.sub(plane.origin).dot(plane.normal).abs() > 10.0 * tolerance {
-                        return Err(format!(
+                        return Err(KernelRefusal::unsupported(KernelStage::Validate, "corner_off_planar_neighbour", format!(
                             "move_faces: re-solved corner at vertex {} left a fixed planar \
                              neighbour — refusing",
                             vertex.id
-                        ));
+                        )));
                     }
                 }
             }
@@ -1755,21 +1777,21 @@ pub fn move_faces(
             corner_planes.push(plane);
         }
         let corner = solve_corner(&corner_planes).ok_or_else(|| {
-            format!(
+            KernelRefusal::ill_posed(KernelStage::Refine, "corner_underconstrained", format!(
                 "move_faces: cannot re-intersect the carriers meeting at vertex {} \
                  (parallel or under-constrained planes)",
                 vertex.id
-            )
+            ))
         })?;
         // The corner must genuinely sit on EVERY carrier; otherwise the group
         // tears away from its fixed neighbours and no manifold heal exists.
         for plane in &corner_planes {
             if corner.sub(plane.origin).dot(plane.normal).abs() > tolerance {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Refine, "corner_tear", format!(
                     "move_faces: the moved group tears away from its neighbours at \
                      vertex {} — refusing rather than emitting an invalid solid",
                     vertex.id
-                ));
+                )));
             }
         }
         new_vertex.insert(vertex.id, corner);
@@ -1783,11 +1805,14 @@ pub fn move_faces(
         .collect();
     let mut actions: HashMap<u64, EdgeMoveAction> = HashMap::default();
     for edge in &solid.edges {
-        let position = |vertex_id: u64| -> Result<Vec3, String> {
-            vertex_position
-                .get(&vertex_id)
-                .copied()
-                .ok_or_else(|| format!("move_faces: missing vertex {vertex_id}"))
+        let position = |vertex_id: u64| -> Result<Vec3, KernelRefusal> {
+            vertex_position.get(&vertex_id).copied().ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Collect,
+                    "vertex_lookup",
+                    format!("move_faces: missing vertex {vertex_id}"),
+                )
+            })
         };
         let start_old = position(edge.start_vertex_id)?;
         let end_old = position(edge.end_vertex_id)?;
@@ -1846,18 +1871,18 @@ pub fn move_faces(
                     // so a tearing push still refuses.
                     let new_chord = end_new.sub(start_new);
                     if new_chord.length() <= tolerance {
-                        return Err(format!(
+                        return Err(KernelRefusal::unsupported(KernelStage::Refine, "curved_edge_collapse", format!(
                             "move_faces: the translation collapses edge {} to zero length (a \
                              moved face lands exactly on its neighbour) — refusing",
                             edge.id
-                        ));
+                        )));
                     }
                     if end_old.sub(start_old).dot(new_chord) <= 0.0 {
-                        return Err(format!(
+                        return Err(KernelRefusal::unsupported(KernelStage::Refine, CURVED_EDGE_INVERSION, format!(
                             "move_faces: the translation inverts edge {} (a moved face passes \
                              beyond its neighbour) — refusing",
                             edge.id
-                        ));
+                        )));
                     }
                     let (fixed_plane, (frame, rho0, rho1, height)) = plane_and_ruled_carriers(
                         solid,
@@ -1867,14 +1892,14 @@ pub fn move_faces(
                         plane_tolerance,
                     )
                     .ok_or_else(|| {
-                        format!(
+                        KernelRefusal::unsupported(KernelStage::Classify, "curved_fixed_edge_pair", format!(
                             "move_faces: curved fixed edge {} is not shared by exactly one plane \
                              and one ruled carrier — refusing",
                             edge.id
-                        )
+                        ))
                     })?;
                     let forward =
-                        arc_sweeps_forward(&frame, &edge.curve, edge.t0, edge.t1)?;
+                        arc_sweeps_forward(&frame, &edge.curve, edge.t0, edge.t1).or_refuse(KernelStage::Refine, "arc_sweeps_forward")?;
                     let curve = conic_arc_on_ruled(
                         &frame,
                         rho0,
@@ -2017,8 +2042,8 @@ pub fn move_faces(
                     // the untouched affine path.
                     let mut replacement = None;
                     if edge.start_vertex_id != edge.end_vertex_id {
-                        let old_start = edge.curve.evaluate(edge.t0)?;
-                        let old_end = edge.curve.evaluate(edge.t1)?;
+                        let old_start = edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Refine, "evaluate")?;
+                        let old_end = edge.curve.evaluate(edge.t1).or_refuse(KernelStage::Refine, "evaluate")?;
                         let rim_start = new_vertex
                             .get(&edge.start_vertex_id)
                             .copied()
@@ -2034,7 +2059,7 @@ pub fn move_faces(
                             .max(map.point(old_end).sub(rim_end).length());
                         if drift > 10.0 * tolerance {
                             let forward =
-                                arc_sweeps_forward(&frame, &edge.curve, edge.t0, edge.t1)?;
+                                arc_sweeps_forward(&frame, &edge.curve, edge.t0, edge.t1).or_refuse(KernelStage::Refine, "arc_sweeps_forward")?;
                             let plane_c = moved_plane
                                 .normal
                                 .dot(moved_plane.origin.add(translation));
@@ -2117,13 +2142,13 @@ pub fn move_faces(
                                 .length()
                                 .max(map.point(end_old).sub(end_new).length());
                             if drift > 10.0 * tolerance {
-                                return Err(format!(
+                                return Err(KernelRefusal::unsupported(KernelStage::Refine, "mirror_rim_flats", format!(
                                     "move_faces: the rim of boundary edge {} does not reach the corners the \
                                      push re-solved (off {drift:.3e}) — its two ends ride \
                                      different fixed flats, which no single affine carries — \
                                      refusing",
                                     edge.id
-                                ));
+                                )));
                             }
                         }
                         actions.insert(edge.id, EdgeMoveAction::Transform(map));
@@ -2157,11 +2182,11 @@ pub fn move_faces(
                         );
                     }
                 } else {
-                    return Err(format!(
+                    return Err(KernelRefusal::unsupported(KernelStage::Classify, "sm3_carrier", format!(
                         "move_faces: boundary edge {} borders a non-planar, non-axis-parallel \
                          carrier — refusing (SM3 territory)",
                         edge.id
-                    ));
+                    )));
                 }
             }
         }
@@ -2298,27 +2323,27 @@ pub fn move_faces(
         0.0,
         0.0,
         1.0,
-    ])?;
+    ]).or_refuse(KernelStage::Sew, "affine")?;
     let mut result = solid.clone();
     for edge in &mut result.edges {
         match actions.get(&edge.id) {
             Some(EdgeMoveAction::Translate) => {
-                edge.curve = transform_curve(&edge.curve, translate)?;
+                edge.curve = transform_curve(&edge.curve, translate).or_refuse(KernelStage::Sew, "transform_curve")?;
             }
             Some(EdgeMoveAction::Rebuild { start, end }) => {
-                edge.curve = make_line(*start, *end)?;
+                edge.curve = make_line(*start, *end).or_refuse(KernelStage::Sew, "make_line")?;
                 edge.t0 = 0.0;
                 edge.t1 = 1.0;
             }
             Some(EdgeMoveAction::Transform(map)) => {
                 // Affine-map the rim (radial scale about the axis + translate).
                 // Rational-quadratic circles map exactly; parameters unchanged.
-                edge.curve = transform_curve(&edge.curve, *map)?;
+                edge.curve = transform_curve(&edge.curve, *map).or_refuse(KernelStage::Sew, "transform_curve")?;
             }
             Some(EdgeMoveAction::Replace { curve }) => {
                 // An exactly rebuilt conic arc spans its whole domain by
                 // construction, so the trim is the domain.
-                let [d0, d1] = curve.domain()?;
+                let [d0, d1] = curve.domain().or_refuse(KernelStage::Sew, "domain")?;
                 edge.curve = curve.clone();
                 edge.t0 = d0;
                 edge.t1 = d1;
@@ -2340,7 +2365,7 @@ pub fn move_faces(
         let face = &mut result.shells[shell_index].faces[face_index];
         match action {
             FaceMoveAction::TranslateSurface => {
-                face.surface = transform_surface(&face.surface, translate)?;
+                face.surface = transform_surface(&face.surface, translate).or_refuse(KernelStage::Sew, "transform_surface")?;
             }
             FaceMoveAction::Retrim(plane) => {
                 retrim_planar_face(face, &plane, &final_edges, scale, "move_faces")?;
@@ -2376,19 +2401,17 @@ pub fn move_faces(
     // validate() re-checks Euler, loop closure, and pcurve agreement.
     let issues = result.validate();
     if !issues.is_empty() {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Validate, "validate", format!(
             "move_faces: moved solid failed validation: {issues:?}"
-        ));
+        )));
     }
     // Belt and braces on top of the per-edge inversion guard: a global
     // inversion flips the signed volume even if every edge kept its direction.
     if let (Ok(before), Ok(after)) = (solid_signed_volume(solid), solid_signed_volume(&result)) {
         if before * after <= 0.0 {
-            return Err(
+            return Err(KernelRefusal::unsupported(KernelStage::Validate, SOLID_INVERSION,
                 "move_faces: the translation inverts the solid (signed volume changed sign) \
-                 — refusing"
-                    .into(),
-            );
+                 — refusing"));
         }
     }
     Ok(result)
@@ -2416,7 +2439,7 @@ fn move_planar_face_across_sphere(
     face_lookup: &HashMap<u64, (usize, usize)>,
     faces_of_edge: &HashMap<u64, Vec<u64>>,
     translation: Vec3,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let scale = solid_model_scale(solid);
     let tolerance = (scale * 1e-7).max(1e-9);
     let plane_tolerance = (scale * 1e-6).max(1e-7);
@@ -2424,22 +2447,27 @@ fn move_planar_face_across_sphere(
     // Single moved planar face only (groups deferred — they would need the
     // generic corner re-solve against the remaining planar neighbours).
     if moved.len() != 1 {
-        return Err(
+        return Err(KernelRefusal::unsupported(KernelStage::Collect, "sphere_group",
             "move_faces: a moved GROUP against a sphere neighbour is deferred \
-             (single planar face only) — refusing"
-                .into(),
-        );
+             (single planar face only) — refusing"));
     }
     let moved_id = *moved.iter().next().unwrap();
-    let &(mshell, mface) = face_lookup
-        .get(&moved_id)
-        .ok_or_else(|| format!("move_faces: missing moved face {moved_id}"))?;
+    let &(mshell, mface) = face_lookup.get(&moved_id).ok_or_else(|| {
+        KernelRefusal::internal(
+            KernelStage::Collect,
+            "moved_face_lookup",
+            format!("move_faces: missing moved face {moved_id}"),
+        )
+    })?;
     // The moved face must itself be planar (it translates rigidly).
     let moved_plane = plane_of_surface(
         &solid.shells[mshell].faces[mface].surface,
         plane_tolerance,
         "move_faces",
-    )?;
+    )
+    .map_err(|message| {
+        KernelRefusal::unsupported(KernelStage::Classify, "sphere_moved_non_planar", message)
+    })?;
     let translated_origin = moved_plane.origin.add(translation);
 
     let edge_by_id: HashMap<u64, &EdgeRecord> =
@@ -2462,7 +2490,13 @@ fn move_planar_face_across_sphere(
         for coedge in &loop_record.coedges {
             let edge = *edge_by_id
                 .get(&coedge.edge_id)
-                .ok_or_else(|| format!("move_faces: missing edge {}", coedge.edge_id))?;
+                .ok_or_else(|| {
+                    KernelRefusal::internal(
+                        KernelStage::Refine,
+                        "rim_edge_lookup",
+                        format!("move_faces: missing edge {}", coedge.edge_id),
+                    )
+                })?;
             let uses = faces_of_edge
                 .get(&edge.id)
                 .map(Vec::as_slice)
@@ -2470,27 +2504,27 @@ fn move_planar_face_across_sphere(
             // The one fixed face across this boundary edge.
             let neighbour = uses.iter().copied().find(|f| *f != moved_id);
             let Some(neighbour) = neighbour else {
-                return Err(format!(
+                return Err(KernelRefusal::internal(KernelStage::Classify, "own_edge", format!(
                     "move_faces: the moved face borders itself along edge {} \
                      (unexpected own edge) — refusing",
                     edge.id
-                ));
+                )));
             };
             let Some((frame, radius)) = carrier_sphere(solid, face_lookup, neighbour) else {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Classify, "sphere_mixed_neighbours", format!(
                     "move_faces: the moved planar face borders a non-sphere fixed \
                      neighbour along edge {} (mixed / planar-corner / torus / \
                      revolution neighbours are other slices) — refusing",
                     edge.id
-                ));
+                )));
             };
             // A single CLOSED-circle rim only (start == end vertex).
             if edge.start_vertex_id != edge.end_vertex_id {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Classify, "sphere_open_rim", format!(
                     "move_faces: the plane × sphere rim (edge {}) is not a single closed \
                      circle (open / multi-edge rims are deferred) — refusing",
                     edge.id
-                ));
+                )));
             }
             let center = frame.origin;
             let axis = frame.axis;
@@ -2498,22 +2532,22 @@ fn move_planar_face_across_sphere(
             // circle we can build seam-aligned; an oblique section crossing the
             // seam is deferred (matches the sphere-pushed path's own refusal).
             if moved_plane.normal.dot(axis).abs() < 1.0 - 1e-6 {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Classify, "sphere_oblique_rim", format!(
                     "move_faces: an OBLIQUE plane × sphere rim (edge {}) is deferred \
                      (only axis-perpendicular caps) — refusing",
                     edge.id
-                ));
+                )));
             }
             // Signed axial offset of the TRANSLATED plane from the sphere centre;
             // the new rim is the small circle of radius √(r²−a²) at that height.
             let a = translated_origin.sub(center).dot(axis);
             let rr2 = radius * radius - a * a;
             if rr2 <= tolerance * tolerance {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Refine, "sphere_cap_vanishes", format!(
                     "move_faces: the pushed plane no longer meets the sphere (edge {}: the \
                      cap vanishes / is tangent) — refusing",
                     edge.id
-                ));
+                )));
             }
             let radius_new = rr2.sqrt();
             let circle_center = center.add(axis.scale(a));
@@ -2524,33 +2558,41 @@ fn move_planar_face_across_sphere(
                 radius_new,
                 0.0,
                 std::f64::consts::TAU,
-            )?;
+            ).or_refuse(KernelStage::Refine, "make_arc")?;
             // Match the new rim's traversal to the old edge so the preserved
             // coedge `forward` flags keep both loops' winding consistent. A
             // closed circle's reversal keeps its start point, so the seam-aligned
             // closure point is unaffected.
-            let closure_old = edge.curve.evaluate(edge.t0)?;
+            let closure_old = edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Refine, "evaluate")?;
             let old_tan = edge
                 .curve
-                .evaluate(edge.t0 + 0.01 * (edge.t1 - edge.t0))?
+                .evaluate(edge.t0 + 0.01 * (edge.t1 - edge.t0)).or_refuse(KernelStage::Refine, "evaluate")?
                 .sub(closure_old);
-            let [c0, c1] = new_circle.domain()?;
-            let new_start = new_circle.evaluate(c0)?;
-            let new_tan = new_circle.evaluate(c0 + 0.01 * (c1 - c0))?.sub(new_start);
+            let [c0, c1] = new_circle.domain().or_refuse(KernelStage::Refine, "domain")?;
+            let new_start = new_circle.evaluate(c0).or_refuse(KernelStage::Refine, "evaluate")?;
+            let new_tan = new_circle.evaluate(c0 + 0.01 * (c1 - c0)).or_refuse(KernelStage::Refine, "evaluate")?.sub(new_start);
             if old_tan.dot(new_tan) < 0.0 {
-                new_circle = new_circle.reversed()?;
+                new_circle = new_circle.reversed().or_refuse(KernelStage::Refine, "reversed")?;
             }
-            let closure_point = new_circle.evaluate(new_circle.domain()?[0])?;
+            let closure_point = new_circle
+                .evaluate(new_circle.domain().or_refuse(KernelStage::Refine, "domain")?[0])
+                .or_refuse(KernelStage::Refine, "evaluate")?;
 
             // The rim latitude in the (unchanged) sphere's (u, v) space, read off
             // the seam-crossing pcurve (constant v). The coupled seam meridian's
             // rim endpoint slides to this v.
             let (nshell, nface) = find_face(solid, neighbour)
-                .ok_or_else(|| format!("move_faces: missing sphere neighbour {neighbour}"))?;
+                .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Refine,
+                    "sphere_lookup",
+                    format!("move_faces: missing sphere neighbour {neighbour}"),
+                )
+            })?;
             let sphere_surface = &solid.shells[nshell].faces[nface].surface;
-            let rim_pcurve = build_pcurve_on_surface(sphere_surface, &new_circle)?;
-            let [q0, q1] = rim_pcurve.domain()?;
-            let v_rim = rim_pcurve.evaluate(0.5 * (q0 + q1))?.y;
+            let rim_pcurve = build_pcurve_on_surface(sphere_surface, &new_circle).or_refuse(KernelStage::Refine, "build_pcurve_on_surface")?;
+            let [q0, q1] = rim_pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+            let v_rim = rim_pcurve.evaluate(0.5 * (q0 + q1)).or_refuse(KernelStage::Refine, "evaluate")?.y;
 
             closure_vertices.insert(edge.start_vertex_id);
             sphere_ids.insert(neighbour);
@@ -2565,7 +2607,7 @@ fn move_planar_face_across_sphere(
         }
     }
     if rims.is_empty() {
-        return Err("move_faces: no plane × sphere rim found — refusing".into());
+        return Err(KernelRefusal::internal(KernelStage::Classify, "sphere_rim_missing", "move_faces: no plane × sphere rim found — refusing"));
     }
     // Per closure vertex: where it moves + its new rim latitude (for the meridian).
     let closure_of: HashMap<u64, (Vec3, f64)> = rims
@@ -2605,11 +2647,11 @@ fn move_planar_face_across_sphere(
             continue; // an uncoupled seam meridian: untouched
         }
         if start_is_closure && end_is_closure {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(KernelStage::Classify, "sphere_zone", format!(
                 "move_faces: sphere seam meridian {} moves at BOTH ends (a sphere zone \
                  with two pushed rims) — deferred, refusing",
                 edge.id
-            ));
+            )));
         }
         let moved_end_is_start = start_is_closure;
         let closure_vertex = if moved_end_is_start {
@@ -2619,35 +2661,41 @@ fn move_planar_face_across_sphere(
         };
         let (moved_vertex_new, v_rim) = *closure_of
             .get(&closure_vertex)
-            .ok_or_else(|| "move_faces: seam meridian is not paired with a rim — refusing".to_string())?;
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Refine,
+                    "meridian_pairing",
+                    "move_faces: seam meridian is not paired with a rim — refusing",
+                )
+            })?;
         // Slide the moved endpoint along the (unchanged) meridian curve. The
         // curve is fixed (the sphere is fixed), so this only re-parametrises the
         // trim; project the new rim point onto it and verify it truly lands there
         // (the safety net if `frame.x_axis` were not the seam azimuth).
-        let projection = project_point_to_curve(&edge.curve, moved_vertex_new)?;
+        let projection = project_point_to_curve(&edge.curve, moved_vertex_new).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
         if projection.distance > 10.0 * tolerance {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(KernelStage::Refine, "seam_off_rim", format!(
                 "move_faces: the re-intersected rim point does not lie on the sphere seam \
                  meridian {} (off {:.3e}) — refusing",
                 edge.id, projection.distance
-            ));
+            )));
         }
         let new_t = projection.u;
         let fixed_t = if moved_end_is_start { edge.t1 } else { edge.t0 };
         let old_moved_t = if moved_end_is_start { edge.t0 } else { edge.t1 };
         // The trim must neither collapse nor invert: the moved parameter must
         // stay on the same side of the fixed endpoint as before, with a real span.
-        let [dom0, dom1] = edge.curve.domain()?;
+        let [dom0, dom1] = edge.curve.domain().or_refuse(KernelStage::Refine, "domain")?;
         let span = (dom1 - dom0).max(1e-12);
         if (new_t - fixed_t) * (old_moved_t - fixed_t) <= 0.0
             || (new_t - fixed_t).abs() <= 1e-7 * span
-            || edge.curve.evaluate(new_t)?.sub(edge.curve.evaluate(fixed_t)?).length() <= tolerance
+            || edge.curve.evaluate(new_t).or_refuse(KernelStage::Refine, "evaluate")?.sub(edge.curve.evaluate(fixed_t).or_refuse(KernelStage::Refine, "evaluate")?).length() <= tolerance
         {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(KernelStage::Refine, "meridian_collapse", format!(
                 "move_faces: the sphere seam meridian {} trim collapses or inverts under \
                  the push — refusing",
                 edge.id
-            ));
+            )));
         }
         let moved_vertex_old = edge_point(solid, closure_vertex)?;
         meridians.push(MeridianRetrim {
@@ -2668,13 +2716,19 @@ fn move_planar_face_across_sphere(
         for coedge in &loop_record.coedges {
             let edge = *edge_by_id
                 .get(&coedge.edge_id)
-                .ok_or_else(|| format!("move_faces: missing edge {}", coedge.edge_id))?;
+                .ok_or_else(|| {
+                    KernelRefusal::internal(
+                        KernelStage::Refine,
+                        "boundary_edge_lookup",
+                        format!("move_faces: missing edge {}", coedge.edge_id),
+                    )
+                })?;
             for v in [edge.start_vertex_id, edge.end_vertex_id] {
                 if !closure_vertices.contains(&v) {
-                    return Err(format!(
+                    return Err(KernelRefusal::unsupported(KernelStage::Classify, "unmodelled_corner", format!(
                         "move_faces: the moved face has a boundary vertex {v} that is not a \
                          sphere-rim closure — refusing",
-                    ));
+                    )));
                 }
             }
         }
@@ -2685,7 +2739,7 @@ fn move_planar_face_across_sphere(
     // Rim edges take their new circle.
     for rim in &rims {
         if let Some(edge) = result.edges.iter_mut().find(|e| e.id == rim.edge_id) {
-            let [d0, d1] = rim.new_circle.domain()?;
+            let [d0, d1] = rim.new_circle.domain().or_refuse(KernelStage::Sew, "domain")?;
             edge.curve = rim.new_circle.clone();
             edge.t0 = d0;
             edge.t1 = d1;
@@ -2725,7 +2779,13 @@ fn move_planar_face_across_sphere(
     // slide only the moved endpoint's v to the new rim latitude).
     for sphere_id in &sphere_ids {
         let (nshell, nface) = find_face(&result, *sphere_id)
-            .ok_or_else(|| format!("move_faces: missing sphere neighbour {sphere_id}"))?;
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Sew,
+                    "sphere_retrim_lookup",
+                    format!("move_faces: missing sphere neighbour {sphere_id}"),
+                )
+            })?;
         let sphere_surface = result.shells[nshell].faces[nface].surface.clone();
         for loop_record in &mut result.shells[nshell].faces[nface].loops {
             for coedge in &mut loop_record.coedges {
@@ -2733,9 +2793,9 @@ fn move_planar_face_across_sphere(
                     .iter()
                     .find(|r| r.edge_id == coedge.edge_id && r.sphere_id == *sphere_id)
                 {
-                    let mut pcurve = build_pcurve_on_surface(&sphere_surface, &rim.new_circle)?;
+                    let mut pcurve = build_pcurve_on_surface(&sphere_surface, &rim.new_circle).or_refuse(KernelStage::Sew, "build_pcurve_on_surface")?;
                     if !coedge.forward {
-                        pcurve = pcurve.reversed()?;
+                        pcurve = pcurve.reversed().or_refuse(KernelStage::Sew, "reversed")?;
                     }
                     coedge.pcurve = pcurve;
                 } else if let Some(mer) = meridians
@@ -2757,16 +2817,14 @@ fn move_planar_face_across_sphere(
 
     let issues = result.validate();
     if !issues.is_empty() {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Validate, "sphere_validate", format!(
             "move_faces: moved solid failed validation: {issues:?}"
-        ));
+        )));
     }
     if let (Ok(before), Ok(after)) = (solid_signed_volume(solid), solid_signed_volume(&result)) {
         if before * after <= 0.0 {
-            return Err(
-                "move_faces: the push inverts the solid (signed volume changed sign) — refusing"
-                    .into(),
-            );
+            return Err(KernelRefusal::unsupported(KernelStage::Validate, SPHERE_SOLID_INVERSION,
+                "move_faces: the push inverts the solid (signed volume changed sign) — refusing"));
         }
     }
     Ok(result)
@@ -2785,12 +2843,12 @@ fn patch_seam_meridian_pcurve(
     moved_vertex_new: Vec3,
     v_rim: f64,
     tolerance: f64,
-) -> Result<NurbsCurve, String> {
-    let [q0, q1] = pcurve.domain()?;
-    let a = pcurve.evaluate(q0)?;
-    let b = pcurve.evaluate(q1)?;
-    let a3 = surface.evaluate(a.x, a.y)?;
-    let b3 = surface.evaluate(b.x, b.y)?;
+) -> Result<NurbsCurve, KernelRefusal> {
+    let [q0, q1] = pcurve.domain().or_refuse(KernelStage::Sew, "domain")?;
+    let a = pcurve.evaluate(q0).or_refuse(KernelStage::Sew, "evaluate")?;
+    let b = pcurve.evaluate(q1).or_refuse(KernelStage::Sew, "evaluate")?;
+    let a3 = surface.evaluate(a.x, a.y).or_refuse(KernelStage::Sew, "evaluate")?;
+    let b3 = surface.evaluate(b.x, b.y).or_refuse(KernelStage::Sew, "evaluate")?;
     let da = a3.sub(moved_vertex_old).length();
     let db = b3.sub(moved_vertex_old).length();
     // Guard: one endpoint must genuinely be the moved vertex, and the surface
@@ -2798,12 +2856,10 @@ fn patch_seam_meridian_pcurve(
     let moved_is_a = da <= db;
     let (moved_uv, fixed_uv) = if moved_is_a { (a, b) } else { (b, a) };
     let patched = Vec3::new(moved_uv.x, v_rim, 0.0);
-    if surface.evaluate(patched.x, patched.y)?.sub(moved_vertex_new).length() > 10.0 * tolerance {
-        return Err(
+    if surface.evaluate(patched.x, patched.y).or_refuse(KernelStage::Sew, "evaluate")?.sub(moved_vertex_new).length() > 10.0 * tolerance {
+        return Err(KernelRefusal::internal(KernelStage::Sew, "seam_patch",
             "move_faces: patched seam-meridian pcurve endpoint does not reach the new rim \
-             vertex — refusing"
-                .into(),
-        );
+             vertex — refusing"));
     }
     let fixed = Vec3::new(fixed_uv.x, fixed_uv.y, 0.0);
     if moved_is_a {
@@ -2811,5 +2867,6 @@ fn patch_seam_meridian_pcurve(
     } else {
         make_line(fixed, patched)
     }
+    .or_refuse(KernelStage::Sew, "make_line")
 }
 

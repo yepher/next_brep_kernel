@@ -45,6 +45,7 @@ pub mod transform;
 // Dressups.
 pub mod chamfer;
 pub mod delete_face;
+pub mod refit_faces;
 pub mod fillet;
 pub mod hole;
 pub mod offset_face;

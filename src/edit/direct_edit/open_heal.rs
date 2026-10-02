@@ -1,4 +1,5 @@
 use super::*;
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 
 /// Which recovered branch an open heal keeps, decided by GEOMETRY.
 ///
@@ -73,7 +74,7 @@ pub(super) fn heal_open_transition_mixed(
     face_index: usize,
     boundary: &[(u64, bool)],
     neighbour_ids: &[u64; 4],
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     if let Some(directory) = census_directory() {
         record_open_heal_census(&directory, solid, shell_index, face_index, boundary, neighbour_ids);
     }
@@ -84,12 +85,21 @@ pub(super) fn heal_open_transition_mixed(
     let plane_tolerance = (scale * 1e-6).max(1e-7);
     let face_id = solid.shells[shell_index].faces[face_index].id;
     let debug = std::env::var("BREP_DEBUG_HEAL").is_ok();
+    let missing_neighbour = |id: u64| {
+        KernelRefusal::internal(
+            KernelStage::Collect,
+            "neighbour",
+            format!("{op}: missing neighbour {id}"),
+        )
+    };
+    let missing_edge = |id: u64| {
+        KernelRefusal::internal(KernelStage::Collect, "edge", format!("{op}: missing edge {id}"))
+    };
 
     // --- Classify the four neighbour carriers ------------------------------
     let mut carriers: Vec<OpenNeighbourCarrier> = Vec::with_capacity(4);
     for &neighbour_id in neighbour_ids {
-        let (ns, nf) = find_face(&solid, neighbour_id)
-            .ok_or_else(|| format!("{op}: missing neighbour {neighbour_id}"))?;
+        let (ns, nf) = find_face(&solid, neighbour_id).ok_or_else(|| missing_neighbour(neighbour_id))?;
         let surface = &solid.shells[ns].faces[nf].surface;
         if let Ok(plane) = plane_of_surface(surface, plane_tolerance, op) {
             carriers.push(OpenNeighbourCarrier::Planar(plane));
@@ -122,17 +132,21 @@ pub(super) fn heal_open_transition_mixed(
                 .edges
                 .iter()
                 .find(|edge| edge.id == *edge_id)
-                .ok_or_else(|| format!("{op}: missing edge {edge_id}"))?;
+                .ok_or_else(|| missing_edge(*edge_id))?;
             Ok(if *forward {
                 edge.start_vertex_id
             } else {
                 edge.end_vertex_id
             })
         })
-        .collect::<Result<Vec<u64>, String>>()?;
+        .collect::<Result<Vec<u64>, KernelRefusal>>()?;
     if transition_vertices.iter().collect::<HashSet<_>>().len() != 4 {
-        return Err(format!(
-            "{op}: transition face has repeated corner vertices (deferred: degenerate transition)"
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "degenerate_transition",
+            format!(
+                "{op}: transition face has repeated corner vertices (deferred: degenerate transition)"
+            ),
         ));
     }
     let mut f_center = Vec3::default();
@@ -167,7 +181,7 @@ pub(super) fn heal_open_transition_mixed(
             .edges
             .iter()
             .find(|edge| edge.id == *edge_id)
-            .ok_or_else(|| format!("{op}: missing edge {edge_id}"))?;
+            .ok_or_else(|| missing_edge(*edge_id))?;
         strip_points.extend(arc_length_stations(edge, 9, *forward)?);
         contacts.push(
             edge_point(&solid, edge.start_vertex_id)?
@@ -175,9 +189,10 @@ pub(super) fn heal_open_transition_mixed(
                 .scale(0.5),
         );
     }
-    let neighbour_surface = |id: u64, solid: &BrepSolid| -> Result<NurbsSurface, String> {
-        let (shell, face) =
-            find_face(solid, id).ok_or_else(|| format!("{op}: missing face {id}"))?;
+    let neighbour_surface = |id: u64, solid: &BrepSolid| -> Result<NurbsSurface, KernelRefusal> {
+        let (shell, face) = find_face(solid, id).ok_or_else(|| {
+            KernelRefusal::internal(KernelStage::Collect, "face", format!("{op}: missing face {id}"))
+        })?;
         Ok(solid.shells[shell].faces[face].surface.clone())
     };
     struct MixedHealPlan {
@@ -223,7 +238,7 @@ pub(super) fn heal_open_transition_mixed(
                     if debug {
                         eprintln!("HEAL open mixed: primaries {primary:?} not extendable: {message}");
                     }
-                    refusals.push(message);
+                    refusals.push(message.message);
                 }
                 extension_refusal = Some(());
                 break;
@@ -374,19 +389,23 @@ pub(super) fn heal_open_transition_mixed(
             Ok(None) => None,
             Err((chosen, rival)) => {
                 let point = |p: Vec3| format!("({:.6}, {:.6}, {:.6})", p.x, p.y, p.z);
-                return Err(format!(
-                    "{op}: two re-intersection branches of faces {} and {} are equally near the \
+                return Err(KernelRefusal::ill_posed(
+                    KernelStage::Classify,
+                    "branch_tie",
+                    format!(
+                        "{op}: two re-intersection branches of faces {} and {} are equally near the \
                      strip's contacts with faces {} and {} (corners {} and {} against {} and {}) \
                      — refusing rather than choosing one by the order the intersector returned \
                      them",
-                    neighbour_ids[primary[0]],
-                    neighbour_ids[primary[1]],
-                    neighbour_ids[lateral[0]],
-                    neighbour_ids[lateral[1]],
-                    point(corners[chosen][0]),
-                    point(corners[chosen][1]),
-                    point(corners[rival][0]),
-                    point(corners[rival][1])
+                        neighbour_ids[primary[0]],
+                        neighbour_ids[primary[1]],
+                        neighbour_ids[lateral[0]],
+                        neighbour_ids[lateral[1]],
+                        point(corners[chosen][0]),
+                        point(corners[chosen][1]),
+                        point(corners[rival][0]),
+                        point(corners[rival][1])
+                    ),
                 ));
             }
         };
@@ -408,15 +427,23 @@ pub(super) fn heal_open_transition_mixed(
             } else {
                 format!(" ({})", refusals.join("; "))
             };
-            return Err(format!(
-                "{op}: no re-intersection branch of the extended carriers spans the deleted \
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "no_spanning_branch",
+                format!(
+                    "{op}: no re-intersection branch of the extended carriers spans the deleted \
                  strip — refusing rather than emitting an invalid solid{detail}"
+                ),
             ))
         }
         _ => {
-            return Err(format!(
-                "{op}: healing is ambiguous — both opposite neighbour pairs re-intersect \
+            return Err(KernelRefusal::ill_posed(
+                KernelStage::Classify,
+                "pairing_ambiguous",
+                format!(
+                    "{op}: healing is ambiguous — both opposite neighbour pairs re-intersect \
                  across the deleted strip"
+                ),
             ))
         }
     };
@@ -425,7 +452,7 @@ pub(super) fn heal_open_transition_mixed(
     let lateral = plan.lateral;
     let branch_curve = plan.branch;
     let crossings = plan.crossings;
-    let [branch_t0, branch_t1] = branch_curve.domain()?;
+    let [branch_t0, branch_t1] = branch_curve.domain().or_refuse(KernelStage::Sew, "domain")?;
     let branch_span = (branch_t1 - branch_t0).max(1e-12);
     let snap = |t: f64| -> f64 {
         if (t - branch_t0).abs() <= 1e-9 * branch_span {
@@ -438,13 +465,15 @@ pub(super) fn heal_open_transition_mixed(
     };
     let t_first = snap(crossings[0].0);
     let t_second = snap(crossings[1].0);
-    let point_first = branch_curve.evaluate(t_first)?;
-    let point_second = branch_curve.evaluate(t_second)?;
+    let point_first = branch_curve.evaluate(t_first).or_refuse(KernelStage::Sew, "evaluate")?;
+    let point_second = branch_curve.evaluate(t_second).or_refuse(KernelStage::Sew, "evaluate")?;
     if (t_second - t_first).abs() <= 1e-9 * branch_span
         || point_first.sub(point_second).length() <= tolerance
     {
-        return Err(format!(
-            "{op}: recovered corners coincide — the carriers do not bound a clean edge"
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "corners_coincide",
+            format!("{op}: recovered corners coincide — the carriers do not bound a clean edge"),
         ));
     }
     if debug {
@@ -504,9 +533,13 @@ pub(super) fn heal_open_transition_mixed(
         } else if lateral_set.contains(&index) {
             index
         } else {
-            return Err(format!(
-                "{op}: transition corner is not flanked by a lateral face (unexpected \
+            return Err(KernelRefusal::internal(
+                KernelStage::Sew,
+                "corner_flank",
+                format!(
+                    "{op}: transition corner is not flanked by a lateral face (unexpected \
                  neighbour ordering)"
+                ),
             ));
         };
         collapse.insert(transition_vertices[index], lateral_vertex[&lateral_index]);
@@ -579,27 +612,37 @@ pub(super) fn heal_open_transition_mixed(
     for &primary_index in &primary {
         let primary_edge = boundary[primary_index].0;
         let neighbour_id = neighbour_ids[primary_index];
-        let (ns, nf) = find_face(&solid, neighbour_id)
-            .ok_or_else(|| format!("{op}: missing neighbour {neighbour_id}"))?;
+        let (ns, nf) = find_face(&solid, neighbour_id).ok_or_else(|| missing_neighbour(neighbour_id))?;
         let face = &mut solid.shells[ns].faces[nf];
         let (loop_index, coedge_index) = locate_coedge(face, primary_edge).ok_or_else(|| {
-            format!("{op}: neighbour {neighbour_id} does not use edge {primary_edge}")
+            KernelRefusal::internal(
+                KernelStage::Sew,
+                "primary_coedge",
+                format!("{op}: neighbour {neighbour_id} does not use edge {primary_edge}"),
+            )
         })?;
         let coedges = &face.loops[loop_index].coedges;
         let count = coedges.len();
         let previous = &coedges[(coedge_index + count - 1) % count];
         let next = &coedges[(coedge_index + 1) % count];
-        let required_from = coedge_to_vertex(previous, &edges_by_id)
-            .ok_or_else(|| format!("{op}: could not resolve loop connectivity"))?;
-        let required_to = coedge_from_vertex(next, &edges_by_id)
-            .ok_or_else(|| format!("{op}: could not resolve loop connectivity"))?;
+        let unresolved = || {
+            KernelRefusal::internal(
+                KernelStage::Sew,
+                "loop_connectivity",
+                format!("{op}: could not resolve loop connectivity"),
+            )
+        };
+        let required_from = coedge_to_vertex(previous, &edges_by_id).ok_or_else(unresolved)?;
+        let required_to = coedge_from_vertex(next, &edges_by_id).ok_or_else(unresolved)?;
         let forward = if required_from == start_vertex && required_to == end_vertex {
             true
         } else if required_from == end_vertex && required_to == start_vertex {
             false
         } else {
-            return Err(format!(
-                "{op}: new edge does not close the primary loop (unexpected connectivity)"
+            return Err(KernelRefusal::internal(
+                KernelStage::Sew,
+                "primary_loop",
+                format!("{op}: new edge does not close the primary loop (unexpected connectivity)"),
             ));
         };
         let new_coedge = CoedgeRecord {
@@ -607,7 +650,8 @@ pub(super) fn heal_open_transition_mixed(
             edge_id: sharp_edge_id,
             forward,
             // Placeholder; the retrim/refit pass below recomputes it.
-            pcurve: make_line(Vec3::default(), Vec3::new(1.0, 0.0, 0.0))?,
+            pcurve: make_line(Vec3::default(), Vec3::new(1.0, 0.0, 0.0))
+                .or_refuse(KernelStage::Sew, "make_line")?,
         };
         face.loops[loop_index].coedges[coedge_index] = new_coedge;
     }
@@ -616,15 +660,22 @@ pub(super) fn heal_open_transition_mixed(
     for &lateral_index in &lateral {
         let lateral_edge = boundary[lateral_index].0;
         let neighbour_id = neighbour_ids[lateral_index];
-        let (ns, nf) = find_face(&solid, neighbour_id)
-            .ok_or_else(|| format!("{op}: missing neighbour {neighbour_id}"))?;
+        let (ns, nf) = find_face(&solid, neighbour_id).ok_or_else(|| missing_neighbour(neighbour_id))?;
         let face = &mut solid.shells[ns].faces[nf];
         let (loop_index, coedge_index) = locate_coedge(face, lateral_edge).ok_or_else(|| {
-            format!("{op}: neighbour {neighbour_id} does not use edge {lateral_edge}")
+            KernelRefusal::internal(
+                KernelStage::Sew,
+                "lateral_coedge",
+                format!("{op}: neighbour {neighbour_id} does not use edge {lateral_edge}"),
+            )
         })?;
         face.loops[loop_index].coedges.remove(coedge_index);
         if face.loops[loop_index].coedges.is_empty() {
-            return Err(format!("{op}: healing emptied a lateral face loop"));
+            return Err(KernelRefusal::internal(
+                KernelStage::Sew,
+                "emptied_loop",
+                format!("{op}: healing emptied a lateral face loop"),
+            ));
         }
     }
 
@@ -658,8 +709,7 @@ pub(super) fn heal_open_transition_mixed(
     let mut touched: HashSet<u64> = relocated.clone();
     touched.insert(sharp_edge_id);
     for &neighbour_id in neighbour_ids {
-        let (ns, nf) = find_face(&solid, neighbour_id)
-            .ok_or_else(|| format!("{op}: missing neighbour {neighbour_id}"))?;
+        let (ns, nf) = find_face(&solid, neighbour_id).ok_or_else(|| missing_neighbour(neighbour_id))?;
         match retrimmed.get(&neighbour_id) {
             Some(plane) => {
                 retrim_planar_face(
@@ -668,7 +718,8 @@ pub(super) fn heal_open_transition_mixed(
                     &final_edges,
                     scale,
                     op,
-                )?;
+                )
+                ?;
                 // The planar retrim maps each edge's WHOLE curve; EVERY edge
                 // of the face that represents a strict subrange of its curve
                 // (widened side edges, but equally untouched edges an earlier
@@ -710,8 +761,10 @@ pub(super) fn heal_open_transition_mixed(
 
     let issues = solid.validate();
     if !issues.is_empty() {
-        return Err(format!(
-            "{op}: open-chain mixed heal failed validation: {issues:?}"
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "validation",
+            format!("{op}: open-chain mixed heal failed validation: {issues:?}"),
         ));
     }
     Ok(solid)

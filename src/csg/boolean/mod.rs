@@ -1307,7 +1307,7 @@ pub fn boolean_operation_nary(
     // clean input, so clean operands are untouched).
     let mut healed = operands.to_vec();
     for operand in &mut healed {
-        crate::heal::heal_operands(operand, &policy).or_refuse(KernelStage::Validate, "heal_operands")?;
+        crate::heal::heal_operands(operand, &policy)?;
         // Same operand normalization as the binary path: seam edges for
         // seamless full-period band faces.
         normalize_operand_band_seams(operand)?;
@@ -1439,8 +1439,10 @@ pub fn boolean_operation_with_diagnostics(
     // passes through — the defect came in with the input and refusing it here
     // would blame the wrong operation — so the operands are only scanned when
     // the result is flagged, and the common case pays for one scan.
-    outcome.value = crate::accept_sound_against(&[first, second], outcome.value, "boolean")
-        .or_refuse(KernelStage::Validate, "boolean.self_intersection")?;
+    // The acceptance's refusal is typed at its origin (an `UnsoundResult`
+    // naming the defect and the faces); it was classed `Internal` here while
+    // `accept_sound_against` still returned text.
+    outcome.value = crate::accept_sound_against(&[first, second], outcome.value, "boolean")?;
     Ok(outcome)
 }
 
@@ -1514,8 +1516,8 @@ fn prepared_operands(
     let stage_started = Instant::now();
     let mut first_owned = first.clone();
     let mut second_owned = second.clone();
-    crate::heal::heal_operands(&mut first_owned, policy).or_refuse(KernelStage::Validate, "heal_operands")?;
-    crate::heal::heal_operands(&mut second_owned, policy).or_refuse(KernelStage::Validate, "heal_operands")?;
+    crate::heal::heal_operands(&mut first_owned, policy)?;
+    crate::heal::heal_operands(&mut second_owned, policy)?;
     profile_stage("heal_ms", stage_started.elapsed().as_secs_f64() * 1_000.0);
     // Seamless full-period band faces (STEP import) break the seam-aware
     // imprint/arrangement machinery; normalize them to the seam-carrying
@@ -1781,6 +1783,7 @@ fn boolean_pipeline(
             );
             return Ok(KernelOutcome {
                 value: BrepSolid {
+                    mass_properties_cache: Default::default(),
                     id: 0,
                     vertices: Vec::new(),
                     edges: Vec::new(),

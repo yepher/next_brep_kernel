@@ -8,7 +8,8 @@
 //! under `{base}:CORNER:{adjacent edge names}`.
 
 use crate::feature_pipeline::features::common;
-use crate::feature_pipeline::{FeatureContext, FeatureResult};
+use crate::feature_pipeline::{FeatureContext, FeatureRefusal, FeatureResult};
+use crate::{KernelRefusal, KernelStage};
 
 pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     match build(ctx) {
@@ -17,7 +18,7 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     }
 }
 
-fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     let selection = common::resolve_blend_selection(ctx)?;
     let mut result = FeatureResult::empty(ctx.id.clone(), ctx.feature_type.clone());
     result.unresolved = selection.unresolved;
@@ -26,10 +27,30 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     if selection.multi_solid {
         return Ok(result);
     }
-    // Nothing resolved: `unresolved` carries the misses (the caller repairs + re-dispatches).
+    // A selection in which NOTHING resolves is refused by name.  Until
+    // 2026-09-26 the misses rode along in `unresolved` and the feature
+    // returned success for a document that blended no edge at all
+    // (`Box_PY|Box_NZ[0]`, the faces in the wrong order, on the through-hole
+    // case document): a no-op reported as a result.  A selection in which SOME
+    // names resolve still blends those and reports the misses — that is the
+    // engine's contract (rule 1: a miss is recorded in `unresolved`, annotated
+    // with the name that replaced it, never a no-op with no signal), and two
+    // reported documents rely on it: the 2026-09-10 mouth-over-wall and
+    // collapsed-fillet reports both select `Box_PY|Box_PZ[0]`, which their own
+    // r = 18 blend consumed, beside the live mouth edge.  Whether that partial
+    // should refuse too is a contract question, not this feature's alone.
     let Some(target) = selection.target else {
-        return Ok(result);
+        if result.unresolved.is_empty() {
+            return Ok(result);
+        }
+        let mut refused = ctx.fail(unresolved_refusal("fillet", &result.unresolved));
+        refused.unresolved = result.unresolved;
+        return Ok(refused);
     };
+    // The feature proceeds on the references that resolved: a miss is
+    // reported as a typed partial fulfilment beside `unresolved`, never
+    // silently (the engine annotates both with the rename hint).
+    result.note_partial_resolution(&common::reference_names(ctx.param("edges")));
 
     let radius = ctx.number("radius")?;
     // A non-positive / non-finite radius is a soft no-op.
@@ -49,7 +70,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         .iter()
         .map(|edge_name| common::blend_face_name(&ctx.id, edge_name))
         .collect();
-    let blended = crate::with_registered_solid_str(target.handle, |solid| match taper {
+    let blended = crate::with_registered_solid_typed(target.handle, |solid| match taper {
         Some(radius_end) => crate::fillet_edges_variable(
             solid,
             &target.edge_points,
@@ -67,13 +88,34 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
             Some(&blend_base),
         ),
     })
-    .map_err(|error| format!("fillet failed: {error}"))?;
+    // The blend's refusal keeps its class through the feature's wrap.
+    .map_err(|error| error.with_message(|error| format!("fillet failed: {error}")))?;
 
     result.added.push(common::register_added(blended, &target.name));
     result.removed.push(target.name);
     Ok(result)
 }
 
+
+/// The refusal for a blend selection none of whose references resolve on
+/// the model, shared with the chamfer feature: an invalid input, class
+/// `unresolved_reference`, typed at the feature boundary.
+pub(super) fn unresolved_refusal(feature: &str, unresolved: &[String]) -> KernelRefusal {
+    let names: Vec<String> = unresolved.iter().map(|name| format!("`{name}`")).collect();
+    KernelRefusal::input(
+        KernelStage::Collect,
+        "unresolved_reference",
+        format!(
+            "{feature}: none of the {} selected reference{} resolves on this model ({}); a blend \
+             of nothing is not a result, so the selection is refused — repair the reference{} \
+             and rerun",
+            unresolved.len(),
+            if unresolved.len() == 1 { "" } else { "s" },
+            names.join(", "),
+            if unresolved.len() == 1 { "" } else { "s" },
+        ),
+    )
+}
 
 /// Context-bar applicability ([`crate::feature_pipeline::context_offer`]):
 /// selected faces/edges drive `edges`.

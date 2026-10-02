@@ -1,14 +1,9 @@
-//! The ten assembly-constraint definitions (build-spec §4) — ONE MODULE PER
-//! CONSTRAINT, the feature-module pattern: each `constraints/<type>.rs` owns
-//! everything about its type — its [`ConstraintTypeDef`] row (names, element
-//! count range, duplicate family, the `applicable` selection-context predicate), its
-//! schema entry, and (for the mate-mapped types) its `map` function. This root
-//! only AGGREGATES them in the spec §4 table order (`feature_pipeline/schema.rs`
-//! pattern) and serves the catalogue, which joins the kernel schema export
-//! under its own namespace (`feature_schemas_json` → `assemblyConstraints`) so
-//! the app dialog engine renders constraint dialogs exactly like feature
-//! dialogs. `fixed` has no `map` — grounding is handled by [`super::lifecycle`]
-//! before body building.
+//! The ten assembly-constraint definitions — ONE MODULE PER CONSTRAINT, the
+//! feature-module pattern: each `constraints/<type>.rs` owns everything about its
+//! type — its [`ConstraintTypeDef`] row (names, element count range, duplicate
+//! family, the `applicable` selection-context predicate), its schema entry, and (for
+//! the mate-mapped types) its `map` function. `fixed` has no `map` — grounding is
+//! handled by [`super::lifecycle`] before body building.
 
 use crate::feature_pipeline::SelectionProbe;
 
@@ -48,7 +43,7 @@ pub struct ConstraintTypeDef {
     pub min_elements: usize,
     pub max_elements: usize,
     /// Member of the duplicate-detection family (overlapping selection pairs
-    /// conflict across these types — requirements §4.3).
+    /// conflict across these types).
     pub duplicate_family: bool,
     /// Selection-context applicability (the feature `context_applicable`
     /// pattern, [`crate::feature_pipeline::context_offer`]): does the current
@@ -79,9 +74,8 @@ pub fn constraint_type(type_id: &str) -> Option<&'static ConstraintTypeDef> {
     CONSTRAINT_TYPES.iter().find(|def| def.type_id == type_id)
 }
 
-/// The ten constraint schemas, spec §4 order. `number` params are
-/// expression-capable against the part's expression scope (the dialog engine's
-/// established convention).
+/// `number` params are expression-capable against the part's expression scope
+/// (the dialog engine's established convention).
 pub fn constraint_schema_catalogue() -> serde_json::Value {
     serde_json::Value::Array(vec![
         fixed::schema(),

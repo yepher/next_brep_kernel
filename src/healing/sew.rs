@@ -16,6 +16,7 @@
 //! Sewing is BEST-EFFORT and honest: pairs that cannot be joined within
 //! tolerance stay open and are counted in the report; nothing is force-welded.
 
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use crate::mass_properties::solid_signed_volume;
 use crate::offset_shell::{flip_all_faces, orient_open_solid_faces};
 use crate::topology::{BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, ShellRecord, VertexRecord};
@@ -51,9 +52,9 @@ fn one_use_edge_ids(solid: &BrepSolid) -> HashSet<u64> {
         .collect()
 }
 
-fn curve_point(edge: &EdgeRecord, fraction: f64) -> Result<Vec3, String> {
+fn curve_point(edge: &EdgeRecord, fraction: f64) -> Result<Vec3, KernelRefusal> {
     edge.curve
-        .evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction)
+        .evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction).or_refuse(KernelStage::Sew, "evaluate")
 }
 
 /// Worst distance from sampled points of `piece` to the locus of `carrier`.
@@ -61,11 +62,11 @@ fn locus_deviation(
     piece: &EdgeRecord,
     carrier: &EdgeRecord,
     samples: usize,
-) -> Result<f64, String> {
+) -> Result<f64, KernelRefusal> {
     let mut worst = 0.0f64;
     for index in 0..=samples {
         let point = curve_point(piece, index as f64 / samples as f64)?;
-        worst = worst.max(project_point_to_curve(&carrier.curve, point)?.distance);
+        worst = worst.max(project_point_to_curve(&carrier.curve, point).or_refuse(KernelStage::Sew, "project_point_to_curve")?.distance);
     }
     Ok(worst)
 }
@@ -77,7 +78,7 @@ fn same_parametrization(
     first: &EdgeRecord,
     second: &EdgeRecord,
     tolerance: f64,
-) -> Result<bool, String> {
+) -> Result<bool, KernelRefusal> {
     for index in 0..=8 {
         let fraction = index as f64 / 8.0;
         if curve_point(first, fraction)?
@@ -94,13 +95,13 @@ fn same_parametrization(
 /// The 3D walk this coedge's loop takes along its edge, sampled from its
 /// pcurve through its face surface. Fractions 0 and 0.35: an interior second
 /// sample avoids the antipodal-projection ambiguity a closed rim has at 0.5.
-fn walk_points(face: &FaceRecord, coedge: &CoedgeRecord) -> Result<[Vec3; 2], String> {
-    let [start, end] = coedge.pcurve.domain()?;
+fn walk_points(face: &FaceRecord, coedge: &CoedgeRecord) -> Result<[Vec3; 2], KernelRefusal> {
+    let [start, end] = coedge.pcurve.domain().or_refuse(KernelStage::Sew, "domain")?;
     let sample = |fraction: f64| -> Result<Vec3, String> {
         let uv = coedge.pcurve.evaluate(start + (end - start) * fraction)?;
         face.surface.evaluate(uv.x, uv.y)
     };
-    Ok([sample(0.0)?, sample(0.35)?])
+    Ok([sample(0.0).or_refuse(KernelStage::Sew, "sample")?, sample(0.35).or_refuse(KernelStage::Sew, "sample")?])
 }
 
 /// One planned coedge rebind, resolved before any mutation so a failed plan
@@ -123,7 +124,7 @@ fn plan_rebind(
     keep: &EdgeRecord,
     remove: &EdgeRecord,
     tolerance: f64,
-) -> Result<Vec<RebindPatch>, String> {
+) -> Result<Vec<RebindPatch>, KernelRefusal> {
     let identical = same_parametrization(keep, remove, tolerance)?;
     let closed = keep.start_vertex_id == keep.end_vertex_id;
     let period = keep.t1 - keep.t0;
@@ -136,8 +137,8 @@ fn plan_rebind(
                         continue;
                     }
                     let [walk_start, walk_next] = walk_points(face, coedge)?;
-                    let t_start = project_point_to_curve(&keep.curve, walk_start)?.u;
-                    let t_next = project_point_to_curve(&keep.curve, walk_next)?.u;
+                    let t_start = project_point_to_curve(&keep.curve, walk_start).or_refuse(KernelStage::Sew, "project_point_to_curve")?.u;
+                    let t_next = project_point_to_curve(&keep.curve, walk_next).or_refuse(KernelStage::Sew, "project_point_to_curve")?.u;
                     let forward = if closed {
                         let mut delta = t_next - t_start;
                         while delta > period * 0.5 {
@@ -156,9 +157,9 @@ fn plan_rebind(
                         let traversal = if forward {
                             keep.curve.clone()
                         } else {
-                            keep.curve.reversed()?
+                            keep.curve.reversed().or_refuse(KernelStage::Sew, "reversed")?
                         };
-                        Some(build_pcurve_on_surface(&face.surface, &traversal)?)
+                        Some(build_pcurve_on_surface(&face.surface, &traversal).or_refuse(KernelStage::Sew, "build_pcurve_on_surface")?)
                     };
                     patches.push(RebindPatch {
                         shell: shell_index,
@@ -523,7 +524,7 @@ fn offer_seconds(
 /// precondition: after pairing, coedge-direction coherence is propagated
 /// across the shared edges and the result is flipped outward by signed
 /// volume. Unsewable gaps stay open and are reported, never force-welded.
-pub fn sew_solid(solid: &BrepSolid, tolerance: f64) -> Result<(BrepSolid, SewReport), String> {
+pub fn sew_solid(solid: &BrepSolid, tolerance: f64) -> Result<(BrepSolid, SewReport), KernelRefusal> {
     let (sewn, report, _examined) = sew_solid_with_search(solid, tolerance, PairSearch::Hashed)?;
     Ok((sewn, report))
 }
@@ -538,9 +539,9 @@ fn sew_solid_with_search(
     solid: &BrepSolid,
     tolerance: f64,
     search: PairSearch,
-) -> Result<(BrepSolid, SewReport, usize), String> {
+) -> Result<(BrepSolid, SewReport, usize), KernelRefusal> {
     if !(tolerance.is_finite() && tolerance > 0.0) {
-        return Err("sew_solid: tolerance must be positive".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "tolerance", "sew_solid: tolerance must be positive"));
     }
     let mut result = solid.clone();
     let open_edges_before = one_use_edge_ids(&result).len();
@@ -750,7 +751,7 @@ fn sew_solid_with_search(
 /// more than one component means distinct fans sharing the record — give
 /// each extra fan its own vertex at the same point and reassign that fan's
 /// edge endpoints. Geometry is untouched; only identity is repaired.
-pub fn split_pinched_vertices(solid: &mut BrepSolid) -> Result<usize, String> {
+pub fn split_pinched_vertices(solid: &mut BrepSolid) -> Result<usize, KernelRefusal> {
     let mut split_count = 0usize;
     let vertex_ids: Vec<u64> = solid.vertices.iter().map(|vertex| vertex.id).collect();
     let mut next_id = solid
@@ -860,7 +861,7 @@ pub fn split_pinched_vertices(solid: &mut BrepSolid) -> Result<usize, String> {
         let point = vertex_of_id
             .get(&vertex_id)
             .map(|&index| solid.vertices[index].point)
-            .ok_or("split_pinched_vertices: vertex vanished")?;
+            .ok_or(KernelRefusal::internal(KernelStage::Sew, "pinched_vertex", "split_pinched_vertices: vertex vanished"))?;
         let mut replacement_ids = vec![vertex_id];
         for _ in 1..components {
             let id = next_id;

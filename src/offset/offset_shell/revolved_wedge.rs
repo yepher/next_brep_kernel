@@ -51,6 +51,7 @@
 //! and a fold that reaches an END of the grown arc rather than lying inside it —
 //! that last is the carve's single-chord lane, and it keeps it.
 
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 use crate::thicken::band::{
     fit_meridian_circle, outward_at, whole_face, wrap_into, MERIDIAN_RESIDUAL_BAR,
@@ -150,13 +151,13 @@ struct LoopCurve {
 }
 
 impl LoopCurve {
-    fn at(&self, fraction: f64) -> Result<Vec3, String> {
+    fn at(&self, fraction: f64) -> Result<Vec3, KernelRefusal> {
         let fraction = if self.forward { fraction } else { 1.0 - fraction };
-        self.curve.evaluate(self.t0 + (self.t1 - self.t0) * fraction)
+        self.curve.evaluate(self.t0 + (self.t1 - self.t0) * fraction).or_refuse(KernelStage::Refine, "evaluate")
     }
 }
 
-fn declined(reason: impl Into<String>) -> Result<Recognition, String> {
+fn declined(reason: impl Into<String>) -> Result<Recognition, KernelRefusal> {
     Ok(Recognition::Declined(reason.into()))
 }
 
@@ -186,7 +187,7 @@ pub(super) fn recognize(
     source: &BrepSolid,
     opening_face_ids: &[u64],
     distance: f64,
-) -> Result<Recognition, String> {
+) -> Result<Recognition, KernelRefusal> {
     if !(distance < -MINIMUM_DISTANCE) || !distance.is_finite() {
         return declined(format!(
             "not a finite outward distance past {MINIMUM_DISTANCE:e}, where the shell refuses"
@@ -223,8 +224,8 @@ pub(super) fn recognize(
     if source.edges.iter().any(|edge| edge.degenerate) {
         return declined("the source has a degenerate edge, so it touches the axis");
     }
-    let [u0, u1] = face.surface.domain_u()?;
-    let [v0, v1] = face.surface.domain_v()?;
+    let [u0, u1] = face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = face.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
     let loops = face
         .loops
         .iter()
@@ -262,17 +263,17 @@ pub(super) fn recognize(
         .iter()
         .map(|edge| (edge.id, edge))
         .collect::<HashMap<_, _>>();
-    let cap_azimuth = |cap: &FaceRecord| -> Result<Option<f64>, String> {
+    let cap_azimuth = |cap: &FaceRecord| -> Result<Option<f64>, KernelRefusal> {
         let edge = cap
             .loops
             .first()
             .and_then(|record| record.coedges.first())
             .and_then(|coedge| edge_by_id.get(&coedge.edge_id))
-            .ok_or_else(|| format!("offset_shell: cap face {} has no edge", cap.id))?;
+            .ok_or_else(|| format!("offset_shell: cap face {} has no edge", cap.id)).or_refuse(KernelStage::Refine, "offset_shell_cap_face_has_no_edge")?;
         for index in 0..=8 {
             let point = edge
                 .curve
-                .evaluate(edge.t0 + (edge.t1 - edge.t0) * index as f64 / 8.0)?;
+                .evaluate(edge.t0 + (edge.t1 - edge.t0) * index as f64 / 8.0).or_refuse(KernelStage::Refine, "evaluate")?;
             if let Some(theta) = azimuth(point) {
                 return Ok(Some(theta));
             }
@@ -339,7 +340,7 @@ pub(super) fn recognize(
         .map(|coedge| {
             let edge = edge_by_id
                 .get(&coedge.edge_id)
-                .ok_or_else(|| format!("offset_shell: missing edge {}", coedge.edge_id))?;
+                .ok_or_else(|| format!("offset_shell: missing edge {}", coedge.edge_id)).or_refuse(KernelStage::Refine, "offset_shell_missing_edge")?;
             Ok(LoopCurve {
                 edge_id: edge.id,
                 curve: edge.curve.clone(),
@@ -348,7 +349,7 @@ pub(super) fn recognize(
                 forward: coedge.forward,
             })
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, KernelRefusal>>()?;
     let retained_edges = face_edges(face);
     let arc_indices = profile
         .iter()
@@ -365,7 +366,7 @@ pub(super) fn recognize(
     let arc = &profile[arc_index];
     let samples = (0..=64)
         .map(|index| arc.at(index as f64 / 64.0))
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, KernelRefusal>>()?;
     let Some((centre, skin, residual)) = fit_meridian_circle(&samples) else {
         return declined("the retained meridian is straight");
     };
@@ -389,9 +390,9 @@ pub(super) fn recognize(
     // The skin's material must be on the tube centre's side: the grown circle
     // is then `skin + |d|` about the same centre.
     let (um, vm) = (0.5 * (u0 + u1), 0.5 * (v0 + v1));
-    let middle = face.surface.evaluate(um, vm)?;
+    let middle = face.surface.evaluate(um, vm).or_refuse(KernelStage::Refine, "evaluate")?;
     let sense = if face.same_sense { 1.0 } else { -1.0 };
-    let normal = face.surface.normal(um, vm)?.scale(sense);
+    let normal = face.surface.normal(um, vm).or_refuse(KernelStage::Refine, "normal")?.scale(sense);
     let Some(outward) = outward_at(middle, origin, axis, major, axial) else {
         return declined("the retained face's mid sample sits on the axis");
     };
@@ -458,7 +459,7 @@ pub(super) fn recognize(
     let count = profile.len();
     let before = &profile[(arc_index + count - 1) % count];
     let after = &profile[(arc_index + 1) % count];
-    let wall_of = |curve: &LoopCurve| -> Result<u64, String> {
+    let wall_of = |curve: &LoopCurve| -> Result<u64, KernelRefusal> {
         faces
             .iter()
             .find(|candidate| {
@@ -466,6 +467,7 @@ pub(super) fn recognize(
             })
             .map(|candidate| candidate.id)
             .ok_or_else(|| format!("offset_shell: profile edge {} bounds no side face", curve.edge_id))
+            .or_refuse(KernelStage::Refine, "offset_shell_profile_edge_no_side_face")
     };
     // Each neighbour's far end, and the straightness that lets it be extended.
     let mut ends = Vec::with_capacity(2);
@@ -607,7 +609,7 @@ fn segments_meet(
 pub(super) fn build(
     wedge: &RevolvedWedge,
     source: &BrepSolid,
-) -> Result<OffsetShellResultRecord, String> {
+) -> Result<OffsetShellResultRecord, KernelRefusal> {
     const SKIN: &str = "skin";
     const WALL_LOW: &str = "wall-low";
     const WALL_HIGH: &str = "wall-high";
@@ -620,13 +622,13 @@ pub(super) fn build(
     let mut profile: Vec<NurbsCurve> = Vec::with_capacity(6);
     let mut tags: Vec<&str> = Vec::with_capacity(6);
     // The skin, from the arc's low end to its high end.
-    profile.push(arc(wedge.skin, wedge.low.angle, wedge.high.angle)?);
+    profile.push(arc(wedge.skin, wedge.low.angle, wedge.high.angle).or_refuse(KernelStage::Refine, "arc")?);
     tags.push(SKIN);
     // Out along the high end's profile edge to the grown circle.
     profile.push(make_line(
         wedge.at(wedge.skin, wedge.high.angle),
         wedge.at(wedge.grown, wedge.high.grown_angle),
-    )?);
+    ).or_refuse(KernelStage::Refine, "make_line")?);
     tags.push(WALL_HIGH);
     // Back along the grown circle, stopping at the axis if it reaches it.
     let pinch = |angle: f64| {
@@ -636,18 +638,18 @@ pub(super) fn build(
     };
     match wedge.band {
         Some([band_start, band_end]) => {
-            profile.push(arc(wedge.grown, band_end, wedge.high.grown_angle)?.reversed()?);
+            profile.push(arc(wedge.grown, band_end, wedge.high.grown_angle).or_refuse(KernelStage::Refine, "arc")?.reversed().or_refuse(KernelStage::Refine, "reversed")?);
             tags.push(GROWN);
             if band_end > band_start {
-                profile.push(make_line(pinch(band_end), pinch(band_start))?);
+                profile.push(make_line(pinch(band_end), pinch(band_start)).or_refuse(KernelStage::Refine, "make_line")?);
                 tags.push(AXIS);
             }
-            profile.push(arc(wedge.grown, wedge.low.grown_angle, band_start)?.reversed()?);
+            profile.push(arc(wedge.grown, wedge.low.grown_angle, band_start).or_refuse(KernelStage::Refine, "arc")?.reversed().or_refuse(KernelStage::Refine, "reversed")?);
             tags.push(GROWN);
         }
         None => {
             profile.push(
-                arc(wedge.grown, wedge.low.grown_angle, wedge.high.grown_angle)?.reversed()?,
+                arc(wedge.grown, wedge.low.grown_angle, wedge.high.grown_angle).or_refuse(KernelStage::Refine, "arc")?.reversed().or_refuse(KernelStage::Refine, "reversed")?,
             );
             tags.push(GROWN);
         }
@@ -656,7 +658,7 @@ pub(super) fn build(
     profile.push(make_line(
         wedge.at(wedge.grown, wedge.low.grown_angle),
         wedge.at(wedge.skin, wedge.low.angle),
-    )?);
+    ).or_refuse(KernelStage::Refine, "make_line")?);
     tags.push(WALL_LOW);
 
     let side_names = tags
@@ -674,7 +676,7 @@ pub(super) fn build(
     )
     .map_err(|error| {
         format!("offset_shell: the revolved wedge's half-plane region could not be revolved: {error}")
-    })?;
+    }).or_refuse(KernelStage::Refine, "revolve_profile_brep_named")?;
 
     // Provenance, positionally parallel to the face order, and the names the
     // pipeline's own assembly would give: a source face keeps its name, an
@@ -697,9 +699,9 @@ pub(super) fn build(
             CAP_START => (OffsetFaceRole::Wall, wedge.start_cap),
             CAP_END => (OffsetFaceRole::Wall, wedge.end_cap),
             other => {
-                return Err(format!(
+                return Err(KernelRefusal::internal(KernelStage::Refine, "offset_shell_wedge_attribution", format!(
                     "offset_shell: the revolved wedge built a face it cannot attribute ({other:?})"
-                ))
+                )))
             }
         };
         face.name = source_names
@@ -735,20 +737,20 @@ pub(super) fn build(
         .iter()
         .flat_map(|shell| &shell.faces)
         .find(|face| face.id == wedge.retained)
-        .ok_or_else(|| "offset_shell: the retained face went missing".to_string())?;
-    let [u0, u1] = skin_face.surface.domain_u()?;
-    let [v0, v1] = skin_face.surface.domain_v()?;
+        .ok_or_else(|| "offset_shell: the retained face went missing".to_string()).or_refuse(KernelStage::Refine, "offset_shell_the_retained_face_went_missing")?;
+    let [u0, u1] = skin_face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = skin_face.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
     let probe = skin_face
         .surface
-        .evaluate(0.5 * (u0 + u1), 0.5 * (v0 + v1))?;
+        .evaluate(0.5 * (u0 + u1), 0.5 * (v0 + v1)).or_refuse(KernelStage::Refine, "evaluate")?;
     let scale = crate::solid_scale(source);
-    let class = classify_point(probe, &solid, LINEAR_BAR * scale * 10.0)?.class;
+    let class = classify_point(probe, &solid, LINEAR_BAR * scale * 10.0).or_refuse(KernelStage::Refine, "classify_point")?.class;
     if class != PointClass::On {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Refine, "offset_shell_wedge_skin", format!(
             "offset_shell: the revolved wedge does not carry its own source skin — the skin's mid \
              sample classifies {class:?} against it ({})",
             wedge.report()
-        ));
+        )));
     }
     let solid = crate::accept_sound(solid, "offsetShell")?;
     Ok(OffsetShellResultRecord { solid, face_images })

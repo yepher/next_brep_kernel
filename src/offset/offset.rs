@@ -1,3 +1,4 @@
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use crate::fit::solve_dense;
 use crate::topology::{BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, VertexRecord};
 use crate::{
@@ -9,17 +10,17 @@ use crate::{
 use rustc_hash::FxHashMap as HashMap;
 use serde::Serialize;
 
-fn domains(surface: &NurbsSurface) -> Result<([f64; 2], [f64; 2]), String> {
+fn domains(surface: &NurbsSurface) -> Result<([f64; 2], [f64; 2]), KernelRefusal> {
     Ok((
-        KnotVector::new(surface.knots_u.clone(), surface.degree_u)?.domain(),
-        KnotVector::new(surface.knots_v.clone(), surface.degree_v)?.domain(),
+        KnotVector::new(surface.knots_u.clone(), surface.degree_u).or_refuse(KernelStage::Refine, "new")?.domain(),
+        KnotVector::new(surface.knots_v.clone(), surface.degree_v).or_refuse(KernelStage::Refine, "new")?.domain(),
     ))
 }
 
 /// The normal `offset_surface` offsets along: the face's oriented normal with
 /// the singular-row recovery, i.e. the shared evaluator's
 /// [`OffsetNormal::FaceStable`] lane, whose body this function used to be.
-fn stable_face_normal(face: &FaceRecord, u: f64, v: f64) -> Result<Vec3, String> {
+fn stable_face_normal(face: &FaceRecord, u: f64, v: f64) -> Result<Vec3, KernelRefusal> {
     OffsetEvaluator::new(
         "offset_surface",
         &face.surface,
@@ -28,6 +29,7 @@ fn stable_face_normal(face: &FaceRecord, u: f64, v: f64) -> Result<Vec3, String>
         },
     )
     .normal(u, v)
+    .or_refuse(KernelStage::Refine, "normal")
 }
 
 fn greville_parameters(knots: &KnotVector) -> Vec<f64> {
@@ -106,7 +108,7 @@ fn interpolate_tensor(
     parameters_v: &[f64],
     samples: &[Vec<Vec3>],
     weights: &[Vec<f64>],
-) -> Result<Vec<Vec<Vec4>>, String> {
+) -> Result<Vec<Vec<Vec4>>, KernelRefusal> {
     let count_u = parameters_u.len();
     let count_v = parameters_v.len();
     if let Some((weights_u, weights_v)) = separable_weights(weights) {
@@ -120,9 +122,9 @@ fn interpolate_tensor(
                     samples.iter().map(|row| axis(row[column])).collect(),
                 )
             };
-            let x = solve_axis(|point| point.x)?;
-            let y = solve_axis(|point| point.y)?;
-            let z = solve_axis(|point| point.z)?;
+            let x = solve_axis(|point| point.x).or_refuse(KernelStage::Refine, "solve_axis")?;
+            let y = solve_axis(|point| point.y).or_refuse(KernelStage::Refine, "solve_axis")?;
+            let z = solve_axis(|point| point.z).or_refuse(KernelStage::Refine, "solve_axis")?;
             for row in 0..count_u {
                 intermediate[row][column] = Vec3::new(x[row], y[row], z[row]);
             }
@@ -135,9 +137,9 @@ fn interpolate_tensor(
                     intermediate[row].iter().copied().map(axis).collect(),
                 )
             };
-            let x = solve_axis(|point| point.x)?;
-            let y = solve_axis(|point| point.y)?;
-            let z = solve_axis(|point| point.z)?;
+            let x = solve_axis(|point| point.x).or_refuse(KernelStage::Refine, "solve_axis")?;
+            let y = solve_axis(|point| point.y).or_refuse(KernelStage::Refine, "solve_axis")?;
+            let z = solve_axis(|point| point.z).or_refuse(KernelStage::Refine, "solve_axis")?;
             for column in 0..count_v {
                 controls[row][column] = Vec4::from_point(
                     Vec3::new(x[column], y[column], z[column]),
@@ -185,9 +187,9 @@ fn interpolate_tensor(
                 .collect(),
         )
     };
-    let x = solve_axis(|point| point.x)?;
-    let y = solve_axis(|point| point.y)?;
-    let z = solve_axis(|point| point.z)?;
+    let x = solve_axis(|point| point.x).or_refuse(KernelStage::Refine, "solve_axis")?;
+    let y = solve_axis(|point| point.y).or_refuse(KernelStage::Refine, "solve_axis")?;
+    let z = solve_axis(|point| point.z).or_refuse(KernelStage::Refine, "solve_axis")?;
     let mut controls = vec![vec![Vec4::from_point(Vec3::default(), 1.0); count_v]; count_u];
     for row in 0..count_u {
         for column in 0..count_v {
@@ -303,7 +305,7 @@ fn trim_domain_fractions(
     face: &FaceRecord,
     [u0, u1]: [f64; 2],
     [v0, v1]: [f64; 2],
-) -> Result<([f64; 2], [f64; 2]), String> {
+) -> Result<([f64; 2], [f64; 2]), KernelRefusal> {
     let mut low = Vec2 {
         x: f64::INFINITY,
         y: f64::INFINITY,
@@ -317,11 +319,11 @@ fn trim_domain_fractions(
         .iter()
         .flat_map(|loop_record| &loop_record.coedges)
     {
-        let [p0, p1] = coedge.pcurve.domain()?;
+        let [p0, p1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
         for sample in 0..=24 {
             let uv = coedge
                 .pcurve
-                .evaluate(p0 + (p1 - p0) * sample as f64 / 24.0)?;
+                .evaluate(p0 + (p1 - p0) * sample as f64 / 24.0).or_refuse(KernelStage::Refine, "evaluate")?;
             low.x = low.x.min(uv.x);
             low.y = low.y.min(uv.y);
             high.x = high.x.max(uv.x);
@@ -373,7 +375,7 @@ pub fn offset_surface(
     face: &FaceRecord,
     distance: f64,
     planar_extension: f64,
-) -> Result<NurbsSurface, String> {
+) -> Result<NurbsSurface, KernelRefusal> {
     offset_surface_with_lane(face, distance, &CarrierExtension::uniform(planar_extension))
         .map(|(surface, _)| surface)
 }
@@ -391,7 +393,7 @@ pub fn offset_surface_measured(
     distance: f64,
     planar_extension: f64,
     band: f64,
-) -> Result<MeasuredOffsetSurface, String> {
+) -> Result<MeasuredOffsetSurface, KernelRefusal> {
     offset_surface_measured_sided(
         face,
         distance,
@@ -406,7 +408,7 @@ pub fn offset_surface_measured_sided(
     distance: f64,
     extension: &CarrierExtension,
     band: f64,
-) -> Result<MeasuredOffsetSurface, String> {
+) -> Result<MeasuredOffsetSurface, KernelRefusal> {
     let (surface, lane, extended) = offset_surface_constructed(face, distance, extension)?;
     let fit = match lane {
         OffsetSurfaceLane::Affine => Some(MeasuredTolerance::exact(band)),
@@ -456,7 +458,7 @@ pub fn offset_surface_measured_sided(
 /// looks spherical — stays on the fit lane, unchanged. This lane widens nothing
 /// on its own: cylinders, cones and tori want a scaling about an axis or a
 /// spine rather than a point, which is a different construction.
-fn sphere_offset_surface(face: &FaceRecord, distance: f64) -> Result<Option<NurbsSurface>, String> {
+fn sphere_offset_surface(face: &FaceRecord, distance: f64) -> Result<Option<NurbsSurface>, KernelRefusal> {
     // Escape hatch, the same shape as `BREP_NO_SPHERE_CHARTS`: it makes the
     // closed form and the collocation fit two cells of one binary, so a
     // measurement can separate this lane's effect from everything else.
@@ -510,13 +512,13 @@ fn sphere_offset_surface(face: &FaceRecord, distance: f64) -> Result<Option<Nurb
             row.iter()
                 .map(|control| {
                     Ok(Vec4::from_point(
-                        centre.add(control.point()?.sub(centre).scale(factor)),
+                        centre.add(control.point().or_refuse(KernelStage::Refine, "point")?.sub(centre).scale(factor)),
                         control.w,
                     ))
                 })
-                .collect::<Result<Vec<_>, String>>()
+                .collect::<Result<Vec<_>, KernelRefusal>>()
         })
-        .collect::<Result<Vec<Vec<_>>, String>>()
+        .collect::<Result<Vec<Vec<_>>, KernelRefusal>>()
     else {
         return Ok(None);
     };
@@ -579,7 +581,7 @@ fn sphere_offset_surface(face: &FaceRecord, distance: f64) -> Result<Option<Nurb
 fn revolved_arc_offset_surface(
     face: &FaceRecord,
     distance: f64,
-) -> Result<Option<NurbsSurface>, String> {
+) -> Result<Option<NurbsSurface>, KernelRefusal> {
     if std::env::var_os("BREP_NO_ANALYTIC_OFFSET").is_some() {
         return Ok(None);
     }
@@ -599,10 +601,10 @@ fn revolved_arc_offset_surface(
     else {
         return Ok(None);
     };
-    let [t0, t1] = generatrix.domain()?;
+    let [t0, t1] = generatrix.domain().or_refuse(KernelStage::Refine, "domain")?;
     let at = |fraction: f64| generatrix.evaluate(t0 + (t1 - t0) * fraction);
     // The circle through three generatrix points, then every sample held to it.
-    let (a, b, e) = (at(0.0)?, at(1.0 / 3.0)?, at(2.0 / 3.0)?);
+    let (a, b, e) = (at(0.0).or_refuse(KernelStage::Refine, "at")?, at(1.0 / 3.0).or_refuse(KernelStage::Refine, "at")?, at(2.0 / 3.0).or_refuse(KernelStage::Refine, "at")?);
     let (ab, ae) = (b.sub(a), e.sub(a));
     let normal = ab.cross(ae);
     let normal_length_squared = normal.dot(normal);
@@ -621,7 +623,7 @@ fn revolved_arc_offset_surface(
     let unit_normal = normal.scale(1.0 / normal_length_squared.sqrt());
     let samples = 16 * generatrix.control_points.len();
     for index in 0..=samples {
-        let point = at(index as f64 / samples as f64)?;
+        let point = at(index as f64 / samples as f64).or_refuse(KernelStage::Refine, "at")?;
         let radial = point.sub(centre);
         if (radial.length() - radius).abs() > band || radial.dot(unit_normal).abs() > band {
             return Ok(None);
@@ -631,8 +633,8 @@ fn revolved_arc_offset_surface(
     // conditioned pair against the first.
     let controls = first_row
         .iter()
-        .map(|control| control.point())
-        .collect::<Result<Vec<_>, String>>()?;
+        .map(|control| control.point().or_refuse(KernelStage::Refine, "point"))
+        .collect::<Result<Vec<_>, KernelRefusal>>()?;
     let origin = controls[0];
     let mut best = (0usize, 0usize, 0.0f64);
     for first in 1..controls.len() {
@@ -698,7 +700,7 @@ fn revolved_arc_offset_surface(
     let Ok(offset_rows) = rows
         .iter()
         .map(|row| {
-            let points = row.iter().map(|control| control.point()).collect::<Result<Vec<_>, String>>()?;
+            let points = row.iter().map(|control| control.point().or_refuse(KernelStage::Refine, "point")).collect::<Result<Vec<_>, KernelRefusal>>()?;
             let row_origin = points[0];
             let row_centre = row_origin
                 .add(points[first].sub(row_origin).scale(s))
@@ -711,7 +713,7 @@ fn revolved_arc_offset_surface(
                 })
                 .collect::<Vec<_>>())
         })
-        .collect::<Result<Vec<Vec<_>>, String>>()
+        .collect::<Result<Vec<Vec<_>>, KernelRefusal>>()
     else {
         return Ok(None);
     };
@@ -740,7 +742,7 @@ pub(crate) fn offset_surface_with_lane(
     face: &FaceRecord,
     distance: f64,
     extension: &CarrierExtension,
-) -> Result<(NurbsSurface, OffsetSurfaceLane), String> {
+) -> Result<(NurbsSurface, OffsetSurfaceLane), KernelRefusal> {
     offset_surface_constructed(face, distance, extension).map(|(surface, lane, _)| (surface, lane))
 }
 
@@ -751,10 +753,10 @@ fn offset_surface_constructed(
     face: &FaceRecord,
     distance: f64,
     extension: &CarrierExtension,
-) -> Result<(NurbsSurface, OffsetSurfaceLane, Option<NurbsSurface>), String> {
+) -> Result<(NurbsSurface, OffsetSurfaceLane, Option<NurbsSurface>), KernelRefusal> {
     let source = &face.surface;
     let extension_active = extension.is_active();
-    if source.is_affine()? {
+    if source.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
         let ([u0, u1], [v0, v1]) = domains(source)?;
         let normal = stable_face_normal(face, (u0 + u1) / 2.0, (v0 + v1) / 2.0)?;
         let shift = normal.scale(-distance);
@@ -763,16 +765,16 @@ fn offset_surface_constructed(
             .iter()
             .map(|row| {
                 row.iter()
-                    .map(|control| Ok(control.point()?.add(shift)))
-                    .collect::<Result<Vec<_>, String>>()
+                    .map(|control| Ok(control.point().or_refuse(KernelStage::Refine, "point")?.add(shift)))
+                    .collect::<Result<Vec<_>, KernelRefusal>>()
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, KernelRefusal>>()?;
         if extension_active {
             let p00 = points[0][0];
             let p01 = points[0][1];
             let p10 = points[1][0];
-            let direction_u = p10.sub(p00).normalized()?;
-            let direction_v = p01.sub(p00).normalized()?;
+            let direction_u = p10.sub(p00).normalized().or_refuse(KernelStage::Refine, "normalized")?;
+            let direction_v = p01.sub(p00).normalized().or_refuse(KernelStage::Refine, "normalized")?;
             // The net slides while the cloned pcurves stay put, so a trim
             // that spans only part of the domain would grow by less than
             // asked (a 20-wide face trimmed to [0,16] by a blend moved its
@@ -822,7 +824,7 @@ fn offset_surface_constructed(
                 source.knots_u.clone(),
                 source.knots_v.clone(),
                 controls,
-            )?,
+            ).or_refuse(KernelStage::Refine, "new")?,
             lane,
             None,
         ));
@@ -846,8 +848,8 @@ fn offset_surface_constructed(
         return Ok((surface, OffsetSurfaceLane::Analytic, None));
     }
 
-    let knot_u = KnotVector::new(source.knots_u.clone(), source.degree_u)?;
-    let knot_v = KnotVector::new(source.knots_v.clone(), source.degree_v)?;
+    let knot_u = KnotVector::new(source.knots_u.clone(), source.degree_u).or_refuse(KernelStage::Refine, "new")?;
+    let knot_v = KnotVector::new(source.knots_v.clone(), source.degree_v).or_refuse(KernelStage::Refine, "new")?;
     let parameters_u = greville_parameters(&knot_u);
     let parameters_v = greville_parameters(&knot_v);
     // The Greville sample grid IS a pointwise offset evaluation — this fit is
@@ -866,7 +868,7 @@ fn offset_surface_constructed(
     for &u in &parameters_u {
         let mut row = Vec::new();
         for &v in &parameters_v {
-            row.push(evaluator.at(u, v, -distance)?.point);
+            row.push(evaluator.at(u, v, -distance).or_refuse(KernelStage::Refine, "at")?.point);
         }
         samples.push(row);
     }
@@ -886,7 +888,13 @@ fn offset_surface_constructed(
     // report a designed divergence as a fit error.
     let mut reparameterised = false;
     let mut extended_source: Option<NurbsSurface> = None;
-    if parameters_v.len() == 2 && parameters_u.len() >= 3 {
+    // Two u samples are enough for both: a 2 × 2 bilinear net (a planar
+    // trapezoid wall of a lofted square frustum, which the affine test above
+    // rejects on its parallelogram defect) has straight rulings like any
+    // other linear-v net, and without the extension its inward carrier
+    // stopped 0.059 short of the opening the reach lane had measured
+    // (2026-09-26, the SHARP rim corner fixture).
+    if parameters_v.len() == 2 && parameters_u.len() >= 2 {
         let centroid = |column: usize| {
             let mut sum = Vec3::default();
             for row in &samples {
@@ -1032,7 +1040,7 @@ fn offset_surface_constructed(
                 };
                 let (near_source, far_source) = (source_centroid(0), source_centroid(1));
                 for row in &source.control_points {
-                    let (near, far) = (row[0].point()?, row[1].point()?);
+                    let (near, far) = (row[0].point().or_refuse(KernelStage::Refine, "point")?, row[1].point().or_refuse(KernelStage::Refine, "point")?);
                     let near_radial = near.sub(near_source).length();
                     let far_radial = far.sub(far_source).length();
                     if (far_radial - near_radial).abs() > 1e-9 {
@@ -1082,7 +1090,7 @@ fn offset_surface_constructed(
                 let mut developability = 0.0f64;
                 for (row, &u) in stretched.iter().zip(&parameters_u) {
                     for fraction in [0.0, 0.5, 1.0] {
-                        let exact = extended_offsets.at(u, v0 + (v1 - v0) * fraction, -distance)?.point;
+                        let exact = extended_offsets.at(u, v0 + (v1 - v0) * fraction, -distance).or_refuse(KernelStage::Refine, "at")?.point;
                         let along = row[0].add(row[1].sub(row[0]).scale(fraction));
                         developability = developability.max(exact.sub(along).length());
                     }
@@ -1097,10 +1105,10 @@ fn offset_surface_constructed(
                         .map(|&u| {
                             parameters_v
                                 .iter()
-                                .map(|&v| Ok(extended_offsets.at(u, v, -distance)?.point))
-                                .collect::<Result<Vec<_>, String>>()
+                                .map(|&v| Ok(extended_offsets.at(u, v, -distance).or_refuse(KernelStage::Refine, "at")?.point))
+                                .collect::<Result<Vec<_>, KernelRefusal>>()
                         })
-                        .collect::<Result<Vec<_>, String>>()?
+                        .collect::<Result<Vec<_>, KernelRefusal>>()?
                 };
                 if let Ok(path) = std::env::var("BREP_OFFSET_FIT_TRACE") {
                     use std::io::Write;
@@ -1142,7 +1150,7 @@ fn offset_surface_constructed(
             &samples,
             &weights,
         )?,
-    )?;
+    ).or_refuse(KernelStage::Refine, "new")?;
     if reparameterised {
         return Ok((fitted, OffsetSurfaceLane::Reparameterised, None));
     }
@@ -1166,7 +1174,7 @@ fn offset_surface_constructed(
 /// homogeneous control rows traces the ruling past both ends. Refused where a
 /// continued weight stops being positive, which is where the ruling leaves the
 /// rational patch.
-fn extend_along_rulings(surface: &NurbsSurface, back: f64, forward: f64) -> Result<NurbsSurface, String> {
+fn extend_along_rulings(surface: &NurbsSurface, back: f64, forward: f64) -> Result<NurbsSurface, KernelRefusal> {
     let rows = surface
         .control_points
         .iter()
@@ -1176,12 +1184,13 @@ fn extend_along_rulings(surface: &NurbsSurface, back: f64, forward: f64) -> Resu
         })
         .collect::<Vec<_>>();
     if rows.iter().flatten().any(|point| point.w <= 1e-12) {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "offset_ruled_extension_weight", format!(
             "offset_surface: extending a ruled face by ({back:.6}, {forward:.6}) of its rulings \
              carries a weight through zero; the extended face is not this surface"
-        ));
+        )));
     }
     NurbsSurface::new(surface.degree_u, 1, surface.knots_u.clone(), surface.knots_v.clone(), rows)
+        .or_refuse(KernelStage::Refine, "new")
 }
 
 /// The fit contract a carrier of `source` is refined toward: the kernel's
@@ -1234,12 +1243,12 @@ fn offset_fit_deviation(
     fitted: &NurbsSurface,
     evaluator: &OffsetEvaluator,
     distance: f64,
-) -> Result<OffsetFitDeviation, String> {
-    let parameters_u = greville_parameters(&KnotVector::new(fitted.knots_u.clone(), fitted.degree_u)?);
-    let parameters_v = greville_parameters(&KnotVector::new(fitted.knots_v.clone(), fitted.degree_v)?);
+) -> Result<OffsetFitDeviation, KernelRefusal> {
+    let parameters_u = greville_parameters(&KnotVector::new(fitted.knots_u.clone(), fitted.degree_u).or_refuse(KernelStage::Refine, "new")?);
+    let parameters_v = greville_parameters(&KnotVector::new(fitted.knots_v.clone(), fitted.degree_v).or_refuse(KernelStage::Refine, "new")?);
     let (middle_u, middle_v) = (greville_midpoints(&parameters_u), greville_midpoints(&parameters_v));
-    let gap = |u: f64, v: f64| -> Result<f64, String> {
-        Ok(fitted.evaluate(u, v)?.sub(evaluator.at(u, v, -distance)?.point).length())
+    let gap = |u: f64, v: f64| -> Result<f64, KernelRefusal> {
+        Ok(fitted.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?.sub(evaluator.at(u, v, -distance).or_refuse(KernelStage::Refine, "at")?.point).length())
     };
     let mut deviation = OffsetFitDeviation {
         along_u: 0.0,
@@ -1275,7 +1284,7 @@ fn raise_linear_directions(
     surface: &NurbsSurface,
     in_u: bool,
     in_v: bool,
-) -> Result<Option<NurbsSurface>, String> {
+) -> Result<Option<NurbsSurface>, KernelRefusal> {
     fn raise(knots: &[f64], row: &[Vec4]) -> Option<(Vec<f64>, Vec<Vec4>)> {
         // Degree 1: knots are [k0, k0, k1, ..., kn, kn] for n + 1 controls.
         let count = row.len();
@@ -1341,13 +1350,13 @@ fn raise_linear_directions(
             .collect();
         degree_u = 3;
     }
-    Ok(Some(NurbsSurface::new(degree_u, degree_v, knots_u, knots_v, net)?))
+    Ok(Some(NurbsSurface::new(degree_u, degree_v, knots_u, knots_v, net).or_refuse(KernelStage::Refine, "new")?))
 }
 
 /// `surface`, the same geometry with a knot inserted at the midpoint of every
 /// non-empty span of each requested direction (exact Boehm insertion on the
 /// homogeneous net, so the weights refine with it).
-fn halve_knot_spans(surface: &NurbsSurface, in_u: bool, in_v: bool) -> Result<NurbsSurface, String> {
+fn halve_knot_spans(surface: &NurbsSurface, in_u: bool, in_v: bool) -> Result<NurbsSurface, KernelRefusal> {
     fn midpoints(knots: &[f64], degree: usize) -> Vec<f64> {
         let last = knots.len() - 1 - degree;
         knots[degree..=last]
@@ -1356,14 +1365,14 @@ fn halve_knot_spans(surface: &NurbsSurface, in_u: bool, in_v: bool) -> Result<Nu
             .map(|pair| 0.5 * (pair[0] + pair[1]))
             .collect()
     }
-    let refine = |degree: usize, knots: &[f64], net: Vec<Vec<Vec4>>| -> Result<(Vec<f64>, Vec<Vec<Vec4>>), String> {
+    let refine = |degree: usize, knots: &[f64], net: Vec<Vec<Vec4>>| -> Result<(Vec<f64>, Vec<Vec<Vec4>>), KernelRefusal> {
         let inserted = midpoints(knots, degree);
         let mut refined_knots = knots.to_vec();
         let mut rows = Vec::with_capacity(net.len());
         for row in net {
-            let mut curve = NurbsCurve::new(degree, knots.to_vec(), row)?;
+            let mut curve = NurbsCurve::new(degree, knots.to_vec(), row).or_refuse(KernelStage::Refine, "new")?;
             for &parameter in &inserted {
-                curve = curve.insert_knot(parameter, 1)?;
+                curve = curve.insert_knot(parameter, 1).or_refuse(KernelStage::Refine, "insert_knot")?;
             }
             refined_knots = curve.knots.clone();
             rows.push(curve.control_points);
@@ -1391,7 +1400,7 @@ fn halve_knot_spans(surface: &NurbsSurface, in_u: bool, in_v: bool) -> Result<Nu
             .map(|row| refined.iter().map(|column| column[row]).collect())
             .collect();
     }
-    NurbsSurface::new(surface.degree_u, surface.degree_v, knots_u, knots_v, net)
+    NurbsSurface::new(surface.degree_u, surface.degree_v, knots_u, knots_v, net).or_refuse(KernelStage::Refine, "new")
 }
 
 /// A collocation fit of the pointwise offset, refined until its OUT-OF-SAMPLE
@@ -1434,7 +1443,7 @@ fn refine_offset_fit(
     evaluator: &OffsetEvaluator,
     distance: f64,
     fitted: NurbsSurface,
-) -> Result<NurbsSurface, String> {
+) -> Result<NurbsSurface, KernelRefusal> {
     let scale = crate::model_scale(
         source
             .control_points
@@ -1497,8 +1506,8 @@ fn refine_offset_fit(
                 stop = "net ceiling";
                 break;
             }
-            let knot_u = KnotVector::new(candidate_source.knots_u.clone(), candidate_source.degree_u)?;
-            let knot_v = KnotVector::new(candidate_source.knots_v.clone(), candidate_source.degree_v)?;
+            let knot_u = KnotVector::new(candidate_source.knots_u.clone(), candidate_source.degree_u).or_refuse(KernelStage::Refine, "new")?;
+            let knot_v = KnotVector::new(candidate_source.knots_v.clone(), candidate_source.degree_v).or_refuse(KernelStage::Refine, "new")?;
             let parameters_u = greville_parameters(&knot_u);
             let parameters_v = greville_parameters(&knot_v);
             let samples = parameters_u
@@ -1506,10 +1515,10 @@ fn refine_offset_fit(
                 .map(|&u| {
                     parameters_v
                         .iter()
-                        .map(|&v| Ok(evaluator.at(u, v, -distance)?.point))
-                        .collect::<Result<Vec<_>, String>>()
+                        .map(|&v| Ok(evaluator.at(u, v, -distance).or_refuse(KernelStage::Refine, "at")?.point))
+                        .collect::<Result<Vec<_>, KernelRefusal>>()
                 })
-                .collect::<Result<Vec<_>, String>>();
+                .collect::<Result<Vec<_>, KernelRefusal>>();
             let Ok(samples) = samples else {
                 stop = "unevaluable sample";
                 break;
@@ -1520,7 +1529,7 @@ fn refine_offset_fit(
                 candidate_source.knots_u.clone(),
                 candidate_source.knots_v.clone(),
                 interpolate_tensor(&knot_u, &knot_v, &parameters_u, &parameters_v, &samples, &weights)?,
-            )?;
+            ).or_refuse(KernelStage::Refine, "new")?;
             let Ok(deviation) = offset_fit_deviation(&candidate, evaluator, distance) else {
                 stop = "unmeasurable round";
                 break;
@@ -1568,12 +1577,12 @@ fn refine_offset_fit(
         }
     }
     if refused {
-        return Err(format!(
+        return Err(KernelRefusal::non_convergence(KernelStage::Refine, "offset_carrier_fit", format!(
             "offset_surface: the fitted offset carrier stays {:.3e} off its pointwise offset at \
              distance {distance} after {rounds} refinement round(s) ({stop}), past the offset \
              construction band {band:.3e}",
             best_deviation.worst()
-        ));
+        )));
     }
     Ok(best)
 }
@@ -1590,25 +1599,31 @@ fn refine_offset_fit(
 pub(crate) fn unify_offset_sheet_bases(
     first: &NurbsSurface,
     second: &NurbsSurface,
-) -> Result<(NurbsSurface, NurbsSurface), String> {
-    fn raise_to(surface: &NurbsSurface, degree_u: usize, degree_v: usize) -> Result<NurbsSurface, String> {
+) -> Result<(NurbsSurface, NurbsSurface), KernelRefusal> {
+    fn raise_to(surface: &NurbsSurface, degree_u: usize, degree_v: usize) -> Result<NurbsSurface, KernelRefusal> {
         let raise_u = surface.degree_u == 1 && degree_u == 3;
         let raise_v = surface.degree_v == 1 && degree_v == 3;
         if !raise_u && !raise_v {
             return Ok(surface.clone());
         }
         raise_linear_directions(surface, raise_u, raise_v)?
-            .ok_or_else(|| "offset sheets: a linear direction could not be raised".to_string())
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Refine,
+                    "offset_raise_linear",
+                    "offset sheets: a linear direction could not be raised",
+                )
+            })
     }
     let degree_u = first.degree_u.max(second.degree_u);
     let degree_v = first.degree_v.max(second.degree_v);
     let mut first = raise_to(first, degree_u, degree_v)?;
     let mut second = raise_to(second, degree_u, degree_v)?;
     if first.degree_u != second.degree_u || first.degree_v != second.degree_v {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Refine, "offset_common_basis", format!(
             "offset sheets: degrees ({},{}) and ({},{}) have no common basis",
             first.degree_u, first.degree_v, second.degree_u, second.degree_v
-        ));
+        )));
     }
     // Knots one vector has beyond the other, counted with multiplicity.
     fn missing(from: &[f64], into: &[f64]) -> Vec<f64> {
@@ -1626,7 +1641,7 @@ pub(crate) fn unify_offset_sheet_bases(
         }
         extra
     }
-    fn insert(surface: &NurbsSurface, knots: &[f64], along_u: bool) -> Result<NurbsSurface, String> {
+    fn insert(surface: &NurbsSurface, knots: &[f64], along_u: bool) -> Result<NurbsSurface, KernelRefusal> {
         if knots.is_empty() {
             return Ok(surface.clone());
         }
@@ -1645,9 +1660,9 @@ pub(crate) fn unify_offset_sheet_bases(
         let mut refined_knots = vector.clone();
         let mut refined = Vec::with_capacity(lines.len());
         for line in lines {
-            let mut curve = NurbsCurve::new(degree, vector.clone(), line)?;
+            let mut curve = NurbsCurve::new(degree, vector.clone(), line).or_refuse(KernelStage::Refine, "new")?;
             for &knot in knots {
-                curve = curve.insert_knot(knot, 1)?;
+                curve = curve.insert_knot(knot, 1).or_refuse(KernelStage::Refine, "insert_knot")?;
             }
             refined_knots = curve.knots.clone();
             refined.push(curve.control_points);
@@ -1664,7 +1679,7 @@ pub(crate) fn unify_offset_sheet_bases(
         } else {
             (surface.knots_u.clone(), refined_knots)
         };
-        NurbsSurface::new(surface.degree_u, surface.degree_v, knots_u, knots_v, net)
+        NurbsSurface::new(surface.degree_u, surface.degree_v, knots_u, knots_v, net).or_refuse(KernelStage::Refine, "new")
     }
     let (to_first_u, to_second_u) = (
         missing(&second.knots_u, &first.knots_u),
@@ -1708,7 +1723,7 @@ fn carrier_edge_curve(
     points: &[Vec3],
     parameters: &[f64],
     fit_tolerance: f64,
-) -> Result<(NurbsCurve, f64, f64), String> {
+) -> Result<(NurbsCurve, f64, f64), KernelRefusal> {
     // `BREP_CARRIER_POLYLINE=1` restores the polyline for an A/B comparison.
     let image = if std::env::var("BREP_CARRIER_POLYLINE").as_deref() == Ok("1") {
         Err("BREP_CARRIER_POLYLINE set".to_string())
@@ -1720,13 +1735,13 @@ fn carrier_edge_curve(
         Ok(image) => {
             // The image runs against the pcurve: reverse it so the edge range
             // is increasing, reflecting the range through the curve's domain.
-            let [start, end] = image.curve.domain()?;
-            let curve = image.curve.reversed()?;
+            let [start, end] = image.curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+            let curve = image.curve.reversed().or_refuse(KernelStage::Refine, "reversed")?;
             Ok((curve, start + end - image.t0, start + end - image.t1))
         }
         Err(_) => {
-            let curve = interpolate_curve(points, 1, parameters)?;
-            let [t0, t1] = curve.domain()?;
+            let curve = interpolate_curve(points, 1, parameters).or_refuse(KernelStage::Refine, "interpolate_curve")?;
+            let [t0, t1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
             Ok((curve, t0, t1))
         }
     }
@@ -1736,11 +1751,11 @@ fn mapped_pcurve_polyline(
     surface: &NurbsSurface,
     pcurve: &NurbsCurve,
     degenerate: bool,
-) -> Result<(Vec<Vec3>, Vec<f64>), String> {
-    let [start, end] = pcurve.domain()?;
-    let evaluate = |fraction: f64| {
-        let uv = pcurve.evaluate(start + (end - start) * fraction)?;
-        surface.evaluate(uv.x, uv.y)
+) -> Result<(Vec<Vec3>, Vec<f64>), KernelRefusal> {
+    let [start, end] = pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let evaluate = |fraction: f64| -> Result<Vec3, KernelRefusal> {
+        let uv = pcurve.evaluate(start + (end - start) * fraction).or_refuse(KernelStage::Refine, "evaluate")?;
+        surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Refine, "evaluate")
     };
     let first = evaluate(0.0)?;
     let last = evaluate(1.0)?;
@@ -1748,7 +1763,7 @@ fn mapped_pcurve_polyline(
         return Ok((vec![first, last], vec![0.0, 1.0]));
     }
     fn append(
-        evaluate: &impl Fn(f64) -> Result<Vec3, String>,
+        evaluate: &impl Fn(f64) -> Result<Vec3, KernelRefusal>,
         a_fraction: f64,
         a: Vec3,
         b_fraction: f64,
@@ -1756,13 +1771,13 @@ fn mapped_pcurve_polyline(
         depth: usize,
         parameters: &mut Vec<f64>,
         points: &mut Vec<Vec3>,
-    ) -> Result<(), String> {
+    ) -> Result<(), KernelRefusal> {
         let fractions =
             [0.25, 0.5, 0.75].map(|local| a_fraction + (b_fraction - a_fraction) * local);
         let samples = fractions
             .map(evaluate)
             .into_iter()
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, KernelRefusal>>()?;
         let deviation = samples
             .iter()
             .enumerate()
@@ -1924,7 +1939,7 @@ pub fn offset_face_carrier(
     face_id: u64,
     distance: f64,
     planar_extension: f64,
-) -> Result<OffsetFaceCarrier, String> {
+) -> Result<OffsetFaceCarrier, KernelRefusal> {
     offset_face_carrier_impl(
         solid,
         face_id,
@@ -1940,7 +1955,7 @@ pub fn offset_face_carrier_sided(
     face_id: u64,
     distance: f64,
     extension: &CarrierExtension,
-) -> Result<OffsetFaceCarrier, String> {
+) -> Result<OffsetFaceCarrier, KernelRefusal> {
     offset_face_carrier_impl(solid, face_id, distance, extension, false)
 }
 
@@ -1968,7 +1983,7 @@ pub fn offset_face_carrier_measured(
     face_id: u64,
     distance: f64,
     planar_extension: f64,
-) -> Result<OffsetFaceCarrier, String> {
+) -> Result<OffsetFaceCarrier, KernelRefusal> {
     offset_face_carrier_impl(
         solid,
         face_id,
@@ -1996,7 +2011,7 @@ fn measure_carrier(
     lane: OffsetSurfaceLane,
     surface_fit: Option<MeasuredTolerance>,
     band: f64,
-) -> Result<CarrierDeviation, String> {
+) -> Result<CarrierDeviation, KernelRefusal> {
     let edge_by_id: HashMap<u64, &EdgeRecord> = edges.iter().map(|edge| (edge.id, edge)).collect();
     // Fold over coedges, not edges: a seam edge is referenced twice with two
     // different pcurves, and OCCT's `FillEdgeData` takes the maximum over every
@@ -2050,7 +2065,7 @@ fn measure_carrier(
         for (edge, parameter) in ends_at.get(&vertex.id).into_iter().flatten() {
             gaps.push(vertex_endpoint_gap(
                 vertex.point,
-                edge.curve.evaluate(*parameter)?,
+                edge.curve.evaluate(*parameter).or_refuse(KernelStage::Refine, "evaluate")?,
             ));
             incident.push(deviation_of.get(&edge.id).copied().unwrap_or(0.0));
         }
@@ -2072,13 +2087,13 @@ fn offset_face_carrier_impl(
     distance: f64,
     extension: &CarrierExtension,
     measure: bool,
-) -> Result<OffsetFaceCarrier, String> {
+) -> Result<OffsetFaceCarrier, KernelRefusal> {
     let source = solid
         .shells
         .iter()
         .flat_map(|shell| &shell.faces)
         .find(|face| face.id == face_id)
-        .ok_or_else(|| format!("offset_face_carrier: missing face {face_id}"))?;
+        .ok_or_else(|| format!("offset_face_carrier: missing face {face_id}")).or_refuse(KernelStage::Refine, "offset_missing_face")?;
     // The band is derived from the SOURCE SOLID's extent, matching every other
     // direct-edit/offset site (`face_offset.rs:103` and its siblings all take
     // `solid_model_scale`). The alternative basis is the FACE's own extent — the
@@ -2124,7 +2139,7 @@ fn offset_face_carrier_impl(
         for source_coedge in &source_loop.coedges {
             let source_edge = source_edges
                 .get(&source_coedge.edge_id)
-                .ok_or_else(|| "offset_face_carrier: missing source edge".to_string())?;
+                .ok_or_else(|| "offset_face_carrier: missing source edge".to_string()).or_refuse(KernelStage::Refine, "offset_missing_edge")?;
             let (source_start, source_end) = if source_coedge.forward {
                 (source_edge.start_vertex_id, source_edge.end_vertex_id)
             } else {
@@ -2133,7 +2148,7 @@ fn offset_face_carrier_impl(
             if !source_vertices.contains_key(&source_start)
                 || !source_vertices.contains_key(&source_end)
             {
-                return Err("offset_face_carrier: missing source vertex".into());
+                return Err(KernelRefusal::internal(KernelStage::Refine, "offset_missing_vertex", "offset_face_carrier: missing source vertex"));
             }
             // Map even DEGENERATE source edges through the full polyline: a
             // cone apex's image on the offset surface is a genuine CIRCLE
@@ -2203,7 +2218,7 @@ fn offset_face_carrier_impl(
                                 Vec4::from_point(points[0], 1.0),
                                 Vec4::from_point(points[0], 1.0),
                             ],
-                        )?;
+                        ).or_refuse(KernelStage::Refine, "new")?;
                         (curve, 0.0, 1.0)
                     } else {
                         carrier_edge_curve(

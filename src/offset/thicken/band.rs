@@ -53,6 +53,7 @@
 //! strictly inside the meridian range, and a reflected lemon that reaches
 //! material the trim never swept — each with the measurement that decided it.
 
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 
 /// How far the generatrix may sit off the circle fitted to it, relative to that
@@ -222,7 +223,7 @@ pub(crate) fn recognize(
     loops: &[Vec<NurbsCurve>],
     distance_bottom: f64,
     distance_top: f64,
-) -> Result<Option<RevolvedBand>, String> {
+) -> Result<Option<RevolvedBand>, KernelRefusal> {
     let Some(crate::AnalyticSurface::Revolution {
         frame,
         sweep,
@@ -257,18 +258,18 @@ pub(crate) fn recognize(
     // Which way the surface normal points decides which end of the segment is
     // which: `thicken` measures along `Su × Sv` and the revolve's own winding
     // sets that.
-    let [u0, u1] = surface.domain_u()?;
-    let [v0, v1] = surface.domain_v()?;
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
     // Which way the surface normal points is measured against the outward
     // direction from the TUBE CENTRE — the direction the offset actually runs —
     // and not from the axis: over the meridian's far half those two disagree,
     // which is the whole of what makes this lane's band fold.
     let (um, vm) = (0.5 * (u0 + u1), 0.5 * (v0 + v1));
-    let middle = surface.evaluate(um, vm)?;
+    let middle = surface.evaluate(um, vm).or_refuse(KernelStage::Refine, "evaluate")?;
     let Some(outward) = outward_at(middle, frame.origin, frame.axis, major, axial) else {
         return Ok(None);
     };
-    let outward_sign = if surface.normal(um, vm)?.dot(outward) > 0.0 {
+    let outward_sign = if surface.normal(um, vm).or_refuse(KernelStage::Refine, "normal")?.dot(outward) > 0.0 {
         1.0
     } else {
         -1.0
@@ -322,7 +323,7 @@ pub(crate) fn recognize(
     // every exit is a refusal by name.
     let full_turn = (*sweep - std::f64::consts::TAU).abs() <= 1e-9;
     if !full_turn {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "thicken_band_partial_revolution", format!(
             "thickenSheet: this sheet's offset folds in a BAND and the sheet is revolved only \
              {:.6} rad. The segments in the band cross the axis and come out at the azimuth half \
              a turn away, so for a FULL revolution the union is again a solid of revolution — the \
@@ -333,7 +334,7 @@ pub(crate) fn recognize(
              that the offset (now {:.6} from the tube centre, against a major radius of {:.6}) \
              does not reach the axis",
             sweep, band.high, band.major
-        ));
+        )));
     }
     reflected_band_is_covered(&band)?;
     Ok(Some(band))
@@ -445,10 +446,14 @@ pub(crate) fn diagnose(
 
 /// Sample the generatrix end to end — 65 points, the population every fit and
 /// every range below reads.
-fn generatrix_samples(generatrix: &NurbsCurve) -> Result<Vec<Vec3>, String> {
-    let [t0, t1] = generatrix.domain()?;
+fn generatrix_samples(generatrix: &NurbsCurve) -> Result<Vec<Vec3>, KernelRefusal> {
+    let [t0, t1] = generatrix.domain().or_refuse(KernelStage::Refine, "domain")?;
     (0..=64)
-        .map(|index| generatrix.evaluate(t0 + (t1 - t0) * index as f64 / 64.0))
+        .map(|index| {
+            generatrix
+                .evaluate(t0 + (t1 - t0) * index as f64 / 64.0)
+                .or_refuse(KernelStage::Refine, "evaluate")
+        })
         .collect()
 }
 
@@ -491,7 +496,7 @@ fn meridian_range(
     tube_centre: Vec3,
     radial: Vec3,
     axis: Vec3,
-) -> Result<(f64, f64), String> {
+) -> Result<(f64, f64), KernelRefusal> {
     let angle = |point: Vec3| {
         let delta = point.sub(tube_centre);
         delta.dot(axis).atan2(delta.dot(radial))
@@ -542,7 +547,7 @@ pub(crate) fn whole_face(
     loops: &[Vec<NurbsCurve>],
     [u0, u1]: [f64; 2],
     [v0, v1]: [f64; 2],
-) -> Result<bool, String> {
+) -> Result<bool, KernelRefusal> {
     if loops.len() != 1 {
         return Ok(false);
     }
@@ -551,10 +556,10 @@ pub(crate) fn whole_face(
     let mut box_u = (f64::INFINITY, f64::NEG_INFINITY);
     let mut box_v = (f64::INFINITY, f64::NEG_INFINITY);
     for curve in &loops[0] {
-        let [t0, t1] = curve.domain()?;
-        let mut previous = curve.evaluate(t0)?;
+        let [t0, t1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let mut previous = curve.evaluate(t0).or_refuse(KernelStage::Refine, "evaluate")?;
         for index in 1..=32 {
-            let point = curve.evaluate(t0 + (t1 - t0) * index as f64 / 32.0)?;
+            let point = curve.evaluate(t0 + (t1 - t0) * index as f64 / 32.0).or_refuse(KernelStage::Refine, "evaluate")?;
             area += 0.5 * (previous.x * point.y - point.x * previous.y);
             box_u = (box_u.0.min(point.x), box_u.1.max(point.x));
             box_v = (box_v.0.min(point.y), box_v.1.max(point.y));
@@ -575,7 +580,7 @@ pub(crate) fn whole_face(
 ///
 /// A BOUND and not a proof, like every other scan in this family: a polar grid
 /// over the lemon, and the first sample that is neither refuses by name.
-fn reflected_band_is_covered(band: &RevolvedBand) -> Result<(), String> {
+fn reflected_band_is_covered(band: &RevolvedBand) -> Result<(), KernelRefusal> {
     let mirror = band.mirror_centre();
     let limit = (band.major / band.high).acos();
     // The grid's own corners sit ON the region's boundary — `s = s_hi` at
@@ -607,7 +612,7 @@ fn reflected_band_is_covered(band: &RevolvedBand) -> Result<(), String> {
             {
                 continue;
             }
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(KernelStage::Refine, "thicken_band_unswept_reflection", format!(
                 "thickenSheet: this sheet's offset folds in a BAND, and the band's reflection \
                  reaches material the trim never swept — the point at meridian distance {:.6} and \
                  angle {:.6} rad from the tube centre is in neither the swept sector \
@@ -620,19 +625,19 @@ fn reflected_band_is_covered(band: &RevolvedBand) -> Result<(), String> {
                 band.end,
                 band.low,
                 band.high
-            ));
+            )));
         }
     }
     Ok(())
 }
 
 /// Build the half-plane union's profile and revolve it a full turn.
-pub(crate) fn build(band: &RevolvedBand) -> Result<BrepSolid, String> {
+pub(crate) fn build(band: &RevolvedBand) -> Result<BrepSolid, KernelRefusal> {
     let centre = band.tube_centre();
     let (radial, axis) = (band.radial, band.axis);
     let fold = band.fold_angle();
     let band_low = wrap_into(fold, band.start, band.end)
-        .ok_or_else(|| "thickenSheet: the fold band left the meridian range".to_string())?;
+        .ok_or_else(|| "thickenSheet: the fold band left the meridian range".to_string()).or_refuse(KernelStage::Refine, "thicken_band_meridian_range")?;
     let band_high = band_low + 2.0 * (std::f64::consts::PI - fold);
     let mut profile: Vec<NurbsCurve> = Vec::with_capacity(8);
 
@@ -644,12 +649,12 @@ pub(crate) fn build(band: &RevolvedBand) -> Result<BrepSolid, String> {
         band.high,
         band.start,
         band_low,
-    )?);
+    ).or_refuse(KernelStage::Refine, "make_arc")?);
     // B. the AXIS chord — the fold band's own far end, which revolves to nothing.
     let half = band.chord_half_length();
     let top = band.origin.add(axis.scale(band.axial + half));
     let bottom = band.origin.add(axis.scale(band.axial - half));
-    profile.push(make_line(top, bottom)?);
+    profile.push(make_line(top, bottom).or_refuse(KernelStage::Refine, "make_line")?);
     // C. the offset arc from the axis back out to the trim's end.
     profile.push(make_arc(
         centre,
@@ -658,12 +663,12 @@ pub(crate) fn build(band: &RevolvedBand) -> Result<BrepSolid, String> {
         band.high,
         band_high,
         band.end,
-    )?);
+    ).or_refuse(KernelStage::Refine, "make_arc")?);
     // D. the extreme normal segment at the trim's END, offset back to sheet.
     profile.push(make_line(
         band.meridian_point(band.high, band.end),
         band.meridian_point(band.low, band.end),
-    )?);
+    ).or_refuse(KernelStage::Refine, "make_line")?);
     // E–G. the sheet's own arc back to the start — interrupted, where the
     // reflected lemon reaches into the tube hole, by the lemon's own arc: that
     // hole is material the reflection sweeps and the sheet's arc is no longer
@@ -680,26 +685,26 @@ pub(crate) fn build(band: &RevolvedBand) -> Result<BrepSolid, String> {
                      rad, which is outside the regular part of the trim ({:.6} to {:.6})",
                     band.start, band_low
                 )
-            })?;
+            }).or_refuse(KernelStage::Refine, "thicken_band_reflection_range")?;
             let lower = wrap_into(lower, band_high, band.end).ok_or_else(|| {
                 format!(
                     "thickenSheet: the reflected band meets the sheet at meridian angle {lower:.6} \
                      rad, which is outside the regular part of the trim ({:.6} to {:.6})",
                     band_high, band.end
                 )
-            })?;
+            }).or_refuse(KernelStage::Refine, "thicken_band_reflection_range")?;
             // E. the sheet, from the trim's end down to the lower crossing.
-            profile.push(make_arc(centre, radial, axis, band.low, lower, band.end)?.reversed()?);
+            profile.push(make_arc(centre, radial, axis, band.low, lower, band.end).or_refuse(KernelStage::Refine, "make_arc")?.reversed().or_refuse(KernelStage::Refine, "reversed")?);
             // F. the reflected lemon, from the lower crossing to the upper one.
             let mirror = band.mirror_centre();
             let alpha = height.atan2(rho + band.major);
-            profile.push(make_arc(mirror, radial, axis, band.high, -alpha, alpha)?);
+            profile.push(make_arc(mirror, radial, axis, band.high, -alpha, alpha).or_refuse(KernelStage::Refine, "make_arc")?);
             // G. the sheet, from the upper crossing back to the trim's start.
-            profile.push(make_arc(centre, radial, axis, band.low, band.start, upper)?.reversed()?);
+            profile.push(make_arc(centre, radial, axis, band.low, band.start, upper).or_refuse(KernelStage::Refine, "make_arc")?.reversed().or_refuse(KernelStage::Refine, "reversed")?);
         }
         None => {
             profile.push(
-                make_arc(centre, radial, axis, band.low, band.start, band.end)?.reversed()?,
+                make_arc(centre, radial, axis, band.low, band.start, band.end).or_refuse(KernelStage::Refine, "make_arc")?.reversed().or_refuse(KernelStage::Refine, "reversed")?,
             );
         }
     }
@@ -708,7 +713,7 @@ pub(crate) fn build(band: &RevolvedBand) -> Result<BrepSolid, String> {
     profile.push(make_line(
         band.meridian_point(band.low, band.start),
         band.meridian_point(band.high, band.start),
-    )?);
+    ).or_refuse(KernelStage::Refine, "make_line")?);
 
     let solid = crate::revolve_profile_brep(
         &profile,
@@ -717,7 +722,11 @@ pub(crate) fn build(band: &RevolvedBand) -> Result<BrepSolid, String> {
         std::f64::consts::TAU,
     )
     .map_err(|error| {
-        format!("thickenSheet: the fold band's half-plane union could not be revolved: {error}")
+        KernelRefusal::internal(
+            KernelStage::Refine,
+            "revolve_profile_brep",
+            format!("thickenSheet: the fold band's half-plane union could not be revolved: {error}"),
+        )
     })?;
     crate::accept_sound(solid, "thickenSheet")
 }

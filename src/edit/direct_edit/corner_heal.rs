@@ -108,6 +108,7 @@
 
 use super::*;
 use crate::project_point_to_surface;
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 
 /// One blend strip of a corner group, read off its own loop.
 pub(super) struct CornerStrip {
@@ -303,7 +304,7 @@ pub(super) fn rederive_side_edge_on_planes(
     end_target: Option<(u64, Vec3)>,
     plane_tolerance: f64,
     tolerance: f64,
-) -> Result<Option<EdgeRecord>, String> {
+) -> Result<Option<EdgeRecord>, KernelRefusal> {
     let mut flanking: Vec<u64> = Vec::new();
     for shell in &solid.shells {
         for face in &shell.faces {
@@ -332,11 +333,11 @@ pub(super) fn rederive_side_edge_on_planes(
     };
     let start_point = match start_target {
         Some((_, point)) => point,
-        None => edge.curve.evaluate(edge.t0)?,
+        None => edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Sew, "evaluate")?,
     };
     let end_point = match end_target {
         Some((_, point)) => point,
-        None => edge.curve.evaluate(edge.t1)?,
+        None => edge.curve.evaluate(edge.t1).or_refuse(KernelStage::Sew, "evaluate")?,
     };
     if !on_line(start_point) || !on_line(end_point) {
         return Ok(None);
@@ -345,7 +346,7 @@ pub(super) fn rederive_side_edge_on_planes(
         return Ok(None);
     }
     let mut record = edge.clone();
-    record.curve = make_line(start_point, end_point)?;
+    record.curve = make_line(start_point, end_point).or_refuse(KernelStage::Sew, "make_line")?;
     record.t0 = 0.0;
     record.t1 = 1.0;
     if let Some((vertex, _)) = start_target {
@@ -364,7 +365,7 @@ fn corner_group_region(
     group: &CornerBlendGroup,
     tolerance: f64,
     op: &str,
-) -> Result<(HashSet<u64>, Vec<u64>, Vec3, f64), String> {
+) -> Result<(HashSet<u64>, Vec<u64>, Vec3, f64), KernelRefusal> {
     let group_edges: HashSet<u64> = group
         .corner_edges
         .iter()
@@ -386,7 +387,11 @@ fn corner_group_region(
     group_vertices.sort_unstable();
     group_vertices.dedup();
     if group_vertices.is_empty() {
-        return Err(format!("{op}: corner blend group has no vertices"));
+        return Err(KernelRefusal::internal(
+            KernelStage::Collect,
+            "group_vertices",
+            format!("{op}: corner blend group has no vertices"),
+        ));
     }
     let mut centre = Vec3::default();
     for &vertex_id in &group_vertices {
@@ -415,11 +420,14 @@ pub(super) fn heal_corner_blend_group(
     solid: &BrepSolid,
     group: &CornerBlendGroup,
     op: &str,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let mut solid = solid.clone();
     let scale = solid_model_scale(&solid);
     let tolerance = (scale * 1e-7).max(1e-9);
     let plane_tolerance = (scale * 1e-6).max(1e-7);
+    let missing = |what: &'static str, id: u64| {
+        KernelRefusal::internal(KernelStage::Collect, what, format!("{op}: missing {what} {id}"))
+    };
 
     // --- Carriers: every wall and every cap must be planar in this slice ---
     let mut planes: HashMap<u64, Plane> = HashMap::default();
@@ -432,8 +440,7 @@ pub(super) fn heal_corner_blend_group(
             if planes.contains_key(&neighbour_id) {
                 continue;
             }
-            let (ns, nf) = find_face(&solid, neighbour_id)
-                .ok_or_else(|| format!("{op}: missing neighbour {neighbour_id}"))?;
+            let (ns, nf) = find_face(&solid, neighbour_id).ok_or_else(|| missing("neighbour", neighbour_id))?;
             let Ok(plane) = plane_of_surface(
                 &solid.shells[ns].faces[nf].surface,
                 plane_tolerance,
@@ -461,19 +468,27 @@ pub(super) fn heal_corner_blend_group(
     for strip in &group.strips {
         let [wall_a, wall_b] = strip.wall_ids();
         let line = intersect_planes(&planes[&wall_a], &planes[&wall_b]).ok_or_else(|| {
-            format!(
-                "{op}: the walls flanking blend face {} are parallel — they cannot \
+            KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "parallel_walls",
+                format!(
+                    "{op}: the walls flanking blend face {} are parallel — they cannot \
                  re-intersect into a sharp edge",
-                strip.face_id
+                    strip.face_id
+                ),
             )
         })?;
         let far_point = intersect_line_plane(&line, &planes[&strip.cap_id()])
             .filter(|point| point.sub(centre).length() <= reach)
             .ok_or_else(|| {
-                format!(
-                    "{op}: the sharp edge recovered for blend face {} does not cross the \
+                KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "cap_not_crossed",
+                    format!(
+                        "{op}: the sharp edge recovered for blend face {} does not cross the \
                      face it runs out into",
-                    strip.face_id
+                        strip.face_id
+                    ),
                 )
             })?;
         // The corner vertex is where this strip's recovered edge meets the
@@ -482,14 +497,24 @@ pub(super) fn heal_corner_blend_group(
             .iter()
             .copied()
             .find(|id| *id != wall_a && *id != wall_b)
-            .ok_or_else(|| format!("{op}: the corner's walls do not close a cycle"))?;
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Classify,
+                    "wall_cycle",
+                    format!("{op}: the corner's walls do not close a cycle"),
+                )
+            })?;
         let corner_point = intersect_line_plane(&line, &planes[&third])
             .filter(|point| point.sub(centre).length() <= reach)
             .ok_or_else(|| {
-                format!(
-                    "{op}: the sharp edge recovered for blend face {} never reaches the \
+                KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "third_wall_not_reached",
+                    format!(
+                        "{op}: the sharp edge recovered for blend face {} never reaches the \
                      corner's third wall",
-                    strip.face_id
+                        strip.face_id
+                    ),
                 )
             })?;
         plans.push(StripPlan {
@@ -508,18 +533,26 @@ pub(super) fn heal_corner_blend_group(
     for plan in &plans {
         let drift = plan.corner_point.sub(corner_point).length();
         if drift > plane_tolerance {
-            return Err(format!(
-                "{op}: the blend strips' recovered edges miss each other by {drift:.6} — \
+            return Err(KernelRefusal::ill_posed(
+                KernelStage::Classify,
+                "corner_drift",
+                format!(
+                    "{op}: the blend strips' recovered edges miss each other by {drift:.6} — \
                  the selection is not one corner"
+                ),
             ));
         }
     }
     for (index, plan) in plans.iter().enumerate() {
         if plan.far_point.sub(corner_point).length() <= tolerance {
-            return Err(format!(
-                "{op}: the sharp edge recovered for blend face {} collapses to the corner \
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "edge_collapse",
+                format!(
+                    "{op}: the sharp edge recovered for blend face {} collapses to the corner \
                  vertex",
-                group.strips[index].face_id
+                    group.strips[index].face_id
+                ),
             ));
         }
     }
@@ -545,7 +578,7 @@ pub(super) fn heal_corner_blend_group(
         let sharp_edge_id = alloc();
         sharp_edges.push(EdgeRecord {
             id: sharp_edge_id,
-            curve: make_line(plans[index].far_point, corner_point)?,
+            curve: make_line(plans[index].far_point, corner_point).or_refuse(KernelStage::Sew, "make_line")?,
             t0: 0.0,
             t1: 1.0,
             start_vertex_id: far_vertex,
@@ -564,7 +597,7 @@ pub(super) fn heal_corner_blend_group(
                 .edges
                 .iter()
                 .find(|edge| edge.id == edge_id)
-                .ok_or_else(|| format!("{op}: missing edge {edge_id}"))?;
+                .ok_or_else(|| missing("edge", edge_id))?;
             collapse.insert(edge.start_vertex_id, target);
             collapse.insert(edge.end_vertex_id, target);
         }
@@ -573,9 +606,13 @@ pub(super) fn heal_corner_blend_group(
     // be left dangling by the prune below.
     for &vertex_id in &group_vertices {
         if !collapse.contains_key(&vertex_id) {
-            return Err(format!(
-                "{op}: corner blend vertex {vertex_id} is not on a cap or corner edge \
+            return Err(KernelRefusal::internal(
+                KernelStage::Sew,
+                "vertex_unmapped",
+                format!(
+                    "{op}: corner blend vertex {vertex_id} is not on a cap or corner edge \
                  (unexpected strip ordering)"
+                ),
             ));
         }
     }
@@ -645,30 +682,44 @@ pub(super) fn heal_corner_blend_group(
         for &wall_index in &strip.walls {
             let rim_edge = strip.boundary[wall_index];
             let neighbour_id = strip.neighbours[wall_index];
-            let (ns, nf) = find_face(&solid, neighbour_id)
-                .ok_or_else(|| format!("{op}: missing wall {neighbour_id}"))?;
+            let (ns, nf) = find_face(&solid, neighbour_id).ok_or_else(|| missing("wall", neighbour_id))?;
             let face = &mut solid.shells[ns].faces[nf];
             let (loop_index, coedge_index) = locate_coedge(face, rim_edge).ok_or_else(|| {
-                format!("{op}: wall {neighbour_id} does not use edge {rim_edge}")
+                KernelRefusal::internal(
+                    KernelStage::Sew,
+                    "wall_coedge",
+                    format!("{op}: wall {neighbour_id} does not use edge {rim_edge}"),
+                )
             })?;
             let coedges = &face.loops[loop_index].coedges;
             let count = coedges.len();
             let previous = &coedges[(coedge_index + count - 1) % count];
             let next = &coedges[(coedge_index + 1) % count];
+            let unresolved = || {
+                KernelRefusal::internal(
+                    KernelStage::Sew,
+                    "loop_connectivity",
+                    format!("{op}: could not resolve loop connectivity"),
+                )
+            };
             let required_from = coedge_to_vertex(previous, &edges_by_id)
                 .map(resolve)
-                .ok_or_else(|| format!("{op}: could not resolve loop connectivity"))?;
+                .ok_or_else(unresolved)?;
             let required_to = coedge_from_vertex(next, &edges_by_id)
                 .map(resolve)
-                .ok_or_else(|| format!("{op}: could not resolve loop connectivity"))?;
+                .ok_or_else(unresolved)?;
             let forward = if required_from == far_vertex && required_to == corner_vertex {
                 true
             } else if required_from == corner_vertex && required_to == far_vertex {
                 false
             } else {
-                return Err(format!(
-                    "{op}: the recovered sharp edge does not close wall {neighbour_id}'s loop \
+                return Err(KernelRefusal::internal(
+                    KernelStage::Sew,
+                    "wall_loop",
+                    format!(
+                        "{op}: the recovered sharp edge does not close wall {neighbour_id}'s loop \
                      (unexpected connectivity)"
+                    ),
                 ));
             };
             let new_coedge = CoedgeRecord {
@@ -676,7 +727,8 @@ pub(super) fn heal_corner_blend_group(
                 edge_id: sharp_edge_id,
                 forward,
                 // Placeholder; the re-trim/refit pass below recomputes it.
-                pcurve: make_line(Vec3::default(), Vec3::new(1.0, 0.0, 0.0))?,
+                pcurve: make_line(Vec3::default(), Vec3::new(1.0, 0.0, 0.0))
+                    .or_refuse(KernelStage::Sew, "make_line")?,
             };
             face.loops[loop_index].coedges[coedge_index] = new_coedge;
         }
@@ -686,14 +738,22 @@ pub(super) fn heal_corner_blend_group(
     for strip in &group.strips {
         let cap_edge = strip.boundary[strip.cap_index];
         let neighbour_id = strip.cap_id();
-        let (ns, nf) = find_face(&solid, neighbour_id)
-            .ok_or_else(|| format!("{op}: missing cap {neighbour_id}"))?;
+        let (ns, nf) = find_face(&solid, neighbour_id).ok_or_else(|| missing("cap", neighbour_id))?;
         let face = &mut solid.shells[ns].faces[nf];
-        let (loop_index, coedge_index) = locate_coedge(face, cap_edge)
-            .ok_or_else(|| format!("{op}: cap {neighbour_id} does not use edge {cap_edge}"))?;
+        let (loop_index, coedge_index) = locate_coedge(face, cap_edge).ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Sew,
+                "cap_coedge",
+                format!("{op}: cap {neighbour_id} does not use edge {cap_edge}"),
+            )
+        })?;
         face.loops[loop_index].coedges.remove(coedge_index);
         if face.loops[loop_index].coedges.is_empty() {
-            return Err(format!("{op}: healing emptied a cap face loop"));
+            return Err(KernelRefusal::internal(
+                KernelStage::Sew,
+                "emptied_loop",
+                format!("{op}: healing emptied a cap face loop"),
+            ));
         }
     }
 
@@ -733,15 +793,15 @@ pub(super) fn heal_corner_blend_group(
     retrim_order.sort_unstable();
     for neighbour_id in retrim_order {
         let plane = &planes[&neighbour_id];
-        let (ns, nf) = find_face(&solid, neighbour_id)
-            .ok_or_else(|| format!("{op}: missing neighbour {neighbour_id}"))?;
+        let (ns, nf) = find_face(&solid, neighbour_id).ok_or_else(|| missing("neighbour", neighbour_id))?;
         retrim_planar_face(
             &mut solid.shells[ns].faces[nf],
             plane,
             &final_edges,
             scale,
             op,
-        )?;
+        )
+        ?;
         // The planar re-trim maps each edge's WHOLE curve; every edge of the
         // face that represents a strict SUBRANGE of its curve — a widened side
         // edge, but equally an untouched edge an earlier boolean trimmed —
@@ -764,8 +824,10 @@ pub(super) fn heal_corner_blend_group(
     }
     let issues = solid.validate();
     if !issues.is_empty() {
-        return Err(format!(
-            "{op}: corner blend heal failed validation: {issues:?}"
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "validation",
+            format!("{op}: corner blend heal failed validation: {issues:?}"),
         ));
     }
     Ok(solid)
@@ -819,18 +881,28 @@ fn setback_past_rim(
     other_rim: &EdgeRecord,
     wall: &TripleCarrier,
     op: &str,
-) -> Result<f64, String> {
+) -> Result<f64, KernelRefusal> {
     let (t, foot) = nearest_on_edge(rim, point)?;
-    let tangent = rim.curve.deriv1(t)?.1.normalized()?;
+    let tangent = rim
+        .curve
+        .deriv1(t)
+        .or_refuse(KernelStage::Classify, "tangent")?
+        .1
+        .normalized()
+        .or_refuse(KernelStage::Classify, "tangent")?;
     let normal = wall.normal_at(foot)?;
     let (_, across) = nearest_on_edge(other_rim, foot)?;
     let mut inward = across.sub(foot);
     inward = inward.sub(normal.scale(inward.dot(normal)));
     inward = inward.sub(tangent.scale(inward.dot(tangent)));
     let inward = inward.normalized().map_err(|_| {
-        format!(
-            "{op}: blend rim {} has no direction into its strip (its rims coincide)",
-            rim.id
+        KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "rims_coincide",
+            format!(
+                "{op}: blend rim {} has no direction into its strip (its rims coincide)",
+                rim.id
+            ),
         )
     })?;
     Ok(point.sub(foot).dot(inward))
@@ -843,13 +915,11 @@ fn strip_setback(
     point: Vec3,
     carriers: &HashMap<u64, TripleCarrier>,
     op: &str,
-) -> Result<f64, String> {
-    let edge = |id: u64| -> Result<&EdgeRecord, String> {
-        solid
-            .edges
-            .iter()
-            .find(|edge| edge.id == id)
-            .ok_or_else(|| format!("{op}: missing edge {id}"))
+) -> Result<f64, KernelRefusal> {
+    let edge = |id: u64| -> Result<&EdgeRecord, KernelRefusal> {
+        solid.edges.iter().find(|edge| edge.id == id).ok_or_else(|| {
+            KernelRefusal::internal(KernelStage::Collect, "edge", format!("{op}: missing edge {id}"))
+        })
     };
     let mut least = f64::INFINITY;
     for side in 0..2 {
@@ -881,9 +951,12 @@ fn arc_through(
     from: Vec3,
     via: Vec3,
     to: Vec3,
-) -> Result<NurbsCurve, String> {
+) -> Result<NurbsCurve, KernelRefusal> {
     let radial = from.sub(center);
-    let x_axis = radial.sub(normal.scale(radial.dot(normal))).normalized()?;
+    let x_axis = radial
+        .sub(normal.scale(radial.dot(normal)))
+        .normalized()
+        .or_refuse(KernelStage::Sew, "arc_axis")?;
     let angle = |point: Vec3, y_axis: Vec3| {
         let delta = point.sub(center);
         let theta = delta.dot(y_axis).atan2(delta.dot(x_axis));
@@ -897,7 +970,7 @@ fn arc_through(
     if angle(via, y_axis) > angle(to, y_axis) {
         y_axis = y_axis.scale(-1.0);
     }
-    crate::make_arc(center, x_axis, y_axis, radius, 0.0, angle(to, y_axis))
+    crate::make_arc(center, x_axis, y_axis, radius, 0.0, angle(to, y_axis)).or_refuse(KernelStage::Sew, "make_arc")
 }
 
 /// The piece of the walls' intersection that joins `far` to `corner` beside the
@@ -912,7 +985,7 @@ fn plan_curved_strip_edge(
     plane_tolerance: f64,
     tolerance: f64,
     op: &str,
-) -> Result<CurvedStripPlan, String> {
+) -> Result<CurvedStripPlan, KernelRefusal> {
     let mut nearest = [f64::INFINITY; 2];
     let mut plans: Vec<CurvedStripPlan> = Vec::new();
     for branch in branches {
@@ -929,10 +1002,11 @@ fn plan_curved_strip_edge(
         if on_far.distance > plane_tolerance || on_corner.distance > plane_tolerance {
             continue;
         }
-        let on_witness = project_point_to_curve(branch, witness)?;
+        let on_witness = project_point_to_curve(branch, witness).or_refuse(KernelStage::Classify, "project")?;
         let (low, high) = (on_far.u.min(on_corner.u), on_far.u.max(on_corner.u));
-        let [d0, d1] = branch.domain()?;
-        let closed = branch.evaluate(d0)?.sub(branch.evaluate(d1)?).length() <= tolerance;
+        let [d0, d1] = branch.domain().or_refuse(KernelStage::Classify, "domain")?;
+        let evaluate = |t: f64| branch.evaluate(t).or_refuse(KernelStage::Classify, "evaluate");
+        let closed = evaluate(d0)?.sub(evaluate(d1)?).length() <= tolerance;
         let inside = on_witness.u >= low && on_witness.u <= high;
         if !inside && !closed {
             continue;
@@ -969,35 +1043,51 @@ fn plan_curved_strip_edge(
                 from_far: on_far.u < on_corner.u,
             },
             None => {
-                return Err(format!(
-                    "{op}: the sharp edge recovered for blend face {} crosses the origin of \
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "origin_crossing",
+                    format!(
+                        "{op}: the sharp edge recovered for blend face {} crosses the origin of \
                      its walls' closed intersection and that intersection is not a circle \
                      (deferred)",
-                    strip.face_id
+                        strip.face_id
+                    ),
                 ))
             }
         };
         plans.push(plan);
     }
     match plans.len() {
-        0 => Err(format!(
-            "{op}: no piece of the walls' intersection beside blend face {} joins its \
+        0 => Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "no_joining_piece",
+            format!(
+                "{op}: no piece of the walls' intersection beside blend face {} joins its \
              recovered corners (nearest branch {:.3e} from the far corner and {:.3e} from the \
              corner vertex)",
-            strip.face_id, nearest[0], nearest[1]
+                strip.face_id, nearest[0], nearest[1]
+            ),
         )),
         _ => {
             // One branch found twice is one branch; two different pieces are a
             // question the strip does not answer.
-            let middle = |plan: &CurvedStripPlan| plan.curve.evaluate(0.5 * (plan.t0 + plan.t1));
+            let middle = |plan: &CurvedStripPlan| {
+                plan.curve
+                    .evaluate(0.5 * (plan.t0 + plan.t1))
+                    .or_refuse(KernelStage::Classify, "evaluate")
+            };
             let first = middle(&plans[0])?;
             for plan in &plans[1..] {
                 let other = middle(plan)?;
                 if other.sub(first).length() > plane_tolerance {
-                    return Err(format!(
-                        "{op}: two different pieces of the walls' intersection join the \
+                    return Err(KernelRefusal::ill_posed(
+                        KernelStage::Classify,
+                        "piece_ambiguous",
+                        format!(
+                            "{op}: two different pieces of the walls' intersection join the \
                          recovered corners of blend face {} — refusing rather than choosing one",
-                        strip.face_id
+                            strip.face_id
+                        ),
                     ));
                 }
             }
@@ -1020,17 +1110,20 @@ pub(super) fn heal_curved_corner_blend_group(
     source: &BrepSolid,
     group: &CornerBlendGroup,
     op: &str,
-) -> Result<(BrepSolid, CurvedCornerReport), String> {
+) -> Result<(BrepSolid, CurvedCornerReport), KernelRefusal> {
     let scale = solid_model_scale(source);
     let tolerance = (scale * 1e-7).max(1e-9);
     let plane_tolerance = (scale * 1e-6).max(1e-7);
     let debug = std::env::var("BREP_DEBUG_HEAL").is_ok();
-    let edge_of = |id: u64| -> Result<&EdgeRecord, String> {
+    let missing = |what: &'static str, id: u64| {
+        KernelRefusal::internal(KernelStage::Collect, what, format!("{op}: missing {what} {id}"))
+    };
+    let edge_of = |id: u64| -> Result<&EdgeRecord, KernelRefusal> {
         source
             .edges
             .iter()
             .find(|edge| edge.id == id)
-            .ok_or_else(|| format!("{op}: missing edge {id}"))
+            .ok_or_else(|| missing("edge", id))
     };
 
     // --- Carriers ---------------------------------------------------------
@@ -1047,22 +1140,27 @@ pub(super) fn heal_curved_corner_blend_group(
     let mut planes: HashMap<u64, Plane> = HashMap::default();
     let mut carriers: HashMap<u64, TripleCarrier> = HashMap::default();
     for &neighbour_id in &neighbour_ids {
-        let (ns, nf) = find_face(source, neighbour_id)
-            .ok_or_else(|| format!("{op}: missing neighbour {neighbour_id}"))?;
+        let (ns, nf) = find_face(source, neighbour_id).ok_or_else(|| missing("neighbour", neighbour_id))?;
         let surface = &source.shells[ns].faces[nf].surface;
         let role = if wall_ids.contains(&neighbour_id) { "wall" } else { "cap" };
         if let Ok(plane) = plane_of_surface(surface, plane_tolerance, op) {
             planes.insert(neighbour_id, plane);
         } else if surface.analytic().is_none() {
-            return Err(format!(
-                "{op}: the corner blend's {role} face {neighbour_id} is a fitted patch — the \
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "fitted_carrier",
+                format!(
+                    "{op}: the corner blend's {role} face {neighbour_id} is a fitted patch — the \
                  corner lane re-intersects analytic carriers only (deferred)"
+                ),
             ));
         }
         carriers.insert(
             neighbour_id,
             TripleCarrier::of(surface).map_err(|reason| {
-                format!("{op}: the corner blend's {role} face {neighbour_id} cannot be read ({reason})")
+                reason.with_message(|reason| {
+                    format!("{op}: the corner blend's {role} face {neighbour_id} cannot be read ({reason})")
+                })
             })?,
         );
     }
@@ -1074,9 +1172,11 @@ pub(super) fn heal_curved_corner_blend_group(
         reach,
         position_bar: plane_tolerance,
     };
-    let edge_middle = |id: u64| -> Result<Vec3, String> {
+    let edge_middle = |id: u64| -> Result<Vec3, KernelRefusal> {
         let edge = edge_of(id)?;
-        edge.curve.evaluate(0.5 * (edge.t0 + edge.t1))
+        edge.curve
+            .evaluate(0.5 * (edge.t0 + edge.t1))
+            .or_refuse(KernelStage::Classify, "evaluate")
     };
 
     // --- The corner vertex: the walls' triple point ------------------------
@@ -1098,28 +1198,36 @@ pub(super) fn heal_curved_corner_blend_group(
         sum.scale(1.0 / count.max(1) as f64)
     };
     let corner = solve_triple_point(walls, corner_seed, &policy).map_err(|refusal| {
-        format!(
-            "{op}: the corner blend's three walls ({}) do not meet at one corner near it: {}",
-            carrier_kinds(walls),
-            refusal.describe()
-        )
+        refusal.into_refusal(|reason| {
+            format!(
+                "{op}: the corner blend's three walls ({}) do not meet at one corner near it: {}",
+                carrier_kinds(walls),
+                reason
+            )
+        })
     })?;
     // The same root from every strip's own edge on the vertex blend.
     let mut seed_spread = 0.0f64;
     for strip in &group.strips {
         let seed = edge_middle(strip.boundary[strip.corner_index])?;
         let again = solve_triple_point(walls, seed, &policy).map_err(|refusal| {
-            format!(
-                "{op}: the corner blend's three walls do not meet near blend face {}'s end: {}",
-                strip.face_id,
-                refusal.describe()
-            )
+            refusal.into_refusal(|reason| {
+                format!(
+                    "{op}: the corner blend's three walls do not meet near blend face {}'s end: {}",
+                    strip.face_id,
+                    reason
+                )
+            })
         })?;
         let spread = again.point.sub(corner.point).length();
         if spread > plane_tolerance {
-            return Err(format!(
-                "{op}: the corner blend's walls meet at different corners from different seeds \
+            return Err(KernelRefusal::ill_posed(
+                KernelStage::Refine,
+                "seed_spread",
+                format!(
+                    "{op}: the corner blend's walls meet at different corners from different seeds \
                  ({spread:.3e} apart) — refusing rather than choosing one"
+                ),
             ));
         }
         seed_spread = seed_spread.max(spread);
@@ -1131,10 +1239,14 @@ pub(super) fn heal_curved_corner_blend_group(
     for strip in &group.strips {
         let setback = strip_setback(source, strip, corner_point, &carriers, op)?;
         if setback <= tolerance {
-            return Err(format!(
-                "{op}: the walls' triple point lies {setback:.3e} short of blend face {}'s rim — \
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Refine,
+                "corner_short_of_rim",
+                format!(
+                    "{op}: the walls' triple point lies {setback:.3e} short of blend face {}'s rim — \
                  it is not the corner the blend was cut from",
-                strip.face_id
+                    strip.face_id
+                ),
             ));
         }
         least_setback = least_setback.min(setback);
@@ -1149,27 +1261,37 @@ pub(super) fn heal_curved_corner_blend_group(
         ];
         let seed = edge_middle(strip.boundary[strip.cap_index])?;
         let solved = solve_triple_point(triple, seed, &policy).map_err(|refusal| {
-            format!(
-                "{op}: the walls flanking blend face {} do not meet the face it runs out into \
+            refusal.into_refusal(|reason| {
+                format!(
+                    "{op}: the walls flanking blend face {} do not meet the face it runs out into \
                  ({}): {}",
-                strip.face_id,
-                carrier_kinds(triple),
-                refusal.describe()
-            )
+                    strip.face_id,
+                    carrier_kinds(triple),
+                    reason
+                )
+            })
         })?;
         let setback = strip_setback(source, strip, solved.point, &carriers, op)?;
         if setback <= tolerance {
-            return Err(format!(
-                "{op}: the far corner recovered for blend face {} lies {setback:.3e} short of its \
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Refine,
+                "far_short_of_rim",
+                format!(
+                    "{op}: the far corner recovered for blend face {} lies {setback:.3e} short of its \
                  rim — it is not the corner the blend was cut from",
-                strip.face_id
+                    strip.face_id
+                ),
             ));
         }
         least_setback = least_setback.min(setback);
         if solved.point.sub(corner_point).length() <= tolerance {
-            return Err(format!(
-                "{op}: the sharp edge recovered for blend face {} collapses to the corner vertex",
-                strip.face_id
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Refine,
+                "curved_edge_collapse",
+                format!(
+                    "{op}: the sharp edge recovered for blend face {} collapses to the corner vertex",
+                    strip.face_id
+                ),
             ));
         }
         far.push(solved);
@@ -1189,8 +1311,8 @@ pub(super) fn heal_curved_corner_blend_group(
             extend_ruled_neighbour_over(&mut solid, neighbour_id, &reach_points, tolerance)?;
         }
     }
-    let surface_of = |solid: &BrepSolid, id: u64| -> Result<NurbsSurface, String> {
-        let (ns, nf) = find_face(solid, id).ok_or_else(|| format!("{op}: missing face {id}"))?;
+    let surface_of = |solid: &BrepSolid, id: u64| -> Result<NurbsSurface, KernelRefusal> {
+        let (ns, nf) = find_face(solid, id).ok_or_else(|| missing("face", id))?;
         Ok(solid.shells[ns].faces[nf].surface.clone())
     };
 
@@ -1204,11 +1326,15 @@ pub(super) fn heal_curved_corner_blend_group(
             (Some(_), Some(_)) => {
                 // Two planes: the exact line, long enough to carry every root
                 // the census below has to see.
-                let direction = corner_point.sub(far_point).normalized()?;
+                let direction = corner_point
+                    .sub(far_point)
+                    .normalized()
+                    .or_refuse(KernelStage::Sew, "edge_direction")?;
                 vec![make_line(
                     corner_point.sub(direction.scale(2.0 * reach)),
                     corner_point.add(direction.scale(2.0 * reach)),
-                )?]
+                )
+                .or_refuse(KernelStage::Sew, "make_line")?]
             }
             _ => intersect_analytic_pair(
                 &surface_of(&solid, wall_a)?,
@@ -1216,12 +1342,16 @@ pub(super) fn heal_curved_corner_blend_group(
                 tolerance,
             )
             .ok_or_else(|| {
-                format!(
-                    "{op}: the walls flanking blend face {} ({} × {}) have no closed-form \
+                KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "no_closed_form_walls",
+                    format!(
+                        "{op}: the walls flanking blend face {} ({} × {}) have no closed-form \
                      re-intersection (deferred)",
-                    strip.face_id,
-                    carrier_kind(&carriers[&wall_a]),
-                    carrier_kind(&carriers[&wall_b])
+                        strip.face_id,
+                        carrier_kind(&carriers[&wall_a]),
+                        carrier_kind(&carriers[&wall_b])
+                    ),
                 )
             })?,
         };
@@ -1234,10 +1364,16 @@ pub(super) fn heal_curved_corner_blend_group(
             .iter()
             .copied()
             .find(|id| *id != wall_a && *id != wall_b)
-            .ok_or_else(|| format!("{op}: the corner's walls do not close a cycle"))?;
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Classify,
+                    "curved_wall_cycle",
+                    format!("{op}: the corner's walls do not close a cycle"),
+                )
+            })?;
         let far_seed = edge_middle(strip.boundary[strip.cap_index])?;
         for branch in &branches {
-            let domain = branch.domain()?;
+            let domain = branch.domain().or_refuse(KernelStage::Classify, "domain")?;
             for (carrier_id, root, seed, is_corner) in [
                 (third, corner_point, corner_seed, true),
                 (strip.cap_id(), far_point, far_seed, false),
@@ -1263,13 +1399,17 @@ pub(super) fn heal_curved_corner_blend_group(
                     if margin <= plane_tolerance {
                         let point = |p: Vec3| format!("({:.6}, {:.6}, {:.6})", p.x, p.y, p.z);
                         let label = if is_corner { "corner vertex" } else { "far corner" };
-                        return Err(format!(
-                            "{op}: the walls flanking blend face {} reach two admissible {label}s, \
+                        return Err(KernelRefusal::ill_posed(
+                            KernelStage::Refine,
+                            "rival_root",
+                            format!(
+                                "{op}: the walls flanking blend face {} reach two admissible {label}s, \
                              {} and {}, and the second is no farther from the deleted corner \
                              ({margin:.3e}) — refusing rather than choosing one",
-                            strip.face_id,
-                            point(root),
-                            point(rival)
+                                strip.face_id,
+                                point(root),
+                                point(rival)
+                            ),
                         ));
                     }
                 }
@@ -1278,7 +1418,7 @@ pub(super) fn heal_curved_corner_blend_group(
         let witness = edge_middle(strip.boundary[strip.walls[0]])?;
         let plan = if planes.contains_key(&wall_a) && planes.contains_key(&wall_b) {
             CurvedStripPlan {
-                curve: make_line(far_point, corner_point)?,
+                curve: make_line(far_point, corner_point).or_refuse(KernelStage::Sew, "make_line")?,
                 t0: 0.0,
                 t1: 1.0,
                 from_far: true,
@@ -1343,19 +1483,30 @@ pub(super) fn heal_curved_corner_blend_group(
     }
     for &vertex_id in &group_vertices {
         if !collapse.contains_key(&vertex_id) {
-            return Err(format!(
-                "{op}: corner blend vertex {vertex_id} is not on a cap or corner edge \
+            return Err(KernelRefusal::internal(
+                KernelStage::Sew,
+                "curved_vertex_unmapped",
+                format!(
+                    "{op}: corner blend vertex {vertex_id} is not on a cap or corner edge \
                  (unexpected strip ordering)"
+                ),
             ));
         }
     }
     // Each sharp edge's ends must BE its vertices, to the incidence bar.
     for edge in &sharp_edges {
         for (t, vertex) in [(edge.t0, edge.start_vertex_id), (edge.t1, edge.end_vertex_id)] {
-            let miss = edge.curve.evaluate(t)?.sub(vertex_points[&vertex]).length();
+            let miss = edge
+                .curve
+                .evaluate(t)
+                .or_refuse(KernelStage::Sew, "evaluate")?
+                .sub(vertex_points[&vertex])
+                .length();
             if miss > plane_tolerance {
-                return Err(format!(
-                    "{op}: a recovered sharp edge ends {miss:.3e} from its corner"
+                return Err(KernelRefusal::internal(
+                    KernelStage::Sew,
+                    "edge_end_miss",
+                    format!("{op}: a recovered sharp edge ends {miss:.3e} from its corner"),
                 ));
             }
         }
@@ -1420,22 +1571,32 @@ pub(super) fn heal_curved_corner_blend_group(
         for &wall_index in &strip.walls {
             let rim_edge = strip.boundary[wall_index];
             let neighbour_id = strip.neighbours[wall_index];
-            let (ns, nf) = find_face(&solid, neighbour_id)
-                .ok_or_else(|| format!("{op}: missing wall {neighbour_id}"))?;
+            let (ns, nf) = find_face(&solid, neighbour_id).ok_or_else(|| missing("wall", neighbour_id))?;
             let face = &mut solid.shells[ns].faces[nf];
             let (loop_index, coedge_index) = locate_coedge(face, rim_edge).ok_or_else(|| {
-                format!("{op}: wall {neighbour_id} does not use edge {rim_edge}")
+                KernelRefusal::internal(
+                    KernelStage::Sew,
+                    "curved_wall_coedge",
+                    format!("{op}: wall {neighbour_id} does not use edge {rim_edge}"),
+                )
             })?;
             let coedges = &face.loops[loop_index].coedges;
             let count = coedges.len();
             let previous = &coedges[(coedge_index + count - 1) % count];
             let next = &coedges[(coedge_index + 1) % count];
+            let unresolved = || {
+                KernelRefusal::internal(
+                    KernelStage::Sew,
+                    "curved_loop_connectivity",
+                    format!("{op}: could not resolve loop connectivity"),
+                )
+            };
             let required_from = coedge_to_vertex(previous, &edges_by_id)
                 .map(resolve)
-                .ok_or_else(|| format!("{op}: could not resolve loop connectivity"))?;
+                .ok_or_else(unresolved)?;
             let required_to = coedge_from_vertex(next, &edges_by_id)
                 .map(resolve)
-                .ok_or_else(|| format!("{op}: could not resolve loop connectivity"))?;
+                .ok_or_else(unresolved)?;
             let forward = if required_from == sharp.start_vertex_id
                 && required_to == sharp.end_vertex_id
             {
@@ -1444,9 +1605,13 @@ pub(super) fn heal_curved_corner_blend_group(
             {
                 false
             } else {
-                return Err(format!(
-                    "{op}: the recovered sharp edge does not close wall {neighbour_id}'s loop \
+                return Err(KernelRefusal::internal(
+                    KernelStage::Sew,
+                    "curved_wall_loop",
+                    format!(
+                        "{op}: the recovered sharp edge does not close wall {neighbour_id}'s loop \
                      (unexpected connectivity)"
+                    ),
                 ));
             };
             face.loops[loop_index].coedges[coedge_index] = CoedgeRecord {
@@ -1454,7 +1619,8 @@ pub(super) fn heal_curved_corner_blend_group(
                 edge_id: sharp.id,
                 forward,
                 // Placeholder; the re-trim/refit pass below recomputes it.
-                pcurve: make_line(Vec3::default(), Vec3::new(1.0, 0.0, 0.0))?,
+                pcurve: make_line(Vec3::default(), Vec3::new(1.0, 0.0, 0.0))
+                    .or_refuse(KernelStage::Sew, "make_line")?,
             };
         }
     }
@@ -1463,14 +1629,22 @@ pub(super) fn heal_curved_corner_blend_group(
     for strip in &group.strips {
         let cap_edge = strip.boundary[strip.cap_index];
         let neighbour_id = strip.cap_id();
-        let (ns, nf) = find_face(&solid, neighbour_id)
-            .ok_or_else(|| format!("{op}: missing cap {neighbour_id}"))?;
+        let (ns, nf) = find_face(&solid, neighbour_id).ok_or_else(|| missing("cap", neighbour_id))?;
         let face = &mut solid.shells[ns].faces[nf];
-        let (loop_index, coedge_index) = locate_coedge(face, cap_edge)
-            .ok_or_else(|| format!("{op}: cap {neighbour_id} does not use edge {cap_edge}"))?;
+        let (loop_index, coedge_index) = locate_coedge(face, cap_edge).ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Sew,
+                "curved_cap_coedge",
+                format!("{op}: cap {neighbour_id} does not use edge {cap_edge}"),
+            )
+        })?;
         face.loops[loop_index].coedges.remove(coedge_index);
         if face.loops[loop_index].coedges.is_empty() {
-            return Err(format!("{op}: healing emptied a cap face loop"));
+            return Err(KernelRefusal::internal(
+                KernelStage::Sew,
+                "curved_emptied_loop",
+                format!("{op}: healing emptied a cap face loop"),
+            ));
         }
     }
 
@@ -1525,15 +1699,21 @@ pub(super) fn heal_curved_corner_blend_group(
             let intervals = sample_intervals(Some(&face.surface), edge, face.id, op)?;
             for sample in 0..=intervals {
                 let t = edge.t0 + (edge.t1 - edge.t0) * sample as f64 / intervals as f64;
-                let point = edge.curve.evaluate(t)?;
-                let distance = project_point_to_surface(&face.surface, point)?.distance;
+                let point = edge.curve.evaluate(t).or_refuse(KernelStage::Validate, "evaluate")?;
+                let distance = project_point_to_surface(&face.surface, point)
+                    .or_refuse(KernelStage::Validate, "project")?
+                    .distance;
                 coverage = coverage.max(distance);
                 if distance > plane_tolerance {
-                    return Err(format!(
-                        "{op}: the carrier of curved face {} does not reach recovered edge {} \
+                    return Err(KernelRefusal::unsupported(
+                        KernelStage::Validate,
+                        "carrier_short",
+                        format!(
+                            "{op}: the carrier of curved face {} does not reach recovered edge {} \
                          ({distance:.3e} off it) — refusing rather than trimming it on an \
                          extrapolation",
-                        face.id, edge.id
+                            face.id, edge.id
+                        ),
                     ));
                 }
             }
@@ -1542,8 +1722,7 @@ pub(super) fn heal_curved_corner_blend_group(
 
     // --- Re-trim planes, refit curved carriers ----------------------------
     for &neighbour_id in &neighbour_ids {
-        let (ns, nf) = find_face(&solid, neighbour_id)
-            .ok_or_else(|| format!("{op}: missing neighbour {neighbour_id}"))?;
+        let (ns, nf) = find_face(&solid, neighbour_id).ok_or_else(|| missing("neighbour", neighbour_id))?;
         let face = &mut solid.shells[ns].faces[nf];
         match planes.get(&neighbour_id) {
             Some(plane) => {
@@ -1565,8 +1744,10 @@ pub(super) fn heal_curved_corner_blend_group(
     }
     let issues = solid.validate();
     if !issues.is_empty() {
-        return Err(format!(
-            "{op}: curved corner blend heal failed validation: {issues:?}"
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "curved_validation",
+            format!("{op}: curved corner blend heal failed validation: {issues:?}"),
         ));
     }
     let report = CurvedCornerReport {

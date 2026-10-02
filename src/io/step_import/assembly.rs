@@ -27,11 +27,11 @@
 //!   lane's own `transform_brep` call reproduces `resolve_assembly`'s solids
 //!   BIT-for-bit on every single-context assembly fixture.
 //!
-//! **Units are resolved PER PRODUCT here** (`step-assembly-import.md` §3.6),
-//! not once per file. `derive_length_scale_mm` picks one global scale out of
-//! `HashMap` iteration order, which a mixed-unit assembly — each product
-//! representation carrying its own `GLOBAL_UNIT_ASSIGNED_CONTEXT` — makes both
-//! wrong and nondeterministic. See [`ProductScales`].
+//! **Units are resolved PER PRODUCT here**, not once per file.
+//! `derive_length_scale_mm` picks one global scale out of `HashMap` iteration
+//! order, which a mixed-unit assembly — each product representation carrying
+//! its own `GLOBAL_UNIT_ASSIGNED_CONTEXT` — makes both wrong and
+//! nondeterministic. See [`ProductScales`].
 
 use super::*;
 use crate::feature_pipeline::pmi::PmiState;
@@ -243,7 +243,7 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
         for body in pd_step_bodies(&entities, &resolver, pd) {
             let built = solid_cache.entry((body, scale_key)).or_insert_with(|| {
                 build_step_body(&resolver, body)
-                    .map(|solid| {
+                    .map(|(solid, _bounded)| {
                         let appearance = step_body_appearance(&resolver, &styles, body, &solid);
                         (solid, appearance)
                     })
@@ -362,7 +362,7 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
     }))
 }
 
-/// Per-product length units, memoised (`step-assembly-import.md` §3.6).
+/// Per-product length units, memoised.
 ///
 /// A product's geometry is expressed in the REPRESENTATION_CONTEXT of the shape
 /// representation that defines it, and that context carries its own unit

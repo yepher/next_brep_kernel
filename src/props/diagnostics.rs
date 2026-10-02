@@ -106,9 +106,10 @@ pub struct KernelRefusal {
 ///
 /// The first five are ARRANGEMENT DEGENERACIES — a coincident or near-tangent
 /// carrier pair made the exact arrangement structurally inconsistent — and are
-/// the only classes the boolean's Simulation-of-Simplicity retry may act on
-/// ([`RefusalClass::perturbation_eligible`]). The rest are honest refusals that
-/// a perturbation cannot and must not "fix".
+/// the only classes the boolean's Simulation-of-Simplicity retry may act on,
+/// because their [`Backing`] is undecided by a degeneracy
+/// ([`RefusalClass::backing`], [`RefusalClass::perturbation_eligible`]). The
+/// rest are honest refusals that a perturbation cannot and must not "fix".
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "class", rename_all = "snake_case")]
 pub enum RefusalClass {
@@ -133,23 +134,108 @@ pub enum RefusalClass {
     UnsupportedGeometry { what: String },
     /// A caller error: bad ids, non-finite parameters, an unusable policy.
     InvalidInput { what: String },
+    /// The operation, as specified, has no single answer and the input does
+    /// not pick one: a turned face part of which moves into the body and part
+    /// out, a carrier whose side the geometry does not decide, several drops
+    /// of a crossing that all rebuild sound. Refusing rather than choosing;
+    /// `what` is the origin's stable slug.
+    IllPosed { what: String },
+    /// The soundness scan convicted the RESULT a lane built — a face folded
+    /// through itself, two faces crossing, a hole loop that left its face —
+    /// and the repair that owns the defect declined it. Geometry, not
+    /// incidence: `validate()`'s verdict is [`Self::InvalidResultTopology`].
+    UnsoundResult {
+        defect: SoundnessDefect,
+        faces: Vec<u64>,
+    },
     /// The long tail — an internal consistency check tripped. Curated
     /// batteries assert zero of these among their expected refusals.
     Internal { what: String },
 }
 
+/// What a refusal's evidence establishes about the claim every refusal
+/// judges: "this input has a result the kernel can certify". A refusal is
+/// either REFUTED — a witness in the input itself disproves the claim, and no
+/// re-run of the construction can change that — or UNDECIDED — the
+/// construction failed to certify and the input has not been shown to be at
+/// fault. Retry policy reads this, never a list of variants: a refuted claim
+/// is never retried, and only one undecided cause is one a perturbation
+/// addresses ([`UndecidedCause::Degeneracy`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Backing {
+    /// The input refutes the claim: a bad parameter, geometry the kernel does
+    /// not model, an operation that as specified has no single answer.
+    Refuted,
+    /// The available evidence decides nothing; `cause` names what was missing.
+    Undecided { cause: UndecidedCause },
+}
+
+/// Why an undecided refusal is undecided — what the evidence lacked. The
+/// boolean's Simulation-of-Simplicity retry acts on exactly one of these.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UndecidedCause {
+    /// A coincident or near-tangent carrier pair made the exact arrangement
+    /// structurally inconsistent. A rigid perturbation of one operand lifts the
+    /// coincidence, so this is the ONE cause a retry addresses.
+    Degeneracy,
+    /// Contact / graze evidence with no boundary faces. Undecided, but a nudge
+    /// would MANUFACTURE the answer (a sliver, or nothing) rather than reveal
+    /// it, so it is never retried.
+    Contact,
+    /// An iterative lane ran out of budget.
+    Budget,
+    /// An internal consistency check tripped — a defect, kept visible rather
+    /// than retried.
+    Defect,
+}
+
+/// What the soundness scan found in a result it refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoundnessDefect {
+    /// One face carries two points of its own domain to the same 3D point.
+    Fold,
+    /// Two faces of the shell cross each other.
+    Crossing,
+    /// A hole loop is no longer contained by the face that carries it.
+    HoleBreach,
+}
+
 impl RefusalClass {
-    /// Whether the boolean's perturbation retry may act on this refusal. The
-    /// set is pinned by `refusal_retry_parity` against the former substring
-    /// matcher; widening or narrowing it is a deliberate change.
+    /// The backing of every class, exhaustively: a variant added without a
+    /// row here does not compile, so no class is retryable or not "by whoever
+    /// remembers to edit the list".
+    pub fn backing(&self) -> Backing {
+        use UndecidedCause::*;
+        match self {
+            Self::DegenerateArrangement { .. }
+            | Self::NonIntegralGenus { .. }
+            | Self::NonPositiveVolume
+            | Self::TangentNodeSingularity
+            | Self::InvalidResultTopology { .. } => Backing::Undecided { cause: Degeneracy },
+            Self::ConservativeEmptyOverlap => Backing::Undecided { cause: Contact },
+            Self::NonConvergence { .. } => Backing::Undecided { cause: Budget },
+            Self::Internal { .. } | Self::UnsoundResult { .. } => {
+                Backing::Undecided { cause: Defect }
+            }
+            Self::UnsupportedGeometry { .. }
+            | Self::InvalidInput { .. }
+            | Self::IllPosed { .. } => Backing::Refuted,
+        }
+    }
+
+    /// Whether the boolean's perturbation retry may act on this refusal: an
+    /// UNDECIDED refusal whose cause is an arrangement degeneracy, read off
+    /// [`RefusalClass::backing`]. The resulting set is pinned by
+    /// `refusal_retry_parity` against the former substring matcher and by
+    /// `backing_reproduces_the_retry_set` below; moving a class between
+    /// backings is a deliberate change.
     pub fn perturbation_eligible(&self) -> bool {
         matches!(
-            self,
-            Self::DegenerateArrangement { .. }
-                | Self::NonIntegralGenus { .. }
-                | Self::NonPositiveVolume
-                | Self::TangentNodeSingularity
-                | Self::InvalidResultTopology { .. }
+            self.backing(),
+            Backing::Undecided {
+                cause: UndecidedCause::Degeneracy
+            }
         )
     }
 
@@ -165,6 +251,8 @@ impl RefusalClass {
             Self::NonConvergence { .. } => "non_convergence",
             Self::UnsupportedGeometry { .. } => "unsupported_geometry",
             Self::InvalidInput { .. } => "invalid_input",
+            Self::IllPosed { .. } => "ill_posed",
+            Self::UnsoundResult { .. } => "unsound_result",
             Self::Internal { .. } => "internal",
         }
     }
@@ -209,6 +297,25 @@ impl KernelRefusal {
             stage,
             message,
         )
+    }
+
+    /// An operation that, as specified, has no single answer.
+    pub fn ill_posed(
+        stage: KernelStage,
+        what: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::new(RefusalClass::IllPosed { what: what.into() }, stage, message)
+    }
+
+    /// A result the soundness scan convicted.
+    pub fn unsound(
+        stage: KernelStage,
+        defect: SoundnessDefect,
+        faces: Vec<u64>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::new(RefusalClass::UnsoundResult { defect, faces }, stage, message)
     }
 
     /// An iterative lane that ran out of budget.

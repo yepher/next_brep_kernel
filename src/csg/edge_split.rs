@@ -33,9 +33,7 @@ fn subcurve_by_fraction(
     Ok(result)
 }
 
-/// Which vertex IS this split point? — the **section-endpoint correspondence
-/// decision**, and the one place `per-entity-tolerances.md`'s measured band is
-/// spent.
+/// Which vertex IS this split point?.
 ///
 /// A split point is where a section curve crossed a boundary edge. The imprint
 /// has already computed that same crossing as a junction VERTEX, from the
@@ -47,11 +45,11 @@ fn subcurve_by_fraction(
 /// it is the only way one junction ends up as one vertex.
 ///
 /// `entity_band` is that edge's own measured residual (`EntityTolerances::edge`),
-/// already capped, and it is used only to WIDEN the search for a canonical
-/// imprint vertex, never to narrow it: the historical origin-coupled band stays
-/// the floor, so every case whose edges measure clean is bit-identical. It is a
-/// search question ("which candidates might be this point?"), not an acceptance
-/// gate — `validate` still judges the assembled solid on the global band.
+/// already capped, and it widens the physical weld floor for this edge only.
+/// The floor must not grow with distance from the world origin: a rigid move
+/// cannot make two distinct junctions become one vertex. It is a search question
+/// ("which candidates might be this point?"), not an acceptance gate — `validate`
+/// still judges the assembled solid on the global band.
 ///
 /// `BREP_DEBUG_SPLIT_VERTEX=1` reports each decision and the distance to the
 /// nearest imprint junction, which is how the band was measured rather than
@@ -59,15 +57,16 @@ fn subcurve_by_fraction(
 fn claim_vertex(
     vertices: &mut Vec<VertexRecord>,
     imprint: &ImprintResultRecord,
+    edge: &EdgeRecord,
     point: Vec3,
     entity_band: f64,
     next_id: &mut u64,
 ) -> u64 {
-    // The historical band. Origin-coupled, which this kernel treats as an
-    // anti-pattern everywhere else (`tolerance::merge_scale`'s doc records why),
-    // but preserved verbatim as the FLOOR so this change cannot narrow any
-    // existing weld: correcting it is a separate question from this one.
-    let floor = 1e-5 * (1.0 + point.length());
+    // Keep a true section/cap intersection distinct from a nearby authored
+    // seam vertex, regardless of placement. The former origin-coupled floor
+    // merged fixture 30's exact crossing 1.422e-5 from its seam, and translating
+    // the same cylinders by ten units made all four operations refuse.
+    let floor: f64 = 1e-7;
     let tolerance = floor.max(if entity_band.is_finite() && entity_band > 0.0 {
         entity_band
     } else {
@@ -91,10 +90,34 @@ fn claim_vertex(
         .iter()
         .map(|vertex| (vertex.point, vertex.point.sub(point).length()))
         .min_by(|a, b| a.1.total_cmp(&b.1));
-    let canonical = nearest
-        .filter(|(_, distance)| *distance <= tolerance)
+    // A computed section endpoint can be displaced along an accurate edge
+    // by more than its carrier residual (e.g. a near-tangent root). Keep the
+    // repair search for that explicit junction, but require it to lie on this
+    // edge at identity precision. A nearby point on the opposite thin wall
+    // therefore cannot authorize moving this split across the wall.
+    let canonical = imprint.vertices.iter()
+        .map(|vertex| (vertex.point, vertex.point.sub(point).length()))
+        .filter(|(candidate, distance)| {
+            if *distance <= tolerance {
+                return true;
+            }
+            if *distance > tolerance.max(crate::tolerance::WELD_FLOOR) {
+                return false;
+            }
+            crate::project_point_to_curve(&edge.curve, *candidate).is_ok_and(|projection| {
+                projection.distance <= tolerance
+                    && projection.u >= edge.t0.min(edge.t1)
+                    && projection.u <= edge.t0.max(edge.t1)
+            })
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(candidate, _)| candidate)
         .unwrap_or(point);
+    if let Some(vertex) = vertices.iter()
+        .find(|vertex| vertex.point.sub(canonical).length() <= tolerance)
+    {
+        return vertex.id;
+    }
     if debug {
         eprintln!(
             "split-vertex ({:.7},{:.7},{:.7}) band={tolerance:.3e} entity={entity_band:.3e}: \
@@ -174,11 +197,10 @@ pub fn apply_edge_splits_with_map(
     // edges actually split. Built on the pre-split solid — the entry snapshot —
     // so nothing measured here can outlive the geometry it was taken from.
     //
-    // Floor ZERO on purpose. This function has no tolerance policy of its own
-    // (its band has always been the origin-coupled literal in `claim_vertex`,
-    // which stays the floor there), and the view's floor also drives the
-    // sampler's refinement: the tighter it is the harder the sampler looks, and
-    // zero asks for its maximum. Only the edges actually split pay that cost.
+    // Floor ZERO on purpose: measure the edge's actual residual separately
+    // from the weld floor in `claim_vertex`. The view's floor also drives the
+    // sampler's refinement: the tighter it is the harder the sampler looks,
+    // and zero asks for its maximum. Only edges actually split pay that cost.
     let mut entity = EntityTolerances::with_floor(solid, 0.0);
 
     for edge in &solid.edges {
@@ -211,6 +233,7 @@ pub fn apply_edge_splits_with_map(
             vertex_ids.push(claim_vertex(
                 &mut result.vertices,
                 imprint,
+                edge,
                 point,
                 entity_band,
                 &mut next_vertex_id,

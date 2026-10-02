@@ -1,10 +1,11 @@
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 
 /// Normalize fragment orientation before tracing the open boundary. Selection
 /// can combine independently generated carrier fragments whose `same_sense`
 /// flags are individually correct but whose shared coedges use the same
 /// direction. Propagate a consistent orientation over every connected shell.
-pub(crate) fn orient_open_solid_faces(solid: &mut BrepSolid) -> Result<(), String> {
+pub(crate) fn orient_open_solid_faces(solid: &mut BrepSolid) -> Result<(), KernelRefusal> {
     let faces = solid
         .shells
         .iter()
@@ -87,7 +88,7 @@ pub(crate) fn orient_open_solid_faces(solid: &mut BrepSolid) -> Result<(), Strin
             loop_record.coedges.reverse();
             for coedge in &mut loop_record.coedges {
                 coedge.forward = !coedge.forward;
-                coedge.pcurve = coedge.pcurve.reversed()?;
+                coedge.pcurve = coedge.pcurve.reversed().or_refuse(KernelStage::Sew, "reversed")?;
             }
         }
     }
@@ -107,7 +108,7 @@ pub(super) fn upgrade_rim_to_owner_isoline(
     owner_shell: usize,
     owner_face: usize,
     tolerance: f64,
-) -> Result<Option<(EdgeRecord, bool)>, String> {
+) -> Result<Option<(EdgeRecord, bool)>, KernelRefusal> {
     let Some(edge) = solid.edges.iter().find(|edge| edge.id == edge_id).cloned() else {
         return Ok(None);
     };
@@ -126,13 +127,13 @@ pub(super) fn upgrade_rim_to_owner_isoline(
     let Ok(iso) = owner.surface.iso_curve_v(prev_end.y) else {
         return Ok(None);
     };
-    let [iso_t0, iso_t1] = iso.domain()?;
+    let [iso_t0, iso_t1] = iso.domain().or_refuse(KernelStage::Sew, "domain")?;
     // The isoline must actually be this rim (same closed locus).
     let mut worst = 0.0f64;
     for sample in 0..=32 {
         let fraction = sample as f64 / 32.0;
-        let on_iso = iso.evaluate(iso_t0 + (iso_t1 - iso_t0) * fraction)?;
-        worst = worst.max(crate::project_point_to_curve(&edge.curve, on_iso)?.distance);
+        let on_iso = iso.evaluate(iso_t0 + (iso_t1 - iso_t0) * fraction).or_refuse(KernelStage::Sew, "evaluate")?;
+        worst = worst.max(crate::project_point_to_curve(&edge.curve, on_iso).or_refuse(KernelStage::Sew, "project_point_to_curve")?.distance);
     }
     if worst > tolerance.max(1e-3) {
         return Ok(None);
@@ -140,7 +141,7 @@ pub(super) fn upgrade_rim_to_owner_isoline(
     let owner_pcurve = crate::make_line(
         Vec3::new(prev_end.x, prev_end.y, 0.0),
         Vec3::new(next_start.x, next_start.y, 0.0),
-    )?;
+    ).or_refuse(KernelStage::Sew, "make_line")?;
     let owner_forward_new = isoline_forward(&owner_pcurve, &owner.surface, &iso)?;
     let updated = EdgeRecord {
         curve: iso,
@@ -169,7 +170,7 @@ pub(super) fn upgrade_rim_to_owner_isoline(
 /// Sew a one-use closed rim into a containing planar face as an inner loop.
 /// This repairs closed-circle/open-chain mismatches left by intersection; rims
 /// outside the face's plane and point-like pole placeholders do not qualify.
-pub(super) fn weld_coplanar_orphan_rims(solid: &mut BrepSolid, tolerance: f64) -> Result<usize, String> {
+pub(super) fn weld_coplanar_orphan_rims(solid: &mut BrepSolid, tolerance: f64) -> Result<usize, KernelRefusal> {
     let use_counts = crate::topology::edge_use_counts(solid);
     let orphan_ids = solid
         .edges
@@ -188,10 +189,10 @@ pub(super) fn weld_coplanar_orphan_rims(solid: &mut BrepSolid, tolerance: f64) -
             .iter()
             .find(|edge| edge.id == edge_id)
             .cloned()
-            .ok_or_else(|| "offset_shell: orphan rim vanished".to_string())?;
+            .ok_or_else(|| "offset_shell: orphan rim vanished".to_string()).or_refuse(KernelStage::Sew, "offset_shell_orphan_rim_vanished")?;
         // Reject true point placeholders (poles): a rim must sweep measurably
         // away from its seam vertex.
-        let anchor = edge.curve.evaluate(edge.t0)?;
+        let anchor = edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Sew, "evaluate")?;
         let sweeps = [0.25, 0.5, 0.75].into_iter().any(|fraction| {
             edge.curve
                 .evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction)
@@ -220,9 +221,9 @@ pub(super) fn weld_coplanar_orphan_rims(solid: &mut BrepSolid, tolerance: f64) -
                             .map(|coedge| (shell_index, face_index, coedge.forward))
                     })
             })
-            .ok_or_else(|| "offset_shell: orphan rim has no use".to_string())?;
+            .ok_or_else(|| "offset_shell: orphan rim has no use".to_string()).or_refuse(KernelStage::Sew, "offset_shell_orphan_rim_has_no_use")?;
         let mut wall_forward = !owner_forward;
-        let rim_mid = edge.curve.evaluate((edge.t0 + edge.t1) * 0.5)?;
+        let rim_mid = edge.curve.evaluate((edge.t0 + edge.t1) * 0.5).or_refuse(KernelStage::Sew, "evaluate")?;
         // Locate a planar face that both carries the rim and strictly contains
         // it — the opening cap the rim should hole.
         let mut target: Option<(usize, usize)> = None;
@@ -242,13 +243,13 @@ pub(super) fn weld_coplanar_orphan_rims(solid: &mut BrepSolid, tolerance: f64) -
                 if !edge_on_surface(&edge, &face.surface, tolerance)? {
                     continue;
                 }
-                let projection = project_point_to_surface(&face.surface, rim_mid)?;
+                let projection = project_point_to_surface(&face.surface, rim_mid).or_refuse(KernelStage::Sew, "project_point_to_surface")?;
                 let uv = Vec2 {
                     x: projection.u,
                     y: projection.v,
                 };
                 if projection.distance > tolerance
-                    || parameter_point_in_face(face, uv, tolerance)? == PolygonClass::Outside
+                    || parameter_point_in_face(face, uv, tolerance).or_refuse(KernelStage::Sew, "parameter_point_in_face")? == PolygonClass::Outside
                 {
                     continue;
                 }
@@ -330,26 +331,26 @@ pub(super) fn weld_coplanar_orphan_rims(solid: &mut BrepSolid, tolerance: f64) -
     Ok(welded)
 }
 
-fn flip_face_orientation(face: &mut FaceRecord) -> Result<(), String> {
+fn flip_face_orientation(face: &mut FaceRecord) -> Result<(), KernelRefusal> {
     face.same_sense = !face.same_sense;
     for loop_record in &mut face.loops {
         loop_record.coedges.reverse();
         for coedge in &mut loop_record.coedges {
             coedge.forward = !coedge.forward;
-            coedge.pcurve = coedge.pcurve.reversed()?;
+            coedge.pcurve = coedge.pcurve.reversed().or_refuse(KernelStage::Sew, "reversed")?;
         }
     }
     Ok(())
 }
 
-pub(crate) fn flip_shell_faces(shell: &mut ShellRecord) -> Result<(), String> {
+pub(crate) fn flip_shell_faces(shell: &mut ShellRecord) -> Result<(), KernelRefusal> {
     for face in &mut shell.faces {
         flip_face_orientation(face)?;
     }
     Ok(())
 }
 
-pub(crate) fn flip_all_faces(solid: &mut BrepSolid) -> Result<(), String> {
+pub(crate) fn flip_all_faces(solid: &mut BrepSolid) -> Result<(), KernelRefusal> {
     for shell in &mut solid.shells {
         flip_shell_faces(shell)?;
     }

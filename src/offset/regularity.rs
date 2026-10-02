@@ -65,6 +65,7 @@
 //! the density rules still hold: a fold has to hide inside a single knot span,
 //! below the `|δ|`-derived arc-length step, and away from the rim, to be missed.
 
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use crate::topology::FaceRecord;
 use crate::{NurbsCurve, NurbsSurface};
 
@@ -171,9 +172,9 @@ pub(crate) struct TrimRegion {
 impl TrimRegion {
     /// The whole carrier: what a face with no loops covers, and the region a
     /// caller means when it has no trim to name.
-    pub(crate) fn whole_domain(surface: &NurbsSurface) -> Result<Self, String> {
-        let [u0, u1] = surface.domain_u()?;
-        let [v0, v1] = surface.domain_v()?;
+    pub(crate) fn whole_domain(surface: &NurbsSurface) -> Result<Self, KernelRefusal> {
+        let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Classify, "domain_u")?;
+        let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Classify, "domain_v")?;
         Ok(Self {
             loops: Vec::new(),
             bounds: [u0, u1, v0, v1],
@@ -189,7 +190,7 @@ impl TrimRegion {
     pub(crate) fn from_pcurve_loops(
         surface: &NurbsSurface,
         loops: &[Vec<NurbsCurve>],
-    ) -> Result<Self, String> {
+    ) -> Result<Self, KernelRefusal> {
         let mut polylines = Vec::with_capacity(loops.len());
         for loop_curves in loops {
             let mut polyline = Vec::new();
@@ -204,7 +205,7 @@ impl TrimRegion {
     }
 
     /// A region from a face's own stored trim.
-    pub(crate) fn from_face(face: &FaceRecord) -> Result<Self, String> {
+    pub(crate) fn from_face(face: &FaceRecord) -> Result<Self, KernelRefusal> {
         let mut polylines = Vec::with_capacity(face.loops.len());
         for loop_record in &face.loops {
             let mut polyline = Vec::new();
@@ -221,9 +222,9 @@ impl TrimRegion {
     fn from_polylines(
         surface: &NurbsSurface,
         loops: Vec<Vec<[f64; 2]>>,
-    ) -> Result<Self, String> {
-        let [u0, u1] = surface.domain_u()?;
-        let [v0, v1] = surface.domain_v()?;
+    ) -> Result<Self, KernelRefusal> {
+        let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Classify, "domain_u")?;
+        let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Classify, "domain_v")?;
         if loops.is_empty() {
             return Self::whole_domain(surface);
         }
@@ -305,8 +306,8 @@ impl TrimRegion {
 /// one polynomial per span, so a span is the unit that cannot be stepped over.
 /// The last parameter is deliberately omitted — the next pcurve of the loop
 /// starts there, and a closed single-pcurve loop closes on its own.
-fn append_pcurve_polyline(curve: &NurbsCurve, into: &mut Vec<[f64; 2]>) -> Result<(), String> {
-    let [t0, t1] = curve.domain()?;
+fn append_pcurve_polyline(curve: &NurbsCurve, into: &mut Vec<[f64; 2]>) -> Result<(), KernelRefusal> {
+    let [t0, t1] = curve.domain().or_refuse(KernelStage::Classify, "domain")?;
     if !(t1 > t0) {
         return Ok(());
     }
@@ -314,7 +315,7 @@ fn append_pcurve_polyline(curve: &NurbsCurve, into: &mut Vec<[f64; 2]>) -> Resul
     let count = (8 * spans).clamp(16, 256);
     for index in 0..count {
         let t = t0 + (t1 - t0) * index as f64 / count as f64;
-        let point = curve.evaluate(t)?;
+        let point = curve.evaluate(t).or_refuse(KernelStage::Classify, "evaluate")?;
         into.push([point.x, point.y]);
     }
     Ok(())
@@ -501,13 +502,13 @@ pub(crate) fn scan_offset_regularity(
     displacements: &[f64],
     collapse_factor: f64,
     budget: ScanBudget,
-) -> Result<RegularityScan, String> {
+) -> Result<RegularityScan, KernelRefusal> {
     let mut scan = RegularityScan::default();
     let reach = displacements
         .iter()
         .fold(0.0f64, |worst, distance| worst.max(distance.abs()));
     // A plane has no curvature to read and no offset that can fold.
-    if reach == 0.0 || surface.is_affine()? {
+    if reach == 0.0 || surface.is_affine().or_refuse(KernelStage::Classify, "is_affine")? {
         return Ok(scan);
     }
     let bounds = region.bounds();
@@ -641,7 +642,7 @@ pub(crate) fn least_fold_factor(
     displacements: &[f64],
     level: f64,
     budget: ScanBudget,
-) -> Result<LeastFoldFactor, String> {
+) -> Result<LeastFoldFactor, KernelRefusal> {
     let region = TrimRegion::from_face(face)?;
     let reach = displacements
         .iter()

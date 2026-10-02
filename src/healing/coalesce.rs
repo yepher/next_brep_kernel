@@ -37,32 +37,29 @@ fn curvature_at(curve: &NurbsCurve, parameter: f64) -> Result<f64, String> {
 ///
 /// Interpolation is mathematically endpoint-interpolating, but a high-degree
 /// solve can lose several digits on long or unevenly parameterized pieces.
-/// Clamped NURBS evaluate to their first and last homogeneous control points,
-/// so restoring those two controls is exact and does not perturb the interior
-/// controls produced by the fit.
+/// Clamped NURBS evaluate to their active endpoint controls. Extra endpoint
+/// knots can leave inactive controls before or after those controls; use the
+/// evaluator's span selection to locate the controls that actually contribute.
+/// Restoring those controls leaves all other fit controls unchanged.
 fn constrain_curve_endpoints(
     mut curve: NurbsCurve,
     start: Vec3,
     end: Vec3,
 ) -> Result<NurbsCurve, String> {
     let [domain_start, domain_end] = curve.domain()?;
-    let first_weight = curve
-        .control_points
-        .first()
-        .ok_or("cannot constrain an empty curve")?
-        .w;
-    let last_weight = curve
-        .control_points
-        .last()
-        .ok_or("cannot constrain an empty curve")?
-        .w;
+    // Over-clamped vectors have inactive controls beyond their endpoint
+    // multiplicities. Anchor the controls that actually evaluate there.
+    let first = crate::curve::knot_find_span(&curve.knots, curve.degree, domain_start)
+        - curve.degree;
+    let last = crate::curve::knot_find_span(&curve.knots, curve.degree, domain_end);
+    let first_weight = curve.control_points[first].w;
+    let last_weight = curve.control_points[last].w;
     if first_weight.abs() <= 1e-15 || last_weight.abs() <= 1e-15 {
         return Err("cannot constrain a curve endpoint with zero weight".into());
     }
-    let last = curve.control_points.len() - 1;
-    curve.control_points[0].x = start.x * first_weight;
-    curve.control_points[0].y = start.y * first_weight;
-    curve.control_points[0].z = start.z * first_weight;
+    curve.control_points[first].x = start.x * first_weight;
+    curve.control_points[first].y = start.y * first_weight;
+    curve.control_points[first].z = start.z * first_weight;
     curve.control_points[last].x = end.x * last_weight;
     curve.control_points[last].y = end.y * last_weight;
     curve.control_points[last].z = end.z * last_weight;
@@ -271,6 +268,13 @@ fn replace_adjacent(
         coedges[0] = replacement;
     }
     true
+}
+
+/// An exact conic piece: a rational quadratic, the form every analytic
+/// section circle or ellipse is built in (`make_circle`), and never the form a
+/// fit takes (`fit_polyline` interpolates non-rational cubics).
+fn is_exact_conic(curve: &NurbsCurve) -> bool {
+    curve.degree == 2 && curve.control_points.iter().any(|point| (point.w - 1.0).abs() > 1e-12)
 }
 
 fn traversal_vertex_ids(edge: &EdgeRecord, coedge: &CoedgeRecord) -> (u64, u64) {
@@ -509,6 +513,20 @@ fn merge_curve_continuation_edges_impl(
                         CONTINUATION_TURN
                     };
                     if turn.abs() > band {
+                        continue;
+                    }
+                    // The band stood in for provenance — "two pieces of one
+                    // analytic circle close, two SSI fits do not" — only while
+                    // fitted pieces met with sloppy endpoint derivatives. Held
+                    // to their carriers at every mid-span (2026-09-26) they meet
+                    // inside it, and the torus collar closed into one edge the
+                    // blend layer does not chain. So a closure asks for the
+                    // provenance itself: both pieces EXACT conics.
+                    // Escape hatch BREP_CLOSE_EXACT_CONICS_ONLY=0.
+                    if closes
+                        && std::env::var("BREP_CLOSE_EXACT_CONICS_ONLY").as_deref() != Ok("0")
+                        && !(is_exact_conic(&first_edge.curve) && is_exact_conic(&second_edge.curve))
+                    {
                         continue;
                     }
                     let mut first_curve =

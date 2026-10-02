@@ -128,6 +128,130 @@ pub fn solve_collocation(
     solve_dense(matrix.to_vec(), rhs.to_vec())
 }
 
+/// A collocation matrix held as its band only: row `r` stores columns
+/// `r - bandwidth ..= r + bandwidth`, the entries [`solve_banded`]'s no-pivot
+/// elimination can read or fill. [`solve_collocation`] on a dense
+/// `(n+1)²` matrix allocates and copies O(n²) per axis for an O(n·degree²)
+/// solve; at the 2000-station ceiling of the pcurve fitters that dominated
+/// the solve (28 s of an 81 s `abc_00000011` import, 4051 builds, measured
+/// 2026-09-26). [`solve_collocation_banded`] performs the SAME operations in
+/// the same order on the same entries, so its result is bit-identical.
+pub(crate) struct CollocationBand {
+    count: usize,
+    bandwidth: usize,
+    data: Vec<f64>,
+}
+
+impl CollocationBand {
+    /// Zeroed, for `count` rows at [`solve_collocation`]'s bandwidth for
+    /// `degree`.
+    pub(crate) fn new(count: usize, degree: usize) -> Self {
+        let bandwidth = degree.max(1).min(count.saturating_sub(1).max(1));
+        CollocationBand { count, bandwidth, data: vec![0.0; count * (2 * bandwidth + 1)] }
+    }
+
+    fn slot(&self, row: usize, column: usize) -> Option<usize> {
+        let offset = column as isize - row as isize + self.bandwidth as isize;
+        (offset >= 0 && offset <= 2 * self.bandwidth as isize)
+            .then(|| row * (2 * self.bandwidth + 1) + offset as usize)
+    }
+
+    /// Store an entry; `false` when it lies outside the band (the caller then
+    /// solves densely, as [`solve_collocation`] would after its banded check).
+    pub(crate) fn set(&mut self, row: usize, column: usize, value: f64) -> bool {
+        match self.slot(row, column) {
+            Some(index) => {
+                self.data[index] = value;
+                true
+            }
+            None => value == 0.0,
+        }
+    }
+
+    fn get(&self, row: usize, column: usize) -> f64 {
+        self.slot(row, column).map_or(0.0, |index| self.data[index])
+    }
+
+    fn to_dense(&self) -> Vec<Vec<f64>> {
+        (0..self.count)
+            .map(|row| (0..self.count).map(|column| self.get(row, column)).collect())
+            .collect()
+    }
+}
+
+/// [`solve_collocation`] on a [`CollocationBand`]: the banded elimination with
+/// its in-band residual check, and the dense partial-pivoting fallback
+/// (materialised only then). Bit-identical to [`solve_collocation`] on the
+/// dense form of the same matrix.
+pub(crate) fn solve_collocation_banded(band: &CollocationBand, rhs: &[f64]) -> Result<Vec<f64>, String> {
+    let count = rhs.len();
+    if count == 0 || band.count != count {
+        return Err("solve_banded: matrix must be square and match RHS".into());
+    }
+    let bandwidth = band.bandwidth;
+    if let Ok(solution) = solve_band_storage(band, rhs) {
+        let scale = rhs
+            .iter()
+            .fold(0.0_f64, |maximum, value| maximum.max(value.abs()));
+        let tolerance = 1e-9 * scale.max(1.0);
+        let mut residual = 0.0_f64;
+        for row in 0..count {
+            let lo = row.saturating_sub(bandwidth);
+            let hi = (row + bandwidth).min(count - 1);
+            let mut accumulated = 0.0;
+            for col in lo..=hi {
+                accumulated += band.get(row, col) * solution[col];
+            }
+            residual = residual.max((accumulated - rhs[row]).abs());
+        }
+        if residual <= tolerance {
+            return Ok(solution);
+        }
+    }
+    solve_dense(band.to_dense(), rhs.to_vec())
+}
+
+fn solve_band_storage(band: &CollocationBand, rhs: &[f64]) -> Result<Vec<f64>, String> {
+    let count = rhs.len();
+    let bandwidth = band.bandwidth;
+    let width = 2 * bandwidth + 1;
+    let mut matrix = band.data.clone();
+    let mut rhs = rhs.to_vec();
+    // Row `r`, column `c` lives at `r * width + (c + bandwidth - r)`.
+    let at = |row: usize, column: usize| row * width + column + bandwidth - row;
+    for column in 0..count {
+        let pivot = matrix[at(column, column)];
+        if pivot.abs() <= 1e-300 {
+            return Err("solve_banded: singular matrix".into());
+        }
+        let maximum_row = (column + bandwidth).min(count - 1);
+        for row in column + 1..=maximum_row {
+            let factor = matrix[at(row, column)] / pivot;
+            if factor == 0.0 {
+                continue;
+            }
+            let maximum_column = (column + bandwidth).min(count - 1);
+            for entry in column..=maximum_column {
+                matrix[at(row, entry)] -= factor * matrix[at(column, entry)];
+            }
+            rhs[row] -= factor * rhs[column];
+        }
+    }
+    let mut result = vec![0.0; count];
+    for row in (0..count).rev() {
+        let mut value = rhs[row];
+        let maximum_column = (row + bandwidth).min(count - 1);
+        for column in row + 1..=maximum_column {
+            value -= matrix[at(row, column)] * result[column];
+        }
+        if matrix[at(row, row)].abs() <= 1e-300 {
+            return Err("solve_banded: singular matrix".into());
+        }
+        result[row] = value / matrix[at(row, row)];
+    }
+    Ok(result)
+}
+
 pub fn solve_banded(
     matrix: &[Vec<f64>],
     rhs: &[f64],
@@ -274,20 +398,28 @@ pub fn interpolate_curve(
         knots[j + degree] = parameters[j..j + degree].iter().sum::<f64>() / degree as f64;
     }
     let knot_vector = KnotVector::new(knots.clone(), degree)?;
-    let mut matrix = vec![vec![0.0; n + 1]; n + 1];
+    // The band alone ([`CollocationBand`]); the dense matrix only when a basis
+    // value falls outside it, which the dense banded solve could not use either.
+    let mut band = CollocationBand::new(n + 1, degree);
+    let mut dense: Option<Vec<Vec<f64>>> = None;
     for (row, &parameter) in parameters.iter().enumerate() {
         let span = knot_vector.find_span(parameter);
         let basis = knot_vector.basis_functions(span, parameter);
         for (offset, value) in basis.into_iter().enumerate() {
-            matrix[row][span - degree + offset] = value;
+            let column = span - degree + offset;
+            if !band.set(row, column, value) {
+                dense.get_or_insert_with(|| band.to_dense())[row][column] = value;
+            } else if let Some(dense) = dense.as_mut() {
+                dense[row][column] = value;
+            }
         }
     }
     let solve_axis = |axis: fn(Vec3) -> f64| {
-        solve_collocation(
-            &matrix,
-            &points.iter().copied().map(axis).collect::<Vec<_>>(),
-            degree,
-        )
+        let rhs = points.iter().copied().map(axis).collect::<Vec<_>>();
+        match &dense {
+            Some(matrix) => solve_collocation(matrix, &rhs, degree),
+            None => solve_collocation_banded(&band, &rhs),
+        }
     };
     let xs = solve_axis(|point| point.x)?;
     let ys = solve_axis(|point| point.y)?;
@@ -998,15 +1130,37 @@ fn fit_rung(
     arc: &[f64],
     maximum_points: usize,
     local_interpolation: bool,
+    degree: usize,
 ) -> Result<(NurbsCurve, Vec<usize>, Vec<f64>, f64, f64, f64), String> {
     let stations = decimate_stations(pool, maximum_points);
+    fit_station_set(points, stations, arc, local_interpolation, degree)
+}
+
+fn fit_station_set(
+    points: &[Vec3],
+    stations: Vec<usize>,
+    arc: &[f64],
+    local_interpolation: bool,
+    degree: usize,
+) -> Result<(NurbsCurve, Vec<usize>, Vec<f64>, f64, f64, f64), String> {
     let parameters = station_parameters(points, &stations)
         .ok_or_else(|| "fit_polyline: degenerate polyline".to_string())?;
     let kept = stations.iter().map(|index| points[*index]).collect::<Vec<_>>();
+    // A run that closes on itself is fitted PERIODICALLY on the global lane:
+    // an open interpolant errs most at its ends, and a closed run's ends are
+    // the march's origin, not a feature of the curve.
+    let closed = kept.len() > degree + 1
+        && kept[0].sub(kept[kept.len() - 1]).length() <= 1e-12 * (1.0 + kept[0].length());
     let curve = if local_interpolation {
         interpolate_curve_local(&kept, &parameters, 1.0)?
+    } else if closed
+        && degree > 3
+        && degree % 2 == 1
+        && std::env::var("BREP_SECTION_FIT_PERIODIC").as_deref() != Ok("0")
+    {
+        interpolate_curve_closed_of_degree(&kept[..kept.len() - 1], &parameters, degree)?
     } else {
-        interpolate_curve(&kept, 3usize.min(kept.len() - 1), &parameters)?
+        interpolate_curve(&kept, degree.min(kept.len() - 1), &parameters)?
     };
     let (deviation, rms, between) =
         measure_polyline_fit(&curve, points, &stations, &parameters, arc)?;
@@ -1026,7 +1180,7 @@ pub fn fit_polyline_at(
     maximum_points: usize,
     local_interpolation: bool,
 ) -> Result<PolylineFit, String> {
-    let fit = fit_polyline_inner(points, tolerance, maximum_points, local_interpolation, false)?;
+    let fit = fit_polyline_inner(points, tolerance, maximum_points, local_interpolation, false, 3)?;
     record_polyline_fit(&fit.report);
     Ok(fit)
 }
@@ -1085,14 +1239,46 @@ pub fn fit_polyline(
     maximum_points: usize,
     local_interpolation: bool,
 ) -> Result<PolylineFit, String> {
+    fit_polyline_of_degree(points, tolerance, maximum_points, local_interpolation, 3)
+}
+
+/// [`fit_polyline`] with the GLOBAL lane's interpolation degree chosen by the
+/// caller (the local lane is cubic Hermite whatever is asked). A marched
+/// section's stations lie on both carriers to the march's residual, and a
+/// degree-`p` interpolant through them errs by O(h^(p+1)) between stations: on
+/// `BadBoolean`'s sphere×bore rim at its own 135 stations the cubic sits
+/// 2.5e-7 off a carrier with a mean signed bias of −1.2e-8, the quintic 8.5e-9
+/// and +6e-11 — the SAME stations, knots and control-point count, so nothing
+/// downstream that samples per knot pays for it (2026-09-27).
+pub fn fit_polyline_of_degree(
+    points: &[Vec3],
+    tolerance: f64,
+    maximum_points: usize,
+    local_interpolation: bool,
+    degree: usize,
+) -> Result<PolylineFit, String> {
+    fit_polyline_of_degree_with_recovery(points, tolerance, maximum_points, local_interpolation, degree)
+        .map(|(fit, _)| fit)
+}
+
+/// Internal provenance for the SSI caller: recovering fidelity to the march
+/// points does not establish accuracy between them against the carriers.
+/// Keep this out of the public fit/report API.
+pub(crate) fn fit_polyline_of_degree_with_recovery(
+    points: &[Vec3],
+    tolerance: f64,
+    maximum_points: usize,
+    local_interpolation: bool,
+    degree: usize,
+) -> Result<(PolylineFit, bool), String> {
     let refine = std::env::var("BREP_POLYLINE_FIT_REFINE").as_deref() != Ok("0");
-    let asked = fit_polyline_inner(points, tolerance, maximum_points, local_interpolation, refine)?;
+    let asked = fit_polyline_inner(points, tolerance, maximum_points, local_interpolation, refine, degree)?;
     if asked.report.met_tolerance() || !refine {
         record_polyline_fit(&asked.report);
-        return Ok(asked);
+        return Ok((asked, false));
     }
     let mut other =
-        fit_polyline_inner(points, tolerance, maximum_points, !local_interpolation, refine)?;
+        fit_polyline_inner(points, tolerance, maximum_points, !local_interpolation, refine, degree)?;
     let spent = asked.report.rungs + other.report.rungs;
     let mut best = if other.report.deviation < asked.report.deviation {
         other.report.lane_switched = true;
@@ -1100,10 +1286,92 @@ pub fn fit_polyline(
     } else {
         asked
     };
-    // Every rung of BOTH ladders was paid for, whichever curve is returned.
+    // Uniform decimation can spend its whole budget away from a short,
+    // highly curved part of the run. Retry a missed fit by adding the worst
+    // eligible station per span, within the same station ceiling. Only a
+    // measured converged fit replaces the already available fallback.
+    let mut spent = spent;
+    let mut recovered = false;
+    if !best.report.met_tolerance() {
+        let (adaptive, rounds) = fit_polyline_adaptive(points, tolerance, maximum_points, degree)?;
+        spent += rounds;
+        if let Some(mut adaptive) = adaptive {
+            adaptive.report.lane_switched = local_interpolation;
+            best = adaptive;
+            recovered = true;
+        }
+    }
+    // Include discarded attempts in the work ledger.
     best.report.rungs = spent;
     record_polyline_fit(&best.report);
-    Ok(best)
+    Ok((best, recovered))
+}
+
+/// Redistribute the existing station budget after both uniform ladders miss.
+/// Measurements still include every input point, not just eligible stations.
+/// This proves fidelity to the sampled run, not accuracy between march points.
+fn fit_polyline_adaptive(
+    points: &[Vec3],
+    tolerance: f64,
+    maximum_points: usize,
+    degree: usize,
+) -> Result<(Option<PolylineFit>, usize), String> {
+    let pool = station_pool(points, tolerance);
+    let arc = cumulative_chord(points);
+    let band = dropped_band(points, &pool);
+    let floor = tolerance.max(band);
+    let budget = maximum_points.max(2);
+    let ceiling = pool.len().min(MAX_FIT_STATIONS)
+        .min(budget.saturating_mul(LADDER_BUDGET_FACTOR)).max(budget);
+    let mut stations = decimate_stations(&pool, budget);
+    // Limit work independently of the station ceiling. A difficult run keeps
+    // the existing measured fallback when this recovery does not converge.
+    for round in 0..=8 {
+        let Ok((curve, current, parameters, deviation, rms, between)) =
+            fit_station_set(points, stations, &arc, false, degree)
+        else { return Ok((None, round + 1)); };
+        stations = current;
+        if deviation <= floor {
+            let report = PolylineFitReport {
+                deviation, rms, between_stations: between, tolerance, floor,
+                stations: stations.len(), controls: curve.control_points.len(),
+                input_points: points.len(), pool_points: pool.len(), dropped_band: band,
+                rungs: round + 1, local_lane: false, lane_switched: false,
+                exit: PolylineFitExit::Converged,
+            };
+            return Ok((Some(PolylineFit {
+                curve, parameters, kept: stations.iter().map(|&i| points[i]).collect(), report,
+            }), round + 1));
+        }
+        if stations.len() >= ceiling || round == 8 { return Ok((None, round + 1)); }
+        let mut candidates = Vec::new();
+        for span in 0..stations.len() - 1 {
+            let (from, to) = (stations[span], stations[span + 1]);
+            let (t0, t1) = (parameters[span], parameters[span + 1]);
+            let lower = parameters[span.saturating_sub(1)];
+            let upper = parameters[(span + 2).min(stations.len() - 1)];
+            let mut candidate: Option<(usize, f64)> = None;
+            for &index in pool.iter().filter(|&&i| i > from && i < to) {
+                let length = arc[to] - arc[from];
+                let seed = if length > 0.0 {
+                    t0 + (t1 - t0) * (arc[index] - arc[from]) / length
+                } else { t0 };
+                let error = distance_to_curve_near(&curve, points[index], seed, lower, upper)?;
+                if candidate.is_none_or(|(_, previous)| error > previous) {
+                    candidate = Some((index, error));
+                }
+            }
+            if let Some((index, error)) = candidate {
+                if error > floor { candidates.push((index, error)); }
+            }
+        }
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let added = candidates.len().min(16).min(ceiling - stations.len());
+        if added == 0 { return Ok((None, round + 1)); }
+        stations.extend(candidates.iter().take(added).map(|&(index, _)| index));
+        stations.sort_unstable();
+    }
+    unreachable!("the bounded refinement returns on its last round")
 }
 
 fn fit_polyline_inner(
@@ -1112,6 +1380,7 @@ fn fit_polyline_inner(
     maximum_points: usize,
     local_interpolation: bool,
     refine: bool,
+    degree: usize,
 ) -> Result<PolylineFit, String> {
     let pool = station_pool(points, tolerance);
     if pool.len() < 2 {
@@ -1127,7 +1396,7 @@ fn fit_polyline_inner(
         .min(budget.saturating_mul(LADDER_BUDGET_FACTOR))
         .max(budget);
     let (mut curve, mut stations, mut parameters, mut deviation, mut rms, mut between) =
-        fit_rung(points, &pool, &arc, budget, local_interpolation)?;
+        fit_rung(points, &pool, &arc, budget, local_interpolation, degree)?;
     let mut rungs = 1usize;
     let mut exit = if deviation <= floor {
         PolylineFitExit::Converged
@@ -1144,7 +1413,7 @@ fn fit_polyline_inner(
             break;
         }
         budget = (budget * 2).min(ceiling);
-        let rung = fit_rung(points, &pool, &arc, budget, local_interpolation)?;
+        let rung = fit_rung(points, &pool, &arc, budget, local_interpolation, degree)?;
         rungs += 1;
         if rung.3 >= deviation * STALL_FACTOR {
             if rung.3 < deviation {
@@ -1444,10 +1713,25 @@ fn raw_insert_knot(knots: &mut Vec<f64>, controls: &mut Vec<Vec3>, degree: usize
 /// domain ends to full multiplicity — the representation every kernel
 /// consumer expects — so the seam is C² by construction, not by welding.
 pub fn interpolate_curve_closed(points: &[Vec3], parameters: &[f64]) -> Result<NurbsCurve, String> {
-    let degree = 3usize;
+    interpolate_curve_closed_of_degree(points, parameters, 3)
+}
+
+/// [`interpolate_curve_closed`] at an odd `degree` (3 or 5): the cyclic knot
+/// line carries `degree` knots either side of the period, and interpolating at
+/// the knots is well posed for an odd degree. A closed marched section fitted
+/// OPEN errs most at its ends — the march's origin, where the loop was cut —
+/// and that end error is what the periodic fit removes (2026-09-27).
+pub fn interpolate_curve_closed_of_degree(
+    points: &[Vec3],
+    parameters: &[f64],
+    degree: usize,
+) -> Result<NurbsCurve, String> {
+    if degree % 2 == 0 || degree < 3 {
+        return Err("interpolate_curve_closed: the degree must be odd and at least 3".into());
+    }
     let station_count = points.len();
-    if station_count < 4 {
-        return Err("interpolate_curve_closed: need at least 4 stations".into());
+    if station_count < degree + 1 {
+        return Err("interpolate_curve_closed: need more stations than the degree".into());
     }
     if parameters.len() != station_count + 1 {
         return Err(
@@ -1458,24 +1742,24 @@ pub fn interpolate_curve_closed(points: &[Vec3], parameters: &[f64]) -> Result<N
         return Err("interpolate_curve_closed: parameters must increase".into());
     }
     let period = parameters[station_count] - parameters[0];
-    // Cyclic knot line u_j = t_{j mod S} + floor(j/S)·T for j in −3..S+4,
-    // stored with offset 3: raw[k] = u_{k−3}.
+    // Cyclic knot line u_j = t_{j mod S} + floor(j/S)·T for j in −p..S+p,
+    // stored with offset p (the degree): raw[k] = u_{k−p}.
     let cyclic = |j: i64| -> f64 {
         let s = station_count as i64;
         let wrap = j.div_euclid(s);
         parameters[j.rem_euclid(s) as usize] + wrap as f64 * period
     };
-    let raw_knots: Vec<f64> = (-3..=(station_count as i64 + 3)).map(cyclic).collect();
+    let raw_knots: Vec<f64> = (-(degree as i64)..=(station_count as i64 + degree as i64)).map(cyclic).collect();
     // Collocation: row i evaluates the cubic basis at t_i; the span in the
-    // raw array is the one containing t_i (raw index i+3 == u_i).
+    // raw array is the one containing t_i (raw index i+p == u_i).
     let mut matrix = vec![vec![0.0; station_count]; station_count];
     for i in 0..station_count {
-        let span = i + 3;
+        let span = i + degree;
         let basis = raw_basis(&raw_knots, degree, span, parameters[i]);
         for (offset, value) in basis.iter().enumerate() {
             // Control j = span − degree + offset in unclamped indexing, i.e.
-            // cyclic control (i + offset − 3) mod S.
-            let index = (i as i64 + offset as i64 - 3).rem_euclid(station_count as i64) as usize;
+            // cyclic control (i + offset − p) mod S.
+            let index = (i as i64 + offset as i64 - degree as i64).rem_euclid(station_count as i64) as usize;
             matrix[i][index] += value;
         }
     }
@@ -1491,8 +1775,8 @@ pub fn interpolate_curve_closed(points: &[Vec3], parameters: &[f64]) -> Result<N
     let cyclic_controls: Vec<Vec3> = (0..station_count)
         .map(|index| Vec3::new(xs[index], ys[index], zs[index]))
         .collect();
-    // Window covering [t_0, t_S]: controls D_{−3..S−1} cyclically.
-    let mut window_controls: Vec<Vec3> = (-3..(station_count as i64))
+    // Window covering [t_0, t_S]: controls D_{−p..S−1} cyclically.
+    let mut window_controls: Vec<Vec3> = (-(degree as i64)..(station_count as i64))
         .map(|j| cyclic_controls[j.rem_euclid(station_count as i64) as usize])
         .collect();
     let mut window_knots = raw_knots.clone();

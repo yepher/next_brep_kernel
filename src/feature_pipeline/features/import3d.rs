@@ -270,11 +270,11 @@ fn stamp_color(name: &str, color: ImportedColor) {
     scene_metadata::merge_record(name, &record, false);
 }
 
-/// The naming half of [`add_named_bodies`]: stamp body + face names onto
-/// `solids` IN PLACE and return the body name chosen for each, WITHOUT
-/// registering anything. Shared by the live import lanes and the payload encoder
+/// The naming half of [`add_named_bodies`]: stamp body + face names onto `solids`
+/// IN PLACE and return the body name chosen for each, WITHOUT registering
+/// anything. Shared by the live import lanes and the payload encoder
 /// [`native_import_payload`], so an imported part is named identically however it
-/// arrived (kernel-plan `step-assembly-import.md` §3.1).
+/// arrived.
 fn stamp_imported_names(solids: &mut [BrepSolid], feature_name: &str) -> Vec<String> {
     let body_names = imported_solid_names(solids.len(), feature_name);
     let multi_body = solids.len() > 1;
@@ -339,7 +339,7 @@ pub(crate) fn imported_solid_names(count: usize, feature_name: &str) -> Vec<Stri
 ///
 /// GENERIC, not STEP-specific: any producer of finished `BrepSolid`s that wants
 /// them to become an IMPORT3D part document uses this (the STEP-assembly import
-/// lane is the first caller — kernel-plan `step-assembly-import.md` §3.1/§3.2).
+/// lane is the first caller).
 ///
 /// The two passes after the stamping are `register_added`'s name-FINALIZING half
 /// ([`common::ensure_unique_face_names`] + [`common::stamp_derived_edge_names`]),

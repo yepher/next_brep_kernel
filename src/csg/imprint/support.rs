@@ -794,7 +794,10 @@ pub(super) fn curve_lies_on_surface(
     tolerance: f64,
 ) -> Result<bool, KernelRefusal> {
     let [start, end] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
-    let scaled_tolerance = (tolerance * 100.0).max(2e-5);
+    // This curve is being offered as lying on another carrier. A short
+    // grazing contact is not a shared section, and translating the operands
+    // must not enlarge that geometric allowance.
+    let carrier_tolerance = tolerance.max(1e-7);
     for fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
         let point = curve
             .evaluate(start + (end - start) * fraction)
@@ -802,7 +805,7 @@ pub(super) fn curve_lies_on_surface(
         if project_point_to_surface(surface, point)
             .or_refuse(KernelStage::Intersect, "project_point_to_surface")?
             .distance
-            > scaled_tolerance * (1.0 + point.length())
+            > carrier_tolerance
         {
             return Ok(false);
         }
@@ -1076,6 +1079,11 @@ pub(super) enum IsoOutcome {
     RootAgreement,
     /// The iso-curve failed `curve_lies_on_surface` against the plane.
     OffPlane,
+    /// The iso-curve collapses to a point: every ruling meets the plane at a
+    /// shared pole (a cone whose apex lies in the plane). That point is not
+    /// the section — a plane through a cone's apex cuts it along rulings —
+    /// so the lane declines and the analytic/marched lanes answer.
+    Pole,
     Curve(NurbsCurve),
 }
 
@@ -1086,6 +1094,7 @@ impl IsoOutcome {
             IsoOutcome::Root => "root",
             IsoOutcome::RootAgreement => "root_agreement",
             IsoOutcome::OffPlane => "off_plane",
+            IsoOutcome::Pole => "pole",
             IsoOutcome::Curve(_) => "curve",
         }
     }
@@ -1217,6 +1226,21 @@ pub(super) fn planar_linear_iso_direction(
             .iso_curve_u(u_domain[0] + (u_domain[1] - u_domain[0]) * root)
             .or_refuse(KernelStage::Intersect, "iso_curve_u")?
     };
+    let anchor = curve
+        .control_points
+        .first()
+        .and_then(|control| control.point().ok());
+    if let Some(anchor) = anchor {
+        let collapsed = curve.control_points.iter().all(|control| {
+            control
+                .point()
+                .map(|point| point.sub(anchor).length() <= tolerance)
+                .unwrap_or(false)
+        });
+        if collapsed {
+            return Ok(IsoOutcome::Pole);
+        }
+    }
     if !curve_lies_on_surface(&curve, plane, tolerance)? {
         return Ok(IsoOutcome::OffPlane);
     }

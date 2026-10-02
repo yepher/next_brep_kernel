@@ -738,6 +738,7 @@ fn revolve_full(
         });
     }
     let solid = BrepSolid {
+        mass_properties_cache: Default::default(),
         id: next_id(&mut counter),
         vertices,
         edges,
@@ -1006,6 +1007,7 @@ fn revolve_partial(
     });
 
     let solid = BrepSolid {
+        mass_properties_cache: Default::default(),
         id: next_id(&mut counter),
         vertices,
         edges,

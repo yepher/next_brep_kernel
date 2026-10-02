@@ -1,4 +1,5 @@
 use super::*;
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 
 pub(super) use crate::offset_retrim::{plane_of_surface, Plane, PARALLEL_EPS};
 
@@ -40,7 +41,7 @@ pub(super) fn finish_intrinsic_face_offset(
     rebuilt_edges: &HashMap<u64, (NurbsCurve, f64, f64)>,
     rebuilt_vertices: &HashMap<u64, Vec3>,
     operation: &str,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let (shell_index, face_index) = face_location;
     let mut result = solid.clone();
     result.shells[shell_index].faces[face_index].surface = offset;
@@ -58,13 +59,19 @@ pub(super) fn finish_intrinsic_face_offset(
     }
     let issues = result.validate();
     if !issues.is_empty() {
-        return Err(format!(
-            "{operation}: pushed solid failed validation: {issues:?}"
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "validation",
+            format!("{operation}: pushed solid failed validation: {issues:?}"),
         ));
     }
     if let (Ok(before), Ok(after)) = (solid_signed_volume(solid), solid_signed_volume(&result)) {
         if before * after <= 0.0 {
-            return Err(format!("{operation}: the push inverts the solid — refusing"));
+            return Err(KernelRefusal::input(
+                KernelStage::Validate,
+                INVERTED,
+                format!("{operation}: the push inverts the solid — refusing"),
+            ));
         }
     }
     Ok(result)
@@ -83,7 +90,7 @@ pub(super) fn find_face(solid: &BrepSolid, face_id: u64) -> Option<(usize, usize
 
 /// The one face (other than `exclude`) that uses `edge_id`. Errs unless the
 /// edge is shared by exactly one other face (manifold interior edge).
-pub(super) fn other_face_of_edge(solid: &BrepSolid, edge_id: u64, exclude: u64) -> Result<u64, String> {
+pub(super) fn other_face_of_edge(solid: &BrepSolid, edge_id: u64, exclude: u64) -> Result<u64, KernelRefusal> {
     let mut found: Option<u64> = None;
     for shell in &solid.shells {
         for face in &shell.faces {
@@ -97,8 +104,10 @@ pub(super) fn other_face_of_edge(solid: &BrepSolid, edge_id: u64, exclude: u64) 
                 .any(|coedge| coedge.edge_id == edge_id);
             if uses {
                 if found.is_some_and(|other| other != face.id) {
-                    return Err(format!(
-                        "delete_face_and_heal: edge {edge_id} is shared by more than two faces"
+                    return Err(KernelRefusal::unsupported(
+                        KernelStage::Collect,
+                        "non_manifold_edge",
+                        format!("delete_face_and_heal: edge {edge_id} is shared by more than two faces"),
                     ));
                 }
                 found = Some(face.id);
@@ -106,17 +115,27 @@ pub(super) fn other_face_of_edge(solid: &BrepSolid, edge_id: u64, exclude: u64) 
         }
     }
     found.ok_or_else(|| {
-        format!("delete_face_and_heal: boundary edge {edge_id} has no opposite face")
+        KernelRefusal::unsupported(
+            KernelStage::Collect,
+            "open_edge",
+            format!("delete_face_and_heal: boundary edge {edge_id} has no opposite face"),
+        )
     })
 }
 
-pub(super) fn edge_point(solid: &BrepSolid, vertex_id: u64) -> Result<Vec3, String> {
+pub(super) fn edge_point(solid: &BrepSolid, vertex_id: u64) -> Result<Vec3, KernelRefusal> {
     solid
         .vertices
         .iter()
         .find(|vertex| vertex.id == vertex_id)
         .map(|vertex| vertex.point)
-        .ok_or_else(|| format!("delete_face_and_heal: missing vertex {vertex_id}"))
+        .ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Collect,
+                "vertex",
+                format!("delete_face_and_heal: missing vertex {vertex_id}"),
+            )
+        })
 }
 
 pub(super) fn intersect_planes(a: &Plane, b: &Plane) -> Option<Line> {
@@ -177,30 +196,31 @@ pub(super) fn pending_edge_relocations(
 }
 
 /// The point of an edge's represented range nearest `point`.
-pub(super) fn nearest_on_edge(edge: &EdgeRecord, point: Vec3) -> Result<(f64, Vec3), String> {
-    let projection = project_point_to_curve(&edge.curve, point)?;
+pub(super) fn nearest_on_edge(edge: &EdgeRecord, point: Vec3) -> Result<(f64, Vec3), KernelRefusal> {
+    let projection = project_point_to_curve(&edge.curve, point).or_refuse(KernelStage::Classify, "project")?;
     let (low, high) = (edge.t0.min(edge.t1), edge.t0.max(edge.t1));
     let t = projection.u.clamp(low, high);
-    Ok((t, edge.curve.evaluate(t)?))
+    Ok((t, edge.curve.evaluate(t).or_refuse(KernelStage::Classify, "evaluate")?))
 }
 
 /// The shortest world length of a knot span along the four boundary curves of
 /// `surface`, spans of zero length (a pole) left out.
-fn shortest_boundary_span(surface: &NurbsSurface) -> Result<Option<f64>, String> {
+fn shortest_boundary_span(surface: &NurbsSurface) -> Result<Option<f64>, KernelRefusal> {
     const STEPS: usize = 8;
-    let [u0, u1] = surface.domain_u()?;
-    let [v0, v1] = surface.domain_v()?;
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Classify, "domain")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Classify, "domain")?;
     let breaks = |knots: &[f64], low: f64, high: f64| -> Vec<f64> {
         let mut values: Vec<f64> = knots.iter().copied().filter(|knot| *knot >= low && *knot <= high).collect();
         values.dedup_by(|a, b| (*a - *b).abs() <= 1e-12 * (high - low));
         values
     };
     let mut lengths: Vec<f64> = Vec::new();
-    let mut span = |at: &dyn Fn(f64) -> Result<Vec3, String>, low: f64, high: f64| -> Result<(), String> {
+    let mut span = |at: &dyn Fn(f64) -> Result<Vec3, String>, low: f64, high: f64| -> Result<(), KernelRefusal> {
         let mut length = 0.0f64;
-        let mut previous = at(low)?;
+        let mut previous = at(low).or_refuse(KernelStage::Classify, "evaluate")?;
         for step in 1..=STEPS {
-            let point = at(low + (high - low) * step as f64 / STEPS as f64)?;
+            let point = at(low + (high - low) * step as f64 / STEPS as f64)
+                .or_refuse(KernelStage::Classify, "evaluate")?;
             length += point.sub(previous).length();
             previous = point;
         }
@@ -222,9 +242,9 @@ fn shortest_boundary_span(surface: &NurbsSurface) -> Result<Option<f64>, String>
 /// The shortest world length of a knot span of `edge`'s own curve among the spans
 /// its range touches. Each span is measured WHOLE, so a range that stops just
 /// past a knot does not read as a tiny span.
-fn shortest_edge_span(edge: &EdgeRecord) -> Result<Option<f64>, String> {
+fn shortest_edge_span(edge: &EdgeRecord) -> Result<Option<f64>, KernelRefusal> {
     const STEPS: usize = 8;
-    let [d0, d1] = edge.curve.domain()?;
+    let [d0, d1] = edge.curve.domain().or_refuse(KernelStage::Classify, "domain")?;
     let (low, high) = (edge.t0.min(edge.t1), edge.t0.max(edge.t1));
     let mut knots: Vec<f64> = edge.curve.knots.iter().copied().filter(|knot| *knot >= d0 && *knot <= d1).collect();
     knots.dedup_by(|a, b| (*a - *b).abs() <= 1e-12 * (d1 - d0));
@@ -234,9 +254,12 @@ fn shortest_edge_span(edge: &EdgeRecord) -> Result<Option<f64>, String> {
             continue;
         }
         let mut length = 0.0f64;
-        let mut previous = edge.curve.evaluate(pair[0])?;
+        let mut previous = edge.curve.evaluate(pair[0]).or_refuse(KernelStage::Classify, "evaluate")?;
         for step in 1..=STEPS {
-            let point = edge.curve.evaluate(pair[0] + (pair[1] - pair[0]) * step as f64 / STEPS as f64)?;
+            let point = edge
+                .curve
+                .evaluate(pair[0] + (pair[1] - pair[0]) * step as f64 / STEPS as f64)
+                .or_refuse(KernelStage::Classify, "evaluate")?;
             length += point.sub(previous).length();
             previous = point;
         }
@@ -281,7 +304,7 @@ pub(super) fn sample_intervals(
     edge: &EdgeRecord,
     face_id: u64,
     op: &str,
-) -> Result<usize, String> {
+) -> Result<usize, KernelRefusal> {
     const FLOOR: usize = 8;
     const PER_SPAN: f64 = 4.0;
     const CAP: usize = 4096;
@@ -297,20 +320,27 @@ pub(super) fn sample_intervals(
         (None, None) => return Ok(FLOOR),
     };
     let mut length = 0.0f64;
-    let mut previous = edge.curve.evaluate(edge.t0)?;
+    let mut previous = edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Classify, "evaluate")?;
     for step in 1..=64 {
-        let point = edge.curve.evaluate(edge.t0 + (edge.t1 - edge.t0) * step as f64 / 64.0)?;
+        let point = edge
+            .curve
+            .evaluate(edge.t0 + (edge.t1 - edge.t0) * step as f64 / 64.0)
+            .or_refuse(KernelStage::Classify, "evaluate")?;
         length += point.sub(previous).length();
         previous = point;
     }
     let intervals = ((PER_SPAN * length / span).ceil() as usize).max(FLOOR);
     if intervals > CAP {
-        return Err(format!(
-            "{op}: edge {} on face {face_id} is {length:.3e} long and {owner} {span:.3e} long, so \
-             reading it at four samples to a span needs {intervals}, over the {CAP} the \
-             incidence gate reads — refusing rather than reading the edge more coarsely than \
-             it or its face can turn",
-            edge.id
+        return Err(KernelRefusal::non_convergence(
+            KernelStage::Classify,
+            "sample_cap",
+            format!(
+                "{op}: edge {} on face {face_id} is {length:.3e} long and {owner} {span:.3e} long, so \
+                 reading it at four samples to a span needs {intervals}, over the {CAP} the \
+                 incidence gate reads — refusing rather than reading the edge more coarsely than \
+                 it or its face can turn",
+                edge.id
+            ),
         ));
     }
     Ok(intervals)
@@ -379,7 +409,7 @@ pub(super) fn moved_edges_lie_on_their_faces(
     planes: &HashMap<u64, Plane>,
     bar: f64,
     op: &str,
-) -> Result<f64, String> {
+) -> Result<f64, KernelRefusal> {
     // How far past a patch's edge a reading lies: the part of the true distance
     // the signed one does not carry. Zero on an analytic carrier.
     let past_edge = |signed: f64, distance: f64| (distance * distance - signed * signed).max(0.0).sqrt();
@@ -415,7 +445,7 @@ pub(super) fn moved_edges_lie_on_their_faces(
             let read = |point: Vec3,
                         now_foot: &mut Option<(f64, f64)>,
                         was_foot: &mut Option<(f64, f64)>|
-             -> Result<((f64, bool, f64, f64), f64), String> {
+             -> Result<((f64, bool, f64, f64), f64), KernelRefusal> {
                 let (now, now_distance) = carrier.signed_and_true_distance(point, now_foot)?;
                 let (was, was_distance) = match old {
                     Some(old) => carrier.signed_and_true_distance(nearest_on_edge(old, point)?.1, was_foot)?,
@@ -439,7 +469,7 @@ pub(super) fn moved_edges_lie_on_their_faces(
             let (mut now_foot, mut was_foot) = (None, None);
             for sample in 0..=intervals {
                 let t = edge.t0 + (edge.t1 - edge.t0) * sample as f64 / intervals as f64;
-                let point = edge.curve.evaluate(t)?;
+                let point = edge.curve.evaluate(t).or_refuse(KernelStage::Validate, "evaluate")?;
                 let seeded = now_foot.is_some() || was_foot.is_some();
                 let (mut reading, mut distance) = read(point, &mut now_foot, &mut was_foot)?;
                 if seeded && reading.0 > bar {
@@ -458,11 +488,15 @@ pub(super) fn moved_edges_lie_on_their_faces(
                 } else {
                     format!("a point of it lies {now:+.3e} from the face where the edge lay {was:+.3e} from it")
                 };
-                return Err(format!(
-                    "{op}: moved edge {} leaves face {} by {by:.3e} ({reading} before the heal) — a \
-                     blend's end runs into a vertex of a face the heal does not read as its \
-                     neighbour; refusing rather than re-trimming the face around an edge off it",
-                    edge.id, face.id
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Validate,
+                    "moved_edge_off_face",
+                    format!(
+                        "{op}: moved edge {} leaves face {} by {by:.3e} ({reading} before the heal) — a \
+                         blend's end runs into a vertex of a face the heal does not read as its \
+                         neighbour; refusing rather than re-trimming the face around an edge off it",
+                        edge.id, face.id
+                    ),
                 ));
             }
         }

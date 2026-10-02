@@ -1,4 +1,5 @@
 use super::*;
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 
 struct HealPlan {
     /// The two boundary-edge indices whose neighbours are the primary pair.
@@ -11,7 +12,7 @@ struct HealPlan {
 
 /// Choose the unique opposite neighbour pair whose planes re-intersect through
 /// the transition face's region.
-fn plan_heal(planes: &[Plane; 4], f_center: Vec3, f_reach: f64) -> Result<HealPlan, String> {
+fn plan_heal(planes: &[Plane; 4], f_center: Vec3, f_reach: f64) -> Result<HealPlan, KernelRefusal> {
     let mut candidates: Vec<HealPlan> = Vec::new();
     for start in 0..2usize {
         let primary = [start, start + 2];
@@ -43,18 +44,32 @@ fn plan_heal(planes: &[Plane; 4], f_center: Vec3, f_reach: f64) -> Result<HealPl
     }
     match candidates.len() {
         1 => Ok(candidates.pop().unwrap()),
-        0 => Err(
+        0 => Err(KernelRefusal::ill_posed(
+            KernelStage::Classify,
+            "no_reintersection",
             "delete_face_and_heal: the neighbours do not re-intersect cleanly \
                   (parallel planes, non-adjacent healing, or a multi-face gap) — refusing \
-                  rather than emitting an invalid solid"
-                .into(),
-        ),
-        _ => Err(
+                  rather than emitting an invalid solid",
+        )),
+        _ => Err(KernelRefusal::ill_posed(
+            KernelStage::Classify,
+            "ambiguous_pair",
             "delete_face_and_heal: healing is ambiguous — both opposite neighbour \
-                  pairs re-intersect through the deleted face"
-                .into(),
-        ),
+                  pairs re-intersect through the deleted face",
+        )),
     }
+}
+
+/// The position of a neighbour the transition face's own boundary named, so a
+/// miss is a consistency failure of the solid rather than a caller error.
+fn neighbour_position(solid: &BrepSolid, neighbour_id: u64) -> Result<(usize, usize), KernelRefusal> {
+    find_face(solid, neighbour_id).ok_or_else(|| {
+        KernelRefusal::internal(
+            KernelStage::Collect,
+            "missing_neighbour",
+            format!("delete_face_and_heal: missing neighbour {neighbour_id}"),
+        )
+    })
 }
 
 // `retrim_planar_face` moved to the shared re-trim home
@@ -107,7 +122,7 @@ pub(super) fn coedge_to_vertex(coedge: &CoedgeRecord, edges: &HashMap<u64, EdgeR
 /// that floor, and it runs on the way out of the public entry only — the
 /// set driver's chain calls [`delete_face_and_heal_impl`] so a ten-face
 /// selection pays for one scan and not ten.
-pub fn delete_face_and_heal(solid: &BrepSolid, face_id: u64) -> Result<BrepSolid, String> {
+pub fn delete_face_and_heal(solid: &BrepSolid, face_id: u64) -> Result<BrepSolid, KernelRefusal> {
     crate::accept_sound(delete_face_and_heal_impl(solid, face_id)?, "deleteFace")
 }
 
@@ -115,22 +130,31 @@ pub fn delete_face_and_heal(solid: &BrepSolid, face_id: u64) -> Result<BrepSolid
 pub(super) fn delete_face_and_heal_impl(
     solid: &BrepSolid,
     face_id: u64,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let mut solid = solid.clone();
     let scale = solid_model_scale(&solid);
     let tolerance = (scale * 1e-7).max(1e-9);
 
-    let (shell_index, face_index) = find_face(&solid, face_id)
-        .ok_or_else(|| format!("delete_face_and_heal: no face with id {face_id}"))?;
+    let (shell_index, face_index) = find_face(&solid, face_id).ok_or_else(|| {
+        KernelRefusal::input(
+            KernelStage::Collect,
+            "face_id",
+            format!("delete_face_and_heal: no face with id {face_id}"),
+        )
+    })?;
 
     // --- Read the transition face's boundary (immutable snapshot) ---------
     let boundary: Vec<(u64, bool)> = {
         let face = &solid.shells[shell_index].faces[face_index];
         if face.loops.len() != 1 {
-            return Err(format!(
-                "delete_face_and_heal: face {face_id} has {} loops; only a simple \
-                 single-loop transition face is supported",
-                face.loops.len()
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "multi_loop",
+                format!(
+                    "delete_face_and_heal: face {face_id} has {} loops; only a simple \
+                     single-loop transition face is supported",
+                    face.loops.len()
+                ),
             ));
         }
         face.loops[0]
@@ -140,11 +164,15 @@ pub(super) fn delete_face_and_heal_impl(
             .collect()
     };
     if boundary.len() != 4 {
-        return Err(format!(
-            "delete_face_and_heal: face {face_id} has {} boundary edges; only 4-sided \
-             transition faces (a single chamfer/fillet edge) are supported \
-             (deferred: multi-face gaps)",
-            boundary.len()
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "side_count",
+            format!(
+                "delete_face_and_heal: face {face_id} has {} boundary edges; only 4-sided \
+                 transition faces (a single chamfer/fillet edge) are supported \
+                 (deferred: multi-face gaps)",
+                boundary.len()
+            ),
         ));
     }
     let boundary_edge_ids: HashSet<u64> = boundary.iter().map(|(edge_id, _)| *edge_id).collect();
@@ -152,28 +180,32 @@ pub(super) fn delete_face_and_heal_impl(
         // A CLOSED transition strip (a fillet/chamfer around a full rim):
         // loop = [seam+, rim_a, seam-, rim_b] — the seam doubled, two closed
         // rims. Heals by re-intersecting the two neighbours analytically.
-        return heal_closed_transition(&solid, shell_index, face_index, &boundary);
+        return heal_closed_transition(&solid, shell_index, face_index, &boundary)
+            ;
     }
     if boundary_edge_ids.len() != 4 {
-        return Err(
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "repeated_edge",
             "delete_face_and_heal: transition face uses an edge more than once \
-                    (deferred: periodic/closed transition)"
-                .into(),
-        );
+                    (deferred: periodic/closed transition)",
+        ));
     }
 
     // Neighbour faces (one per boundary edge, in loop order).
     let mut neighbour_ids = [0u64; 4];
     for (index, (edge_id, _)) in boundary.iter().enumerate() {
-        neighbour_ids[index] = other_face_of_edge(&solid, *edge_id, face_id)?;
+        neighbour_ids[index] =
+            other_face_of_edge(&solid, *edge_id, face_id)?;
     }
     let unique: HashSet<u64> = neighbour_ids.iter().copied().collect();
     if unique.len() != 4 {
-        return Err(
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "repeated_neighbour",
             "delete_face_and_heal: the transition face touches a neighbour more \
-                    than once (deferred: periodic/closed transition)"
-                .into(),
-        );
+                    than once (deferred: periodic/closed transition)",
+        ));
     }
 
     // Carriers of the neighbours: all-planar takes the closed-form planar
@@ -182,8 +214,7 @@ pub(super) fn delete_face_and_heal_impl(
     let neighbour_planes: [Plane; 4] = {
         let mut planes: Vec<Option<Plane>> = Vec::with_capacity(4);
         for &neighbour_id in &neighbour_ids {
-            let (ns, nf) = find_face(&solid, neighbour_id)
-                .ok_or_else(|| format!("delete_face_and_heal: missing neighbour {neighbour_id}"))?;
+            let (ns, nf) = neighbour_position(&solid, neighbour_id)?;
             planes.push(
                 plane_of_surface(
                     &solid.shells[ns].faces[nf].surface,
@@ -200,7 +231,8 @@ pub(super) fn delete_face_and_heal_impl(
                 face_index,
                 &boundary,
                 &neighbour_ids,
-            );
+            )
+            ;
         }
         [
             planes[0].unwrap(),
@@ -218,20 +250,27 @@ pub(super) fn delete_face_and_heal_impl(
                 .edges
                 .iter()
                 .find(|edge| edge.id == *edge_id)
-                .ok_or_else(|| format!("delete_face_and_heal: missing edge {edge_id}"))?;
+                .ok_or_else(|| {
+                    KernelRefusal::internal(
+                        KernelStage::Collect,
+                        "missing_edge",
+                        format!("delete_face_and_heal: missing edge {edge_id}"),
+                    )
+                })?;
             Ok(if *forward {
                 edge.start_vertex_id
             } else {
                 edge.end_vertex_id
             })
         })
-        .collect::<Result<Vec<u64>, String>>()?;
+        .collect::<Result<Vec<u64>, KernelRefusal>>()?;
     if transition_vertices.iter().collect::<HashSet<_>>().len() != 4 {
-        return Err(
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "repeated_corner",
             "delete_face_and_heal: transition face has repeated corner vertices \
-                    (deferred: degenerate transition)"
-                .into(),
-        );
+                    (deferred: degenerate transition)",
+        ));
     }
     let mut f_center = Vec3::default();
     for &vertex_id in &transition_vertices {
@@ -240,7 +279,12 @@ pub(super) fn delete_face_and_heal_impl(
     f_center = f_center.scale(0.25);
     let mut f_reach = 0.0f64;
     for &vertex_id in &transition_vertices {
-        f_reach = f_reach.max(edge_point(&solid, vertex_id)?.sub(f_center).length());
+        f_reach = f_reach.max(
+            edge_point(&solid, vertex_id)
+                ?
+                .sub(f_center)
+                .length(),
+        );
     }
     let f_reach = f_reach * 3.0 + tolerance;
 
@@ -262,11 +306,12 @@ pub(super) fn delete_face_and_heal_impl(
     let point_a = plan.lateral_point[&lateral_a];
     let point_b = plan.lateral_point[&lateral_b];
     if point_a.sub(point_b).length() <= tolerance {
-        return Err(
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "coincident_corners",
             "delete_face_and_heal: recovered corners coincide — the neighbours \
-                    do not bound a clean edge"
-                .into(),
-        );
+                    do not bound a clean edge",
+        ));
     }
     let vertex_a = alloc();
     let vertex_b = alloc();
@@ -278,7 +323,7 @@ pub(super) fn delete_face_and_heal_impl(
     let sharp_edge_id = alloc();
     let sharp_edge = EdgeRecord {
         id: sharp_edge_id,
-        curve: make_line(point_a, point_b)?,
+        curve: make_line(point_a, point_b).or_refuse(KernelStage::Fragment, "make_line")?,
         t0: 0.0,
         t1: 1.0,
         start_vertex_id: vertex_a,
@@ -300,11 +345,12 @@ pub(super) fn delete_face_and_heal_impl(
         } else if lateral_set.contains(&index) {
             index
         } else {
-            return Err(
+            return Err(KernelRefusal::internal(
+                KernelStage::Classify,
+                "corner_flank",
                 "delete_face_and_heal: transition corner is not flanked by a \
-                        lateral face (unexpected neighbour ordering)"
-                    .into(),
-            );
+                        lateral face (unexpected neighbour ordering)",
+            ));
         };
         let target = lateral_vertex[&lateral_index];
         collapse.insert(transition_vertices[index], target);
@@ -327,11 +373,12 @@ pub(super) fn delete_face_and_heal_impl(
         }
         moved.insert(edge.id);
         if edge.curve.straight_segment(tolerance).is_none() {
-            return Err(
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "curved_side_edge",
                 "delete_face_and_heal: a side edge meeting the transition face is \
-                        not a straight line (deferred: curved neighbour edges)"
-                    .into(),
-            );
+                        not a straight line (deferred: curved neighbour edges)",
+            ));
         }
         // The edge's OWN ends, at `t0`/`t1`. `straight_segment` answers "is this
         // a line" with the first and last control points — the WHOLE curve's ends
@@ -340,8 +387,14 @@ pub(super) fn delete_face_and_heal_impl(
         // ends there moved that far end back out to the old sharp corner, so
         // deleting one of two chamfers rebuilt the cap edge right through the
         // other one.
-        let mut start_point = edge.curve.evaluate(edge.t0)?;
-        let mut end_point = edge.curve.evaluate(edge.t1)?;
+        let mut start_point = edge
+            .curve
+            .evaluate(edge.t0)
+            .or_refuse(KernelStage::Fragment, "evaluate")?;
+        let mut end_point = edge
+            .curve
+            .evaluate(edge.t1)
+            .or_refuse(KernelStage::Fragment, "evaluate")?;
         if let Some(target) = start_target {
             edge.start_vertex_id = target;
             start_point = new_vertex_points[&target];
@@ -351,13 +404,14 @@ pub(super) fn delete_face_and_heal_impl(
             end_point = new_vertex_points[&target];
         }
         if start_point.sub(end_point).length() <= tolerance {
-            return Err(
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Fragment,
+                "collapsed_side_edge",
                 "delete_face_and_heal: healing would collapse a side edge to zero \
-                        length (deferred: degenerate transition)"
-                    .into(),
-            );
+                        length (deferred: degenerate transition)",
+            ));
         }
-        edge.curve = make_line(start_point, end_point)?;
+        edge.curve = make_line(start_point, end_point).or_refuse(KernelStage::Fragment, "make_line")?;
         edge.t0 = 0.0;
         edge.t1 = 1.0;
     }
@@ -371,7 +425,8 @@ pub(super) fn delete_face_and_heal_impl(
         &retrimmed,
         (scale * 1e-6).max(1e-7),
         "delete_face_and_heal",
-    )?;
+    )
+    ?;
 
     // Index the (now relocated) edges for loop rewrites and pcurve rebuilds.
     let mut edges_by_id: HashMap<u64, EdgeRecord> = solid
@@ -387,12 +442,15 @@ pub(super) fn delete_face_and_heal_impl(
     for &primary_index in &plan.primary {
         let primary_edge = boundary[primary_index].0;
         let neighbour_id = neighbour_ids[primary_index];
-        let (ns, nf) = find_face(&solid, neighbour_id)
-            .ok_or_else(|| format!("delete_face_and_heal: missing neighbour {neighbour_id}"))?;
+        let (ns, nf) = neighbour_position(&solid, neighbour_id)?;
         let face = &mut solid.shells[ns].faces[nf];
         let (loop_index, coedge_index) = locate_coedge(face, primary_edge).ok_or_else(|| {
-            format!(
-                "delete_face_and_heal: neighbour {neighbour_id} does not use edge {primary_edge}"
+            KernelRefusal::internal(
+                KernelStage::Sew,
+                "primary_coedge",
+                format!(
+                    "delete_face_and_heal: neighbour {neighbour_id} does not use edge {primary_edge}"
+                ),
             )
         })?;
         let coedges = &face.loops[loop_index].coedges;
@@ -400,28 +458,38 @@ pub(super) fn delete_face_and_heal_impl(
         let previous = &coedges[(coedge_index + count - 1) % count];
         let next = &coedges[(coedge_index + 1) % count];
         let required_from = coedge_to_vertex(previous, &edges_by_id).ok_or_else(|| {
-            "delete_face_and_heal: could not resolve loop connectivity".to_string()
+            KernelRefusal::internal(
+                KernelStage::Sew,
+                "loop_connectivity_from",
+                "delete_face_and_heal: could not resolve loop connectivity",
+            )
         })?;
         let required_to = coedge_from_vertex(next, &edges_by_id).ok_or_else(|| {
-            "delete_face_and_heal: could not resolve loop connectivity".to_string()
+            KernelRefusal::internal(
+                KernelStage::Sew,
+                "loop_connectivity_to",
+                "delete_face_and_heal: could not resolve loop connectivity",
+            )
         })?;
         let forward = if required_from == vertex_a && required_to == vertex_b {
             true
         } else if required_from == vertex_b && required_to == vertex_a {
             false
         } else {
-            return Err(
+            return Err(KernelRefusal::internal(
+                KernelStage::Sew,
+                "primary_loop_closure",
                 "delete_face_and_heal: new edge does not close the primary loop \
-                        (unexpected connectivity)"
-                    .into(),
-            );
+                        (unexpected connectivity)",
+            ));
         };
         let new_coedge = CoedgeRecord {
             id: alloc(),
             edge_id: sharp_edge_id,
             forward,
             // Placeholder; retrim_planar_face recomputes every pcurve below.
-            pcurve: make_line(Vec3::default(), Vec3::new(1.0, 0.0, 0.0))?,
+            pcurve: make_line(Vec3::default(), Vec3::new(1.0, 0.0, 0.0))
+                .or_refuse(KernelStage::Sew, "make_line")?,
         };
         face.loops[loop_index].coedges[coedge_index] = new_coedge;
     }
@@ -431,17 +499,24 @@ pub(super) fn delete_face_and_heal_impl(
     for &lateral_index in &plan.lateral {
         let lateral_edge = boundary[lateral_index].0;
         let neighbour_id = neighbour_ids[lateral_index];
-        let (ns, nf) = find_face(&solid, neighbour_id)
-            .ok_or_else(|| format!("delete_face_and_heal: missing neighbour {neighbour_id}"))?;
+        let (ns, nf) = neighbour_position(&solid, neighbour_id)?;
         let face = &mut solid.shells[ns].faces[nf];
         let (loop_index, coedge_index) = locate_coedge(face, lateral_edge).ok_or_else(|| {
-            format!(
-                "delete_face_and_heal: neighbour {neighbour_id} does not use edge {lateral_edge}"
+            KernelRefusal::internal(
+                KernelStage::Sew,
+                "lateral_coedge",
+                format!(
+                    "delete_face_and_heal: neighbour {neighbour_id} does not use edge {lateral_edge}"
+                ),
             )
         })?;
         face.loops[loop_index].coedges.remove(coedge_index);
         if face.loops[loop_index].coedges.is_empty() {
-            return Err("delete_face_and_heal: healing emptied a lateral face loop".into());
+            return Err(KernelRefusal::internal(
+                KernelStage::Sew,
+                "emptied_loop",
+                "delete_face_and_heal: healing emptied a lateral face loop",
+            ));
         }
     }
 
@@ -474,23 +549,25 @@ pub(super) fn delete_face_and_heal_impl(
         .collect();
     for neighbour_id in neighbour_ids {
         let plane = &retrimmed[&neighbour_id];
-        let (ns, nf) = find_face(&solid, neighbour_id)
-            .ok_or_else(|| format!("delete_face_and_heal: missing neighbour {neighbour_id}"))?;
+        let (ns, nf) = neighbour_position(&solid, neighbour_id)?;
         retrim_planar_face(
             &mut solid.shells[ns].faces[nf],
             plane,
             &final_edges,
             scale,
             "delete_face_and_heal",
-        )?;
+        )
+        ?;
     }
 
     // Genus is preserved by removing a genus-neutral transition face; the
     // Euler check inside validate() confirms it.
     let issues = solid.validate();
     if !issues.is_empty() {
-        return Err(format!(
-            "delete_face_and_heal: healed solid failed validation: {issues:?}"
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "validate",
+            format!("delete_face_and_heal: healed solid failed validation: {issues:?}"),
         ));
     }
     Ok(solid)
@@ -498,7 +575,7 @@ pub(super) fn delete_face_and_heal_impl(
 
 /// Resolve the id of the face nearest a 3D point (used by the app: the picked
 /// point lies on the selected face). Mirrors `resolve_edge_by_point`.
-pub fn resolve_face_by_point(solid: &BrepSolid, point: Vec3) -> Result<u64, String> {
+pub fn resolve_face_by_point(solid: &BrepSolid, point: Vec3) -> Result<u64, KernelRefusal> {
     let scale = solid_model_scale(&solid);
     let mut best: Option<(u64, f64)> = None;
     for shell in &solid.shells {
@@ -516,10 +593,18 @@ pub fn resolve_face_by_point(solid: &BrepSolid, point: Vec3) -> Result<u64, Stri
     }
     match best {
         Some((face_id, distance)) if distance <= (scale * 1e-3).max(1e-4) => Ok(face_id),
-        Some((_, distance)) => Err(format!(
-            "delete_face_and_heal: no face within tolerance of the point (nearest {distance:.6})"
+        Some((_, distance)) => Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "point_off_faces",
+            format!(
+                "delete_face_and_heal: no face within tolerance of the point (nearest {distance:.6})"
+            ),
         )),
-        None => Err("delete_face_and_heal: solid has no faces".into()),
+        None => Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "no_faces",
+            "delete_face_and_heal: solid has no faces",
+        )),
     }
 }
 

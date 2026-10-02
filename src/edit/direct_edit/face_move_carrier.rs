@@ -1,5 +1,6 @@
 use super::*;
 use crate::RevolutionFrame;
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 
 // ---------------------------------------------------------------------------
 // Move Face by CARRIER RE-INTERSECTION — the operator's construction.
@@ -93,11 +94,11 @@ pub(super) fn move_faces_by_carrier(
     solid: &BrepSolid,
     moved: &HashSet<u64>,
     translation: Vec3,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let scale = solid_model_scale(solid);
     let tolerance = (scale * 1e-7).max(1e-9);
     let plane_tolerance = (scale * 1e-6).max(1e-7);
-    let motion = translate_affine(translation)?;
+    let motion = translate_affine(translation).or_refuse(KernelStage::Collect, "translate_affine")?;
 
     let mut face_lookup: HashMap<u64, (usize, usize)> = HashMap::default();
     for (shell_index, shell) in solid.shells.iter().enumerate() {
@@ -120,11 +121,11 @@ pub(super) fn move_faces_by_carrier(
         let uses = faces_of_edge.get(&edge.id).map(Vec::as_slice).unwrap_or(&[]);
         let expected = if edge.degenerate { 1 } else { 2 };
         if uses.len() != expected {
-            return Err(format!(
+            return Err(KernelRefusal::input(KernelStage::Collect, "non_manifold", format!(
                 "{OP}: edge {} is used {} times (non-manifold input)",
                 edge.id,
                 uses.len()
-            ));
+            )));
         }
     }
 
@@ -167,10 +168,10 @@ pub(super) fn move_faces_by_carrier(
                     &stretched,
                     motion,
                     invariance_tolerance,
-                )?
+                ).or_refuse(KernelStage::Classify, "carrier_invariant_under_motion")?
             {
                 moves_carrier.insert(face.id);
-                transform_surface(&stretched, motion)?
+                transform_surface(&stretched, motion).or_refuse(KernelStage::Classify, "transform_surface")?
             } else {
                 stretched
             };
@@ -208,7 +209,11 @@ pub(super) fn move_faces_by_carrier(
         ids.sort_unstable();
         for face_id in &ids {
             at.push(carriers.get(face_id).ok_or_else(|| {
-                format!("{OP}: no carrier for face {face_id} at vertex {}", vertex.id)
+                KernelRefusal::internal(
+                    KernelStage::Refine,
+                    "carrier_lookup",
+                    format!("{OP}: no carrier for face {face_id} at vertex {}", vertex.id),
+                )
             })?);
         }
         // The corner is only forced to move by a carrier the motion CHANGES.
@@ -262,12 +267,12 @@ pub(super) fn move_faces_by_carrier(
             } else {
                 ""
             };
-            format!(
+            why.with_message(|why| format!(
                 "{OP}: the {} carriers meeting at the corner of {} no longer share a point \
                  after the motion ({why}){split}",
                 ids.len(),
                 named.join(", ")
-            )
+            ))
         })?;
         new_vertex.insert(vertex.id, corner);
     }
@@ -337,15 +342,15 @@ pub(super) fn move_faces_by_carrier(
             tolerance,
         )?;
         let Section::Curve(curve) = section else {
-            return Err(format!(
+            return Err(KernelRefusal::internal(KernelStage::Refine, "closed_rim_straight", format!(
                 "{OP}: the closed rim {} sections in a straight line, which cannot close — \
                  refusing",
                 edge.id
-            ));
+            )));
         };
         let matched = match_marched_rim_direction(curve, edge)?;
-        let [d0, d1] = matched.domain()?;
-        let anchor = matched.evaluate(d0)?;
+        let [d0, d1] = matched.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let anchor = matched.evaluate(d0).or_refuse(KernelStage::Refine, "evaluate")?;
         new_vertex.insert(edge.start_vertex_id, anchor);
         rebuilt.insert(edge.id, (matched, d0, d1));
     }
@@ -357,8 +362,8 @@ pub(super) fn move_faces_by_carrier(
         }
         let uses = faces_of_edge.get(&edge.id).map(Vec::as_slice).unwrap_or(&[]);
         let moved_uses = uses.iter().filter(|face_id| moves_carrier.contains(*face_id)).count();
-        let old_start = edge.curve.evaluate(edge.t0)?;
-        let old_end = edge.curve.evaluate(edge.t1)?;
+        let old_start = edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Refine, "evaluate")?;
+        let old_end = edge.curve.evaluate(edge.t1).or_refuse(KernelStage::Refine, "evaluate")?;
         let start_new = new_vertex
             .get(&edge.start_vertex_id)
             .copied()
@@ -367,7 +372,13 @@ pub(super) fn move_faces_by_carrier(
             .get(&edge.end_vertex_id)
             .copied()
             .unwrap_or_else(|| point_of(solid, edge.end_vertex_id));
-        let first = *uses.first().ok_or_else(|| format!("{OP}: edge {} has no faces", edge.id))?;
+        let first = *uses.first().ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Refine,
+                "edge_faces",
+                format!("{OP}: edge {} has no faces", edge.id),
+            )
+        })?;
         let second = uses.get(1).copied();
 
         // A rigid shortcut that carries a PROOF, not a case: when every carrier
@@ -384,7 +395,7 @@ pub(super) fn move_faces_by_carrier(
         if moved_uses == uses.len() && rigid_ends {
             rebuilt.insert(
                 edge.id,
-                (transform_curve(&edge.curve, motion)?, edge.t0, edge.t1),
+                (transform_curve(&edge.curve, motion).or_refuse(KernelStage::Refine, "transform_curve")?, edge.t0, edge.t1),
             );
             continue;
         }
@@ -401,7 +412,7 @@ pub(super) fn move_faces_by_carrier(
         let (curve, t0, t1) = match carrier_pair {
             None => {
                 let carried = if moves_carrier.contains(&first) {
-                    transform_curve(&edge.curve, motion)?
+                    transform_curve(&edge.curve, motion).or_refuse(KernelStage::Refine, "transform_curve")?
                 } else {
                     edge.curve.clone()
                 };
@@ -425,18 +436,18 @@ pub(super) fn move_faces_by_carrier(
                 // both roads agree, so the cell table could not see it and the
                 // swept column is what found it.
                 let curve = if carried.straight_segment(tolerance).is_some() {
-                    make_line(start_new, end_new)?
+                    make_line(start_new, end_new).or_refuse(KernelStage::Refine, "make_line")?
                 } else {
                     carried
                 };
                 let t0 = parameter_on(&curve, start_new, tolerance, edge.id, "start")?;
                 let t1 = parameter_on(&curve, end_new, tolerance, edge.id, "end")?;
                 if (t1 - t0).abs() <= 1e-12 {
-                    return Err(format!(
+                    return Err(KernelRefusal::unsupported(KernelStage::Refine, "seam_collapse", format!(
                         "{OP}: the corners of the single-carrier edge {} land on the same point \
                          of it — refusing",
                         edge.id
-                    ));
+                    )));
                 }
                 (curve, t0, t1)
             }
@@ -465,25 +476,25 @@ pub(super) fn move_faces_by_carrier(
         if edge.start_vertex_id == edge.end_vertex_id || edge.degenerate {
             continue;
         }
-        let old_start = edge.curve.evaluate(edge.t0)?;
-        let old_end = edge.curve.evaluate(edge.t1)?;
-        let new_start = curve.evaluate(*t0)?;
-        let new_end = curve.evaluate(*t1)?;
+        let old_start = edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Refine, "evaluate")?;
+        let old_end = edge.curve.evaluate(edge.t1).or_refuse(KernelStage::Refine, "evaluate")?;
+        let new_start = curve.evaluate(*t0).or_refuse(KernelStage::Refine, "evaluate")?;
+        let new_end = curve.evaluate(*t1).or_refuse(KernelStage::Refine, "evaluate")?;
         let old_chord = old_end.sub(old_start);
         let new_chord = new_end.sub(new_start);
         if new_chord.length() <= tolerance {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(KernelStage::Validate, "edge_collapse", format!(
                 "{OP}: the translation collapses edge {} to zero length (a moved face lands \
                  exactly on its neighbour)",
                 edge.id
-            ));
+            )));
         }
         if old_chord.length() > tolerance && new_chord.dot(old_chord) < 0.0 {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(KernelStage::Validate, EDGE_INVERSION, format!(
                 "{OP}: the translation inverts edge {} (a moved face passes beyond its \
                  neighbour)",
                 edge.id
-            ));
+            )));
         }
     }
 
@@ -524,7 +535,7 @@ pub(super) fn move_faces_by_carrier(
     for (shell_index, face_index) in touched_faces {
         let face = &mut result.shells[shell_index].faces[face_index];
         if moves_carrier.contains(&face.id) {
-            face.surface = transform_surface(&face.surface, motion)?;
+            face.surface = transform_surface(&face.surface, motion).or_refuse(KernelStage::Sew, "transform_surface")?;
         }
         regrow_and_refit_carrier(face, &final_edges, scale, OP)?;
     }
@@ -534,13 +545,13 @@ pub(super) fn move_faces_by_carrier(
     // move the bar it is measured against.
     let issues = result.validate();
     if !issues.is_empty() {
-        return Err(format!("{OP}: moved solid failed validation: {issues:?}"));
+        return Err(KernelRefusal::internal(KernelStage::Validate, "validate", format!("{OP}: moved solid failed validation: {issues:?}")));
     }
     if let (Ok(before), Ok(after)) = (solid_signed_volume(solid), solid_signed_volume(&result)) {
         if before * after <= 0.0 {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(KernelStage::Validate, SOLID_INVERSION, format!(
                 "{OP}: the translation inverts the solid (signed volume changed sign) — refusing"
-            ));
+            )));
         }
     }
     Ok(result)
@@ -597,10 +608,14 @@ fn face_label(
 fn carrier_of<'a>(
     carriers: &'a HashMap<u64, NurbsSurface>,
     face_id: u64,
-) -> Result<&'a NurbsSurface, String> {
-    carriers
-        .get(&face_id)
-        .ok_or_else(|| format!("{OP}: no carrier for face {face_id}"))
+) -> Result<&'a NurbsSurface, KernelRefusal> {
+    carriers.get(&face_id).ok_or_else(|| {
+        KernelRefusal::internal(
+            KernelStage::Refine,
+            "carrier_missing",
+            format!("{OP}: no carrier for face {face_id}"),
+        )
+    })
 }
 
 fn point_of(solid: &BrepSolid, vertex_id: u64) -> Vec3 {
@@ -623,9 +638,9 @@ fn translate_affine(translation: Vec3) -> Result<AffineTransform, String> {
 
 /// The centre and radius of a ball containing every vertex of the body — the
 /// scale at which "cover the rest of the solid" is measured.
-fn body_ball(solid: &BrepSolid) -> Result<(Vec3, f64), String> {
+fn body_ball(solid: &BrepSolid) -> Result<(Vec3, f64), KernelRefusal> {
     if solid.vertices.is_empty() {
-        return Err(format!("{OP}: the body has no vertices"));
+        return Err(KernelRefusal::input(KernelStage::Collect, "empty_solid", format!("{OP}: the body has no vertices")));
     }
     let mut low = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
     let mut high = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
@@ -662,7 +677,7 @@ fn unbounded_carrier(
     centre: Vec3,
     reach: f64,
     plane_tolerance: f64,
-) -> Result<NurbsSurface, String> {
+) -> Result<NurbsSurface, KernelRefusal> {
     match surface.analytic() {
         Some(AnalyticSurface::Sphere { .. }) | Some(AnalyticSurface::Torus { .. }) => {
             return Ok(surface.clone())
@@ -712,6 +727,7 @@ fn unbounded_carrier(
                 .sub(plane.u_dir.scale(reach))
                 .sub(plane.v_dir.scale(reach));
             crate::make_plane(origin, plane.u_dir, plane.v_dir, 2.0 * reach, 2.0 * reach)
+                .or_refuse(KernelStage::Classify, "make_plane")
         }
         Err(_) => Ok(surface.clone()),
     }
@@ -733,7 +749,7 @@ fn stretch_ruled(
     height: f64,
     centre: Vec3,
     reach: f64,
-) -> Result<NurbsSurface, String> {
+) -> Result<NurbsSurface, KernelRefusal> {
     stretch_ruled_sweep(
         frame,
         rho0,
@@ -756,9 +772,9 @@ fn stretch_ruled_sweep(
     centre: Vec3,
     reach: f64,
     sweep: f64,
-) -> Result<NurbsSurface, String> {
+) -> Result<NurbsSurface, KernelRefusal> {
     if height.abs() <= 1e-12 {
-        return Err(format!("{OP}: a ruled carrier with no height cannot be stretched"));
+        return Err(KernelRefusal::unsupported(KernelStage::Classify, "flat_ruled_carrier", format!("{OP}: a ruled carrier with no height cannot be stretched")));
     }
     let axial = centre.sub(frame.origin).dot(frame.axis);
     let low = (axial - reach).min(0.0);
@@ -788,8 +804,9 @@ fn stretch_ruled_sweep(
         .origin
         .add(frame.axis.scale(high))
         .add(frame.x_axis.scale(rho_at(high)));
-    let generatrix = make_line(start, end)?;
+    let generatrix = make_line(start, end).or_refuse(KernelStage::Classify, "make_line")?;
     make_revolution(base, frame.axis, &generatrix, sweep)
+        .or_refuse(KernelStage::Classify, "make_revolution")
 }
 
 /// Where a corner goes: as near the rigid guess `seed` as a point can be while
@@ -808,7 +825,7 @@ fn solve_corner(
     at: &[&NurbsSurface],
     seed: Vec3,
     tolerance: f64,
-) -> Result<Vec3, String> {
+) -> Result<Vec3, KernelRefusal> {
     // Enough to make the 3×3 normal matrix invertible in the directions no
     // carrier constrains, and small enough that the bias it leaves at the fixed
     // point (≈ λ·|correction|) is orders below the residual gate.
@@ -820,9 +837,9 @@ fn solve_corner(
         let mut rhs = [0.0f64; 3];
         worst = 0.0;
         for surface in at {
-            let projection = crate::project_point_to_surface(surface, x)?;
+            let projection = crate::project_point_to_surface(surface, x).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
             let foot = projection.point;
-            let normal = surface.normal(projection.u, projection.v)?;
+            let normal = surface.normal(projection.u, projection.v).or_refuse(KernelStage::Refine, "normal")?;
             worst = worst.max(foot.sub(x).length());
             // n·(seed + d) = n·foot  ⇒  n·d = n·(foot − seed)
             let row = [normal.x, normal.y, normal.z];
@@ -852,7 +869,13 @@ fn solve_corner(
             }
         }
         let delta = solve3(&normal_matrix, &rhs)
-            .ok_or_else(|| "the carriers give no correction".to_string())?;
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Refine,
+                    "corner_singular",
+                    "the carriers give no correction",
+                )
+            })?;
         let next = seed.add(Vec3::new(delta[0], delta[1], delta[2]));
         if next.sub(x).length() <= tolerance * 1e-3 {
             x = next;
@@ -864,7 +887,7 @@ fn solve_corner(
     // iteration count.
     let mut residual = 0.0f64;
     for surface in at {
-        let projection = crate::project_point_to_surface(surface, x)?;
+        let projection = crate::project_point_to_surface(surface, x).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
         residual = residual.max(projection.point.sub(x).length());
     }
     if residual <= tolerance * RESIDUAL_SLACK {
@@ -880,8 +903,8 @@ fn solve_corner(
     let mut spread: f64 = 0.0;
     let mut normals: Vec<Vec3> = Vec::with_capacity(at.len());
     for surface in at {
-        let projection = crate::project_point_to_surface(surface, x)?;
-        normals.push(surface.normal(projection.u, projection.v)?);
+        let projection = crate::project_point_to_surface(surface, x).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
+        normals.push(surface.normal(projection.u, projection.v).or_refuse(KernelStage::Refine, "normal")?);
     }
     for (index, first) in normals.iter().enumerate() {
         for second in &normals[index + 1..] {
@@ -891,19 +914,19 @@ fn solve_corner(
         }
     }
     if spread <= 1e-6 {
-        return Err(format!(
+        return Err(KernelRefusal::ill_posed(KernelStage::Refine, "tangent_corner", format!(
             "they share a common TANGENT PLANE there (their normals agree to {spread:.1e} rad), \
              so together they fix the corner in one direction and pin it in neither of the \
              other two; the nearest point to all of them is still {residual:.3e} away"
-        ));
+        )));
     }
-    Err(format!(
+    Err(KernelRefusal::unsupported(KernelStage::Refine, "corner_apart", format!(
         "the nearest point to all of them is {residual:.3e} off at least one, against a \
          tolerance of {:.3e} (their normals there are {spread:.3e} rad apart, so they are \
          transverse and it is the MOTION that carried them apart); worst reading while \
          iterating {worst:.3e}",
         tolerance * RESIDUAL_SLACK
-    ))
+    )))
 }
 
 /// Solve a symmetric 3×3 system by Cramer's rule. `None` when it is singular
@@ -943,28 +966,28 @@ fn rebuild_edge(
     start_new: Vec3,
     end_new: Vec3,
     tolerance: f64,
-) -> Result<(NurbsCurve, f64, f64), String> {
+) -> Result<(NurbsCurve, f64, f64), KernelRefusal> {
     let section = carrier_section(edge, first, second, tolerance)?;
     match section {
         Section::Straight => {
-            let curve = make_line(start_new, end_new)?;
+            let curve = make_line(start_new, end_new).or_refuse(KernelStage::Refine, "make_line")?;
             Ok((curve, 0.0, 1.0))
         }
         Section::Curve(curve) => {
             let start_t = parameter_on(&curve, start_new, tolerance, edge.id, "start")?;
             let end_t = parameter_on(&curve, end_new, tolerance, edge.id, "end")?;
             if (end_t - start_t).abs() <= 1e-12 {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Refine, "section_collapse", format!(
                     "{OP}: the corners of edge {} land on the same point of their section \
                      — refusing",
                     edge.id
-                ));
+                )));
             }
             if start_t < end_t {
                 Ok((curve, start_t, end_t))
             } else {
-                let reversed = curve.reversed()?;
-                let [d0, d1] = reversed.domain()?;
+                let reversed = curve.reversed().or_refuse(KernelStage::Refine, "reversed")?;
+                let [d0, d1] = reversed.domain().or_refuse(KernelStage::Refine, "domain")?;
                 // `reversed` maps t ↦ d0 + d1 − t on the same domain.
                 Ok((reversed, d0 + d1 - start_t, d0 + d1 - end_t))
             }
@@ -978,7 +1001,7 @@ fn carrier_section(
     first: &NurbsSurface,
     second: &NurbsSurface,
     tolerance: f64,
-) -> Result<Section, String> {
+) -> Result<Section, KernelRefusal> {
     let plane_tolerance = tolerance * 10.0;
     if plane_of_surface(first, plane_tolerance, OP).is_ok()
         && plane_of_surface(second, plane_tolerance, OP).is_ok()
@@ -994,18 +1017,37 @@ fn carrier_section(
     let found = match reintersect_carriers(first, second, &policy) {
         Ok(found) => found,
         Err(ReintersectRefusal::Separated) => {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(KernelStage::Refine, "carriers_separated", format!(
                 "{OP}: the carriers of edge {} no longer meet after the motion — refusing",
                 edge.id
-            ))
+            )))
+        }
+        // The marched lane's fit missed the caller's residual gate: a march
+        // that did not conform, so a budget class rather than a defect.
+        Err(other @ ReintersectRefusal::Residual { .. }) => {
+            return Err(KernelRefusal::non_convergence(
+                KernelStage::Refine,
+                "section_residual",
+                format!("{OP}: edge {}: {}", edge.id, other.describe()),
+            ));
         }
         Err(other) => {
-            return Err(format!("{OP}: edge {}: {}", edge.id, other.describe()));
+            return Err(KernelRefusal::internal(
+                KernelStage::Refine,
+                "reintersect",
+                format!("{OP}: edge {}: {}", edge.id, other.describe()),
+            ));
         }
     };
     let section = found
         .nearest_section(&seeds)
-        .map_err(|error| format!("{OP}: edge {}: {error}", edge.id))?;
+        .map_err(|error| {
+            KernelRefusal::internal(
+                KernelStage::Refine,
+                "nearest_section",
+                format!("{OP}: edge {}: {error}", edge.id),
+            )
+        })?;
     Ok(Section::Curve(section.curve.clone()))
 }
 
@@ -1017,14 +1059,14 @@ fn parameter_on(
     tolerance: f64,
     edge_id: u64,
     which: &str,
-) -> Result<f64, String> {
-    let projection = project_point_to_curve(curve, point)?;
+) -> Result<f64, KernelRefusal> {
+    let projection = project_point_to_curve(curve, point).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
     let off = projection.point.sub(point).length();
     if off > tolerance * RESIDUAL_SLACK {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Refine, "corner_off_section", format!(
             "{OP}: the re-solved {which} corner of edge {edge_id} is {off:.3e} off the section \
              its carriers make — refusing"
-        ));
+        )));
     }
     Ok(projection.u)
 }
@@ -1108,7 +1150,7 @@ pub fn route_reading(
     solid: &BrepSolid,
     moved: &[u64],
     motion: &AffineTransform,
-) -> Result<RouteReading, String> {
+) -> Result<RouteReading, KernelRefusal> {
     let tolerances = crate::KernelTolerances::for_solid(solid, 1e-7);
     let tolerance = tolerances.model.max(1e-9);
     let scale = crate::solid_scale(solid).max(1.0);
@@ -1158,11 +1200,11 @@ pub fn route_reading(
     let mut after_carriers: Vec<NurbsSurface> = Vec::new();
     for face_id in moved {
         let Some((shell, position)) = find_face(solid, *face_id) else {
-            return Err(format!("route_reading: no face with id {face_id}"));
+            return Err(KernelRefusal::input(KernelStage::Collect, "face_id", format!("route_reading: no face with id {face_id}")));
         };
         let surface = &solid.shells[shell].faces[position].surface;
         let unbounded = unbounded_carrier(surface, centre, reach, tolerance * 10.0)?;
-        after_carriers.push(transform_surface(&unbounded, *motion)?);
+        after_carriers.push(transform_surface(&unbounded, *motion).or_refuse(KernelStage::Classify, "transform_surface")?);
         before_carriers.push(unbounded);
     }
 

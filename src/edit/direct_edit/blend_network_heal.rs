@@ -125,6 +125,7 @@
 
 use super::delete_faces::euler_characteristic;
 use super::*;
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 
 /// One strip of the network: a selected face with exactly two rims.
 pub(super) struct NetworkStrip {
@@ -197,7 +198,7 @@ pub(super) enum NetworkRead {
     /// Not a blend network; the lanes after this one decide.
     NotANetwork,
     /// A blend network this lane cannot heal, and why.
-    Refused(String),
+    Refused(KernelRefusal),
     Network(BlendNetwork),
 }
 
@@ -481,7 +482,7 @@ fn scan_caps(
     edge_records: &HashMap<u64, &EdgeRecord>,
     plane_tolerance: f64,
     op: &str,
-) -> Result<CapScan, String> {
+) -> Result<CapScan, KernelRefusal> {
     let mut scan = CapScan {
         owned: Vec::new(),
         standing: HashMap::default(),
@@ -493,11 +494,15 @@ fn scan_caps(
         if selected.contains(&cap.strip) {
             scan.owned.push((face.id, cap));
         } else if selected.contains(&face.id) {
-            return Err(format!(
-                "{op}: {} is the end cap of blend face {}, which is not selected — a cap is the \
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Collect,
+                "cap_without_strip",
+                format!(
+                    "{op}: {} is the end cap of blend face {}, which is not selected — a cap is the \
                  end of its strip's fill and goes with it; select the strip as well",
-                face_title(face),
-                cap.strip
+                    face_title(face),
+                    cap.strip
+                ),
             ));
         } else {
             scan.standing.insert(
@@ -515,7 +520,7 @@ fn scan_caps(
 
 /// `face_ids` with every cap its strips own appended (see [`scan_caps`]), so
 /// that every lane is asked about a strip together with its caps.
-pub(super) fn with_owned_caps(solid: &BrepSolid, face_ids: &[u64], op: &str) -> Result<Vec<u64>, String> {
+pub(super) fn with_owned_caps(solid: &BrepSolid, face_ids: &[u64], op: &str) -> Result<Vec<u64>, KernelRefusal> {
     let selected: HashSet<u64> = face_ids.iter().copied().collect();
     let edge_records: HashMap<u64, &EdgeRecord> =
         solid.edges.iter().map(|edge| (edge.id, edge)).collect();
@@ -669,7 +674,7 @@ fn read_network(solid: &BrepSolid, face_ids: &[u64], op: &str) -> Option<Network
     }
     curved.sort_unstable();
     let mut kept: HashMap<u64, KeptStrip> = HashMap::default();
-    let mut refusals: Vec<String> = Vec::new();
+    let mut refusals: Vec<KernelRefusal> = Vec::new();
     for face_id in &curved {
         let (shell, position) = find_face(solid, *face_id)?;
         let face = &solid.shells[shell].faces[position];
@@ -686,11 +691,15 @@ fn read_network(solid: &BrepSolid, face_ids: &[u64], op: &str) -> Option<Network
             Ok(strip) => {
                 kept.insert(*face_id, strip);
             }
-            Err(reason) => refusals.push(format!(
-                "{op}: {} is left beside the selected blend network but cannot stay: {reason} \
+            Err(reason) => refusals.push(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "kept_face",
+                format!(
+                    "{op}: {} is left beside the selected blend network but cannot stay: {reason} \
                  — only planar faces and straight cylindrical blend strips between two planar \
                  walls can be kept beside a deleted network; select it as well",
-                face_title(face)
+                    face_title(face)
+                ),
             )),
         }
     }
@@ -870,16 +879,24 @@ fn read_network(solid: &BrepSolid, face_ids: &[u64], op: &str) -> Option<Network
                     == 1
             });
             if !whole_width {
-                refusals.push(format!(
-                    "{op}: {} is left beside the selected blend network but does not end in \
+                refusals.push(KernelRefusal::ill_posed(
+                    KernelStage::Classify,
+                    "kept_strip_end",
+                    format!(
+                        "{op}: {} is left beside the selected blend network but does not end in \
                      it across its whole width — refusing rather than guessing its end",
-                    face_title(face)
+                        face_title(face)
+                    ),
                 ));
             }
             if let Some(other) = kept_at.insert(junction, kept_id) {
-                refusals.push(format!(
-                    "{op}: blend faces {other} and {kept_id} are both left standing where they \
+                refusals.push(KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "two_kept_at_junction",
+                    format!(
+                        "{op}: blend faces {other} and {kept_id} are both left standing where they \
                      end in one junction of the selected blend network — select one of them as well"
+                    ),
                 ));
             }
         }
@@ -941,7 +958,7 @@ enum JunctionEnd {
 
 impl JunctionEnd {
     /// The vertex an edge flanked by `flanking` ends on at this junction.
-    fn end_for(&self, flanking: &[u64], what: &str, op: &str) -> Result<(u64, Vec3), String> {
+    fn end_for(&self, flanking: &[u64], what: &str, op: &str) -> Result<(u64, Vec3), KernelRefusal> {
         match self {
             JunctionEnd::Point { vertex, point } => Ok((*vertex, *point)),
             JunctionEnd::Split {
@@ -953,10 +970,14 @@ impl JunctionEnd {
                 let sides: Vec<usize> = (0..2).filter(|side| flanking.contains(&walls[*side])).collect();
                 match sides.as_slice() {
                     [side] => Ok((vertices[*side], points[*side])),
-                    _ => Err(format!(
-                        "{op}: {what} reaches the end of kept blend face {kept} on {} of its \
+                    _ => Err(KernelRefusal::ill_posed(
+                        KernelStage::Sew,
+                        "kept_end_side",
+                        format!(
+                            "{op}: {what} reaches the end of kept blend face {kept} on {} of its \
                          walls — refusing rather than guessing which rim it ends on",
-                        if sides.is_empty() { "neither" } else { "both" }
+                            if sides.is_empty() { "neither" } else { "both" }
+                        ),
                     )),
                 }
             }
@@ -971,7 +992,7 @@ pub(super) fn heal_blend_network(
     solid: &BrepSolid,
     network: &BlendNetwork,
     op: &str,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let mut solid = solid.clone();
     let chi_before = euler_characteristic(&solid);
     let scale = solid_model_scale(&solid);
@@ -1051,11 +1072,15 @@ pub(super) fn heal_blend_network(
             .collect();
         standing.sort_unstable_by_key(|(face_id, _)| *face_id);
         if let (Some(cap), Some((standing_id, _))) = (held.first(), standing.first()) {
-            return Err(format!(
-                "{op}: the blend junction near ({:.6}, {:.6}, {:.6}) holds the apex of blend cap \
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "held_and_standing",
+                format!(
+                    "{op}: the blend junction near ({:.6}, {:.6}, {:.6}) holds the apex of blend cap \
                  face {} and the apex of blend cap face {standing_id}, which stays — reading \
                  both in one junction is not supported",
-                near.x, near.y, near.z, cap.face_id
+                    near.x, near.y, near.z, cap.face_id
+                ),
             ));
         }
 
@@ -1065,11 +1090,15 @@ pub(super) fn heal_blend_network(
                 .map(|cap| cap.face_id)
                 .or(standing.first().map(|(face_id, _)| *face_id))
             {
-                return Err(format!(
-                    "{op}: kept blend face {kept_id} ends in the blend junction near \
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "kept_and_apex",
+                    format!(
+                        "{op}: kept blend face {kept_id} ends in the blend junction near \
                      ({:.6}, {:.6}, {:.6}), which also holds the apex of blend cap face {} — \
                      splitting a junction across both is not supported",
-                    near.x, near.y, near.z, cap
+                        near.x, near.y, near.z, cap
+                    ),
                 ));
             }
             let kept = &network.kept[kept_id];
@@ -1080,28 +1109,39 @@ pub(super) fn heal_blend_network(
                 .filter(|face_id| !walls.contains(face_id))
                 .collect();
             if caps.len() != 1 || !walls.iter().all(|wall| incident.contains(wall)) {
-                return Err(format!(
-                    "{op}: kept blend face {kept_id} ends in the blend junction near \
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "kept_cap_count",
+                    format!(
+                        "{op}: kept blend face {kept_id} ends in the blend junction near \
                      ({:.6}, {:.6}, {:.6}) against {} faces besides its walls — one cap plane \
                      is needed to end it",
-                    near.x,
-                    near.y,
-                    near.z,
-                    caps.len()
+                        near.x,
+                        near.y,
+                        near.z,
+                        caps.len()
+                    ),
                 ));
             }
             let cap = &network.planes[&caps[0]];
             if cap.normal.cross(kept.axis).length() > angular {
-                return Err(format!(
-                    "{op}: face {} would end kept blend face {kept_id} obliquely to its axis — \
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "oblique_cap",
+                    format!(
+                        "{op}: face {} would end kept blend face {kept_id} obliquely to its axis — \
                      that section is an ellipse, which this lane does not build",
-                    caps[0]
+                        caps[0]
+                    ),
                 ));
             }
             let mut points = [Vec3::default(); 2];
             for side in 0..2 {
                 let rim = &edge_records[&kept.rims[side].0];
-                let on_rim = rim.curve.evaluate(0.5 * (rim.t0 + rim.t1))?;
+                let on_rim = rim
+                    .curve
+                    .evaluate(0.5 * (rim.t0 + rim.t1))
+                    .or_refuse(KernelStage::Sew, "evaluate")?;
                 let wall = &network.planes[&walls[side]];
                 let point = intersect_line_plane(
                     &Line {
@@ -1111,7 +1151,11 @@ pub(super) fn heal_blend_network(
                     cap,
                 )
                 .ok_or_else(|| {
-                    format!("{op}: kept blend face {kept_id}'s rim runs parallel to its cap")
+                    KernelRefusal::unsupported(
+                        KernelStage::Sew,
+                        "rim_parallel_cap",
+                        format!("{op}: kept blend face {kept_id}'s rim runs parallel to its cap"),
+                    )
                 })?;
                 let delta = point.sub(kept.origin);
                 let along = delta.dot(kept.axis);
@@ -1119,24 +1163,36 @@ pub(super) fn heal_blend_network(
                 if point.sub(wall.origin).dot(wall.normal).abs() > plane_tolerance
                     || (radial - kept.radius).abs() > plane_tolerance
                 {
-                    return Err(format!(
-                        "{op}: kept blend face {kept_id}'s rim on face {} does not meet its cap \
+                    return Err(KernelRefusal::unsupported(
+                        KernelStage::Sew,
+                        "kept_rim_cap_miss",
+                        format!(
+                            "{op}: kept blend face {kept_id}'s rim on face {} does not meet its cap \
                          face {} on both the wall and the cylinder",
-                        walls[side], caps[0]
+                            walls[side], caps[0]
+                        ),
                     ));
                 }
                 if along < kept.axial[0] - plane_tolerance || along > kept.axial[1] + plane_tolerance
                 {
-                    return Err(format!(
-                        "{op}: kept blend face {kept_id} does not reach its cap face {} — \
+                    return Err(KernelRefusal::unsupported(
+                        KernelStage::Sew,
+                        "kept_carrier_short",
+                        format!(
+                            "{op}: kept blend face {kept_id} does not reach its cap face {} — \
                          extending its carrier is not supported",
-                        caps[0]
+                            caps[0]
+                        ),
                     ));
                 }
                 if outside_region(point) {
-                    return Err(format!(
-                        "{op}: the end of kept blend face {kept_id} lands outside the network's \
+                    return Err(KernelRefusal::unsupported(
+                        KernelStage::Sew,
+                        "kept_end_outside",
+                        format!(
+                            "{op}: the end of kept blend face {kept_id} lands outside the network's \
                          own region"
+                        ),
                     ));
                 }
                 points[side] = point;
@@ -1152,21 +1208,33 @@ pub(super) fn heal_blend_network(
                 },
                 cap,
             )
-            .ok_or_else(|| format!("{op}: kept blend face {kept_id}'s axis misses its cap"))?;
-            let x_axis = points[0].sub(centre_point).normalized()?;
+            .ok_or_else(|| {
+                KernelRefusal::unsupported(
+                    KernelStage::Sew,
+                    "axis_misses_cap",
+                    format!("{op}: kept blend face {kept_id}'s axis misses its cap"),
+                )
+            })?;
+            let x_axis = points[0]
+                .sub(centre_point)
+                .normalized()
+                .or_refuse(KernelStage::Sew, "section_axis")?;
             let to_second = points[1].sub(centre_point);
             let across = to_second.sub(x_axis.scale(to_second.dot(x_axis)));
             if across.length() <= tolerance {
-                return Err(format!(
-                    "{op}: kept blend face {kept_id}'s rims meet its cap at a degenerate section"
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Sew,
+                    "degenerate_section",
+                    format!("{op}: kept blend face {kept_id}'s rims meet its cap at a degenerate section"),
                 ));
             }
-            let y_axis = across.normalized()?;
+            let y_axis = across.normalized().or_refuse(KernelStage::Sew, "section_axis")?;
             let sweep = to_second.dot(y_axis).atan2(to_second.dot(x_axis));
             // The strip itself must lie on that short arc: read the azimuth of
             // the mitre it wore at this junction.
-            let (kept_shell, kept_position) = find_face(&solid, *kept_id)
-                .ok_or_else(|| format!("{op}: missing face {kept_id}"))?;
+            let (kept_shell, kept_position) = find_face(&solid, *kept_id).ok_or_else(|| {
+                KernelRefusal::internal(KernelStage::Collect, "face", format!("{op}: missing face {kept_id}"))
+            })?;
             let mitre = solid.shells[kept_shell].faces[kept_position]
                 .loops
                 .iter()
@@ -1178,25 +1246,41 @@ pub(super) fn heal_blend_network(
                         && members.contains(&edge.end_vertex_id)
                 })
                 .ok_or_else(|| {
-                    format!("{op}: kept blend face {kept_id} wears no end edge at its junction")
+                    KernelRefusal::internal(
+                        KernelStage::Sew,
+                        "kept_end_edge",
+                        format!("{op}: kept blend face {kept_id} wears no end edge at its junction"),
+                    )
                 })?;
-            let inside = mitre.curve.evaluate(0.5 * (mitre.t0 + mitre.t1))?.sub(kept.origin);
+            let inside = mitre
+                .curve
+                .evaluate(0.5 * (mitre.t0 + mitre.t1))
+                .or_refuse(KernelStage::Sew, "evaluate")?
+                .sub(kept.origin);
             let azimuth = inside.dot(y_axis).atan2(inside.dot(x_axis));
             if !(azimuth > 0.0 && azimuth < sweep) {
-                return Err(format!(
-                    "{op}: kept blend face {kept_id} does not lie on the short arc between its \
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Sew,
+                    "long_arc",
+                    format!(
+                        "{op}: kept blend face {kept_id} does not lie on the short arc between its \
                      rims at its cap face {}",
-                    caps[0]
+                        caps[0]
+                    ),
                 ));
             }
             let vertices = [alloc(), alloc()];
-            let curve = crate::make_arc(centre_point, x_axis, y_axis, kept.radius, 0.0, sweep)?;
-            let [d0, d1] = curve.domain()?;
-            if curve.evaluate(d0)?.sub(points[0]).length() > plane_tolerance
-                || curve.evaluate(d1)?.sub(points[1]).length() > plane_tolerance
+            let curve = crate::make_arc(centre_point, x_axis, y_axis, kept.radius, 0.0, sweep)
+                .or_refuse(KernelStage::Sew, "make_arc")?;
+            let [d0, d1] = curve.domain().or_refuse(KernelStage::Sew, "domain")?;
+            let arc_at = |t: f64| curve.evaluate(t).or_refuse(KernelStage::Sew, "evaluate");
+            if arc_at(d0)?.sub(points[0]).length() > plane_tolerance
+                || arc_at(d1)?.sub(points[1]).length() > plane_tolerance
             {
-                return Err(format!(
-                    "{op}: the section arc ending kept blend face {kept_id} misses its rims"
+                return Err(KernelRefusal::internal(
+                    KernelStage::Sew,
+                    "arc_ends",
+                    format!("{op}: the section arc ending kept blend face {kept_id} misses its rims"),
                 ));
             }
             arcs.push(EdgeRecord {
@@ -1245,13 +1329,17 @@ pub(super) fn heal_blend_network(
             }
         }
         let Some((point, _)) = best else {
-            return Err(format!(
-                "{op}: the {} faces meeting at the blend junction near ({:.6}, {:.6}, {:.6}) \
+            return Err(KernelRefusal::ill_posed(
+                KernelStage::Classify,
+                "junction_unpinned",
+                format!(
+                    "{op}: the {} faces meeting at the blend junction near ({:.6}, {:.6}, {:.6}) \
                  do not pin a vertex — refusing rather than emitting an invalid solid",
-                pinning.len(),
-                near.x,
-                near.y,
-                near.z
+                    pinning.len(),
+                    near.x,
+                    near.y,
+                    near.z
+                ),
             ));
         };
         for (face_id, plane) in &pinning {
@@ -1264,19 +1352,27 @@ pub(super) fn heal_blend_network(
                     ),
                     None => format!("face {face_id}"),
                 };
-                return Err(format!(
-                    "{op}: {what} misses the vertex its blend junction near \
+                return Err(KernelRefusal::ill_posed(
+                    KernelStage::Classify,
+                    "junction_disagree",
+                    format!(
+                        "{op}: {what} misses the vertex its blend junction near \
                      ({:.6}, {:.6}, {:.6}) recovers by {miss:.6} — the faces there do not \
                      meet in one point",
-                    near.x, near.y, near.z
+                        near.x, near.y, near.z
+                    ),
                 ));
             }
         }
         if outside_region(point) {
-            return Err(format!(
-                "{op}: the blend junction near ({:.6}, {:.6}, {:.6}) recovers a vertex outside \
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "junction_outside",
+                format!(
+                    "{op}: the blend junction near ({:.6}, {:.6}, {:.6}) recovers a vertex outside \
                  the network's own region",
-                near.x, near.y, near.z
+                    near.x, near.y, near.z
+                ),
             ));
         }
         let vertex = match held.as_slice() {
@@ -1286,11 +1382,15 @@ pub(super) fn heal_blend_network(
                 if rest.iter().any(|other| other.apex != cap.apex)
                     || apex.sub(point).length() > plane_tolerance
                 {
-                    return Err(format!(
-                        "{op}: the blend junction near ({:.6}, {:.6}, {:.6}) recovers \
+                    return Err(KernelRefusal::unsupported(
+                        KernelStage::Classify,
+                        "held_apex_moves",
+                        format!(
+                            "{op}: the blend junction near ({:.6}, {:.6}, {:.6}) recovers \
                          ({:.6}, {:.6}, {:.6}), which is not the apex of its blend cap face {} — \
                          the edge that continues past the cap stays, so its vertex cannot move",
-                        near.x, near.y, near.z, point.x, point.y, point.z, cap.face_id
+                            near.x, near.y, near.z, point.x, point.y, point.z, cap.face_id
+                        ),
                     ));
                 }
                 cap.apex
@@ -1306,24 +1406,28 @@ pub(super) fn heal_blend_network(
                 })
             });
             if !on_walls || apex.sub(point).length() <= tolerance {
-                return Err(format!(
-                    "{op}: blend cap face {cap_id} stays with blend face {}, but the blend \
+                return Err(KernelRefusal::ill_posed(
+                    KernelStage::Classify,
+                    "standing_apex_join",
+                    format!(
+                        "{op}: blend cap face {cap_id} stays with blend face {}, but the blend \
                      junction near ({:.6}, {:.6}, {:.6}) recovers ({:.6}, {:.6}, {:.6}), which is \
                      {} — refusing rather than guessing how the cap's apex joins it",
-                    cap.strip,
-                    near.x,
-                    near.y,
-                    near.z,
-                    point.x,
-                    point.y,
-                    point.z,
-                    if on_walls { "the apex itself" } else { "not on both of the cap's walls" }
+                        cap.strip,
+                        near.x,
+                        near.y,
+                        near.z,
+                        point.x,
+                        point.y,
+                        point.z,
+                        if on_walls { "the apex itself" } else { "not on both of the cap's walls" }
+                    ),
                 ));
             }
             spokes.push((
                 EdgeRecord {
                     id: alloc(),
-                    curve: make_line(apex, point)?,
+                    curve: make_line(apex, point).or_refuse(KernelStage::Sew, "make_line")?,
                     t0: 0.0,
                     t1: 1.0,
                     start_vertex_id: cap.apex,
@@ -1347,16 +1451,24 @@ pub(super) fn heal_blend_network(
         let (start_vertex, start) = ends[junction_a].end_for(&[wall_a, wall_b], &what, op)?;
         let (end_vertex, end) = ends[junction_b].end_for(&[wall_a, wall_b], &what, op)?;
         if start.sub(end).length() <= tolerance {
-            return Err(format!(
-                "{op}: the sharp edge recovered for blend face {} collapses to a point",
-                strip.face_id
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Sew,
+                "edge_collapse",
+                format!(
+                    "{op}: the sharp edge recovered for blend face {} collapses to a point",
+                    strip.face_id
+                ),
             ));
         }
         if intersect_planes(&network.planes[&wall_a], &network.planes[&wall_b]).is_none() {
-            return Err(format!(
-                "{op}: the walls flanking blend face {} are parallel — they cannot \
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Sew,
+                "parallel_walls",
+                format!(
+                    "{op}: the walls flanking blend face {} are parallel — they cannot \
                  re-intersect into a sharp edge",
-                strip.face_id
+                    strip.face_id
+                ),
             ));
         }
         let key = (
@@ -1366,14 +1478,18 @@ pub(super) fn heal_blend_network(
             wall_a.max(wall_b),
         );
         if !spans.insert(key) {
-            return Err(format!(
-                "{op}: two blend strips recover the same sharp edge (blend face {})",
-                strip.face_id
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Sew,
+                "duplicate_edge",
+                format!(
+                    "{op}: two blend strips recover the same sharp edge (blend face {})",
+                    strip.face_id
+                ),
             ));
         }
         sharp_edges.push(EdgeRecord {
             id: alloc(),
-            curve: make_line(start, end)?,
+            curve: make_line(start, end).or_refuse(KernelStage::Sew, "make_line")?,
             t0: 0.0,
             t1: 1.0,
             start_vertex_id: start_vertex,
@@ -1404,7 +1520,7 @@ pub(super) fn heal_blend_network(
         let flanking = owners.get(&edge.id).map(Vec::as_slice).unwrap_or(&[]);
         let what = format!("edge {}", edge.id);
         // An end on a held apex, or on a standing cap's apex, does not move.
-        let target = |junction: Option<&usize>, vertex: u64| -> Result<Option<(u64, Vec3)>, String> {
+        let target = |junction: Option<&usize>, vertex: u64| -> Result<Option<(u64, Vec3)>, KernelRefusal> {
             if fixed_apexes.contains(&vertex) {
                 return Ok(None);
             }
@@ -1503,13 +1619,18 @@ pub(super) fn heal_blend_network(
                         edge_id: sharp.id,
                         forward,
                         // Placeholder; the re-trim/refit pass below recomputes it.
-                        pcurve: make_line(Vec3::default(), Vec3::new(1.0, 0.0, 0.0))?,
+                        pcurve: make_line(Vec3::default(), Vec3::new(1.0, 0.0, 0.0))
+                            .or_refuse(KernelStage::Sew, "make_line")?,
                     });
                 }
                 if rebuilt.is_empty() {
-                    return Err(format!(
-                        "{op}: healing the blend network emptied a loop of face {}",
-                        face.id
+                    return Err(KernelRefusal::internal(
+                        KernelStage::Sew,
+                        "emptied_loop",
+                        format!(
+                            "{op}: healing the blend network emptied a loop of face {}",
+                            face.id
+                        ),
                     ));
                 }
                 loop_record.coedges = rebuilt;
@@ -1552,9 +1673,13 @@ pub(super) fn heal_blend_network(
                         let next = &loop_record.coedges[(position + 1) % count];
                         let (Some((_, tail)), Some((head, _))) = (traversed(coedge), traversed(next))
                         else {
-                            return Err(format!(
-                                "{op}: a healed loop of face {} uses an unknown edge",
-                                face.id
+                            return Err(KernelRefusal::internal(
+                                KernelStage::Sew,
+                                "unknown_edge",
+                                format!(
+                                    "{op}: a healed loop of face {} uses an unknown edge",
+                                    face.id
+                                ),
                             ));
                         };
                         if tail == head {
@@ -1577,9 +1702,13 @@ pub(super) fn heal_blend_network(
                             }
                         }
                         if path.is_empty() {
-                            return Err(format!(
-                                "{op}: healing the blend network left a gap in a loop of face {}",
-                                face.id
+                            return Err(KernelRefusal::internal(
+                                KernelStage::Sew,
+                                "loop_gap",
+                                format!(
+                                    "{op}: healing the blend network left a gap in a loop of face {}",
+                                    face.id
+                                ),
                             ));
                         }
                         for (edge, forward) in path {
@@ -1589,7 +1718,8 @@ pub(super) fn heal_blend_network(
                                 edge_id: edge.id,
                                 forward,
                                 // Placeholder; the re-trim/refit pass below recomputes it.
-                                pcurve: make_line(Vec3::default(), Vec3::new(1.0, 0.0, 0.0))?,
+                                pcurve: make_line(Vec3::default(), Vec3::new(1.0, 0.0, 0.0))
+                                    .or_refuse(KernelStage::Sew, "make_line")?,
                             });
                         }
                     }
@@ -1605,9 +1735,13 @@ pub(super) fn heal_blend_network(
     {
         let uses = orientation.get(&edge.id).map(Vec::as_slice).unwrap_or(&[]);
         if uses.len() != 2 || uses[0] == uses[1] {
-            return Err(format!(
-                "{op}: a recovered edge is not used once in each direction by its two \
+            return Err(KernelRefusal::internal(
+                KernelStage::Sew,
+                "edge_uses",
+                format!(
+                    "{op}: a recovered edge is not used once in each direction by its two \
                  faces (unexpected connectivity)"
+                ),
             ));
         }
     }
@@ -1675,16 +1809,19 @@ pub(super) fn heal_blend_network(
         })
         .collect();
     retrim_order.sort_unstable();
+    let missing_face = |id: u64| {
+        KernelRefusal::internal(KernelStage::Collect, "face", format!("{op}: missing face {id}"))
+    };
     for face_id in retrim_order {
-        let (ns, nf) =
-            find_face(&solid, face_id).ok_or_else(|| format!("{op}: missing face {face_id}"))?;
+        let (ns, nf) = find_face(&solid, face_id).ok_or_else(|| missing_face(face_id))?;
         retrim_planar_face(
             &mut solid.shells[ns].faces[nf],
             &network.planes[&face_id],
             &final_edges,
             scale,
             op,
-        )?;
+        )
+        ?;
         // The planar re-trim maps each edge's WHOLE curve; a widened side edge
         // or an untouched subrange edge needs the range fitter.
         let touched: HashSet<u64> = solid.shells[ns].faces[nf]
@@ -1706,8 +1843,7 @@ pub(super) fn heal_blend_network(
     let mut kept_order: Vec<u64> = network.kept.keys().copied().collect();
     kept_order.sort_unstable();
     for face_id in kept_order {
-        let (ns, nf) =
-            find_face(&solid, face_id).ok_or_else(|| format!("{op}: missing face {face_id}"))?;
+        let (ns, nf) = find_face(&solid, face_id).ok_or_else(|| missing_face(face_id))?;
         let touched: HashSet<u64> = solid.shells[ns].faces[nf]
             .loops
             .iter()
@@ -1724,13 +1860,21 @@ pub(super) fn heal_blend_network(
     }
     let issues = solid.validate();
     if !issues.is_empty() {
-        return Err(format!("{op}: blend network heal failed validation: {issues:?}"));
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "validation",
+            format!("{op}: blend network heal failed validation: {issues:?}"),
+        ));
     }
     let chi_after = euler_characteristic(&solid);
     if chi_after != chi_before {
-        return Err(format!(
-            "{op}: healing the blend network changed the Euler characteristic from \
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "euler",
+            format!(
+                "{op}: healing the blend network changed the Euler characteristic from \
              {chi_before} to {chi_after} — refusing rather than adding or removing a handle"
+            ),
         ));
     }
     Ok(solid)

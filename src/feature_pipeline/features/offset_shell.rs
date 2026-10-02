@@ -41,7 +41,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::feature_pipeline::features::common;
-use crate::feature_pipeline::{FeatureContext, FeatureResult};
+use crate::feature_pipeline::{FeatureContext, FeatureRefusal, FeatureResult};
 use crate::OffsetFaceRole;
 
 pub fn execute(ctx: &FeatureContext) -> FeatureResult {
@@ -88,7 +88,7 @@ fn unique_name(counts: &mut HashMap<String, usize>, base: String) -> String {
     name
 }
 
-fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     let mut result = FeatureResult::empty(ctx.id.clone(), ctx.feature_type.clone());
 
     // Distance: no-op on NaN / 0 (a soft warn,
@@ -136,11 +136,17 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         .iter()
         .find(|(_, resident)| **resident == handle)
         .map(|(name, _)| name.clone())
-        .ok_or_else(|| "offset_shell: opening faces resolve to no scene-resident solid".to_string())?;
+        .ok_or_else(|| {
+            crate::KernelRefusal::internal(
+                crate::KernelStage::Collect,
+                "offset_shell_no_resident_solid",
+                "offset_shell: opening faces resolve to no scene-resident solid",
+            )
+        })?;
 
     // Short borrow: capture the source face id → name map and run the op in one
     // borrow, then release the registry (contract handle discipline).
-    let (source_names, record) = crate::with_registered_solid_str(handle, |solid| {
+    let (source_names, record) = crate::with_registered_solid_typed(handle, |solid| {
         let source_names: HashMap<u64, String> = solid
             .shells
             .iter()
@@ -152,9 +158,9 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     })?;
     let record = match record {
         Ok(record) => record,
-        // Every face selected → no support left to offset. Pattern-match this
-        // one refusal and warn + no-op.
-        Err(error) if error.contains("cannot produce a shell") => return Ok(result),
+        // Every face selected → no support left to offset: warn + no-op. Keyed
+        // on the refusal's class and slug, never its text.
+        Err(error) if crate::is_offset_shell_no_retained_face(&error) => return Ok(result),
         // The opening-wall machinery still cannot close a watertight shell around
         // SOME openings whose boundary is a complex CURVED (non-ruled) cut — e.g. a
         // tangent rim fillet (A3c). (Sphere-carved, cone-crater, partial-arc, and
@@ -165,21 +171,24 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         // leaves the shell open (a non-integral genus / unwelded-rim refusal);
         // give the user an ACTIONABLE message + the reorder workaround instead
         // of the raw genus dump.
-        Err(error)
-            if error.contains("completion produced non-integral genus")
-                || error.contains("non-watertight shell")
-                || error.contains("unwelded rim") =>
-        {
-            return Err(format!(
-                "offset shell could not close a watertight shell around the selected opening. \
-                 Some openings carved by a complex CURVED cut (e.g. a rim-tangent fillet) \
-                 are not yet supported — the wall along such a rim is neither ruled nor \
-                 planar. Fix: run the offset shell EARLIER in the history, before that cut \
-                 (reorder it above the curved boolean). (kernel detail: {error})"
-            ));
+        // Keyed on the class: the assembly's `NonIntegralGenus` (carried
+        // through every cause the shell puts in front of it) or the unwelded
+        // curved rim (`is_offset_shell_open_curved_rim`).
+        Err(error) if crate::is_offset_shell_open_curved_rim(&error) => {
+            return Err(error
+                .with_message(|error| {
+                    format!(
+                        "offset shell could not close a watertight shell around the selected opening. \
+                         Some openings carved by a complex CURVED cut (e.g. a rim-tangent fillet) \
+                         are not yet supported — the wall along such a rim is neither ruled nor \
+                         planar. Fix: run the offset shell EARLIER in the history, before that cut \
+                         (reorder it above the curved boolean). (kernel detail: {error})"
+                    )
+                })
+                .into());
         }
         // Any other kernel refusal is a genuine failure (the caller rethrows).
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     };
 
     let mut shell = record.solid;

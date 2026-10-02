@@ -1,16 +1,17 @@
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 use crate::offset_carve::carve_folded_trim;
 use crate::offset_regularity::{scan_offset_regularity, ScanBudget, TrimRegion};
 use crate::{NurbsCurve, NurbsSurface};
 
-pub(super) fn standalone_face(solid: &BrepSolid, face_id: u64) -> Result<BrepSolid, String> {
+pub(super) fn standalone_face(solid: &BrepSolid, face_id: u64) -> Result<BrepSolid, KernelRefusal> {
     let face = solid
         .shells
         .iter()
         .flat_map(|shell| &shell.faces)
         .find(|face| face.id == face_id)
         .cloned()
-        .ok_or_else(|| format!("offset_shell: missing face {face_id}"))?;
+        .ok_or_else(|| format!("offset_shell: missing face {face_id}")).or_refuse(KernelStage::Refine, "offset_shell_missing_face")?;
     let edge_ids = face
         .loops
         .iter()
@@ -34,6 +35,7 @@ pub(super) fn standalone_face(solid: &BrepSolid, face_id: u64) -> Result<BrepSol
         .cloned()
         .collect();
     Ok(BrepSolid {
+        mass_properties_cache: Default::default(),
         id: solid.id,
         vertices,
         edges,
@@ -50,7 +52,7 @@ pub(super) fn standalone_face(solid: &BrepSolid, face_id: u64) -> Result<BrepSol
 /// fitting a zero-radius surface leaves line edges, and fitting past zero
 /// creates a reflected surface that is no longer part of the shell boundary.
 /// Keep the source face itself for the outer skin and distance classification.
-pub(super) fn offset_support_collapsed(face: &FaceRecord, distance: f64) -> Result<bool, String> {
+pub(super) fn offset_support_collapsed(face: &FaceRecord, distance: f64) -> Result<bool, KernelRefusal> {
     use crate::AnalyticSurface;
     let (center, axis, radius) = match face.surface.analytic() {
         Some(AnalyticSurface::Sphere { frame, radius }) => (frame.origin, None, *radius),
@@ -62,8 +64,8 @@ pub(super) fn offset_support_collapsed(face: &FaceRecord, distance: f64) -> Resu
         Some(AnalyticSurface::Revolution {
             frame, generatrix, ..
         }) if generatrix.degree == 1 && generatrix.control_points.len() == 2 => {
-            let a = generatrix.control_points[0].point()?.sub(frame.origin);
-            let b = generatrix.control_points[1].point()?.sub(frame.origin);
+            let a = generatrix.control_points[0].point().or_refuse(KernelStage::Refine, "point")?.sub(frame.origin);
+            let b = generatrix.control_points[1].point().or_refuse(KernelStage::Refine, "point")?.sub(frame.origin);
             let ra = a.sub(frame.axis.scale(a.dot(frame.axis)));
             let rb = b.sub(frame.axis.scale(b.dot(frame.axis)));
             if ra.sub(rb).length() > 1e-9 * ra.length().max(1.0) {
@@ -73,16 +75,16 @@ pub(super) fn offset_support_collapsed(face: &FaceRecord, distance: f64) -> Resu
         }
         _ => return offset_curvature_collapsed(face, distance),
     };
-    let [u0, u1] = face.surface.domain_u()?;
-    let [v0, v1] = face.surface.domain_v()?;
+    let [u0, u1] = face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = face.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
     let (u, v) = ((u0 + u1) * 0.5, (v0 + v1) * 0.5);
-    let mut radial = face.surface.evaluate(u, v)?.sub(center);
+    let mut radial = face.surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?.sub(center);
     if let Some(axis) = axis {
         radial = radial.sub(axis.scale(radial.dot(axis)));
     }
-    let normal = face.surface.normal(u, v)?;
+    let normal = face.surface.normal(u, v).or_refuse(KernelStage::Refine, "normal")?;
     let sense = if face.same_sense { 1.0 } else { -1.0 };
-    let inward_change = distance * sense * normal.dot(radial.normalized()?);
+    let inward_change = distance * sense * normal.dot(radial.normalized().or_refuse(KernelStage::Refine, "normalized")?);
     Ok(radius - inward_change <= 1e-9 * radius.max(distance.abs()).max(1.0))
 }
 
@@ -135,8 +137,8 @@ pub(super) fn shell_displacement(face: &FaceRecord, distance: f64) -> f64 {
 /// skin is ever built. A support that folds over only PART of its trim is not
 /// this lane's to answer: [`carve_folded_support`] splits that trim along the
 /// fold locus and keeps the regular side.
-fn offset_curvature_collapsed(face: &FaceRecord, distance: f64) -> Result<bool, String> {
-    if distance == 0.0 || face.surface.is_affine()? {
+fn offset_curvature_collapsed(face: &FaceRecord, distance: f64) -> Result<bool, KernelRefusal> {
+    if distance == 0.0 || face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
         return Ok(false);
     }
     let displacement = shell_displacement(face, distance);
@@ -159,9 +161,74 @@ fn offset_curvature_collapsed(face: &FaceRecord, distance: f64) -> Result<bool, 
         scan.collapsed,
         scan.sampled
     );
-    Ok(scan.sampled > 0 && scan.collapsed == scan.sampled && scan.between_regular == 0)
+    if scan.sampled > 0 && scan.collapsed == scan.sampled && scan.between_regular == 0 {
+        return Ok(true);
+    }
+    if scan.collapsed > 0 && offset_sections_collapsed(face, displacement)? {
+        return Ok(true);
+    }
+    Ok(false)
 }
 
+/// A fitted circular strip can collapse to its spine even though interpolation
+/// noise makes its curvature straddle COLLAPSE_FACTOR. Marching that noise
+/// produces spurious fold islands or an untraceable level set. Check the
+/// pointwise image of each quadratic section against the existing geometric
+/// carrier-consistency tolerance instead. This is only used after the scan
+/// actually finds a collapse: a wholly regular, thin inner skin stays regular.
+///
+/// Read every knot span, including its ends, over the trim's parameter box.
+/// A uniform grid missed the largest normal errors on the reported blend.
+/// The whole box is conservative for nonrectangular trims: any section which
+/// still has width prevents omission. Unreadable normals also prevent it.
+fn offset_sections_collapsed(face: &FaceRecord, displacement: f64) -> Result<bool, KernelRefusal> {
+    let surface = &face.surface;
+    let tolerance = KernelTolerances::default().pcurve_consistency;
+    let [u0, u1, v0, v1] = TrimRegion::from_face(face)?.bounds();
+    // Single-span quadratic sections are the circular cross sections used by
+    // fitted fillets; do not infer a general free-form patch's rank from them.
+    if surface.degree_v != 2 || surface.control_points[0].len() != 3 {
+        return Ok(false);
+    }
+    let mut sampled = false;
+    for span in surface.knots_u.windows(2) {
+        let lo = span[0].max(u0);
+        let hi = span[1].min(u1);
+        if hi <= lo {
+            continue;
+        }
+        for i in 0..=4 {
+            let u = lo + (hi - lo) * i as f64 / 4.0;
+            let mut low = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+            let mut high = low.scale(-1.0);
+            let first = surface.evaluate(u, v0).or_refuse(KernelStage::Refine, "evaluate")?;
+            let last = surface.evaluate(u, v1).or_refuse(KernelStage::Refine, "evaluate")?;
+            // Do not mistake an already tiny source strip for a collapse.
+            if last.sub(first).length() <= 2.0 * tolerance {
+                return Ok(false);
+            }
+            for j in 0..=16 {
+                let v = v0 + (v1 - v0) * j as f64 / 16.0;
+                let Ok(point) = surface.evaluate(u, v) else {
+                    return Ok(false);
+                };
+                let Ok(normal) = surface.normal(u, v) else {
+                    return Ok(false);
+                };
+                let image = point.add(normal.scale(displacement));
+                low = Vec3::new(low.x.min(image.x), low.y.min(image.y), low.z.min(image.z));
+                high = Vec3::new(high.x.max(image.x), high.y.max(image.y), high.z.max(image.z));
+                // Every point must lie within the carrier-consistency band
+                // of the section's box centre, not of its first endpoint.
+                if high.sub(low).length() > 2.0 * tolerance {
+                    return Ok(false);
+                }
+            }
+            sampled = true;
+        }
+    }
+    Ok(sampled)
+}
 
 /// The source solid with one face's FOLDED part carved away — the support a
 /// carrier should actually be built over when the offset folds across part of
@@ -198,8 +265,8 @@ pub(super) fn carve_folded_support(
     source: &BrepSolid,
     face: &FaceRecord,
     distance: f64,
-) -> Result<Option<CarvedSupport>, String> {
-    if distance == 0.0 || face.surface.is_affine()? {
+) -> Result<Option<CarvedSupport>, KernelRefusal> {
+    if distance == 0.0 || face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
         return Ok(None);
     }
     let loops = face
@@ -292,7 +359,7 @@ pub(super) fn carve_folded_support(
     // and refusing by name is what keeps a shell that cannot close from
     // arriving as an unexplained weld failure.
     if carved.kept.len() > 1 {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "offset_shell_fold_band", format!(
             "offset_shell: the offset of source face {} folds in a BAND across its trim. The \
              fold locus divides it into {} regular piece(s) with {} folded one(s) dropped \
              between them, and thicken builds a body per piece — but this lane keeps the source \
@@ -302,7 +369,7 @@ pub(super) fn carve_folded_support(
             face.id,
             carved.kept.len(),
             carved.dropped.len()
-        ));
+        )));
     }
 
     // The cavity may end at a fold only where the fold is a PINCH.
@@ -322,7 +389,7 @@ pub(super) fn carve_folded_support(
     // a pinch.
     let (fold_image_extent, fold_image_bar) = fold_image_extent(source, face, &carved.kept[0], distance)?;
     if fold_image_extent > fold_image_bar {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "offset_shell_cusp", format!(
             "offset_shell: the offset of source face {} folds across part of its trim, and the \
              fold locus that bounds the kept part is not a PINCH — its offset image spans \
              {fold_image_extent:.6e} against the {fold_image_bar:.3e} a pinch can reach at the \
@@ -333,7 +400,7 @@ pub(super) fn carve_folded_support(
             face.id,
             carved.kept.len(),
             carved.dropped.len()
-        ));
+        )));
     }
 
     let mut fold_boundary = 0usize;
@@ -341,17 +408,17 @@ pub(super) fn carve_folded_support(
     for carved_loop in &carved.kept[0] {
         let count = carved_loop.pcurves.len();
         if count == 0 {
-            return Err("offset_shell: the carve produced an empty loop".into());
+            return Err(KernelRefusal::internal(KernelStage::Refine, "offset_shell_carve_empty_loop", "offset_shell: the carve produced an empty loop"));
         }
         // Junction j is the START of pcurve j: the same convention the carrier
         // builder and `thicken` both use for a loop of pcurves.
         let mut vertex_ids = Vec::with_capacity(count);
         for pcurve in &carved_loop.pcurves {
-            let [t0, _] = pcurve.domain()?;
-            let uv = pcurve.evaluate(t0)?;
+            let [t0, _] = pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+            let uv = pcurve.evaluate(t0).or_refuse(KernelStage::Refine, "evaluate")?;
             solid.vertices.push(VertexRecord {
                 id: next_id,
-                point: face.surface.evaluate(uv.x, uv.y)?,
+                point: face.surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Refine, "evaluate")?,
             });
             vertex_ids.push(next_id);
             next_id += 1;
@@ -370,7 +437,7 @@ pub(super) fn carve_folded_support(
             // circle on a cone) whatever its offset image does.
             let degenerate = source_edge.is_some_and(|edge| edge.degenerate);
             let curve = source_image_curve(&face.surface, pcurve, degenerate)?;
-            let [t0, t1] = curve.domain()?;
+            let [t0, t1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
             let edge_id = next_id;
             next_id += 1;
             solid.edges.push(EdgeRecord {
@@ -440,7 +507,7 @@ fn fold_image_extent(
     face: &FaceRecord,
     kept: &[crate::offset_carve::CarvedLoop],
     distance: f64,
-) -> Result<(f64, f64), String> {
+) -> Result<(f64, f64), KernelRefusal> {
     const SAMPLES: usize = 32;
     let bar = 2.0 * 3.0f64.sqrt() * COLLAPSE_FACTOR * crate::solid_scale(source)
         + KernelTolerances::for_solid(source, 1e-7).model;
@@ -451,17 +518,17 @@ fn fold_image_extent(
             if origin.is_some() {
                 continue;
             }
-            let [t0, t1] = pcurve.domain()?;
+            let [t0, t1] = pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
             let (mut lo, mut hi) = (
                 Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY),
                 Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY),
             );
             for index in 0..=SAMPLES {
-                let uv = pcurve.evaluate(t0 + (t1 - t0) * index as f64 / SAMPLES as f64)?;
+                let uv = pcurve.evaluate(t0 + (t1 - t0) * index as f64 / SAMPLES as f64).or_refuse(KernelStage::Refine, "evaluate")?;
                 let point = face
                     .surface
-                    .evaluate(uv.x, uv.y)?
-                    .add(face.surface.normal(uv.x, uv.y)?.scale(displacement));
+                    .evaluate(uv.x, uv.y).or_refuse(KernelStage::Refine, "evaluate")?
+                    .add(face.surface.normal(uv.x, uv.y).or_refuse(KernelStage::Refine, "normal")?.scale(displacement));
                 lo = Vec3::new(lo.x.min(point.x), lo.y.min(point.y), lo.z.min(point.z));
                 hi = Vec3::new(hi.x.max(point.x), hi.y.max(point.y), hi.z.max(point.z));
             }
@@ -486,16 +553,16 @@ fn source_image_curve(
     surface: &NurbsSurface,
     pcurve: &NurbsCurve,
     degenerate: bool,
-) -> Result<NurbsCurve, String> {
-    let [t0, t1] = pcurve.domain()?;
+) -> Result<NurbsCurve, KernelRefusal> {
+    let [t0, t1] = pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
     const SAMPLES: usize = 64;
     let mut points = Vec::with_capacity(SAMPLES + 1);
     for index in 0..=SAMPLES {
-        let uv = pcurve.evaluate(t0 + (t1 - t0) * index as f64 / SAMPLES as f64)?;
-        points.push(surface.evaluate(uv.x, uv.y)?);
+        let uv = pcurve.evaluate(t0 + (t1 - t0) * index as f64 / SAMPLES as f64).or_refuse(KernelStage::Refine, "evaluate")?;
+        points.push(surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Refine, "evaluate")?);
     }
     if degenerate {
-        return crate::make_line(points[0], points[points.len() - 1]);
+        return crate::make_line(points[0], points[points.len() - 1]).or_refuse(KernelStage::Refine, "make_line");
     }
     let mut parameters = Vec::with_capacity(points.len());
     let mut total = 0.0;
@@ -504,7 +571,7 @@ fn source_image_curve(
         total += window[1].sub(window[0]).length().max(1e-12);
         parameters.push(total);
     }
-    crate::interpolate_curve(&points, 3, &parameters)
+    crate::interpolate_curve(&points, 3, &parameters).or_refuse(KernelStage::Refine, "interpolate_curve")
 }
 
 pub(super) fn carrier_solid(
@@ -512,7 +579,7 @@ pub(super) fn carrier_solid(
     face_id: u64,
     distance: f64,
     planar_extension: f64,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     carrier_solid_sided(
         source,
         face_id,
@@ -526,9 +593,10 @@ pub(super) fn carrier_solid_sided(
     face_id: u64,
     distance: f64,
     extension: &crate::CarrierExtension,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let carrier = crate::offset_face_carrier_sided(source, face_id, distance, extension)?;
     Ok(BrepSolid {
+        mass_properties_cache: Default::default(),
         id: 1,
         vertices: carrier.vertices,
         edges: carrier.edges,
@@ -543,7 +611,7 @@ pub(super) fn carrier_solid_sided(
 /// Keep only the outer (largest |UV area|) loop of a one-face wall carrier and
 /// prune the edges/vertices the dropped interior loops referenced. See the
 /// call site in `offset_shell_impl` for why interior loops must go.
-pub(super) fn drop_wall_interior_loops(wall: &mut BrepSolid) -> Result<(), String> {
+pub(super) fn drop_wall_interior_loops(wall: &mut BrepSolid) -> Result<(), KernelRefusal> {
     let face = &mut wall.shells[0].faces[0];
     if face.loops.len() < 2 {
         return Ok(());
@@ -557,7 +625,7 @@ pub(super) fn drop_wall_interior_loops(wall: &mut BrepSolid) -> Result<(), Strin
             same_sense: true,
             loops: vec![loop_record.clone()],
             name: None,
-        })?
+        }).or_refuse(KernelStage::Refine, "parameter_space_area")?
         .abs();
         if area > outer_area {
             outer_area = area;
@@ -731,13 +799,13 @@ pub(super) fn empty_imprint() -> ImprintResultRecord {
     }
 }
 
-pub(super) fn flip_fragment(fragment: &mut FaceFragmentRecord) -> Result<(), String> {
+pub(super) fn flip_fragment(fragment: &mut FaceFragmentRecord) -> Result<(), KernelRefusal> {
     fragment.same_sense = !fragment.same_sense;
     for loop_record in &mut fragment.loops {
         loop_record.coedges.reverse();
         for coedge in &mut loop_record.coedges {
             coedge.forward = !coedge.forward;
-            coedge.pcurve = coedge.pcurve.reversed()?;
+            coedge.pcurve = coedge.pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")?;
         }
     }
     Ok(())
@@ -778,7 +846,7 @@ fn skin_distance_to_trimmed_face(
     face: &FaceRecord,
     edges: &[&EdgeRecord],
     point: Vec3,
-) -> Result<f64, String> {
+) -> Result<f64, KernelRefusal> {
     match miter_distance_to_trimmed_face(face, edges, point)? {
         Some(measured) => Ok(measured),
         None => distance_to_trimmed_face(face, edges, point),
@@ -791,7 +859,7 @@ fn distance_to_trimmed_face(
     face: &FaceRecord,
     edges: &[&EdgeRecord],
     point: Vec3,
-) -> Result<f64, String> {
+) -> Result<f64, KernelRefusal> {
     Ok(nearest_on_trimmed_face(face, edges, point)?.0)
 }
 
@@ -813,15 +881,15 @@ fn miter_distance_to_trimmed_face(
     face: &FaceRecord,
     edges: &[&EdgeRecord],
     point: Vec3,
-) -> Result<Option<f64>, String> {
-    if !face.surface.is_affine()? {
+) -> Result<Option<f64>, KernelRefusal> {
+    if !face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
         return Ok(None);
     }
-    let [u0, u1] = face.surface.domain_u()?;
-    let [v0, v1] = face.surface.domain_v()?;
-    let origin = face.surface.evaluate(u0, v0)?;
-    let along_u = face.surface.evaluate(u1, v0)?.sub(origin);
-    let along_v = face.surface.evaluate(u0, v1)?.sub(origin);
+    let [u0, u1] = face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = face.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    let origin = face.surface.evaluate(u0, v0).or_refuse(KernelStage::Refine, "evaluate")?;
+    let along_u = face.surface.evaluate(u1, v0).or_refuse(KernelStage::Refine, "evaluate")?.sub(origin);
+    let along_v = face.surface.evaluate(u0, v1).or_refuse(KernelStage::Refine, "evaluate")?.sub(origin);
     let normal = along_u.cross(along_v);
     let normal_length = normal.length();
     if !(normal_length > 0.0) {
@@ -847,7 +915,7 @@ fn miter_distance_to_trimmed_face(
         x: u0 + (u1 - u0) * (r1 * g22 - r2 * g12) / determinant,
         y: v0 + (v1 - v0) * (r2 * g11 - r1 * g12) / determinant,
     };
-    if parameter_point_in_face(face, uv, 1e-9)? != PolygonClass::Outside {
+    if parameter_point_in_face(face, uv, 1e-9).or_refuse(KernelStage::Refine, "parameter_point_in_face")? != PolygonClass::Outside {
         return Ok(Some(height.abs()));
     }
     let mut tangential = f64::INFINITY;
@@ -857,9 +925,9 @@ fn miter_distance_to_trimmed_face(
         }
         // The exact projection, not a sampled one: a sampled rim overstates how
         // far a foot lies past it, and that is the whole quantity here.
-        let projection = crate::project_point_to_curve(&edge.curve, foot)?;
+        let projection = crate::project_point_to_curve(&edge.curve, foot).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
         let parameter = projection.u.clamp(edge.t0, edge.t1);
-        tangential = tangential.min(edge.curve.evaluate(parameter)?.sub(foot).length());
+        tangential = tangential.min(edge.curve.evaluate(parameter).or_refuse(KernelStage::Refine, "evaluate")?.sub(foot).length());
     }
     if !tangential.is_finite() {
         return Ok(None);
@@ -912,13 +980,13 @@ fn nearest_on_trimmed_face(
     face: &FaceRecord,
     edges: &[&EdgeRecord],
     point: Vec3,
-) -> Result<(f64, Option<Vec3>), String> {
-    let projection = project_point_to_surface(&face.surface, point)?;
+) -> Result<(f64, Option<Vec3>), KernelRefusal> {
+    let projection = project_point_to_surface(&face.surface, point).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
     let uv = Vec2 {
         x: projection.u,
         y: projection.v,
     };
-    if parameter_point_in_face(face, uv, 1e-9)? != PolygonClass::Outside {
+    if parameter_point_in_face(face, uv, 1e-9).or_refuse(KernelStage::Refine, "parameter_point_in_face")? != PolygonClass::Outside {
         return Ok((projection.distance, Some(projection.point)));
     }
     let mut best = (f64::INFINITY, None);
@@ -929,7 +997,7 @@ fn nearest_on_trimmed_face(
         let samples = 48;
         for index in 0..=samples {
             let parameter = edge.t0 + (edge.t1 - edge.t0) * index as f64 / samples as f64;
-            let sample = edge.curve.evaluate(parameter)?;
+            let sample = edge.curve.evaluate(parameter).or_refuse(KernelStage::Refine, "evaluate")?;
             let separation = sample.sub(point).length();
             if separation < best.0 {
                 best = (separation, Some(sample));
@@ -961,7 +1029,7 @@ pub(super) fn coincident_offset_face(
     retained_faces: &[(&FaceRecord, Vec<&EdgeRecord>)],
     distance: f64,
     tolerance: f64,
-) -> Result<Option<(u64, f64)>, String> {
+) -> Result<Option<(u64, f64)>, KernelRefusal> {
     let Some(own_foot) = retained_foot(point, own_face_id, retained_faces)? else {
         return Ok(None);
     };
@@ -1001,7 +1069,7 @@ fn retained_foot(
     point: Vec3,
     face_id: u64,
     retained_faces: &[(&FaceRecord, Vec<&EdgeRecord>)],
-) -> Result<Option<Vec3>, String> {
+) -> Result<Option<Vec3>, KernelRefusal> {
     let Some((face, edges)) = retained_faces.iter().find(|(face, _)| face.id == face_id) else {
         return Ok(None);
     };
@@ -1022,7 +1090,7 @@ pub(super) fn crossing_face_at(
     retained_faces: &[(&FaceRecord, Vec<&EdgeRecord>)],
     distance: f64,
     tolerance: f64,
-) -> Result<Option<(u64, f64)>, String> {
+) -> Result<Option<(u64, f64)>, KernelRefusal> {
     let Some(own) = retained_foot(point, own_face_id, retained_faces)? else {
         return Ok(None);
     };
@@ -1155,7 +1223,7 @@ pub(super) fn offset_skin_reading(
                 unmeasured.get_or_insert((face.id, format!("the distance read {separation}")));
             }
             Err(error) => {
-                unmeasured.get_or_insert((face.id, error));
+                unmeasured.get_or_insert((face.id, error.message));
             }
         }
     }
@@ -1176,12 +1244,116 @@ pub(super) fn point_on_offset_skin(
     retained_faces: &[(&FaceRecord, Vec<&EdgeRecord>)],
     distance: f64,
     tolerance: f64,
-) -> Result<bool, String> {
+) -> Result<bool, KernelRefusal> {
     match offset_skin_reading(point, retained_faces, distance, tolerance) {
         SkinReading::On => Ok(true),
         SkinReading::Shadowed { .. } => Ok(false),
         SkinReading::Unmeasured { face, reason } => Err(unmeasured_skin_refusal(point, face, &reason)),
     }
+}
+
+/// At a reflex opening, the rim can move past the original outline. The
+/// outward side of a retained plane is then cavity, not a second wall strip.
+/// The unsigned miter metric would keep both sides of that plane, filling the
+/// opening with a phantom strip beside the legitimate inward wall.
+pub(super) fn point_on_inward_opening_skin(
+    point: Vec3,
+    retained_faces: &[(&FaceRecord, Vec<&EdgeRecord>)],
+    reflex_neighbors: &HashSet<u64>,
+    inside_source: bool,
+    distance: f64,
+    tolerance: f64,
+) -> Result<bool, KernelRefusal> {
+    let mut material_side = Vec::new();
+    let mut reflex_side = Vec::new();
+    for (face, edges) in retained_faces {
+        if face
+            .surface
+            .is_affine()
+            .or_refuse(KernelStage::Select, "is_affine")?
+        {
+            let projection = project_point_to_surface(&face.surface, point)
+                .or_refuse(KernelStage::Select, "project_point_to_surface")?;
+            let foot = face
+                .surface
+                .evaluate(projection.u, projection.v)
+                .or_refuse(KernelStage::Select, "evaluate")?;
+            let normal = face_normal(face, projection.u, projection.v)?;
+            if point.sub(foot).dot(normal) > tolerance {
+                continue;
+            }
+        }
+        if inside_source && reflex_neighbors.contains(&face.id) {
+            reflex_side.push((*face, edges.clone()));
+        } else {
+            material_side.push((*face, edges.clone()));
+        }
+    }
+    let other_skin = point_on_offset_skin(point, &material_side, distance, tolerance)?;
+    if inside_source {
+        // Outside the original opening, a wall exists only in a reflex rim's
+        // strip, and only where other offsets leave cavity. Near (say) the
+        // top of a step both sides are material, so there is no wall there.
+        let reflex_skin = point_on_offset_skin(point, &reflex_side, distance, tolerance)?;
+        Ok(reflex_skin || !other_skin)
+    } else {
+        Ok(other_skin)
+    }
+}
+
+/// A planar source face entirely on one side of an adjacent opening must
+/// keep its offset on that side too. At a reflex rim this may be the FRONT
+/// of the opening; a global opening halfspace would cut away the wrong side.
+/// Bound the trimmed face with its pcurve control hull, using the affine
+/// surface map so the side test is conservative between sample stations.
+pub(super) fn opening_trim_halfspaces(
+    face: &FaceRecord,
+    openings: &[&FaceRecord],
+    tolerance: f64,
+) -> Result<Vec<(Vec3, Vec3)>, KernelRefusal> {
+    let mut planes = Vec::new();
+    if !face
+        .surface
+        .is_affine()
+        .or_refuse(KernelStage::Select, "is_affine")?
+    {
+        return Ok(planes);
+    }
+    'opening: for opening in openings {
+        if !source_faces_adjacent(face, opening) {
+            continue;
+        }
+        let Some((origin, normal)) = planar_surface_frame(&opening.surface, tolerance)? else {
+            continue;
+        };
+        let mut low = f64::INFINITY;
+        let mut high = f64::NEG_INFINITY;
+        for control in face
+            .loops
+            .iter()
+            .flat_map(|l| &l.coedges)
+            .flat_map(|c| &c.pcurve.control_points)
+        {
+            if control.w <= 0.0 {
+                continue 'opening;
+            }
+            let Ok(point) = face
+                .surface
+                .evaluate(control.x / control.w, control.y / control.w)
+            else {
+                continue 'opening;
+            };
+            let side = point.sub(origin).dot(normal);
+            low = low.min(side);
+            high = high.max(side);
+        }
+        if low >= -tolerance && high > tolerance {
+            planes.push((origin, normal));
+        } else if high <= tolerance && low < -tolerance {
+            planes.push((origin, normal.scale(-1.0)));
+        }
+    }
+    Ok(planes)
 }
 
 /// Where a RETAINED face meets an OPENING along a sharp edge that is not
@@ -1255,11 +1427,15 @@ pub(super) fn name_retained_opening_junction(
 }
 
 /// The refusal for a skin test that could not be taken.
-pub(super) fn unmeasured_skin_refusal(point: Vec3, face: u64, reason: &str) -> String {
-    format!(
-        "offset_shell: cannot tell whether ({:.4}, {:.4}, {:.4}) lies on the offset skin: its \
-         distance to retained face {face} could not be measured ({reason})",
-        point.x, point.y, point.z
+pub(super) fn unmeasured_skin_refusal(point: Vec3, face: u64, reason: &str) -> KernelRefusal {
+    KernelRefusal::internal(
+        KernelStage::Select,
+        "offset_shell_unmeasured_skin",
+        format!(
+            "offset_shell: cannot tell whether ({:.4}, {:.4}, {:.4}) lies on the offset skin: its \
+             distance to retained face {face} could not be measured ({reason})",
+            point.x, point.y, point.z
+        ),
     )
 }
 
@@ -1268,11 +1444,11 @@ pub(super) fn unmeasured_skin_refusal(point: Vec3, face: u64, reason: &str) -> S
 /// mouth tangent to all four edge setbacks of a top face — owns one offset skin
 /// per region, and each needs its own seed. An ordinary face has one region, so
 /// `seeds[0]` is the seed it always had.
-pub(super) fn source_seeds(source: &BrepSolid, face_id: u64) -> Result<Vec<Vec2>, String> {
+pub(super) fn source_seeds(source: &BrepSolid, face_id: u64) -> Result<Vec<Vec2>, KernelRefusal> {
     let face = standalone_face(source, face_id)?;
     let fragments = fragment_solid(&face, SOURCE_OPERAND, &empty_imprint())?;
     if fragments.is_empty() {
-        return Err("offset_shell: source face has no interior seed".into());
+        return Err(KernelRefusal::internal(KernelStage::Select, "offset_shell_no_interior_seed", "offset_shell: source face has no interior seed"));
     }
     Ok(fragments.iter().map(|fragment| fragment.test_uv).collect())
 }
@@ -1297,11 +1473,11 @@ pub(super) fn offset_seed(
     carrier_surface: &crate::NurbsSurface,
     distance: f64,
     band: f64,
-) -> Result<Option<Vec2>, String> {
+) -> Result<Option<Vec2>, KernelRefusal> {
     // `face_offsets` is signed ALONG the outward normal; offset-shell's
     // positive distance moves opposite it.
-    let sample = face_offsets(source_face).at(raw_seed.x, raw_seed.y, -distance)?;
-    let projection = project_point_to_surface(carrier_surface, sample.point)?;
+    let sample = face_offsets(source_face).at(raw_seed.x, raw_seed.y, -distance).or_refuse(KernelStage::Refine, "at")?;
+    let projection = project_point_to_surface(carrier_surface, sample.point).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
     if !projection.distance.is_finite() || projection.distance > band {
         return Ok(None);
     }
@@ -1322,11 +1498,11 @@ pub(super) fn fragment_edge_segment_key(
     source: &FragmentEdgeSource,
     solids: &HashMap<u8, &BrepSolid>,
     imprint: &ImprintResultRecord,
-) -> Result<[i64; 9], String> {
+) -> Result<[i64; 9], KernelRefusal> {
     let geometry = fragment_edge_geometry(source, solids, imprint)?;
-    let mut start = geometry.curve.evaluate(geometry.t0)?;
-    let middle = geometry.curve.evaluate((geometry.t0 + geometry.t1) * 0.5)?;
-    let mut end = geometry.curve.evaluate(geometry.t1)?;
+    let mut start = geometry.curve.evaluate(geometry.t0).or_refuse(KernelStage::Refine, "evaluate")?;
+    let middle = geometry.curve.evaluate((geometry.t0 + geometry.t1) * 0.5).or_refuse(KernelStage::Refine, "evaluate")?;
+    let mut end = geometry.curve.evaluate(geometry.t1).or_refuse(KernelStage::Refine, "evaluate")?;
     if (end.x, end.y, end.z) < (start.x, start.y, start.z) {
         std::mem::swap(&mut start, &mut end);
     }
@@ -1348,7 +1524,7 @@ fn fragment_edge_geometry(
     source: &FragmentEdgeSource,
     solids: &HashMap<u8, &BrepSolid>,
     imprint: &ImprintResultRecord,
-) -> Result<FragmentEdgeGeometry, String> {
+) -> Result<FragmentEdgeGeometry, KernelRefusal> {
     match source {
         FragmentEdgeSource::Boundary { operand, edge_id }
         | FragmentEdgeSource::SharedBoundary { operand, edge_id } => {
@@ -1357,7 +1533,7 @@ fn fragment_edge_geometry(
                 .and_then(|solid| solid.edges.iter().find(|edge| edge.id == *edge_id))
                 .ok_or_else(|| {
                     format!("offset_shell: missing boundary edge {operand}:{edge_id}")
-                })?;
+                }).or_refuse(KernelStage::Refine, "offset_shell_missing_boundary_edge")?;
             Ok(FragmentEdgeGeometry {
                 curve: edge.curve.clone(),
                 t0: edge.t0,
@@ -1369,7 +1545,7 @@ fn fragment_edge_geometry(
                 .pieces
                 .iter()
                 .find(|piece| piece.id == *piece_id)
-                .ok_or_else(|| format!("offset_shell: missing imprint piece {piece_id}"))?;
+                .ok_or_else(|| format!("offset_shell: missing imprint piece {piece_id}")).or_refuse(KernelStage::Refine, "offset_shell_missing_imprint_piece")?;
             Ok(FragmentEdgeGeometry {
                 curve: piece.curve.clone(),
                 t0: piece.t0,
@@ -1388,12 +1564,12 @@ pub(super) fn fragment_edge_lies_on(
     source: &FragmentEdgeGeometry,
     target: &FragmentEdgeGeometry,
     tolerance: f64,
-) -> Result<bool, String> {
+) -> Result<bool, KernelRefusal> {
     for fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
         let point = source
             .curve
-            .evaluate(source.t0 + (source.t1 - source.t0) * fraction)?;
-        let projection = crate::project_point_to_curve(&target.curve, point)?;
+            .evaluate(source.t0 + (source.t1 - source.t0) * fraction).or_refuse(KernelStage::Refine, "evaluate")?;
+        let projection = crate::project_point_to_curve(&target.curve, point).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
         if projection.distance > tolerance
             || projection.u < target.t0 - tolerance
             || projection.u > target.t1 + tolerance
@@ -1408,7 +1584,7 @@ fn fragment_edges_overlap(
     first: &FragmentEdgeGeometry,
     second: &FragmentEdgeGeometry,
     tolerance: f64,
-) -> Result<bool, String> {
+) -> Result<bool, KernelRefusal> {
     Ok(fragment_edge_lies_on(first, second, tolerance)?
         || fragment_edge_lies_on(second, first, tolerance)?)
 }
@@ -1417,7 +1593,7 @@ fn fragment_edge_geometries(
     fragment: &FaceFragmentRecord,
     solids: &HashMap<u8, &BrepSolid>,
     imprint: &ImprintResultRecord,
-) -> Result<Vec<FragmentEdgeGeometry>, String> {
+) -> Result<Vec<FragmentEdgeGeometry>, KernelRefusal> {
     fragment
         .loops
         .iter()
@@ -1429,10 +1605,10 @@ fn fragment_edge_geometries(
 /// An edge whose whole extent lies within `tolerance` of one point: a PINCH,
 /// the collapsed boundary a carved offset carries where its cavity ends on an
 /// axis.
-fn fragment_edge_is_a_point(edge: &FragmentEdgeGeometry, tolerance: f64) -> Result<bool, String> {
-    let start = edge.curve.evaluate(edge.t0)?;
+fn fragment_edge_is_a_point(edge: &FragmentEdgeGeometry, tolerance: f64) -> Result<bool, KernelRefusal> {
+    let start = edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Refine, "evaluate")?;
     for fraction in [0.25, 0.5, 0.75, 1.0] {
-        let point = edge.curve.evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction)?;
+        let point = edge.curve.evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction).or_refuse(KernelStage::Refine, "evaluate")?;
         if point.sub(start).length() > tolerance {
             return Ok(false);
         }
@@ -1446,7 +1622,7 @@ pub(super) fn would_overuse_existing_boundary(
     solids: &HashMap<u8, &BrepSolid>,
     imprint: &ImprintResultRecord,
     tolerance: f64,
-) -> Result<bool, String> {
+) -> Result<bool, KernelRefusal> {
     let existing_edges = existing
         .map(|fragment| fragment_edge_geometries(&fragment, solids, imprint))
         .collect::<Result<Vec<_>, _>>()?
@@ -1477,15 +1653,15 @@ pub(super) fn fragment_has_sustained_source_contact(
     solids: &HashMap<u8, &BrepSolid>,
     imprint: &ImprintResultRecord,
     tolerance: f64,
-) -> Result<bool, String> {
+) -> Result<bool, KernelRefusal> {
     for edge in fragment_edge_geometries(fragment, solids, imprint)? {
         for source_face in source_faces {
             let mut sustained = true;
             for fraction in [0.2, 0.5, 0.8] {
                 let point = edge
                     .curve
-                    .evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction)?;
-                let projection = project_point_to_surface(&source_face.surface, point)?;
+                    .evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction).or_refuse(KernelStage::Refine, "evaluate")?;
+                let projection = project_point_to_surface(&source_face.surface, point).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
                 if projection.distance > tolerance
                     || parameter_point_in_face(
                         source_face,
@@ -1494,7 +1670,7 @@ pub(super) fn fragment_has_sustained_source_contact(
                             y: projection.v,
                         },
                         tolerance,
-                    )? == PolygonClass::Outside
+                    ).or_refuse(KernelStage::Refine, "parameter_point_in_face")? == PolygonClass::Outside
                 {
                     sustained = false;
                     break;

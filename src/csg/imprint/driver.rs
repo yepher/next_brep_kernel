@@ -1,4 +1,339 @@
-use crate::{KernelRefusal, KernelStage, OrRefuse, RefusalClass};
+use crate::{KernelRefusal, KernelStage, OrRefuse, RefusalClass, MAX_FIT_STATIONS};
+
+/// The degree a marched section is interpolated at (2026-09-27). The march
+/// puts every station on both carriers; the fit decides how far the curve
+/// strays BETWEEN them, and a cubic's O(h^4) there left `BadBoolean`'s
+/// sphere×bore rim 2.5e-7 off the bore with a mean bias of −1.2e-8 that both
+/// trims inherited (+1.14e-6 on the solid). A quintic through the same
+/// stations reads 8.5e-9 and +6e-11 with the same knots and control-point
+/// count. More stations bought the same accuracy on 2026-09-26 and were
+/// reverted for their cost: the watertight tessellator samples every interior
+/// knot, so every scan downstream scales with station count, and a degree does
+/// not add knots. `BREP_SECTION_FIT_DEGREE=3` restores the cubic. The gate on
+/// the mid-span refinement, as a multiple of the fit tolerance (2026-09-27): a
+/// marched section whose unrefined fit misses a carrier between stations by
+/// more than this is UNDERSAMPLED — the 20° cylinder crossing of
+/// `fillet-skew-cylinder-seam-split-20deg` sits 4e-5..8e-5 off, 470 times the
+/// tolerance, at any degree — and only such a section is given true
+/// intersection points until its mid-spans hold. Refining every section cost
+/// more downstream than it returned (the tessellator samples every knot).
+/// `BREP_SECTION_REFINE_GATE` sets the multiple (`on` for
+/// [`SECTION_REFINE_GATE`]). OFF BY DEFAULT: at k = 100 the sequential
+/// blend/direct_edit/imprint/boolean lib set costs +64 % and
+/// `oblique_multi_rim_cone_cap_tearing_push_refuses` goes red; k = 1000 costs
+/// +32 % and leaves the skew union +5.3e-4 off. This global switch stays off.
+/// Independently, a pair of grazing crossings on one trim edge requests a
+/// fit-floor check for that face pair below: those two nearby junctions and
+/// the intervening cap must survive the fit.
+fn section_refine_gate() -> Option<f64> {
+    static GATE: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| match std::env::var("BREP_SECTION_REFINE_GATE") {
+        Ok(value) if value == "on" => Some(SECTION_REFINE_GATE),
+        Ok(value) => value.parse::<f64>().ok().filter(|gate| *gate >= 0.0),
+        Err(_) => None,
+    })
+}
+
+/// The multiple `BREP_SECTION_REFINE_GATE=on` uses: the smallest measured
+/// that trips the skew union's undersampled sections and leaves fixture 22 as
+/// it was (k = 10 flips it).
+const SECTION_REFINE_GATE: f64 = 100.0;
+
+/// A clipped run's END span can be a sliver: the clip endpoint lands beside a
+/// march station, a spacing ratio to the run's median of 0.011 on
+/// `anotherBooleanFail`, and a global interpolant rings next to such a jump —
+/// the mid-spans near the ends miss their carriers by 1e-3, and bisecting them
+/// only makes the spacing more uneven (2026-09-27). Below
+/// `SLIVER_END_FRACTION` of the median spacing the station beside the endpoint
+/// is RE-SOLVED at the middle of the merged gap as a fresh intersection point
+/// (`BREP_SECTION_SLIVER_END=resolve`) or dropped (`drop`). OFF BY DEFAULT:
+/// resolve evens every `anotherBooleanFail` section but reddens three
+/// fixture-25 pins, one a closure residual 2.32e-3 against its 1.41e-4 bar.
+/// Returns how many ends were evened.
+fn even_sliver_ends(
+    section: &mut Vec<Vec3>,
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    tolerance: f64,
+) -> Result<usize, String> {
+    static MODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let mode = MODE.get_or_init(|| std::env::var("BREP_SECTION_SLIVER_END").unwrap_or_default());
+    if !(mode == "drop" || mode == "resolve") {
+        return Ok(0);
+    }
+    let mut evened = 0;
+    // One sliver at a time: each removal changes the spans it sits between.
+    for _ in 0..4 {
+        let count = section.len();
+        if count < 6 {
+            break;
+        }
+        let mut chords: Vec<f64> = section.windows(2).map(|pair| pair[1].sub(pair[0]).length()).collect();
+        let lengths = chords.clone();
+        chords.sort_by(f64::total_cmp);
+        let median = chords[chords.len() / 2];
+        let spans = lengths.len();
+        let near_ends = [0, 1, 2, spans - 3, spans - 2, spans - 1];
+        let Some(&sliver) = near_ends
+            .iter()
+            .filter(|&&span| lengths[span] < sliver_end_fraction() * median)
+            .min_by(|a, b| lengths[**a].total_cmp(&lengths[**b]))
+        else {
+            break;
+        };
+        // The sliver's bounding stations are `sliver` and `sliver + 1`; a run
+        // endpoint is never moved. Of the interior ones, remove the one whose
+        // removal leaves the shorter merged span.
+        let mut candidates = Vec::new();
+        for station in [sliver, sliver + 1] {
+            if station == 0 || station == count - 1 {
+                continue;
+            }
+            let merged = section[station + 1].sub(section[station - 1]).length();
+            candidates.push((station, merged));
+        }
+        let Some(&(station, _)) = candidates.iter().min_by(|a, b| a.1.total_cmp(&b.1)) else {
+            break;
+        };
+        if mode == "resolve" {
+            let (before, after) = (section[station - 1], section[station + 1]);
+            let seed = before.add(after).scale(0.5);
+            let reach = 0.5 * after.sub(before).length();
+            match crate::surface_surface_intersection::refine_to_intersection(first, second, seed, tolerance, reach)? {
+                Some(point) => section[station] = point,
+                None => {
+                    section.remove(station);
+                }
+            }
+        } else {
+            section.remove(station);
+        }
+        evened += 1;
+    }
+    Ok(evened)
+}
+
+/// At 0.25 six of `anotherBooleanFail`'s eight sections stay NoProgress
+/// (worst miss 2.7e-4); at 0.5 all eight are evened and fall below the
+/// refinement gate (worst miss 2.8e-3 -> 5.4e-8).
+const SLIVER_END_FRACTION: f64 = 0.5;
+
+/// `BREP_SECTION_SLIVER_FRACTION` overrides [`SLIVER_END_FRACTION`] for the
+/// measurement that picks it.
+fn sliver_end_fraction() -> f64 {
+    static FRACTION: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *FRACTION.get_or_init(|| {
+        std::env::var("BREP_SECTION_SLIVER_FRACTION")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|fraction| *fraction > 0.0 && *fraction < 1.0)
+            .unwrap_or(SLIVER_END_FRACTION)
+    })
+}
+
+fn section_fit_degree() -> usize {
+    static DEGREE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *DEGREE.get_or_init(|| {
+        std::env::var("BREP_SECTION_FIT_DEGREE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|degree| (1..=7).contains(degree))
+            .unwrap_or(5)
+    })
+}
+
+/// A marched section is held to the fit tolerance against the CARRIERS, not
+/// only against the polyline it was fitted through (2026-09-26). The march
+/// refines every station onto both surfaces to `tolerance * 0.01`, but the
+/// cubic interpolant between stations is measured by `fit_polyline` against the
+/// polyline's own chords, which are further from the true curve than the
+/// interpolant is — so a systematic bias of the interpolant (2.8e-8 mean,
+/// 4.7e-7 worst, inside the bore on `BadBoolean`'s sphere/bore rim at 135
+/// stations) passed every check the fit could make, and both trims inherited it
+/// (+1.14e-6 on the solid's volume, against two independent readings agreeing
+/// to 1e-8). The check below evaluates the fitted curve at every mid-span,
+/// measures it against both carriers, and where it misses `fit tolerance *
+/// SECTION_MIDSPAN_FRACTION` inserts a TRUE intersection point there and
+/// refits. The interpolant's bias falls as h^4, so one round usually suffices.
+/// A round that neither halves the worst miss nor lowers the count of spans
+/// missing is not in that regime — a carrier's C0 crease puts a corner in the
+/// section (fixture 25's pierce solid), where every round only doubles the
+/// stations — so that round is discarded and the loop stops. It is also capped
+/// in rounds and stations, and names how it left.
+/// `BREP_SECTION_REFINE_GATE=off` switches it off, for the before/after reading
+/// and nothing else.
+pub(super) const SECTION_MIDSPAN_FRACTION: f64 = 0.1;
+const SECTION_MIDSPAN_ROUNDS: usize = 4;
+/// A round earns another if it cuts the worst mid-span miss by this factor
+/// (h^4 promises 16 for a halved spacing) OR lowers the count of spans
+/// missing: near the floor a few isolated spans hold the worst while the count
+/// falls, and on a corner the count GROWS round on round.
+const SECTION_MIDSPAN_PROGRESS: f64 = 0.5;
+
+/// Squared distance from `point` to the segment `from`-`to`.
+fn distance_to_segment_sq(point: Vec3, from: Vec3, to: Vec3) -> f64 {
+    let d = to.sub(from);
+    let l2 = d.dot(d);
+    let t = if l2 > 0.0 { (point.sub(from).dot(d) / l2).clamp(0.0, 1.0) } else { 0.0 };
+    let q = from.add(d.scale(t));
+    point.sub(q).dot(point.sub(q))
+}
+
+/// How a mid-span refinement left (`SECTION_MIDSPAN_*`), for the pair trace.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MidspanExit {
+    /// Every mid-span within the floor of both carriers.
+    Converged,
+    /// The unrefined fit's worst mid-span is within the gate: the section is
+    /// sampled well enough that its degree carries it, and stations would
+    /// cost more downstream than they return.
+    BelowGate,
+    /// Some mid-span still misses and no inserted point could improve it
+    /// (the Newton failed, wandered off the span, or landed on a station
+    /// already present).
+    Stalled,
+    /// A round neither halved the worst miss nor lowered the count of spans
+    /// missing: not the h^4 regime, so the section has a corner the
+    /// interpolant cannot follow. That round's fit is discarded.
+    NoProgress,
+    RoundBudget,
+    StationCeiling,
+}
+
+/// Measure `fit` at every mid-span against both carriers; return the worst
+/// distance, the count of spans that miss `floor` and, for each of them the
+/// Newton could place, the refined intersection point to insert (with the
+/// span's index).
+fn midspan_misses(
+    fit: &PolylineFit,
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    floor: f64,
+    tolerance: f64,
+) -> Result<(f64, usize, Vec<(usize, Vec3)>), String> {
+    let mut worst = 0.0f64;
+    let mut missing = 0usize;
+    let mut inserts = Vec::new();
+    for span in 0..fit.parameters.len().saturating_sub(1) {
+        let mid = 0.5 * (fit.parameters[span] + fit.parameters[span + 1]);
+        let point = fit.curve.evaluate(mid)?;
+        let off = project_point_to_surface(first, point)?
+            .distance
+            .max(project_point_to_surface(second, point)?.distance);
+        worst = worst.max(off);
+        if off <= floor {
+            continue;
+        }
+        missing += 1;
+        // The refined point must stay on THIS span: half its chord is the reach.
+        let reach = 0.5 * fit.kept[span + 1].sub(fit.kept[span]).length();
+        if let Some(refined) = crate::surface_surface_intersection::refine_to_intersection(
+            first, second, point, tolerance, reach,
+        )? {
+            inserts.push((span, refined));
+        }
+    }
+    Ok((worst, missing, inserts))
+}
+
+/// Refit `section` until its mid-spans sit within `floor` of both carriers,
+/// inserting true intersection points where they do not. Returns the fit that
+/// stands, the worst mid-span miss it still carries, the unrefined fit's worst
+/// (what the gate read), the rounds spent and the exit.
+fn refine_section_against_carriers(
+    section: &mut Vec<Vec3>,
+    fit: PolylineFit,
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    fit_tolerance: f64,
+    tolerance: f64,
+    local_fit: bool,
+    gate: f64,
+) -> Result<(PolylineFit, f64, f64, usize, MidspanExit), String> {
+    let floor = fit_tolerance * SECTION_MIDSPAN_FRACTION;
+    let mut unrefined = f64::NAN;
+    let mut fit = fit;
+    let mut rounds = 0usize;
+    let mut previous: Option<(PolylineFit, f64, usize)> = None;
+    loop {
+        let (worst, missing, inserts) = midspan_misses(&fit, first, second, floor, tolerance)?;
+        if rounds == 0 {
+            unrefined = worst;
+        }
+        if worst <= floor {
+            return Ok((fit, worst, unrefined, rounds, MidspanExit::Converged));
+        }
+        if rounds == 0 && worst <= gate {
+            return Ok((fit, worst, unrefined, rounds, MidspanExit::BelowGate));
+        }
+        if let Some((earlier, earlier_worst, earlier_missing)) = previous.take() {
+            // A round that did not earn its keep is discarded whole: the fit
+            // of the last round that did stands (on a corner, the unrefined
+            // fit), not whichever of the two happens to read a smaller max.
+            if worst > earlier_worst * SECTION_MIDSPAN_PROGRESS && missing >= earlier_missing {
+                return Ok((earlier, earlier_worst, unrefined, rounds, MidspanExit::NoProgress));
+            }
+        }
+        if inserts.is_empty() {
+            return Ok((fit, worst, unrefined, rounds, MidspanExit::Stalled));
+        }
+        if rounds >= SECTION_MIDSPAN_ROUNDS {
+            return Ok((fit, worst, unrefined, rounds, MidspanExit::RoundBudget));
+        }
+        if section.len() + inserts.len() > MAX_FIT_STATIONS {
+            return Ok((fit, worst, unrefined, rounds, MidspanExit::StationCeiling));
+        }
+        // Insert each refined point into the run between its span's stations,
+        // on the nearest segment of the run there. Positions are located
+        // against the run BEFORE any insertion of this round, then applied
+        // from the back so earlier indices stay valid. The kept stations are
+        // found by a FORWARD search from the previous one: a closed section
+        // ends on its first station, and a search from the start would put
+        // the last span's far end at index 0 and skip that span forever.
+        let station_index = |point: Vec3, from: usize| -> Option<usize> {
+            section[from..]
+                .iter()
+                .position(|p| p.sub(point).length() <= 1e-15 * (1.0 + point.length()))
+                .map(|offset| from + offset)
+        };
+        let mut placed: Vec<(usize, Vec3)> = Vec::new();
+        for (span, point) in inserts {
+            let Some(lo) = station_index(fit.kept[span], 0) else {
+                continue;
+            };
+            let Some(hi) = station_index(fit.kept[span + 1], lo + 1) else {
+                continue;
+            };
+            if hi <= lo {
+                continue;
+            }
+            if section[lo..=hi].iter().any(|p| p.sub(point).length() <= floor) {
+                continue; // already a station: inserting it again refines nothing
+            }
+            let mut best = (lo, f64::INFINITY);
+            for index in lo..hi {
+                let d2 = distance_to_segment_sq(point, section[index], section[index + 1]);
+                if d2 < best.1 {
+                    best = (index, d2);
+                }
+            }
+            placed.push((best.0 + 1, point));
+        }
+        if placed.is_empty() {
+            return Ok((fit, worst, unrefined, rounds, MidspanExit::Stalled));
+        }
+        placed.sort_by(|a, b| b.0.cmp(&a.0));
+        for (at, point) in placed {
+            section.insert(at, point);
+        }
+        // Every station of the denser run is entitled to be an interpolation
+        // station: the ladder starts at the run's own count.
+        let maximum_points = section.len().min(MAX_FIT_STATIONS);
+        let refit = fit_polyline_of_degree(section, fit_tolerance, maximum_points, local_fit, section_fit_degree())?;
+        previous = Some((std::mem::replace(&mut fit, refit), worst, missing));
+        rounds += 1;
+    }
+}
 use super::*;
 use super::gate_census::{census_pair, fit_census_enabled};
 
@@ -7,9 +342,29 @@ pub fn build_imprints(
     solid_b: &BrepSolid,
     options: &ImprintOptions,
 ) -> Result<ImprintResultRecord, KernelRefusal> {
+    build_imprints_impl(solid_a, solid_b, options, false)
+}
+
+/// Imprint temporary open offset sheets. A section riding one sheet's trim
+/// still cuts the other sheet when no boundary copy supplied that section.
+pub(crate) fn build_carrier_imprints(
+    solid_a: &BrepSolid,
+    solid_b: &BrepSolid,
+    options: &ImprintOptions,
+) -> Result<ImprintResultRecord, KernelRefusal> {
+    build_imprints_impl(solid_a, solid_b, options, true)
+}
+
+fn build_imprints_impl(
+    solid_a: &BrepSolid,
+    solid_b: &BrepSolid,
+    options: &ImprintOptions,
+    open_carriers: bool,
+) -> Result<ImprintResultRecord, KernelRefusal> {
     let mut section_evidence = false;
     let edges = edge_map(solid_a, solid_b);
     let mut builder = ImprintBuilder {
+        open_carriers,
         edges,
         tolerance: options.tolerance,
         barrier_edges: HashSet::default(),
@@ -495,6 +850,10 @@ pub fn build_imprints(
             // pierces the other surface tangentially). Gates the near-tangent
             // clip-order rescue below to genuinely grazing pairs.
             let mut min_seed_tangency = f64::INFINITY;
+            // Two grazing crossings of one trim edge bound a real, narrow
+            // interval. It cannot tolerate a section fit that misses either
+            // crossing, even when a coarse whole-model distance looks small.
+            let mut paired_grazing_crossings = false;
             for (face, other_march, other) in
                 [(first, second_march, second), (second, first_march, first)]
             {
@@ -502,6 +861,7 @@ pub fn build_imprints(
                     if edge.degenerate {
                         continue;
                     }
+                    let mut grazing_crossings: Vec<Vec3> = Vec::new();
                     for hit in intersect_curve_surface(&edge.curve, other_march, options.tolerance).or_refuse(KernelStage::Intersect, "intersect_curve_surface")?
                     {
                         if hit.t < edge.t0 - 1e-9 || hit.t > edge.t1 + 1e-9 {
@@ -565,6 +925,13 @@ pub fn build_imprints(
                             seed_points.push(hit.point);
                             min_seed_tangency = min_seed_tangency.min(tangent.dot(normal).abs());
                             section_evidence = true;
+                        } else {
+                            if grazing_crossings.iter().any(|point| {
+                                point.sub(hit.point).length() > assembler_weld(options.tolerance)
+                            }) {
+                                paired_grazing_crossings = true;
+                            }
+                            grazing_crossings.push(hit.point);
                         }
                     }
                 }
@@ -861,12 +1228,68 @@ pub fn build_imprints(
                     while start + 1 < run.len() {
                         let end = (start + chunk_points - 1).min(run.len() - 1);
                         let fit_started = profile.enabled.then(Instant::now);
-                        let fit = fit_polyline(
-                            &run[start..=end],
-                            options.tolerance.max(1e-7),
+                        let fit_tolerance = options.tolerance.max(1e-7);
+                        let mut section: Vec<Vec3> = run[start..=end].to_vec();
+                        let slivers = even_sliver_ends(&mut section, &first.face.surface, &second.face.surface, options.tolerance)
+                            .or_refuse(KernelStage::Intersect, "csg.imprint.driver.sliver_end")?;
+                        if slivers > 0 {
+                            if let Ok(path) = std::env::var("BREP_SECTION_SLIVER_CENSUS") {
+                                use std::io::Write;
+                                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                                    let _ = writeln!(file, "sliver-end census: pair {}x{} slivers {slivers} stations {}", first.face.id, second.face.id, section.len());
+                                }
+                            }
+                        }
+                        let (mut fit, recovered) = crate::fit::fit_polyline_of_degree_with_recovery(
+                            &section,
+                            fit_tolerance,
                             options.maximum_fit_points,
                             options.local_fit,
+                            section_fit_degree(),
                         ).or_refuse(KernelStage::Intersect, "csg.imprint.driver")?;
+                        // A recovered fit may reproduce every march point yet
+                        // still wander off the carriers between sparse stations.
+                        // Measure it against both supports before accepting that
+                        // recovery, and use the existing bounded SSI refiner.
+                        let refine_gate = section_refine_gate()
+                            .or_else(|| recovered.then_some(1.0)).or_else(|| {
+                            (paired_grazing_crossings
+                                && std::env::var("BREP_GRAZE_SECTION_REFINE").as_deref() != Ok("0"))
+                                .then_some(1.0)
+                        });
+                        if let Some(gate) = refine_gate {
+                            let stations_before = fit.kept.len();
+                            let (refined, worst, unrefined, rounds, exit) = refine_section_against_carriers(
+                                &mut section,
+                                fit,
+                                &first.face.surface,
+                                &second.face.surface,
+                                fit_tolerance,
+                                options.tolerance,
+                                options.local_fit,
+                                gate * fit_tolerance,
+                            ).or_refuse(KernelStage::Intersect, "csg.imprint.driver.midspan")?;
+                            // `BREP_SECTION_REFINE_CENSUS=<file>`: one line per section,
+                            // appended, so a corpus replay (whose children's stderr is
+                            // captured) can be read for trip counts and growth.
+                            if let Ok(path) = std::env::var("BREP_SECTION_REFINE_CENSUS") {
+                                use std::io::Write;
+                                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                                    let _ = writeln!(
+                                        file,
+                                        "section-refine census: pair {}x{} exit {:?} rounds {} stations {} -> {} unrefined {:.3e} worst {:.3e}",
+                                        first.face.id, second.face.id, exit, rounds, stations_before, refined.kept.len(), unrefined, worst
+                                    );
+                                }
+                            }
+                            if debug_pairs && (rounds > 0 || !matches!(exit, MidspanExit::Converged | MidspanExit::BelowGate)) {
+                                eprintln!(
+                                    "pair {}x{}: mid-span refinement {:?} after {} round(s): {} stations, worst {:.3e}",
+                                    first.face.id, second.face.id, exit, rounds, section.len(), worst
+                                );
+                            }
+                            fit = refined;
+                        }
                         if let Some(started) = fit_started {
                             profile.fit += started.elapsed();
                         }

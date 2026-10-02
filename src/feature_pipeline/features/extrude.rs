@@ -67,7 +67,7 @@
 //! The optional `boolean` param folds via `common::finalize_solid`.
 
 use crate::feature_pipeline::features::common;
-use crate::feature_pipeline::{FeatureContext, FeatureResult, SketchProfile};
+use crate::feature_pipeline::{FeatureContext, FeatureRefusal, FeatureResult, SketchProfile};
 use crate::{extrude_profile_brep, extrude_profile_brep_draft, BrepSolid, NurbsCurve, Vec3};
 
 pub fn execute(ctx: &FeatureContext) -> FeatureResult {
@@ -77,7 +77,7 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     }
 }
 
-fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // Draft angle in DEGREES (`draftAngle`); 0 / absent = straight extrude.
     let draft_deg = optional_number(ctx, "draftAngle")?;
 
@@ -101,7 +101,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
             None => {
                 return Err(format!(
                     "extrude: profile '{name}' not found (no sketch profile or resident face)"
-                ));
+                ).into());
             }
         },
     };
@@ -154,7 +154,7 @@ fn build_straight(
     direction: Vec3,
     distance: f64,
     back: f64,
-) -> Result<(BrepSolid, common::CapNames), String> {
+) -> Result<(BrepSolid, common::CapNames), FeatureRefusal> {
     let total = distance + back;
     if total.abs() <= 1e-9 {
         return Err("extrude: total extrusion length (distance + distanceBack) is zero".into());
@@ -190,7 +190,7 @@ fn build_straight(
         let outer = region.first().ok_or("extrude: profile has no outer loop")?;
         let count = outer.curves.len();
         if count < 2 {
-            return Err(format!("extrude: outer loop needs >= 2 curves, got {count}"));
+            return Err(format!("extrude: outer loop needs >= 2 curves, got {count}").into());
         }
         let outer_curves: Vec<NurbsCurve> = if back.abs() > 1e-12 {
             outer
@@ -216,7 +216,7 @@ fn build_straight(
                     "extrude builder produced {} faces, expected {}",
                     faces.len(),
                     count + 2
-                ));
+                ).into());
             }
             for (index, face) in faces.iter_mut().take(count).enumerate() {
                 let raw = outer
@@ -297,7 +297,7 @@ fn build_drafted(
     distance: f64,
     back: f64,
     draft_deg: f64,
-) -> Result<(BrepSolid, common::CapNames), String> {
+) -> Result<(BrepSolid, common::CapNames), FeatureRefusal> {
     if back < -1e-12 {
         return Err("extrude: draft (`draftAngle`) needs `distanceBack` >= 0".into());
     }
@@ -321,7 +321,7 @@ fn build_drafted(
             "extrude: draft (`draftAngle`) does not support profiles with holes \
              ({} hole loop(s) in the profile); several separate regions do draft",
             holed.len() - 1
-        ));
+        ).into());
     }
 
     // Straight-path naming bases (see build_straight): `{id}:` tag, cap_base
@@ -352,7 +352,7 @@ fn build_drafted(
         let outer = region.first().ok_or("extrude: profile has no outer loop")?;
         let count = outer.curves.len();
         if count < 2 {
-            return Err(format!("extrude: outer loop needs >= 2 curves, got {count}"));
+            return Err(format!("extrude: outer loop needs >= 2 curves, got {count}").into());
         }
         let (start_name, end_name) = caps.per_loop[region_index].clone();
 
@@ -383,7 +383,7 @@ fn build_drafted(
                     "extrude draft builder produced {} faces, expected {}",
                     faces.len(),
                     count + 2
-                ));
+                ).into());
             }
             for (index, face) in faces.iter_mut().take(count).enumerate() {
                 let raw = outer

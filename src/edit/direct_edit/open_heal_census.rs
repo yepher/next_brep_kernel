@@ -261,7 +261,9 @@ fn run(solid: &BrepSolid, shell_index: usize, face_index: usize, face_id: u64, n
         return Outcome { verdict: Err("strip vanished".into()) };
     };
     let input_top = max_topology_id(solid);
-    let verdict = heal_open_transition_mixed(solid, shell_index, face_index, &boundary, neighbour_ids).map(|healed| {
+    let verdict = heal_open_transition_mixed(solid, shell_index, face_index, &boundary, neighbour_ids)
+        .map_err(String::from)
+        .map(|healed| {
         let volume = crate::solid_mass_properties(&healed).map(|mass| mass.volume).unwrap_or(f64::NAN);
         let corners: Vec<Vec3> = healed
             .vertices
@@ -486,7 +488,7 @@ pub(super) fn record_planar_open_heal(directory: &str, solid: &BrepSolid, face_i
     INSIDE.with(|inside| inside.set(true));
     let scale = solid_model_scale(solid);
     let summarise = |body: &BrepSolid| Outcome {
-        verdict: delete_face_and_heal_impl(body, face_id).map(|healed| {
+        verdict: delete_face_and_heal_impl(body, face_id).map_err(String::from).map(|healed| {
             let volume = crate::solid_mass_properties(&healed).map(|mass| mass.volume).unwrap_or(f64::NAN);
             (bits_hash(&healed), volume, Vec::new(), true)
         }),

@@ -483,7 +483,7 @@ impl<'a> SolidBuilder<'a> {
 
         let mut loops = Vec::with_capacity(bounds.len());
         for (specs, _) in bounds {
-            let loop_record = self.build_loop(&surface, surface_ref, &specs)?;
+            let loop_record = self.build_loop(&surface, face_ref, surface_ref, &specs)?;
             loops.push(loop_record);
         }
 

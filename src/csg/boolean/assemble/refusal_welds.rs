@@ -45,6 +45,17 @@ pub(super) fn weld_identical_coincident_one_use_edges(
     let tolerance = assembler.tolerance.max(1e-3);
     // duplicate edge id -> (survivor id, flip coedge orientation)
     let mut redirect = HashMap::<u64, (u64, bool)>::default();
+    // Sharing an edge also identifies its two endpoint pairs. Leaving the
+    // duplicate's neighbours on separate vertices opens their loops even when
+    // every edge has two coedges. Plan the endpoint identifications atomically,
+    // rejecting any plan that would collapse an existing non-degenerate edge.
+    let mut vertex_redirect = HashMap::<u64, u64>::default();
+    fn root(redirect: &HashMap<u64, u64>, mut id: u64) -> u64 {
+        while let Some(&next) = redirect.get(&id) {
+            id = next;
+        }
+        id
+    }
     for (index, survivor) in one_use.iter().enumerate() {
         if redirect.contains_key(&survivor.id) {
             continue;
@@ -57,10 +68,12 @@ pub(super) fn weld_identical_coincident_one_use_edges(
             }
             let duplicate_start = vertex_map[&duplicate.start_vertex_id];
             let duplicate_end = vertex_map[&duplicate.end_vertex_id];
-            let aligned = survivor_start.sub(duplicate_start).length() <= tolerance
-                && survivor_end.sub(duplicate_end).length() <= tolerance;
-            let reversed = survivor_start.sub(duplicate_end).length() <= tolerance
-                && survivor_end.sub(duplicate_start).length() <= tolerance;
+            let aligned_error = survivor_start.sub(duplicate_start).length()
+                .max(survivor_end.sub(duplicate_end).length());
+            let reversed_error = survivor_start.sub(duplicate_end).length()
+                .max(survivor_end.sub(duplicate_start).length());
+            let aligned = aligned_error <= tolerance;
+            let reversed = reversed_error <= tolerance;
             if !aligned && !reversed {
                 continue;
             }
@@ -84,11 +97,59 @@ pub(super) fn weld_identical_coincident_one_use_edges(
             if !coincident_span {
                 continue;
             }
-            redirect.insert(duplicate.id, (survivor.id, reversed));
+            // A short edge can fit BOTH endpoint correspondences inside the
+            // repair band. The band admits the weld; the closer correspondence
+            // determines its direction. Otherwise an aligned micro-edge is
+            // reversed merely because its length is smaller than the band.
+            let flip = reversed && (!aligned || reversed_error <= aligned_error);
+            let mut proposed = vertex_redirect.clone();
+            let pairs = if flip {
+                [(duplicate.start_vertex_id, survivor.end_vertex_id),
+                 (duplicate.end_vertex_id, survivor.start_vertex_id)]
+            } else {
+                [(duplicate.start_vertex_id, survivor.start_vertex_id),
+                 (duplicate.end_vertex_id, survivor.end_vertex_id)]
+            };
+            for (from, to) in pairs {
+                let (from, to) = (root(&proposed, from), root(&proposed, to));
+                if from != to {
+                    proposed.insert(from, to);
+                }
+            }
+            if proposed.keys().any(|id|
+                vertex_map[id].sub(vertex_map[&root(&proposed, *id)]).length() > tolerance
+            ) || assembler.edges.iter().any(|edge| {
+                !edge.degenerate && edge.start_vertex_id != edge.end_vertex_id
+                    && root(&proposed, edge.start_vertex_id)
+                        == root(&proposed, edge.end_vertex_id)
+            }) {
+                continue;
+            }
+            vertex_redirect = proposed;
+            redirect.insert(duplicate.id, (survivor.id, flip));
         }
     }
     if redirect.is_empty() {
         return Ok(false);
+    }
+    for edge in &mut assembler.edges {
+        let start = root(&vertex_redirect, edge.start_vertex_id);
+        let end = root(&vertex_redirect, edge.end_vertex_id);
+        if start == edge.start_vertex_id && end == edge.end_vertex_id {
+            continue;
+        }
+        let curve = super::builder::snap_edge_curve_endpoints(
+            edge.curve.clone(), edge.t0, edge.t1,
+            vertex_map[&start], vertex_map[&end],
+        )?;
+        let [t0, t1] = curve.domain().map_err(|error|
+            crate::KernelRefusal::internal(crate::KernelStage::Sew,
+                "assemble.refusal_welds", error.to_string()))?;
+        edge.curve = curve;
+        edge.t0 = t0;
+        edge.t1 = t1;
+        edge.start_vertex_id = start;
+        edge.end_vertex_id = end;
     }
     for face in faces.iter_mut() {
         for loop_record in &mut face.loops {
@@ -402,6 +463,30 @@ pub(in crate::boolean) fn conform_unmatched_one_use_edges(
             if !(survivor.t0.is_finite() && survivor.t1.is_finite() && survivor.t0 < survivor.t1) {
                 continue;
             }
+            // Evaluate both endpoint welds against the current edge table,
+            // including changes from earlier successful merges. Close rims
+            // cannot authorize erasing an existing material-thickness edge.
+            let survivor_pair = if reversed {
+                [survivor.end_vertex_id, survivor.start_vertex_id]
+            } else {
+                [survivor.start_vertex_id, survivor.end_vertex_id]
+            };
+            let endpoint_pairs = [loser.start_vertex_id, loser.end_vertex_id]
+                .into_iter().zip(survivor_pair).collect::<Vec<_>>();
+            let redirected = |mut id| {
+                for &(from, to) in &endpoint_pairs {
+                    if id == from { id = to; }
+                }
+                id
+            };
+            if edges.iter().any(|edge| !edge.degenerate
+                && edge.start_vertex_id != edge.end_vertex_id
+                && redirected(edge.start_vertex_id) == redirected(edge.end_vertex_id)) {
+                if debug {
+                    eprintln!("conform: merge {loser_id}->{survivor_id} rejected (collapses an existing edge)");
+                }
+                continue;
+            }
             let (shell_index, face_index, loop_index, coedge_index, old_forward) =
                 uses[&loser_id][0];
             let new_forward = if reversed { !old_forward } else { old_forward };
@@ -441,11 +526,6 @@ pub(in crate::boolean) fn conform_unmatched_one_use_edges(
                 coedge.pcurve = pcurve;
             }
             edges.retain(|edge| edge.id != loser_id);
-            let survivor_pair = if reversed {
-                [survivor.end_vertex_id, survivor.start_vertex_id]
-            } else {
-                [survivor.start_vertex_id, survivor.end_vertex_id]
-            };
             for (loser_vertex, survivor_vertex) in [loser.start_vertex_id, loser.end_vertex_id]
                 .into_iter()
                 .zip(survivor_pair)

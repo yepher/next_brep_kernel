@@ -47,7 +47,10 @@ use crate::feature_pipeline::features::common;
 use crate::feature_pipeline::{
     Axis, FeatureContext, FeatureResult, Frame, ProfileLoop, SketchProfile,
 };
-use crate::{make_arc, make_line, solve_sketch, NurbsCurve, SolveSketchRequest, Vec3, Vec4};
+use crate::{
+    is_sketch_origin_point_id, make_arc, make_line, solve_sketch, NurbsCurve, SolveSketchRequest, Vec3,
+    Vec4,
+};
 use serde_json::Value;
 
 /// Endpoint-coincidence tolerance for chaining loop segments (sketch units = mm).

@@ -1,11 +1,12 @@
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 
-pub(super) struct ChainSegment<'a> {
-    pub(super) edge: &'a EdgeRecord,
+pub(in crate::blend) struct ChainSegment<'a> {
+    pub(in crate::blend) edge: &'a EdgeRecord,
     /// Chain traversal: true when the chain runs t0 -> t1.
-    pub(super) forward: bool,
-    pub(super) first: BlendMate<'a>,
-    pub(super) second: BlendMate<'a>,
+    pub(in crate::blend) forward: bool,
+    pub(in crate::blend) first: BlendMate<'a>,
+    pub(in crate::blend) second: BlendMate<'a>,
 }
 
 impl<'a> ChainSegment<'a> {
@@ -19,9 +20,9 @@ impl<'a> ChainSegment<'a> {
 }
 
 /// A tangent-continuous edge run, closed or terminated at two free ends.
-pub(super) struct SmoothChain<'a> {
-    pub(super) segments: Vec<ChainSegment<'a>>,
-    pub(super) closed: bool,
+pub(in crate::blend) struct SmoothChain<'a> {
+    pub(in crate::blend) segments: Vec<ChainSegment<'a>>,
+    pub(in crate::blend) closed: bool,
     /// Entry and exit vertices; unused for closed chains.
     pub(super) start_vertex: u64,
     pub(super) end_vertex: u64,
@@ -42,7 +43,7 @@ fn find_conjugate<'a>(
     reference_first_normal: Vec3,
     exclude_edge: u64,
     extend_forward: bool,
-) -> Result<Option<ChainContinuation<'a>>, String> {
+) -> Result<Option<ChainContinuation<'a>>, KernelRefusal> {
     let mut next: Option<ChainContinuation<'a>> = None;
     for candidate in &solid.edges {
         if candidate.id == exclude_edge || candidate.start_vertex_id == candidate.end_vertex_id {
@@ -74,7 +75,7 @@ fn find_conjugate<'a>(
         let tangent = candidate
             .curve
             .unit_tangent(join_t, candidate.t0, candidate.t1)
-            .map_err(|error| format!("blend chain: edge {}: {error}", candidate.id))?;
+            .map_err(|error| format!("blend chain: edge {}: {error}", candidate.id)).or_refuse(KernelStage::Refine, "unit_tangent")?;
         let chain_tangent = if forward {
             tangent
         } else {
@@ -84,7 +85,7 @@ fn find_conjugate<'a>(
             continue;
         }
         if next.is_some() {
-            return Err("blend: ambiguous conjugated continuation at a chain vertex".into());
+            return Err(KernelRefusal::ill_posed(KernelStage::Classify, "conjugate_continuation", "blend: ambiguous conjugated continuation at a chain vertex"));
         }
         let (face_a, loop_a, coedge_a) = locate_mate(solid, candidate.id, None)?;
         let (face_b, loop_b, coedge_b) =
@@ -94,7 +95,7 @@ fn find_conjugate<'a>(
         let normal_b = outward_normal_at(face_b, coedge_b, candidate, join_t)?;
         let side_b_first = normal_b.dot(reference_first_normal) > 0.9;
         if side_a_first == side_b_first {
-            return Err("blend: cannot assign chain sides (normals ambiguous)".into());
+            return Err(KernelRefusal::ill_posed(KernelStage::Classify, "chain_sides", "blend: cannot assign chain sides (normals ambiguous)"));
         }
         let (first, second) = if side_a_first {
             (
@@ -137,7 +138,7 @@ fn outward_normal_at(
     coedge: &CoedgeRecord,
     edge: &EdgeRecord,
     t: f64,
-) -> Result<Vec3, String> {
+) -> Result<Vec3, KernelRefusal> {
     let uv = edge_uv_on_face(coedge, edge, t)?;
     let normal = raw_normal(&face.surface, uv[0], uv[1])?;
     Ok(if face.same_sense {
@@ -154,14 +155,14 @@ fn outward_normal_at(
 /// (no conjugated continuation); an unclosed forward walk then also walks
 /// BACKWARD from the seed start, so the returned OPEN chain runs free end to
 /// free end in order.
-pub(super) fn collect_smooth_chain(solid: &BrepSolid, seed_edge_id: u64) -> Result<SmoothChain<'_>, String> {
+pub(in crate::blend) fn collect_smooth_chain(solid: &BrepSolid, seed_edge_id: u64) -> Result<SmoothChain<'_>, KernelRefusal> {
     let seed = solid
         .edges
         .iter()
         .find(|edge| edge.id == seed_edge_id)
-        .ok_or_else(|| format!("blend: edge {seed_edge_id} not found"))?;
+        .ok_or_else(|| format!("blend: edge {seed_edge_id} not found")).or_refuse(KernelStage::Refine, "ok_or_else")?;
     if seed.start_vertex_id == seed.end_vertex_id {
-        return Err("blend: chain seed must be an open edge".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "chain_seed", "blend: chain seed must be an open edge"));
     }
     let (first_face, first_loop, first_coedge) = locate_mate(solid, seed_edge_id, None)?;
     let (second_face, second_loop, second_coedge) =
@@ -186,7 +187,7 @@ pub(super) fn collect_smooth_chain(solid: &BrepSolid, seed_edge_id: u64) -> Resu
 
     // The chain-forward tangent and first-side outward normal a segment has
     // at one of its endpoints, used to require G1 continuity at the vertex.
-    let endpoint_tangent = |segment: &ChainSegment, at_exit: bool| -> Result<Vec3, String> {
+    let endpoint_tangent = |segment: &ChainSegment, at_exit: bool| -> Result<Vec3, KernelRefusal> {
         let t = if segment.forward == at_exit {
             segment.edge.t1
         } else {
@@ -198,14 +199,14 @@ pub(super) fn collect_smooth_chain(solid: &BrepSolid, seed_edge_id: u64) -> Resu
             .edge
             .curve
             .unit_tangent(t, segment.edge.t0, segment.edge.t1)
-            .map_err(|error| format!("blend chain: edge {}: {error}", segment.edge.id))?;
+            .map_err(|error| format!("blend chain: edge {}: {error}", segment.edge.id)).or_refuse(KernelStage::Refine, "unit_tangent")?;
         Ok(if segment.forward {
             tangent
         } else {
             tangent.scale(-1.0)
         })
     };
-    let endpoint_normal = |segment: &ChainSegment, at_exit: bool| -> Result<Vec3, String> {
+    let endpoint_normal = |segment: &ChainSegment, at_exit: bool| -> Result<Vec3, KernelRefusal> {
         let t = if segment.forward == at_exit {
             segment.edge.t1
         } else {
@@ -226,7 +227,7 @@ pub(super) fn collect_smooth_chain(solid: &BrepSolid, seed_edge_id: u64) -> Resu
         }
         guard += 1;
         if guard > 128 {
-            return Err("blend: chain walk did not terminate after 128 segments".into());
+            return Err(KernelRefusal::unsupported(KernelStage::Collect, "chain_walk_cap", "blend: chain walk did not terminate after 128 segments"));
         }
         let previous = forward_segments.last().unwrap();
         let arrive_tangent = endpoint_tangent(previous, true)?;
@@ -269,7 +270,7 @@ pub(super) fn collect_smooth_chain(solid: &BrepSolid, seed_edge_id: u64) -> Resu
     loop {
         guard += 1;
         if guard > 128 {
-            return Err("blend: chain walk did not terminate after 128 segments".into());
+            return Err(KernelRefusal::unsupported(KernelStage::Collect, "chain_walk_cap", "blend: chain walk did not terminate after 128 segments"));
         }
         let front = prefix.last().unwrap_or(&forward_segments[0]);
         let arrive_tangent = endpoint_tangent(front, false)?;

@@ -683,6 +683,108 @@ fn trimmed_curve(curve: &NurbsCurve, t0: f64, t1: f64) -> Result<NurbsCurve, Ker
     Ok(result)
 }
 
+/// An affine plane chart, proven from its complete bilinear control net.
+/// Rational or warped charts need the general projection path instead.
+struct AffinePlaneChart {
+    origin: Vec3,
+    du: Vec3,
+    dv: Vec3,
+    u0: f64,
+    v0: f64,
+}
+
+fn affine_plane_chart(surface: &NurbsSurface) -> Option<AffinePlaneChart> {
+    if surface.degree_u != 1 || surface.degree_v != 1
+        || surface.control_points.len() != 2
+        || surface.control_points.iter().any(|row| row.len() != 2)
+        || surface.knots_u.len() != 4 || surface.knots_v.len() != 4
+    { return None; }
+    let ku = &surface.knots_u;
+    let kv = &surface.knots_v;
+    if ku[0] != ku[1] || ku[2] != ku[3] || kv[0] != kv[1] || kv[2] != kv[3]
+        || ku[2] <= ku[1] || kv[2] <= kv[1]
+    { return None; }
+    let weight = surface.control_points[0][0].w;
+    if !weight.is_finite() || weight.abs() <= 1e-300
+        || surface.control_points.iter().flatten().any(|point| point.w != weight)
+    { return None; }
+    let p00 = surface.control_points[0][0].point().ok()?;
+    let p10 = surface.control_points[1][0].point().ok()?;
+    let p01 = surface.control_points[0][1].point().ok()?;
+    let p11 = surface.control_points[1][1].point().ok()?;
+    let u = p10.sub(p00);
+    let v = p01.sub(p00);
+    let scale = u.length().max(v.length()).max(1.0);
+    if p11.sub(p10).sub(v).length() > 1e-12 * scale { return None; }
+    let du = u.scale(1.0 / (ku[2] - ku[1]));
+    let dv = v.scale(1.0 / (kv[2] - kv[1]));
+    let determinant = du.dot(du) * dv.dot(dv) - du.dot(dv).powi(2);
+    if !determinant.is_finite() || determinant <= 1e-12 * du.dot(du) * dv.dot(dv) {
+        return None;
+    }
+    Some(AffinePlaneChart { origin: p00, du, dv, u0: ku[1], v0: kv[1] })
+}
+
+/// Transfer the existing trimmed locus, rather than replacing it with the
+/// shared edge's potentially displaced fitted curve. Affine reparameterization
+/// preserves every rational weight, knot and degree, including controls outside
+/// the surface's finite patch.
+fn transfer_affine_planar_pcurve(
+    source: &NurbsSurface,
+    target: &NurbsSurface,
+    curve: &NurbsCurve,
+    tolerance: f64,
+) -> Option<NurbsCurve> {
+    let source = affine_plane_chart(source)?;
+    let target = affine_plane_chart(target)?;
+    let uu = target.du.dot(target.du);
+    let uv = target.du.dot(target.dv);
+    let vv = target.dv.dot(target.dv);
+    let determinant = uu * vv - uv * uv;
+    let mut transferred = curve.clone();
+    for control in &mut transferred.control_points {
+        if !control.w.is_finite() || control.w.abs() <= 1e-300 { return None; }
+        let point = source.origin
+            .add(source.du.scale(control.x / control.w - source.u0))
+            .add(source.dv.scale(control.y / control.w - source.v0));
+        let relative = point.sub(target.origin);
+        let a = relative.dot(target.du);
+        let b = relative.dot(target.dv);
+        let u = (a * vv - b * uv) / determinant;
+        let v = (b * uu - a * uv) / determinant;
+        let reconstructed = target.origin.add(target.du.scale(u)).add(target.dv.scale(v));
+        if !u.is_finite() || !v.is_finite()
+            || reconstructed.sub(point).length() > tolerance.max(1e-12)
+        { return None; }
+        control.x = (target.u0 + u) * control.w;
+        control.y = (target.v0 + v) * control.w;
+        control.z = 0.0;
+    }
+    Some(transferred)
+}
+
+fn transfer_planar_loops(
+    target: &NurbsSurface,
+    loops: &[LoopRecord],
+    older: &FaceRecord,
+    newer: &FaceRecord,
+    tolerance: f64,
+) -> Option<Vec<LoopRecord>> {
+    let mut transferred = loops.to_vec();
+    for loop_record in &mut transferred {
+        for coedge in &mut loop_record.coedges {
+            let source = [older, newer].into_iter().find(|face| {
+                face.loops.iter().flat_map(|lp| &lp.coedges)
+                    .any(|original| original.id == coedge.id && original.edge_id == coedge.edge_id)
+            })?;
+            coedge.pcurve = transfer_affine_planar_pcurve(
+                &source.surface, target, &coedge.pcurve, tolerance,
+            )?;
+        }
+    }
+    Some(transferred)
+}
+
 fn reproject_loops(
     surface: &NurbsSurface,
     loops: Vec<LoopRecord>,
@@ -890,6 +992,65 @@ pub(crate) fn faces_are_cosurface(
     Ok(coextrusion_pair(first, second, tolerance)?.is_some())
 }
 
+/// Degree-one clamped trims follow their control polygon regardless of knot
+/// spacing. For higher degrees, equal positive rational bases make the
+/// difference of the two affine images a convex combination of control-point
+/// differences. Bound the whole
+/// shared trim, rather than relying on cancellation of its area integral.
+fn opposed_planar_trims_agree(
+    older: &FaceRecord,
+    first: &CoedgeRecord,
+    newer: &FaceRecord,
+    second: &CoedgeRecord,
+    tolerance: f64,
+) -> bool {
+    let Ok(reverse) = second.pcurve.reversed() else {
+        return false;
+    };
+    let curve = &first.pcurve;
+    if curve.degree != reverse.degree || curve.control_points.len() != reverse.control_points.len()
+    {
+        return false;
+    }
+    let linear_polygon = |c: &NurbsCurve| {
+        c.degree == 1
+            && c.knots.len() == c.control_points.len() + 2
+            && c.knots[0] == c.knots[1]
+            && c.knots[c.knots.len() - 1] == c.knots[c.knots.len() - 2]
+            && c.knots[1..c.knots.len() - 1]
+                .windows(2)
+                .all(|k| k[1] > k[0])
+    };
+    let polygon = linear_polygon(curve) && linear_polygon(&reverse);
+    if !polygon && curve.knots != reverse.knots {
+        return false;
+    }
+    curve
+        .control_points
+        .iter()
+        .zip(&reverse.control_points)
+        .all(|(a, b)| {
+            if !a.w.is_finite()
+                || !b.w.is_finite()
+                || a.w <= 0.0
+                || b.w <= 0.0
+                || (!polygon && a.w != b.w)
+            {
+                return false;
+            }
+            let (Ok(a), Ok(b)) = (a.point(), b.point()) else {
+                return false;
+            };
+            let (Ok(a), Ok(b)) = (
+                older.surface.evaluate_extended(a.x, a.y),
+                newer.surface.evaluate_extended(b.x, b.y),
+            ) else {
+                return false;
+            };
+            a.sub(b).length() <= tolerance
+        })
+}
+
 fn try_merge_pair(
     older: &FaceRecord,
     newer: &FaceRecord,
@@ -899,6 +1060,21 @@ fn try_merge_pair(
 ) -> Result<Option<FaceRecord>, KernelRefusal> {
     let same_carrier = older.same_sense == newer.same_sense
         && same_surface(&older.surface, &newer.surface, tolerance);
+    // Oppositely oriented planar patches can form a folded, zero-thickness
+    // overlap along a multi-edge seam. Cancelling that seam preserves the
+    // signed region, not the sum of the two unsigned face areas.
+    let cancel_planar_fold = older.same_sense != newer.same_sense
+        && older.loops.len() == 1
+        && newer.loops.len() == 1
+        && same_surface(&older.surface, &newer.surface, tolerance)
+        && older
+            .surface
+            .is_affine()
+            .or_refuse(KernelStage::Sew, "is_affine")?
+        && newer
+            .surface
+            .is_affine()
+            .or_refuse(KernelStage::Sew, "is_affine")?;
     let coplanar_planar =
         !same_carrier && coplanar_with_same_outward_normal(older, newer, tolerance)?;
     let cosurface_cylinder = if !same_carrier && !coplanar_planar {
@@ -934,6 +1110,11 @@ fn try_merge_pair(
             if first.forward == second.forward {
                 return Ok(None);
             }
+            if cancel_planar_fold
+                && !opposed_planar_trims_agree(older, first, newer, second, tolerance)
+            {
+                return Ok(None);
+            }
             shared_older.insert(first.id);
             shared_newer.insert(second.id);
         }
@@ -941,7 +1122,11 @@ fn try_merge_pair(
     if shared_older.is_empty() || shared_older.len() != shared_newer.len() {
         return Ok(None);
     }
+    if cancel_planar_fold && shared_older.len() < 2 {
+        return Ok(None);
+    }
     if !same_carrier
+        && !cancel_planar_fold
         && !coplanar_planar
         && cosurface_cylinder.is_none()
         && cosurface_extrusion.is_none()
@@ -960,11 +1145,31 @@ fn try_merge_pair(
         }))
         .cloned()
         .collect::<Vec<_>>();
-    let space = same_carrier.then(|| SharedParameterSpace {
+    let space = (same_carrier || cancel_planar_fold).then(|| SharedParameterSpace {
         surface: &older.surface,
         weld: crate::tolerance::assembler_weld(tolerance),
     });
-    if let Some(space) = &space {
+    if cancel_planar_fold {
+        // The opposite fold shares this affine chart too. A retraced slit
+        // contributes no signed boundary, but three coincident samples do
+        // not prove that: opposite bows can match there and enclose slivers.
+        // Use the whole-curve control bound before discarding either use.
+        let mut uses = HashMap::<u64, Vec<&CoedgeRecord>>::default();
+        for coedge in &remaining {
+            uses.entry(coedge.edge_id).or_default().push(coedge);
+        }
+        let mut slits = HashSet::default();
+        for (id, uses) in uses {
+            if uses.len() == 2
+                && !edges[&id].degenerate
+                && uses[0].forward != uses[1].forward
+                && opposed_planar_trims_agree(older, uses[0], older, uses[1], tolerance)
+            {
+                slits.insert(id);
+            }
+        }
+        remaining.retain(|coedge| !slits.contains(&coedge.edge_id));
+    } else if let Some(space) = &space {
         dissolve_slits(&mut remaining, edges, space);
     }
     let Some(mut loops) = walk_cycles(remaining, edges, space.as_ref()) else {
@@ -997,20 +1202,36 @@ fn try_merge_pair(
             _ => std::cmp::Ordering::Equal,
         }
     });
-    if same_carrier {
-        let merged = FaceRecord {
-            id: older.id,
-            surface: older.surface.clone(),
-            same_sense: older.same_sense,
-            loops,
-            name: older.name.clone(),
-        };
+    if same_carrier || cancel_planar_fold {
+        if cancel_planar_fold && loops.len() != 1 {
+            return Ok(None);
+        }
         let expected = parameter_space_area(older)
             .or_refuse(KernelStage::Sew, "parameter_space_area")?
             + parameter_space_area(newer).or_refuse(KernelStage::Sew, "parameter_space_area")?;
+        if cancel_planar_fold && expected.abs() <= tolerance * tolerance {
+            return Ok(None);
+        }
+        let merged = FaceRecord {
+            id: older.id,
+            surface: older.surface.clone(),
+            same_sense: if cancel_planar_fold {
+                expected > 0.0
+            } else {
+                older.same_sense
+            },
+            loops,
+            name: older.name.clone(),
+        };
+
         let actual =
             parameter_space_area(&merged).or_refuse(KernelStage::Sew, "parameter_space_area")?;
-        let area_tolerance = 1e-9f64.max(expected.abs() * same_carrier_area_tolerance_ratio);
+        let area_ratio = if cancel_planar_fold {
+            same_carrier_area_tolerance_ratio.min(1e-7)
+        } else {
+            same_carrier_area_tolerance_ratio
+        };
+        let area_tolerance = 1e-9f64.max(expected.abs() * area_ratio);
         if (actual - expected).abs() > area_tolerance
             || (actual.abs() > 1e-12 && actual.is_sign_positive() != merged.same_sense)
         {
@@ -1303,7 +1524,11 @@ fn try_merge_pair(
         .add(v_axis.scale(bounds_v[0]));
     let surface = make_plane(surface_origin, u_axis, v_axis, extent_u, extent_v)
         .or_refuse(KernelStage::Sew, "make_plane")?;
-    let mut projected_loops = reproject_loops(&surface, loops, edges)?;
+    let mut projected_loops = match transfer_planar_loops(&surface, &loops, older, newer, tolerance)
+    {
+        Some(transferred) => transferred,
+        None => reproject_loops(&surface, loops, edges)?,
+    };
     projected_loops.sort_by(|first, second| {
         let area = |loop_record: &LoopRecord| {
             parameter_space_area(&FaceRecord {

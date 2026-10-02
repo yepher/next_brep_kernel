@@ -7,7 +7,7 @@ use crate::tolerance::{
 use crate::topology::{BrepSolid, EdgeRecord, FaceRecord};
 use crate::{
     build_pcurve_on_surface, build_pcurve_on_surface_marched, classify_surface_pair_cached,
-    fit_polyline, intersect_curve_surface,
+    fit_polyline, fit_polyline_of_degree, intersect_curve_surface, PolylineFit,
     intersect_curves, intersect_surfaces, intersect_surfaces_supplemental, project_point_to_curve,
     project_point_to_surface, project_point_to_surface_seeded, KnotVector, NurbsCurve, NurbsSurface,
     SurfaceClassifyData,
@@ -311,5 +311,5 @@ use support::*;
 use tangent_contact::classify_tangent_contact;
 
 pub use driver::build_imprints;
+pub(crate) use driver::build_carrier_imprints;
 pub(crate) use self_touch::self_touch_edge_splits;
-

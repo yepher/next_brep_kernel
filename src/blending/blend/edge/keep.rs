@@ -1,3 +1,4 @@
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 
 // ====================================================================
@@ -23,7 +24,7 @@ pub(in crate::blend) fn fit_preserved_pcurve(
     parameters: &[f64],
     edge_domain: [f64; 2],
     u_domain: [f64; 2],
-) -> Result<NurbsCurve, String> {
+) -> Result<NurbsCurve, KernelRefusal> {
     let [s_first, s_last] = edge_domain;
     let s_span = s_last - s_first;
     let [u_start, u_end] = u_domain;
@@ -44,7 +45,7 @@ pub(in crate::blend) fn fit_preserved_pcurve(
         .iter()
         .map(|(_, u)| Vec4::from_point(Vec3::new(*u, 1.0, 0.0), 1.0))
         .collect();
-    fit::interpolate_homogeneous(&points, FIT_DEGREE, &params)
+    fit::interpolate_homogeneous(&points, FIT_DEGREE, &params).or_refuse(KernelStage::Refine, "interpolate_homogeneous")
 }
 
 /// Residual for the edge-preserving tangency: c = s1(u,v) + ρ1·n1 must
@@ -58,11 +59,11 @@ fn keep_residual(
     x: [f64; 3],
     section_point: Vec3,
     section_tangent: Vec3,
-) -> Result<([f64; 3], Vec3, Vec3, Vec3), String> {
+) -> Result<([f64; 3], Vec3, Vec3, Vec3), KernelRefusal> {
     // Rest the ball on F2's boundary curve while remaining tangent to F1.
-    let offset = blend_offset(first).at(x[0], x[1], rho1)?;
+    let offset = blend_offset(first).at(x[0], x[1], rho1).or_refuse(KernelStage::Refine, "at")?;
     let (p1, center) = (offset.source, offset.point);
-    let derivatives = boundary.derivatives_extended(x[2], 1)?;
+    let derivatives = boundary.derivatives_extended(x[2], 1).or_refuse(KernelStage::Refine, "derivatives_extended")?;
     let q = derivatives[0];
     let q_tangent = derivatives[1];
     let offset = center.sub(q);
@@ -88,7 +89,7 @@ fn solve_keep_station(
     section_point: Vec3,
     section_tangent: Vec3,
     scale: f64,
-) -> Result<[f64; 3], String> {
+) -> Result<[f64; 3], KernelRefusal> {
     let mut x = seed;
     let tolerance = 1e-10 * (1.0 + scale * scale);
     for _ in 0..NEWTON_ITERATIONS {
@@ -124,12 +125,12 @@ fn solve_keep_station(
             }
         }
         let delta = fit::solve_small::<3>(jacobian, residual, 3)
-            .map_err(|error| format!("blend: keep-edge Newton is singular ({error})"))?;
+            .map_err(|error| format!("blend: keep-edge Newton is singular ({error})")).or_refuse(KernelStage::Refine, "solve_small")?;
         for (value, correction) in x.iter_mut().zip(delta) {
             *value -= correction;
         }
     }
-    Err("blend: keep-edge tangency did not converge".into())
+    Err(KernelRefusal::non_convergence(KernelStage::Refine, "keep_tangency", "blend: keep-edge tangency did not converge"))
 }
 
 /// Build one keep-march station (contact/apex/weight) from a converged
@@ -143,7 +144,7 @@ fn keep_station_from(
     x: [f64; 3],
     section_point: Vec3,
     section_tangent: Vec3,
-) -> Result<KeepStation, String> {
+) -> Result<KeepStation, KernelRefusal> {
     let (_, p1, q, center) = keep_residual(
         first,
         boundary,
@@ -159,7 +160,7 @@ fn keep_station_from(
     let cos_alpha = toward1.dot(toward_q);
     let weight = ((1.0 + cos_alpha) * 0.5).max(0.0).sqrt();
     if weight <= 1e-6 {
-        return Err("blend: keep-edge sections are degenerate".into());
+        return Err(KernelRefusal::internal(KernelStage::Refine, "keep_sections", "blend: keep-edge sections are degenerate"));
     }
     let apex = apex_point(p1, n1, q, toward_q, center)?;
     Ok(KeepStation {
@@ -185,7 +186,7 @@ pub(in crate::blend) fn blend_closed_edge_keep(
     rho1: f64,
     chamfer: bool,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     // Fillet (rational arc) and chamfer (ruled chord) share the same rolling-
     // ball march and the same surgery topology (cr on F1 at v=0, the preserved
     // edge at v=1); only the fitted blend surface differs.
@@ -206,24 +207,24 @@ pub(in crate::blend) fn blend_closed_edge_keep(
                 .edges
                 .iter()
                 .find(|candidate| candidate.id == coedge.edge_id)
-                .ok_or("blend: consumed face references a missing edge")?;
+                .ok_or(KernelRefusal::internal(KernelStage::Sew, "missing_edge", "blend: consumed face references a missing edge"))?;
             if blended_ends.contains(&candidate.start_vertex_id)
                 || blended_ends.contains(&candidate.end_vertex_id)
             {
                 continue;
             }
             if preserved.is_some() && preserved != Some(coedge.edge_id) {
-                return Err("blend: ambiguous preserved boundary edge".into());
+                return Err(KernelRefusal::ill_posed(KernelStage::Classify, "preserved_edge", "blend: ambiguous preserved boundary edge"));
             }
             preserved = Some(coedge.edge_id);
         }
     }
-    let preserved_id = preserved.ok_or("blend: no preserved boundary edge on the consumed face")?;
+    let preserved_id = preserved.ok_or(KernelRefusal::internal(KernelStage::Classify, "preserved_edge", "blend: no preserved boundary edge on the consumed face"))?;
     let preserved_edge = solid
         .edges
         .iter()
         .find(|candidate| candidate.id == preserved_id)
-        .ok_or("blend: preserved edge missing")?;
+        .ok_or(KernelRefusal::internal(KernelStage::Classify, "preserved_edge", "blend: preserved edge missing"))?;
     // An OPEN preserved edge (two distinct end vertices) takes the clamped
     // open path below; a CLOSED one keeps the wrapped-overlap closed path.
     let open_preserved = preserved_edge.start_vertex_id != preserved_edge.end_vertex_id;
@@ -260,11 +261,11 @@ pub(in crate::blend) fn blend_closed_edge_keep(
         anchor_s
     };
     let seed0 = {
-        let rim_point = edge.curve.evaluate(seed_t)?;
+        let rim_point = edge.curve.evaluate(seed_t).or_refuse(KernelStage::Refine, "evaluate")?;
         let rim_tangent = edge
             .curve
             .unit_tangent(seed_t, edge.t0, edge.t1)
-            .map_err(|error| format!("blend keep: edge {}: {error}", edge.id))?;
+            .map_err(|error| format!("blend keep: edge {}: {error}", edge.id)).or_refuse(KernelStage::Refine, "unit_tangent")?;
         let into1 = crate::fillet::into_face_direction(
             first.face,
             rim_point,
@@ -274,15 +275,15 @@ pub(in crate::blend) fn blend_closed_edge_keep(
             (radius * 0.25).max(1e-4),
         )?;
         let nudged = rim_point.add(into1.scale(radius * 0.5));
-        let projection = crate::project_point_to_surface(&first.face.surface, nudged)?;
+        let projection = crate::project_point_to_surface(&first.face.surface, nudged).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
         [projection.u, projection.v, seed_s]
     };
     // The section plane at `t` — the extended point and the edge's unit
     // tangent, the one-sided limit where the parameterization is stationary.
-    let section_frame = |t: f64| -> Result<(Vec3, Vec3), String> {
+    let section_frame = |t: f64| -> Result<(Vec3, Vec3), KernelRefusal> {
         edge.curve
             .point_and_unit_tangent_extended(t, edge.t0, edge.t1)
-            .map_err(|error| format!("blend keep: edge {}: {error}", edge.id))
+            .map_err(|error| format!("blend keep: edge {}: {error}", edge.id)).or_refuse(KernelStage::Refine, "point_and_unit_tangent_extended")
     };
     if open_preserved {
         // OPEN keep march: run along the WHOLE blended edge [t0, t1]
@@ -293,7 +294,7 @@ pub(in crate::blend) fn blend_closed_edge_keep(
         // conditioned middle station, then each end from its neighbour) so
         // the corner sections inherit a converged seed.
         let mid_index = STATIONS / 2;
-        let section_at = |index: usize| -> Result<(Vec3, Vec3), String> {
+        let section_at = |index: usize| -> Result<(Vec3, Vec3), KernelRefusal> {
             let t = edge.t0 + span * index as f64 / STATIONS as f64;
             section_frame(t)
         };
@@ -356,7 +357,7 @@ pub(in crate::blend) fn blend_closed_edge_keep(
         let t_start;
         {
             let mut x = [edge.t0, seed0[0], seed0[1]];
-            let residual_at = |x: &[f64; 3]| -> Result<[f64; 3], String> {
+            let residual_at = |x: &[f64; 3]| -> Result<[f64; 3], KernelRefusal> {
                 let (section_point, section_tangent) = section_frame(x[0])?;
                 let (residual, ..) = keep_residual(
                     surface1,
@@ -394,13 +395,13 @@ pub(in crate::blend) fn blend_closed_edge_keep(
                     }
                 }
                 let delta = fit::solve_small::<3>(jacobian, residual, 3)
-                    .map_err(|error| format!("blend: keep-edge anchor is singular ({error})"))?;
+                    .map_err(|error| format!("blend: keep-edge anchor is singular ({error})")).or_refuse(KernelStage::Refine, "solve_small")?;
                 for (value, correction) in x.iter_mut().zip(delta) {
                     *value -= correction;
                 }
             }
             if !converged {
-                return Err("blend: keep-edge anchored start did not converge".into());
+                return Err(KernelRefusal::non_convergence(KernelStage::Refine, "keep_anchored_start", "blend: keep-edge anchored start did not converge"));
             }
             t_start = x[0];
         }
@@ -431,7 +432,7 @@ pub(in crate::blend) fn blend_closed_edge_keep(
         }
         let closure = stations[STATIONS].p1.sub(stations[0].p1).length();
         if closure > 1e-6 * scale {
-            return Err("blend: keep-edge march did not close".into());
+            return Err(KernelRefusal::non_convergence(KernelStage::Refine, "keep_march_closure", "blend: keep-edge march did not close"));
         }
     }
 
@@ -476,7 +477,7 @@ pub(in crate::blend) fn blend_closed_edge_keep(
     let vertex1_id = take_id();
     result.vertices.push(VertexRecord {
         id: vertex1_id,
-        point: rows.cr.evaluate(u_start)?,
+        point: rows.cr.evaluate(u_start).or_refuse(KernelStage::Refine, "evaluate")?,
     });
     let cr_edge_id = take_id();
     result.edges.push(EdgeRecord {
@@ -490,8 +491,8 @@ pub(in crate::blend) fn blend_closed_edge_keep(
         name: None,
     });
     // Blend seam: from the cr seam vertex to the preserved edge's vertex.
-    let seam_curve = rows.surface.iso_curve_u(u_start)?;
-    let [seam_t0, seam_t1] = seam_curve.domain()?;
+    let seam_curve = rows.surface.iso_curve_u(u_start).or_refuse(KernelStage::Refine, "iso_curve_u")?;
+    let [seam_t0, seam_t1] = seam_curve.domain().or_refuse(KernelStage::Refine, "domain")?;
     let blend_seam_id = take_id();
     result.edges.push(EdgeRecord {
         id: blend_seam_id,
@@ -511,13 +512,13 @@ pub(in crate::blend) fn blend_closed_edge_keep(
             .iter_mut()
             .flat_map(|shell| &mut shell.faces)
             .find(|face| face.id == first.face.id)
-            .ok_or("blend: mate face lost during keep surgery")?;
+            .ok_or(KernelRefusal::internal(KernelStage::Sew, "mate_face", "blend: mate face lost during keep surgery"))?;
         let loop_record = &mut face.loops[first.loop_index];
         let position = loop_record
             .coedges
             .iter()
             .position(|coedge| coedge.edge_id == edge.id)
-            .ok_or("blend: edge coedge lost during keep surgery")?;
+            .ok_or(KernelRefusal::internal(KernelStage::Sew, "edge_coedge", "blend: edge coedge lost during keep surgery"))?;
         let old_forward = loop_record.coedges[position].forward;
         loop_record.coedges[position] = CoedgeRecord {
             id: loop_record.coedges[position].id,
@@ -526,11 +527,11 @@ pub(in crate::blend) fn blend_closed_edge_keep(
             pcurve: if old_forward {
                 rows.cr_pcurve.clone()
             } else {
-                rows.cr_pcurve.reversed()?
+                rows.cr_pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")?
             },
         };
         if loop_record.coedges.len() > 1 {
-            return Err("blend: keep-edge with a seam-structured F1 is unsupported".into());
+            return Err(KernelRefusal::unsupported(KernelStage::Classify, "keep_seam_face", "blend: keep-edge with a seam-structured F1 is unsupported"));
         }
     }
 
@@ -560,7 +561,7 @@ pub(in crate::blend) fn blend_closed_edge_keep(
         .flat_map(|loop_record| &loop_record.coedges)
         .find(|coedge| coedge.edge_id == preserved_id)
         .map(|coedge| coedge.forward)
-        .ok_or("blend: consumed face does not use the preserved edge")?;
+        .ok_or(KernelRefusal::internal(KernelStage::Sew, "preserved_edge", "blend: consumed face does not use the preserved edge"))?;
     // The blend REPLACES the consumed face's use of the preserved edge —
     // manifold pairing keeps that use's sense.
     let blend_preserved_forward = consumed_use_forward;
@@ -569,7 +570,7 @@ pub(in crate::blend) fn blend_closed_edge_keep(
     let s_last = stations[STATIONS].s;
     let s_span = s_last - s_first;
     if s_span.abs() < 1e-9 {
-        return Err("blend: preserved-edge parameterisation collapsed".into());
+        return Err(KernelRefusal::internal(KernelStage::Refine, "preserved_edge_parameter", "blend: preserved-edge parameterisation collapsed"));
     }
     let preserved_pcurve_t = fit_preserved_pcurve(
         &stations,
@@ -584,12 +585,12 @@ pub(in crate::blend) fn blend_closed_edge_keep(
     // The loop layout must place the v=1 rim in that direction AND the
     // v=0 rim opposite F1's use; orientable inputs make these agree.
     if preserved_up_in_u != !blend_cr_forward {
-        return Err("blend: keep-edge orientations are inconsistent".into());
+        return Err(KernelRefusal::internal(KernelStage::Sew, "keep_orientation", "blend: keep-edge orientations are inconsistent"));
     }
     let preserved_pcurve = if blend_preserved_forward {
         preserved_pcurve_t.clone()
     } else {
-        preserved_pcurve_t.reversed()?
+        preserved_pcurve_t.reversed().or_refuse(KernelStage::Refine, "reversed")?
     };
     let loop_id = take_id();
     let coedges = if blend_cr_forward {
@@ -598,13 +599,13 @@ pub(in crate::blend) fn blend_closed_edge_keep(
                 id: take_id(),
                 edge_id: cr_edge_id,
                 forward: true,
-                pcurve: crate::sweep_topology::parameter_line(u_start, 0.0, u_end, 0.0)?,
+                pcurve: crate::sweep_topology::parameter_line(u_start, 0.0, u_end, 0.0).or_refuse(KernelStage::Refine, "parameter_line")?,
             },
             CoedgeRecord {
                 id: take_id(),
                 edge_id: blend_seam_id,
                 forward: true,
-                pcurve: crate::sweep_topology::parameter_line(u_end, 0.0, u_end, 1.0)?,
+                pcurve: crate::sweep_topology::parameter_line(u_end, 0.0, u_end, 1.0).or_refuse(KernelStage::Refine, "parameter_line")?,
             },
             CoedgeRecord {
                 id: take_id(),
@@ -616,7 +617,7 @@ pub(in crate::blend) fn blend_closed_edge_keep(
                 id: take_id(),
                 edge_id: blend_seam_id,
                 forward: false,
-                pcurve: crate::sweep_topology::parameter_line(u_start, 1.0, u_start, 0.0)?,
+                pcurve: crate::sweep_topology::parameter_line(u_start, 1.0, u_start, 0.0).or_refuse(KernelStage::Refine, "parameter_line")?,
             },
         ]
     } else {
@@ -631,19 +632,19 @@ pub(in crate::blend) fn blend_closed_edge_keep(
                 id: take_id(),
                 edge_id: blend_seam_id,
                 forward: false,
-                pcurve: crate::sweep_topology::parameter_line(u_end, 1.0, u_end, 0.0)?,
+                pcurve: crate::sweep_topology::parameter_line(u_end, 1.0, u_end, 0.0).or_refuse(KernelStage::Refine, "parameter_line")?,
             },
             CoedgeRecord {
                 id: take_id(),
                 edge_id: cr_edge_id,
                 forward: false,
-                pcurve: crate::sweep_topology::parameter_line(u_end, 0.0, u_start, 0.0)?,
+                pcurve: crate::sweep_topology::parameter_line(u_end, 0.0, u_start, 0.0).or_refuse(KernelStage::Refine, "parameter_line")?,
             },
             CoedgeRecord {
                 id: take_id(),
                 edge_id: blend_seam_id,
                 forward: true,
-                pcurve: crate::sweep_topology::parameter_line(u_start, 0.0, u_start, 1.0)?,
+                pcurve: crate::sweep_topology::parameter_line(u_start, 0.0, u_start, 1.0).or_refuse(KernelStage::Refine, "parameter_line")?,
             },
         ]
     };
@@ -662,7 +663,7 @@ pub(in crate::blend) fn blend_closed_edge_keep(
         .shells
         .iter()
         .position(|shell| shell.faces.iter().any(|face| face.id == first.face.id))
-        .ok_or("blend: mate shell lost during keep surgery")?;
+        .ok_or(KernelRefusal::internal(KernelStage::Sew, "mate_shell", "blend: mate shell lost during keep surgery"))?;
     result.shells[shell_index].faces.push(blend_face);
 
     // Delete the consumed face, its exclusive seam edges, the blended

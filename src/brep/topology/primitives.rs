@@ -120,6 +120,7 @@ pub fn make_box_brep(
         next_topology_id += 1;
     }
     let solid = BrepSolid {
+        mass_properties_cache: Default::default(),
         id: next_topology_id + 1,
         vertices,
         edges,
@@ -270,6 +271,7 @@ pub fn make_pyramid_brep(
     }
     drop(make_face);
     let solid = BrepSolid {
+        mass_properties_cache: Default::default(),
         id: next_topology_id + 1,
         vertices,
         edges,
@@ -449,6 +451,7 @@ pub fn make_cylinder_brep(
     };
 
     let solid = BrepSolid {
+        mass_properties_cache: Default::default(),
         id: 114,
         vertices,
         edges,

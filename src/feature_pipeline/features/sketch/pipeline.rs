@@ -122,6 +122,7 @@ fn build(ctx: &FeatureContext) -> Result<SketchOutput, String> {
     };
 
     pre_evaluate_expressions(ctx, &mut sketch)?;
+    pin_origin_point(&mut sketch, &frame);
 
     // Solve to final coordinates (committed solve: exact, polished).
     let request = SolveSketchRequest {
@@ -172,6 +173,10 @@ fn build(ctx: &FeatureContext) -> Result<SketchOutput, String> {
             ) else {
                 continue;
             };
+            // The part-origin reference exists only inside the sketch.
+            if is_sketch_origin_point_id(id) {
+                continue;
+            }
             let construction = point.get("construction").and_then(|v| v.as_bool()) == Some(true);
             published_points.push((
                 format!("{}:P{}", ctx.id, id_display(id)),
@@ -449,6 +454,28 @@ fn build_profile(
         z_axis: frame.z_axis,
         regions,
     }))
+}
+
+/// Re-project the part-origin reference point ([`SKETCH_ORIGIN_POINT_ID`]) onto
+/// the RESOLVED frame, so a sketch whose plane moved since it was last edited
+/// (a face or datum upstream changed) still constrains to the true origin, not
+/// to where it projected when the editor last saw it. Its role flags are forced
+/// too: the origin is always fixed, construction and an external reference.
+fn pin_origin_point(sketch: &mut Value, frame: &Frame) {
+    let Some(points) = sketch.get_mut("points").and_then(|p| p.as_array_mut()) else {
+        return;
+    };
+    let offset = Vec3::new(0.0, 0.0, 0.0).sub(frame.origin);
+    for point in points {
+        if !point.get("id").is_some_and(is_sketch_origin_point_id) {
+            continue;
+        }
+        point["x"] = Value::from(offset.dot(frame.x_axis));
+        point["y"] = Value::from(offset.dot(frame.y_axis));
+        point["fixed"] = Value::Bool(true);
+        point["construction"] = Value::Bool(true);
+        point["externalReference"] = Value::Bool(true);
+    }
 }
 
 /// An id JSON value as a plain number, for the ids that must be ORDERED rather

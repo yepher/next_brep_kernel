@@ -404,8 +404,7 @@ pub(super) struct BiBand {
 /// precision, so nothing that reads exactly today moves. Set at 1e-9 rather
 /// than at the noise floor so a level rim of a large-domain surface is never
 /// pushed onto the pcurve walk by rounding alone. `importTestWorking`
-/// SOLID_03 face 90 (record `kernel-step-precision-and-importtestworking-
-/// 2026-09-12.md`): a torus fillet strip whose upper rim was projected from
+/// SOLID_03 face 90: a torus fillet strip whose upper rim was projected from
 /// an edge 2.2e-3 mm off the torus wanders over v ∈ [0.746903, 0.750195] —
 /// 3.3e-3 of the period — and the rectangle at the mean level 0.748549 read
 /// the strip 9.67e-3 mm² (0.09%) small and its origin flux 0.388 low.

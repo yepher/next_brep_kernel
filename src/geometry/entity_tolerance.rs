@@ -1,7 +1,3 @@
-//! Per-entity measured tolerances — the lazy, capped, per-edge/per-vertex band
-//! `per-entity-tolerances.md` asks for, derived from the entity's own redundant
-//! representations rather than predicted from the model's size.
-//!
 //! # Why an entity needs its own band
 //!
 //! Everything in [`crate::tolerance`] is a *policy*: one spatial base `model`,

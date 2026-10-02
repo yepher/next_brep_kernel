@@ -1,10 +1,10 @@
 //! Center (`CNTR`) — hold one component's element(s) centred between two
-//! parallel planar faces of another (spec §4; the "width" mate of other CAD
-//! systems). The WIDTH is two parallel planar faces on one component; the TAB
-//! is one element, or two like elements, on a second component. The tab's
-//! CENTRE geometry — the element itself, or the mid-geometry of the pair
-//! (mid-plane of two parallel planes, mid-line of two parallel lines, midpoint
-//! of two points) — is held on the width's MID-PLANE:
+//! parallel planar faces of another (the "width" mate of other CAD systems).
+//! The WIDTH is two parallel planar faces on one component; the TAB is one
+//! element, or two like elements, on a second component. The tab's CENTRE
+//! geometry — the element itself, or the mid-geometry of the pair (mid-plane
+//! of two parallel planes, mid-line of two parallel lines, midpoint of two
+//! points) — is held on the width's MID-PLANE:
 //!
 //! | tab centre | mates | DOF removed |
 //! |---|---|---|

@@ -11,6 +11,7 @@ struct FragmentIndex<'a> {
     by_face: HashMap<(u8, u64), &'a [u64]>,
     pieces_by_id: HashMap<u64, &'a ImprintPieceRecord>,
     vertex_points: HashMap<u64, Vec3>,
+    cosurface_pairs: HashSet<(FaceKey, FaceKey)>,
 }
 
 impl<'a> FragmentIndex<'a> {
@@ -25,6 +26,8 @@ impl<'a> FragmentIndex<'a> {
         }
         FragmentIndex {
             by_face,
+            cosurface_pairs: imprint.cosurface_pairs.iter()
+                .flat_map(|&(a,b)| [(a,b),(b,a)]).collect(),
             pieces_by_id: imprint
                 .pieces
                 .iter()
@@ -161,6 +164,90 @@ fn source_loop_winding_negative(face: &FaceRecord) -> Result<Option<bool>, Kerne
     })
 }
 
+/// A cut against the other operand's coincident copy of an incident face
+/// inherits that already-established face identity. This permits bounded rim
+/// repair without treating an unrelated nearby curve as the same boundary.
+fn boundary_has_cosurface_partner(
+    solid: &BrepSolid,
+    face: FaceKey,
+    boundary_edge: u64,
+    piece: &ImprintPieceRecord,
+    index: &FragmentIndex,
+) -> bool {
+    piece.support_faces.iter().filter(|other| other.operand != face.operand).any(|other| {
+        solid.shells.iter().flat_map(|shell| &shell.faces).any(|neighbour| {
+            neighbour.id != face.face_id
+                && index.cosurface_pairs.contains(&(FaceKey { operand:face.operand, face_id:neighbour.id }, *other))
+                && neighbour.loops.iter().flat_map(|lp| &lp.coedges)
+                    .any(|coedge| coedge.edge_id == boundary_edge)
+        })
+    })
+}
+
+/// Detect a distinct narrow strip before replacing its curves by chords.
+/// Search tolerance only nominates a nearby boundary; positive separation in
+/// model space and parallel interior tangents establish a resolvable strip.
+fn thin_boundary_resolution(
+    solid: &BrepSolid,
+    face: &FaceRecord,
+    face_key: FaceKey,
+    piece_ids: &[u64],
+    index: &FragmentIndex,
+    search: f64,
+) -> Option<(f64, f64)> {
+    let mut resolution: Option<(f64, f64)> = None;
+    for piece_id in piece_ids {
+        let Some(piece) = index.pieces_by_id.get(piece_id) else { continue };
+        let Ok(cut) = pcurve_for(piece, face_key) else { continue };
+        for boundary in face.loops.iter().flat_map(|lp| &lp.coedges) {
+            if boundary_has_cosurface_partner(solid, face_key, boundary.edge_id, piece, index) {
+                continue;
+            }
+            let measure = || -> Option<(f64, f64)> {
+                let [lo, hi] = cut.domain().ok()?;
+                let middle = cut.evaluate((lo + hi) * 0.5).ok()?;
+                let nearest = project_point_to_curve(&boundary.pcurve, middle).ok()?;
+                if nearest.distance > search * 8.0 { return None; }
+                let mut low_gap = f64::INFINITY;
+                let mut high_gap = 0.0f64;
+                let mut identity = 0.0f64;
+                for fraction in [0.125, 0.25, 0.5, 0.75, 0.875] {
+                    let parameter = lo + (hi - lo) * fraction;
+                    let cut_sample = cut.derivatives(parameter, 1).ok()?;
+                    let point = cut_sample[0];
+                    let projected = project_point_to_curve(&boundary.pcurve, point).ok()?;
+                    if projected.distance > search * 8.0 { return None; }
+                    let boundary_sample = boundary.pcurve.derivatives(projected.u, 1).ok()?;
+                    let a = cut_sample[1];
+                    let b = boundary_sample[1];
+                    let lengths = a.length() * b.length();
+                    if lengths <= 1e-30 || a.dot(b).abs() < 0.995 * lengths { return None; }
+                    let actual = face.surface.evaluate(point.x, point.y).ok()?;
+                    let rim = face.surface.evaluate(projected.point.x, projected.point.y).ok()?;
+                    if actual.sub(rim).length() <= 8e-7 { return None; }
+                    let floor = crate::classification::surface_uv_band(
+                        &face.surface, point.x, point.y, 1e-7,
+                    );
+                    if projected.distance <= floor * 8.0 { return None; }
+                    low_gap = low_gap.min(projected.distance);
+                    high_gap = high_gap.max(projected.distance);
+                    identity = identity.max(floor);
+                }
+                // A crossing or isolated tangency does not describe a strip.
+                if high_gap > low_gap * 4.0 { return None; }
+                Some((search.min((low_gap / 128.0).max(identity)), search.min(low_gap / 8.0)))
+            };
+            if let Some((arrangement, sampling)) = measure() {
+                resolution = Some(match resolution {
+                    Some((a, s)) => (a.min(arrangement), s.min(sampling)),
+                    None => (arrangement, sampling),
+                });
+            }
+        }
+    }
+    resolution
+}
+
 fn fragment_face_indexed(
     solid: &BrepSolid,
     operand: u8,
@@ -231,7 +318,10 @@ fn fragment_face_indexed(
     let v_domain = KnotVector::new(face.surface.knots_v.clone(), face.surface.degree_v).or_refuse(KernelStage::Fragment, "new")?.domain();
     let diagonal =
         ((u_domain[1] - u_domain[0]).powi(2) + (v_domain[1] - v_domain[0]).powi(2)).sqrt();
-    let arrangement_tolerance = 1e-7f64.max(diagonal * 1e-6);
+    let original_resolution = 1e-7f64.max(diagonal * 1e-6);
+    let strip_resolution = thin_boundary_resolution(solid, face, face_key, piece_ids, index, original_resolution);
+    let (arrangement_tolerance, sampling_bound) = strip_resolution
+        .unwrap_or((original_resolution, original_resolution));
     let snap_threshold = 0.1 * diagonal;
     let junction_radius = (arrangement_tolerance * 50.0).max(diagonal * 1.5e-3);
     // WRAPPED-BAND RE-BASE: a face on a closed direction whose material is the
@@ -660,8 +750,13 @@ fn fragment_face_indexed(
                 .get(coedge_index)
                 .copied()
                 .unwrap_or([0.0, 0.0]);
-            let points: Vec<Vec2> =
-                refine_near_hints(&sample_chain(&coedge.pcurve)?, &coedge.pcurve, &cut_hints)?
+            let initial = sample_chain(&coedge.pcurve)?;
+            // Adaptive samples are not uniformly spaced in parameter. Do not
+            // feed them to refine_near_hints, which assumes uniform input.
+            let boundary_points = if strip_resolution.is_some() {
+                sag_refine_chain(&coedge.pcurve, initial, sampling_bound)?.0
+            } else { refine_near_hints(&initial, &coedge.pcurve, &cut_hints)? };
+            let points: Vec<Vec2> = boundary_points
                     .into_iter()
                     .map(|point| {
                         rebase_point(Vec2 {
@@ -868,7 +963,7 @@ fn fragment_face_indexed(
         let (mut points, original_flags) = sag_refine_chain(
             &pcurve,
             sample_chain(&pcurve)?,
-            arrangement_tolerance,
+            sampling_bound,
         )?;
         for point in &mut points {
             if point.x < clamp_u[0] {
@@ -1378,11 +1473,11 @@ fn fragment_face_indexed(
                 && near_chain(b, &chains[pole], coincidence_tolerance)
         })
     };
-    let coincident_in_space = |cut: &Chain, boundary: &Chain| -> bool {
-        let ChainSource::Boundary { curve, .. } = &boundary.source else {
+    let coincident_in_space = |cut: &Chain, boundary: &Chain, weld_scale: bool| -> bool {
+        let ChainSource::Boundary { curve, coedge } = &boundary.source else {
             return false;
         };
-        let ChainSource::Cut { curve: section, .. } = &cut.source else {
+        let ChainSource::Cut { curve: section, piece_id, .. } = &cut.source else {
             return false;
         };
         let Ok([start, end]) = section.domain() else {
@@ -1400,7 +1495,14 @@ fn fragment_face_indexed(
         if chart_length <= 0.0 || space_length <= 0.0 {
             return false;
         }
-        let bound = coincidence_tolerance * space_length / chart_length;
+        let copy_boundary = index.pieces_by_id.get(piece_id).is_some_and(|piece| {
+            boundary_has_cosurface_partner(solid, face_key, coedge.edge_id, piece, index)
+        });
+        let bound = if weld_scale {
+            if copy_boundary { crate::tolerance::WELD_FLOOR } else { 1e-7 }
+        } else {
+            coincidence_tolerance * space_length / chart_length
+        };
         let stations = cut.segments.len().max(16);
         (0..=stations).all(|index| {
             section
@@ -1443,7 +1545,7 @@ fn fragment_face_indexed(
                 continue;
             }
             let interior_coincident = if at_pole {
-                coincident_in_space(chain, boundary)
+                coincident_in_space(chain, boundary, false)
             } else {
                 chain.segments.iter().all(|(a, b)| {
                     near_chain(*a, boundary, coincidence_tolerance)
@@ -1452,6 +1554,26 @@ fn fragment_face_indexed(
                 })
             };
             if !interior_coincident {
+                continue;
+            }
+            // UV proximity only nominates a duplicate. A real cap lens can
+            // be narrower than that chart-space search band while its two
+            // arcs are distinct in 3D. Discard the cut only when the section
+            // follows the boundary within model identity, not the repair band.
+            // Endpoint anchoring can turn a very short cut and boundary into
+            // the SAME chart segment even when their pre-anchor 3D curves
+            // differ. Such identical constraints cannot enclose a region;
+            // keeping both would corrupt arrangement cycle extraction.
+            let identical_segment = chain.segments.len() == 1
+                && boundary.segments.len() == 1
+                && ((chain.start.sub(boundary.start).length() <= node_tolerance
+                    && chain.end.sub(boundary.end).length() <= node_tolerance)
+                    || (chain.start.sub(boundary.end).length() <= node_tolerance
+                        && chain.end.sub(boundary.start).length() <= node_tolerance));
+            if !identical_segment
+                && std::env::var("BREP_DUP_CUT_GEOMETRY").as_deref() != Ok("0")
+                && !coincident_in_space(chain, boundary, true)
+            {
                 continue;
             }
             if corner_veto_enabled {

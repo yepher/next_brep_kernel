@@ -5,7 +5,7 @@ pub fn extrude_brep_json(request_json: &str) -> Result<String, JsValue> {
     let request: ExtrudeBrepRequest =
         serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
     let solid = extrude_profile_brep(&request.profile, request.direction, request.distance)
-        .map_err(javascript_error)?;
+        .map_err(javascript_refusal)?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -36,7 +36,7 @@ pub fn fillet_edge_json(request_json: &str) -> Result<String, JsValue> {
         request.radius,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -51,7 +51,7 @@ pub fn fillet_edge_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValue
         request.radius,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
 }
 
@@ -66,7 +66,7 @@ pub fn chamfer_edge_json(request_json: &str) -> Result<String, JsValue> {
         request.radius,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -81,7 +81,7 @@ pub fn chamfer_edge_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValu
         request.radius,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
 }
 
@@ -124,7 +124,7 @@ pub fn fillet_edges_json(request_json: &str) -> Result<String, JsValue> {
         request.chamfer,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -140,7 +140,7 @@ pub fn fillet_edges_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValu
         request.chamfer,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
 }
 
@@ -168,7 +168,7 @@ pub fn fillet_edges_variable_json(request_json: &str) -> Result<String, JsValue>
         request.chamfer,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -184,7 +184,7 @@ pub fn fillet_edges_variable_buffer(request_json: &str) -> Result<WasmSolidBuffe
         request.chamfer,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
 }
 
@@ -212,7 +212,7 @@ pub fn chamfer_edges_asymmetric_json(request_json: &str) -> Result<String, JsVal
         request.d2,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -228,7 +228,7 @@ pub fn chamfer_edges_asymmetric_buffer(request_json: &str) -> Result<WasmSolidBu
         request.d2,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
 }
 
@@ -256,7 +256,7 @@ pub fn chamfer_edges_angle_json(request_json: &str) -> Result<String, JsValue> {
         request.angle,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -272,7 +272,7 @@ pub fn chamfer_edges_angle_buffer(request_json: &str) -> Result<WasmSolidBuffer,
         request.angle,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
 }
 
@@ -286,7 +286,7 @@ pub fn round_convex_corner_json(request_json: &str) -> Result<String, JsValue> {
         request.radius,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -300,7 +300,7 @@ pub fn round_convex_corner_buffer(request_json: &str) -> Result<WasmSolidBuffer,
         request.radius,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
 }
 
@@ -308,7 +308,7 @@ pub fn round_convex_corner_buffer(request_json: &str) -> Result<WasmSolidBuffer,
 pub fn loft_brep_json(request_json: &str) -> Result<String, JsValue> {
     let request: LoftBrepRequest =
         serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
-    let solid = loft_profile_brep(&request.sections).map_err(javascript_error)?;
+    let solid = loft_profile_brep(&request.sections).map_err(javascript_refusal)?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -317,7 +317,7 @@ pub fn extrude_brep_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValu
     let request: ExtrudeBrepRequest =
         serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
     let solid = extrude_profile_brep(&request.profile, request.direction, request.distance)
-        .map_err(javascript_error)?;
+        .map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
 }
 
@@ -332,7 +332,7 @@ pub fn extrude_profile_brep_draft_json(request_json: &str) -> Result<String, JsV
         request.draft_angle,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -347,7 +347,7 @@ pub fn extrude_profile_brep_draft_buffer(request_json: &str) -> Result<WasmSolid
         request.draft_angle,
         request.name.as_deref(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
 }
 
@@ -364,7 +364,7 @@ pub fn rib_from_profile_json(request_json: &str) -> Result<String, JsValue> {
         request.extrusion,
         &request.names(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -381,7 +381,7 @@ pub fn rib_from_profile_buffer(request_json: &str) -> Result<WasmSolidBuffer, Js
         request.extrusion,
         &request.names(),
     )
-    .map_err(javascript_error)?;
+    .map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
 }
 
@@ -405,7 +405,7 @@ pub fn revolve_brep_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValu
 pub fn loft_brep_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValue> {
     let request: LoftBrepRequest =
         serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
-    let solid = loft_profile_brep(&request.sections).map_err(javascript_error)?;
+    let solid = loft_profile_brep(&request.sections).map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
 }
 
@@ -413,6 +413,6 @@ pub fn loft_brep_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValue> 
 pub fn loft_profile_brep_guided_json(request_json: &str) -> Result<String, JsValue> {
     let request: GuidedLoftRequest =
         serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
-    let solid = guided_loft_dispatch(&request).map_err(javascript_error)?;
+    let solid = guided_loft_dispatch(&request).map_err(javascript_refusal)?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }

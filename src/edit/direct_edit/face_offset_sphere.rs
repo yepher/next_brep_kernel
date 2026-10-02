@@ -1,4 +1,5 @@
 use super::*;
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 
 // ---------------------------------------------------------------------------
 // Push a SPHERICAL analytic face by OFFSETTING its carrier to a concentric
@@ -78,19 +79,33 @@ pub fn offset_sphere_face(
     solid: &BrepSolid,
     face_id: u64,
     distance: f64,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     if !distance.is_finite() {
-        return Err("offset_sphere_face: distance must be finite".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "distance",
+            "offset_sphere_face: distance must be finite",
+        ));
     }
     let scale = solid_model_scale(solid);
     let tolerance = (scale * 1e-7).max(1e-9);
     let plane_tolerance = (scale * 1e-6).max(1e-7);
 
     let (pshell, pface) = find_face(solid, face_id)
-        .ok_or_else(|| format!("offset_sphere_face: no face {face_id}"))?;
+        .ok_or_else(|| {
+            KernelRefusal::input(
+                KernelStage::Collect,
+                "face_id",
+                format!("offset_sphere_face: no face {face_id}"),
+            )
+        })?;
     let pushed = &solid.shells[pshell].faces[pface];
     let Some(AnalyticSurface::Sphere { frame, radius }) = pushed.surface.analytic() else {
-        return Err("offset_sphere_face: the pushed face is not a sphere".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "not_sphere",
+            "offset_sphere_face: the pushed face is not a sphere",
+        ));
     };
     let center = frame.origin;
     let axis = frame.axis;
@@ -98,32 +113,41 @@ pub fn offset_sphere_face(
     let seam_y = frame.y_axis;
     let radius = *radius;
     if radius <= tolerance {
-        return Err("offset_sphere_face: degenerate sphere radius".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "degenerate_radius",
+            "offset_sphere_face: degenerate sphere radius",
+        ));
     }
 
     // Sign the push: `distance` is measured along the face's OUTWARD normal. For
     // a convex ball the outward normal is radial (s = +1) so the radius grows; a
     // spherical POCKET's outward normal points inward (s = −1) so a positive push
     // (more material) SHRINKS the cavity. Either way r_new = r + distance·s.
-    let [u0, u1] = pushed.surface.domain_u()?;
-    let [v0, v1] = pushed.surface.domain_v()?;
+    let [u0, u1] = pushed.surface.domain_u().or_refuse(KernelStage::Classify, "domain_u")?;
+    let [v0, v1] = pushed.surface.domain_v().or_refuse(KernelStage::Classify, "domain_v")?;
     let (um, vm) = (0.5 * (u0 + u1), 0.5 * (v0 + v1));
-    let point = pushed.surface.evaluate(um, vm)?;
-    let mut normal = pushed.surface.normal(um, vm)?;
+    let point = pushed.surface.evaluate(um, vm).or_refuse(KernelStage::Classify, "evaluate")?;
+    let mut normal = pushed.surface.normal(um, vm).or_refuse(KernelStage::Classify, "normal")?;
     if !pushed.same_sense {
         normal = normal.scale(-1.0);
     }
     let radial = point.sub(center);
     if radial.length() <= tolerance {
-        return Err("offset_sphere_face: degenerate radial direction".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Classify,
+            "radial_direction",
+            "offset_sphere_face: degenerate radial direction",
+        ));
     }
     let outward_sign = if normal.dot(radial) >= 0.0 { 1.0 } else { -1.0 };
     let radius_new = radius + distance * outward_sign;
     if radius_new <= tolerance {
-        return Err(
-            "offset_sphere_face: the push collapses the sphere to or past its centre — refusing"
-                .into(),
-        );
+        return Err(KernelRefusal::input(
+            KernelStage::Classify,
+            "collapse",
+            "offset_sphere_face: the push collapses the sphere to or past its centre — refusing",
+        ));
     }
 
     // S′ = exact concentric offset = uniform scale of the carrier about the
@@ -134,24 +158,28 @@ pub fn offset_sphere_face(
         0.0, k, 0.0, (1.0 - k) * center.y,
         0.0, 0.0, k, (1.0 - k) * center.z,
         0.0, 0.0, 0.0, 1.0,
-    ])?;
-    let s_prime = transform_surface(&pushed.surface, scale_about_center)?;
+    ]).or_refuse(KernelStage::Refine, "affine_transform")?;
+    let s_prime = transform_surface(&pushed.surface, scale_about_center).or_refuse(KernelStage::Refine, "transform_surface")?;
     // Defensive: confirm the offset is the concentric sphere we expect.
     match s_prime.analytic() {
         Some(AnalyticSurface::Sphere { frame, radius }) => {
             if frame.origin.sub(center).length() > plane_tolerance
                 || (radius - radius_new).abs() > plane_tolerance.max(radius_new * 1e-9)
             {
-                return Err("offset_sphere_face: offset carrier is not the expected \
-                            concentric sphere — refusing"
-                    .into());
+                return Err(KernelRefusal::internal(
+                    KernelStage::Refine,
+                    "offset_carrier",
+                    "offset_sphere_face: offset carrier is not the expected \
+                            concentric sphere — refusing",
+                ));
             }
         }
         _ => {
-            return Err(
-                "offset_sphere_face: offset carrier did not re-recognise as a sphere — refusing"
-                    .into(),
-            )
+            return Err(KernelRefusal::internal(
+                KernelStage::Refine,
+                "offset_recognition",
+                "offset_sphere_face: offset carrier did not re-recognise as a sphere — refusing",
+            ))
         }
     }
 
@@ -176,7 +204,7 @@ pub fn offset_sphere_face(
 
     // The v-parameter domain of the offset sphere (== the source domain; the
     // uniform scale preserves the parameterisation exactly).
-    let [dv0, dv1] = s_prime.domain_v()?;
+    let [dv0, dv1] = s_prime.domain_v().or_refuse(KernelStage::Classify, "domain_v")?;
 
     // Classify. A rim neighbour is one of:
     //   * PLANE through the centre → exact-scale path (the landed 4a behaviour):
@@ -199,7 +227,13 @@ pub fn offset_sphere_face(
         for coedge in &loop_record.coedges {
             let edge = *edge_by_id
                 .get(&coedge.edge_id)
-                .ok_or_else(|| format!("offset_sphere_face: missing edge {}", coedge.edge_id))?;
+                .ok_or_else(|| {
+                    KernelRefusal::internal(
+                        KernelStage::Classify,
+                        "missing_edge",
+                        format!("offset_sphere_face: missing edge {}", coedge.edge_id),
+                    )
+                })?;
             all_boundary_vertices.insert(edge.start_vertex_id);
             all_boundary_vertices.insert(edge.end_vertex_id);
 
@@ -211,9 +245,21 @@ pub fn offset_sphere_face(
             let neighbour = *incident
                 .iter()
                 .find(|f| **f != face_id)
-                .ok_or_else(|| format!("offset_sphere_face: edge {} has no neighbour", edge.id))?;
+                .ok_or_else(|| {
+                    KernelRefusal::internal(
+                        KernelStage::Classify,
+                        "no_neighbour",
+                        format!("offset_sphere_face: edge {} has no neighbour", edge.id),
+                    )
+                })?;
             let (nshell, nface) = find_face(solid, neighbour)
-                .ok_or_else(|| format!("offset_sphere_face: missing neighbour {neighbour}"))?;
+                .ok_or_else(|| {
+                    KernelRefusal::internal(
+                        KernelStage::Classify,
+                        "missing_neighbour",
+                        format!("offset_sphere_face: missing neighbour {neighbour}"),
+                    )
+                })?;
             let neighbour_surface = &solid.shells[nshell].faces[nface].surface;
             match neighbour_surface.analytic() {
                 Some(AnalyticSurface::Plane { .. }) => {
@@ -237,23 +283,32 @@ pub fn offset_sphere_face(
                         axis,
                         scale,
                     ) {
-                        return Err("offset_sphere_face: a cylinder/cone rim neighbour is \
+                        return Err(KernelRefusal::unsupported(
+                            KernelStage::Classify,
+                            "non_coaxial_ruled",
+                            "offset_sphere_face: a cylinder/cone rim neighbour is \
                                     NON-coaxial (only coaxial sphere × ruled intersections are \
-                                    supported) — refusing"
-                            .into());
+                                    supported) — refusing",
+                        ));
                     }
                     raw_rims.push((edge.id, neighbour, RimKind::CoaxialRuled));
                 }
                 Some(AnalyticSurface::Torus { .. }) => {
-                    return Err("offset_sphere_face: a toroidal rim neighbour is deferred \
-                                (torus is untouched in this slice)"
-                        .into());
+                    return Err(KernelRefusal::unsupported(
+                        KernelStage::Classify,
+                        "torus_neighbour",
+                        "offset_sphere_face: a toroidal rim neighbour is deferred \
+                                (torus is untouched in this slice)",
+                    ));
                 }
                 _ => {
-                    return Err("offset_sphere_face: a rim neighbour is not a supported plane, \
+                    return Err(KernelRefusal::unsupported(
+                        KernelStage::Classify,
+                        "neighbour_kind",
+                        "offset_sphere_face: a rim neighbour is not a supported plane, \
                                 sphere, or coaxial cylinder/cone (general revolution and \
-                                free-form neighbours are deferred in this slice)"
-                        .into());
+                                free-form neighbours are deferred in this slice)",
+                    ));
                 }
             }
         }
@@ -265,11 +320,12 @@ pub fn offset_sphere_face(
     for (edge_id, _, _) in &raw_rims {
         let edge = *edge_by_id.get(edge_id).unwrap();
         if edge.start_vertex_id != edge.end_vertex_id {
-            return Err(
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "open_rim",
                 "offset_sphere_face: a recomputed rim is not a single closed edge \
-                        (multi-edge / open rims are deferred in this slice)"
-                    .into(),
-            );
+                        (multi-edge / open rims are deferred in this slice)",
+            ));
         }
         closure_vertices.insert(edge.start_vertex_id);
     }
@@ -328,20 +384,22 @@ pub fn offset_sphere_face(
             match kind {
                 RimKind::OffCentrePlane(plane) => {
                     if plane.normal.dot(axis).abs() < 1.0 - 1e-6 {
-                        return Err(
+                        return Err(KernelRefusal::unsupported(
+                            KernelStage::Classify,
+                            "oblique_seam_rim",
                             "offset_sphere_face: a seam-crossing rim on an OBLIQUE plane is \
-                                    deferred in this slice (only axis-perpendicular caps)"
-                                .into(),
-                        );
+                                    deferred in this slice (only axis-perpendicular caps)",
+                        ));
                     }
                     let a = plane.origin.sub(center).dot(axis);
                     let rr2 = radius_new * radius_new - a * a;
                     if rr2 <= tolerance * tolerance {
-                        return Err(
+                        return Err(KernelRefusal::unsupported(
+                            KernelStage::Refine,
+                            "cap_vanishes",
                             "offset_sphere_face: the push pulls the grown sphere off its cap \
-                                    plane (the cap vanishes) — refusing"
-                                .into(),
-                        );
+                                    plane (the cap vanishes) — refusing",
+                        ));
                     }
                     crate::make_arc(
                         center.add(axis.scale(a)),
@@ -350,14 +408,15 @@ pub fn offset_sphere_face(
                         rr2.sqrt(),
                         0.0,
                         std::f64::consts::TAU,
-                    )?
+                    ).or_refuse(KernelStage::Refine, "make_arc")?
                 }
                 RimKind::NeighbourSphere => {
-                    return Err(
+                    return Err(KernelRefusal::unsupported(
+                        KernelStage::Classify,
+                        "sphere_seam_rim",
                         "offset_sphere_face: a sphere neighbour whose rim crosses the \
-                                pushed sphere's seam is deferred in this slice"
-                            .into(),
-                    )
+                                pushed sphere's seam is deferred in this slice",
+                    ))
                 }
                 RimKind::CoaxialRuled => {
                     // A coaxial ruled neighbour meets the sphere in latitude
@@ -370,11 +429,14 @@ pub fn offset_sphere_face(
                     let curves = intersect_analytic_pair(&s_prime, neighbour_surface, tolerance)
                         .filter(|curves| !curves.is_empty())
                         .ok_or_else(|| {
-                            "offset_sphere_face: the grown sphere no longer meets its coaxial \
-                             cylinder/cone neighbour — refusing"
-                                .to_string()
+                            KernelRefusal::unsupported(
+                                KernelStage::Refine,
+                                "ruled_separated",
+                                "offset_sphere_face: the grown sphere no longer meets its coaxial \
+                             cylinder/cone neighbour — refusing",
+                            )
                         })?;
-                    let old_mid = edge.curve.evaluate(0.5 * (edge.t0 + edge.t1))?;
+                    let old_mid = edge.curve.evaluate(0.5 * (edge.t0 + edge.t1)).or_refuse(KernelStage::Refine, "evaluate")?;
                     nearest_circle(&curves, old_mid)?
                 }
             }
@@ -384,33 +446,36 @@ pub fn offset_sphere_face(
             let curves = intersect_analytic_pair(&s_prime, neighbour_surface, tolerance)
                 .filter(|curves| !curves.is_empty())
                 .ok_or_else(|| {
-                    "offset_sphere_face: the grown sphere no longer meets a neighbour (the cap \
-                     vanishes / tangent / separated) — refusing"
-                        .to_string()
+                    KernelRefusal::unsupported(
+                        KernelStage::Refine,
+                        "separated",
+                        "offset_sphere_face: the grown sphere no longer meets a neighbour (the cap \
+                     vanishes / tangent / separated) — refusing",
+                    )
                 })?;
-            let old_mid = edge.curve.evaluate(0.5 * (edge.t0 + edge.t1))?;
+            let old_mid = edge.curve.evaluate(0.5 * (edge.t0 + edge.t1)).or_refuse(KernelStage::Refine, "evaluate")?;
             nearest_circle(&curves, old_mid)?
         };
 
         // Match the new rim's traversal to the old edge so the preserved coedge
         // `forward` flags keep the loop winding consistent.
-        let closure_old = edge.curve.evaluate(edge.t0)?;
+        let closure_old = edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Refine, "evaluate")?;
         let old_tan = edge
             .curve
-            .evaluate(edge.t0 + 0.01 * (edge.t1 - edge.t0))?
+            .evaluate(edge.t0 + 0.01 * (edge.t1 - edge.t0)).or_refuse(KernelStage::Refine, "evaluate")?
             .sub(closure_old);
-        let [c0, c1] = circle.domain()?;
-        let new_start = circle.evaluate(c0)?;
-        let new_tan = circle.evaluate(c0 + 0.01 * (c1 - c0))?.sub(new_start);
+        let [c0, c1] = circle.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let new_start = circle.evaluate(c0).or_refuse(KernelStage::Refine, "evaluate")?;
+        let new_tan = circle.evaluate(c0 + 0.01 * (c1 - c0)).or_refuse(KernelStage::Refine, "evaluate")?.sub(new_start);
         if old_tan.dot(new_tan) < 0.0 {
-            circle = circle.reversed()?;
+            circle = circle.reversed().or_refuse(KernelStage::Refine, "reversed")?;
         }
-        let closure_point = circle.evaluate(circle.domain()?[0])?;
-        let pushed_pcurve = build_pcurve_on_surface(&s_prime, &circle)?;
+        let closure_point = circle.evaluate(circle.domain().or_refuse(KernelStage::Refine, "domain")?[0]).or_refuse(KernelStage::Refine, "evaluate")?;
+        let pushed_pcurve = build_pcurve_on_surface(&s_prime, &circle).or_refuse(KernelStage::Refine, "build_pcurve_on_surface")?;
         // The rim's v on the offset sphere (constant for a latitude rim; only the
         // seam-coupled meridian rebuild consumes it).
-        let [q0, q1] = pushed_pcurve.domain()?;
-        let v_rim = pushed_pcurve.evaluate(0.5 * (q0 + q1))?.y;
+        let [q0, q1] = pushed_pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let v_rim = pushed_pcurve.evaluate(0.5 * (q0 + q1)).or_refuse(KernelStage::Refine, "evaluate")?.y;
 
         rim_builds.push(RimBuild {
             edge_id: *edge_id,
@@ -427,7 +492,7 @@ pub fn offset_sphere_face(
     // The offset sphere's u = 0 seam meridian (parameterised by v exactly: an
     // iso-curve preserves the surface v-parameter, so a straight (u, v) pcurve
     // stays synchronised with it — a fresh `make_arc` would not).
-    let iso_meridian = s_prime.iso_curve_u(0.0)?;
+    let iso_meridian = s_prime.iso_curve_u(0.0).or_refuse(KernelStage::Refine, "iso_curve_u")?;
 
     // --- Apply to a fresh clone (the input is never mutated) ---------------
     let mut result = solid.clone();
@@ -435,13 +500,13 @@ pub fn offset_sphere_face(
     // Scale the intrinsic own-only edges + any through-centre great-circle rims.
     for edge in &mut result.edges {
         if edges_to_scale.contains(&edge.id) {
-            edge.curve = transform_curve(&edge.curve, scale_about_center)?;
+            edge.curve = transform_curve(&edge.curve, scale_about_center).or_refuse(KernelStage::Fragment, "transform_curve")?;
         }
     }
     // Recomputed rim edges take their new circle.
     for rb in &rim_builds {
         if let Some(edge) = result.edges.iter_mut().find(|e| e.id == rb.edge_id) {
-            let [d0, d1] = rb.circle.domain()?;
+            let [d0, d1] = rb.circle.domain().or_refuse(KernelStage::Fragment, "domain")?;
             edge.curve = rb.circle.clone();
             edge.t0 = d0;
             edge.t1 = d1;
@@ -461,8 +526,11 @@ pub fn offset_sphere_face(
             .find(|rb| rb.closure_vertex == cv)
             .map(|rb| rb.v_rim)
             .ok_or_else(|| {
-                "offset_sphere_face: a seam meridian is not paired with a rim — refusing"
-                    .to_string()
+                KernelRefusal::internal(
+                    KernelStage::Fragment,
+                    "meridian_pairing",
+                    "offset_sphere_face: a seam meridian is not paired with a rim — refusing",
+                )
             })?;
         let closure_at_start = e.start_vertex_id == cv;
         let fixed_vertex = if closure_at_start {
@@ -475,14 +543,24 @@ pub fn offset_sphere_face(
             .iter()
             .find(|v| v.id == fixed_vertex)
             .map(|v| v.point)
-            .ok_or_else(|| format!("offset_sphere_face: missing seam vertex {fixed_vertex}"))?;
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Fragment,
+                    "seam_vertex",
+                    format!("offset_sphere_face: missing seam vertex {fixed_vertex}"),
+                )
+            })?;
         let fixed_new = scale_about_center.point(fixed_old);
-        let fixed_projection = project_point_to_curve(&iso_meridian, fixed_new)?;
+        let fixed_projection = project_point_to_curve(&iso_meridian, fixed_new).or_refuse(KernelStage::Fragment, "project_point_to_curve")?;
         if fixed_projection.distance > plane_tolerance {
-            return Err(format!(
+            return Err(KernelRefusal::internal(
+                KernelStage::Fragment,
+                "seam_projection",
+                format!(
                 "offset_sphere_face: a coupled own-edge is not on the sphere seam \
                  (off by {:.3e}) — refusing",
                 fixed_projection.distance
+            ),
             ));
         }
         let v_start = if closure_at_start {
@@ -499,7 +577,7 @@ pub fn offset_sphere_face(
             (iso_meridian.clone(), v_start, v_end)
         } else {
             (
-                iso_meridian.reversed()?,
+                iso_meridian.reversed().or_refuse(KernelStage::Fragment, "reversed")?,
                 dv0 + dv1 - v_start,
                 dv0 + dv1 - v_end,
             )
@@ -533,7 +611,7 @@ pub fn offset_sphere_face(
                 if let Some(rb) = rim_builds.iter().find(|rb| rb.edge_id == coedge.edge_id) {
                     let mut pcurve = rb.pushed_pcurve.clone();
                     if !coedge.forward {
-                        pcurve = pcurve.reversed()?;
+                        pcurve = pcurve.reversed().or_refuse(KernelStage::Fragment, "reversed")?;
                     }
                     coedge.pcurve = pcurve;
                 } else if coupled_meridians.contains(&coedge.edge_id) {
@@ -564,8 +642,13 @@ pub fn offset_sphere_face(
         result.vertices.iter().map(|v| (v.id, v.point)).collect();
     let mut ruled_seams: HashSet<u64> = HashSet::default();
     for rb in &rim_builds {
-        let (ns, nf) = find_face(&result, rb.neighbour_id)
-            .ok_or_else(|| format!("offset_sphere_face: missing neighbour {}", rb.neighbour_id))?;
+        let (ns, nf) = find_face(&result, rb.neighbour_id).ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Fragment,
+                "ruled_seam_neighbour",
+                format!("offset_sphere_face: missing neighbour {}", rb.neighbour_id),
+            )
+        })?;
         if !matches!(
             result.shells[ns].faces[nf].surface.analytic(),
             Some(AnalyticSurface::RuledRevolution { .. })
@@ -575,7 +658,11 @@ pub fn offset_sphere_face(
         for loop_record in &result.shells[ns].faces[nf].loops {
             for coedge in &loop_record.coedges {
                 let edge = *edge_by_id.get(&coedge.edge_id).ok_or_else(|| {
-                    format!("offset_sphere_face: missing edge {}", coedge.edge_id)
+                    KernelRefusal::internal(
+                        KernelStage::Fragment,
+                        "ruled_seam_edge",
+                        format!("offset_sphere_face: missing edge {}", coedge.edge_id),
+                    )
                 })?;
                 let incident = faces_of_edge.get(&edge.id).cloned().unwrap_or_default();
                 let is_seam = incident.iter().all(|f| *f == rb.neighbour_id);
@@ -591,17 +678,23 @@ pub fn offset_sphere_face(
     for seam_id in ruled_seams {
         let edge = *edge_by_id
             .get(&seam_id)
-            .ok_or_else(|| format!("offset_sphere_face: missing ruled seam {seam_id}"))?;
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Fragment,
+                    "missing_ruled_seam",
+                    format!("offset_sphere_face: missing ruled seam {seam_id}"),
+                )
+            })?;
         let curve = make_line(
             result_vertex[&edge.start_vertex_id],
             result_vertex[&edge.end_vertex_id],
-        )?;
+        ).or_refuse(KernelStage::Fragment, "make_line")?;
         if let Some(out) = result
             .edges
             .iter_mut()
             .find(|candidate| candidate.id == seam_id)
         {
-            let [t0, t1] = curve.domain()?;
+            let [t0, t1] = curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
             out.curve = curve;
             out.t0 = t0;
             out.t1 = t1;
@@ -663,17 +756,21 @@ pub fn offset_sphere_face(
             let Some(&target) = relocated.get(&vertex_id) else {
                 continue;
             };
-            let projection = project_point_to_curve(&edge.curve, target)?;
+            let projection = project_point_to_curve(&edge.curve, target).or_refuse(KernelStage::Fragment, "project_point_to_curve")?;
             if projection.distance > 10.0 * tolerance {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Fragment,
+                    "corner_off_edge",
+                    format!(
                     "offset_sphere_face: the push moves rim corner (vertex {vertex_id}) OFF \
                      fixed edge {} by {:.3e} — a rim corner that leaves its own side edge \
                      needs the corner re-solved against the neighbour carriers, which is \
                      deferred — refusing",
                     edge.id, projection.distance
+                ),
                 ));
             }
-            let [d0, d1] = edge.curve.domain()?;
+            let [d0, d1] = edge.curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
             let span = (d1 - d0).max(1e-12);
             let fixed_t = if at_start { edge.t1 } else { edge.t0 };
             let old_t = if at_start { edge.t0 } else { edge.t1 };
@@ -681,10 +778,14 @@ pub fn offset_sphere_face(
             if (new_t - fixed_t) * (old_t - fixed_t) <= 0.0
                 || (new_t - fixed_t).abs() <= 1e-7 * span
             {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Fragment,
+                    "trim_collapse",
+                    format!(
                     "offset_sphere_face: the push collapses or inverts the trim of fixed edge \
                      {} at rim corner (vertex {vertex_id}) — refusing",
                     edge.id
+                ),
                 ));
             }
             if at_start {
@@ -700,17 +801,22 @@ pub fn offset_sphere_face(
     let final_edges: HashMap<u64, EdgeRecord> =
         result.edges.iter().map(|e| (e.id, e.clone())).collect();
     for rb in &rim_builds {
-        let (ns, nf) = find_face(&result, rb.neighbour_id)
-            .ok_or_else(|| format!("offset_sphere_face: missing neighbour {}", rb.neighbour_id))?;
+        let (ns, nf) = find_face(&result, rb.neighbour_id).ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Sew,
+                "retrim_neighbour",
+                format!("offset_sphere_face: missing neighbour {}", rb.neighbour_id),
+            )
+        })?;
         if rb.neighbour_is_sphere {
             // A fixed sphere neighbour: only the shared rim coedge's pcurve moves.
             let nsurf = result.shells[ns].faces[nf].surface.clone();
             for loop_record in &mut result.shells[ns].faces[nf].loops {
                 for coedge in &mut loop_record.coedges {
                     if coedge.edge_id == rb.edge_id {
-                        let mut pcurve = build_pcurve_on_surface(&nsurf, &rb.circle)?;
+                        let mut pcurve = build_pcurve_on_surface(&nsurf, &rb.circle).or_refuse(KernelStage::Sew, "build_pcurve_on_surface")?;
                         if !coedge.forward {
-                            pcurve = pcurve.reversed()?;
+                            pcurve = pcurve.reversed().or_refuse(KernelStage::Sew, "reversed")?;
                         }
                         coedge.pcurve = pcurve;
                     }
@@ -749,7 +855,13 @@ pub fn offset_sphere_face(
     // Through-centre planar caps re-trim around their grown great-circle rims.
     for cap in &through_centre_caps {
         let (cshell, cface) = find_face(&result, *cap)
-            .ok_or_else(|| format!("offset_sphere_face: missing cap {cap}"))?;
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Sew,
+                    "missing_cap",
+                    format!("offset_sphere_face: missing cap {cap}"),
+                )
+            })?;
         let plane = plane_of_surface(
             &result.shells[cshell].faces[cface].surface,
             plane_tolerance,
@@ -793,13 +905,21 @@ pub fn offset_sphere_face(
 
     let issues = result.validate();
     if !issues.is_empty() {
-        return Err(format!(
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "validate",
+            format!(
             "offset_sphere_face: pushed solid failed validation: {issues:?}"
+        ),
         ));
     }
     if let (Ok(before), Ok(after)) = (solid_signed_volume(solid), solid_signed_volume(&result)) {
         if before * after <= 0.0 {
-            return Err("offset_sphere_face: the push inverts the solid — refusing".into());
+            return Err(KernelRefusal::internal(
+                KernelStage::Validate,
+                INVERTED,
+                "offset_sphere_face: the push inverts the solid — refusing",
+            ));
         }
     }
     Ok(result)
@@ -826,7 +946,7 @@ fn refit_subrange_pcurves(
     face: &mut FaceRecord,
     edges: &HashMap<u64, EdgeRecord>,
     tolerance: f64,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let face_edges: HashSet<u64> = face
         .loops
         .iter()
@@ -840,22 +960,29 @@ fn refit_subrange_pcurves(
         tolerance,
         "offset_sphere_face",
     )
+    
 }
 
 /// The intersection circle whose parameter-midpoint is nearest `reference`
 /// (branch selection when S′ ∩ neighbour returns more than one component).
-fn nearest_circle(curves: &[NurbsCurve], reference: Vec3) -> Result<NurbsCurve, String> {
+fn nearest_circle(curves: &[NurbsCurve], reference: Vec3) -> Result<NurbsCurve, KernelRefusal> {
     let mut best: Option<(f64, &NurbsCurve)> = None;
     for curve in curves {
-        let [d0, d1] = curve.domain()?;
-        let mid = curve.evaluate(0.5 * (d0 + d1))?;
+        let [d0, d1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let mid = curve.evaluate(0.5 * (d0 + d1)).or_refuse(KernelStage::Refine, "evaluate")?;
         let distance = mid.sub(reference).length();
         if best.map(|(known, _)| distance < known).unwrap_or(true) {
             best = Some((distance, curve));
         }
     }
     best.map(|(_, curve)| curve.clone())
-        .ok_or_else(|| "offset_sphere_face: the sphere ∩ neighbour intersection is empty".into())
+        .ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Refine,
+                "empty_intersection",
+                "offset_sphere_face: the sphere ∩ neighbour intersection is empty",
+            )
+        })
 }
 
 /// Move a seam-meridian pcurve's RIM endpoint to the new latitude `v_new`,
@@ -866,10 +993,10 @@ fn patch_meridian_pcurve(
     pcurve: &NurbsCurve,
     v_new: f64,
     closure_at_start: bool,
-) -> Result<NurbsCurve, String> {
-    let [q0, q1] = pcurve.domain()?;
-    let start = pcurve.evaluate(q0)?;
-    let end = pcurve.evaluate(q1)?;
+) -> Result<NurbsCurve, KernelRefusal> {
+    let [q0, q1] = pcurve.domain().or_refuse(KernelStage::Fragment, "domain")?;
+    let start = pcurve.evaluate(q0).or_refuse(KernelStage::Fragment, "evaluate")?;
+    let end = pcurve.evaluate(q1).or_refuse(KernelStage::Fragment, "evaluate")?;
     let (v_start, v_end) = if closure_at_start {
         (v_new, end.y)
     } else {
@@ -879,5 +1006,6 @@ fn patch_meridian_pcurve(
         Vec3::new(start.x, v_start, 0.0),
         Vec3::new(end.x, v_end, 0.0),
     )
+    .or_refuse(KernelStage::Fragment, "make_line")
 }
 

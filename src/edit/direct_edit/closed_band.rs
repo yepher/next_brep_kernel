@@ -47,6 +47,7 @@
 //! verified by the Euler count, not by `validate()`'s parity check.
 
 use super::*;
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 
 /// How densely each boundary edge of the band is sampled for the carrier
 /// extension and the branch pick — the closed strip's own figure.
@@ -284,20 +285,33 @@ fn run_samples(
     rim: &BandRim,
     edges: &HashMap<u64, EdgeRecord>,
     op: &str,
-) -> Result<Vec<Vec3>, String> {
-    let (shell, position) = find_face(solid, rim.neighbour)
-        .ok_or_else(|| format!("{op}: missing face {}", rim.neighbour))?;
+) -> Result<Vec<Vec3>, KernelRefusal> {
+    let (shell, position) = find_face(solid, rim.neighbour).ok_or_else(|| {
+        KernelRefusal::internal(
+            KernelStage::Collect,
+            "face",
+            format!("{op}: missing face {}", rim.neighbour),
+        )
+    })?;
     let loop_record = &solid.shells[shell].faces[position].loops[rim.loop_index];
     let mut points = Vec::with_capacity(rim.run.len() * RIM_EDGE_SAMPLES);
     for index in &rim.run {
         let coedge = &loop_record.coedges[*index];
-        let edge = edges
-            .get(&coedge.edge_id)
-            .ok_or_else(|| format!("{op}: missing edge {}", coedge.edge_id))?;
+        let edge = edges.get(&coedge.edge_id).ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Collect,
+                "edge",
+                format!("{op}: missing edge {}", coedge.edge_id),
+            )
+        })?;
         for step in 0..RIM_EDGE_SAMPLES {
             let fraction = step as f64 / RIM_EDGE_SAMPLES as f64;
             let fraction = if coedge.forward { fraction } else { 1.0 - fraction };
-            points.push(edge.curve.evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction)?);
+            points.push(
+                edge.curve
+                    .evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction)
+                    .or_refuse(KernelStage::Classify, "evaluate")?,
+            );
         }
     }
     Ok(points)
@@ -324,7 +338,7 @@ pub(super) fn heal_closed_band(
     solid: &BrepSolid,
     band: &ClosedBand,
     op: &str,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     if let Some(directory) = census_directory() {
         record_closed_band_census(&directory, solid, band);
     }
@@ -335,22 +349,30 @@ pub(super) fn heal_closed_band(
     let tolerance = (scale * 1e-6).max(1e-9);
     let pcurve_tolerance = (scale * 1e-7).max(1e-9);
     let neighbour_ids = [band.rims[0].neighbour, band.rims[1].neighbour];
+    // The text every refusal of this lane wears; the class is minted at each
+    // site, since a deferral, an ambiguity and a consistency miss share it.
     let refusal = |reason: &str| {
         format!(
             "{op}: the selection is a closed band between faces {} and {}, and {reason} (deferred)",
             neighbour_ids[0], neighbour_ids[1]
         )
     };
+    let missing_face = |id: u64| {
+        KernelRefusal::internal(KernelStage::Collect, "face", format!("{op}: missing face {id}"))
+    };
 
     // --- Both carriers analytic ------------------------------------------
     for &neighbour_id in &neighbour_ids {
-        let (shell, position) = find_face(&solid, neighbour_id)
-            .ok_or_else(|| format!("{op}: missing face {neighbour_id}"))?;
+        let (shell, position) = find_face(&solid, neighbour_id).ok_or_else(|| missing_face(neighbour_id))?;
         if solid.shells[shell].faces[position].surface.analytic().is_none() {
-            return Err(refusal(&format!(
-                "neighbour {neighbour_id} is a fitted surface this lane has no closed-form \
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "fitted_neighbour",
+                refusal(&format!(
+                    "neighbour {neighbour_id} is a fitted surface this lane has no closed-form \
                  re-intersection for"
-            )));
+                )),
+            ));
         }
     }
 
@@ -370,15 +392,19 @@ pub(super) fn heal_closed_band(
     for &neighbour_id in &neighbour_ids {
         extend_ruled_neighbour_over(&mut solid, neighbour_id, &band_points, tolerance)?;
     }
-    let surface_of = |solid: &BrepSolid, id: u64| -> Result<NurbsSurface, String> {
-        let (shell, position) =
-            find_face(solid, id).ok_or_else(|| format!("{op}: missing face {id}"))?;
+    let surface_of = |solid: &BrepSolid, id: u64| -> Result<NurbsSurface, KernelRefusal> {
+        let (shell, position) = find_face(solid, id).ok_or_else(|| missing_face(id))?;
         Ok(solid.shells[shell].faces[position].surface.clone())
     };
     let surface_a = surface_of(&solid, neighbour_ids[0])?;
     let surface_b = surface_of(&solid, neighbour_ids[1])?;
-    let curves = intersect_analytic_pair(&surface_a, &surface_b, tolerance)
-        .ok_or_else(|| refusal("its neighbours are not a recognized analytic pair"))?;
+    let curves = intersect_analytic_pair(&surface_a, &surface_b, tolerance).ok_or_else(|| {
+        KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "analytic_pair",
+            refusal("its neighbours are not a recognized analytic pair"),
+        )
+    })?;
     // The healed rim is the closed branch that runs through the band: score
     // each by its WORST sample's distance to the band's rims.
     let mut centre = Vec3::default();
@@ -393,13 +419,14 @@ pub(super) fn heal_closed_band(
             .fold(0.0f64, f64::max);
     let mut best: Option<(f64, NurbsCurve)> = None;
     for curve in curves {
-        let [t0, t1] = curve.domain()?;
-        if curve.evaluate(t0)?.sub(curve.evaluate(t1)?).length() > tolerance {
+        let [t0, t1] = curve.domain().or_refuse(KernelStage::Classify, "domain")?;
+        let evaluate = |t: f64| curve.evaluate(t).or_refuse(KernelStage::Classify, "evaluate");
+        if evaluate(t0)?.sub(evaluate(t1)?).length() > tolerance {
             continue;
         }
         let mut worst = 0.0f64;
         for step in 0..BRANCH_SAMPLES {
-            let point = curve.evaluate(t0 + (t1 - t0) * step as f64 / BRANCH_SAMPLES as f64)?;
+            let point = evaluate(t0 + (t1 - t0) * step as f64 / BRANCH_SAMPLES as f64)?;
             let nearest = band_points
                 .iter()
                 .map(|band_point| band_point.sub(point).length())
@@ -411,13 +438,22 @@ pub(super) fn heal_closed_band(
             best = Some((worst, curve));
         }
     }
-    let (score, new_curve) =
-        best.ok_or_else(|| refusal("its neighbours do not re-intersect in a closed rim"))?;
+    let (score, new_curve) = best.ok_or_else(|| {
+        KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "closed_rim",
+            refusal("its neighbours do not re-intersect in a closed rim"),
+        )
+    })?;
     if score > band_extent {
-        return Err(refusal(&format!(
-            "its neighbours' nearest closed re-intersection passes {score:.6} from the band, \
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "rim_beyond_band",
+            refusal(&format!(
+                "its neighbours' nearest closed re-intersection passes {score:.6} from the band, \
              beyond the band's own extent {band_extent:.6}"
-        )));
+            )),
+        ));
     }
 
     // --- Re-origin the rim on the curved neighbour's seam ---------------------
@@ -427,22 +463,33 @@ pub(super) fn heal_closed_band(
     let curved = [0usize, 1].map(|index| {
         !matches!(surfaces[index].analytic(), Some(AnalyticSurface::Plane { .. }))
     });
-    let seam_rim = (0..2)
-        .find(|index| curved[*index])
-        .ok_or_else(|| refusal("neither neighbour is curved"))?;
+    let seam_rim = (0..2).find(|index| curved[*index]).ok_or_else(|| {
+        KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "no_curved_neighbour",
+            refusal("neither neighbour is curved"),
+        )
+    })?;
     let seam = solid
         .vertices
         .iter()
         .find(|vertex| vertex.id == band.rims[seam_rim].start_vertex)
         .map(|vertex| vertex.point)
-        .ok_or_else(|| format!("{op}: missing vertex {}", band.rims[seam_rim].start_vertex))?;
+        .ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Collect,
+                "vertex",
+                format!("{op}: missing vertex {}", band.rims[seam_rim].start_vertex),
+            )
+        })?;
     let new_curve = align_closed_rim_origin(&new_curve, seam, tolerance, op)?;
-    let [nt0, nt1] = new_curve.domain()?;
-    let new_point = new_curve.evaluate(nt0)?;
+    let [nt0, nt1] = new_curve.domain().or_refuse(KernelStage::Sew, "domain")?;
+    let rim_at = |t: f64| new_curve.evaluate(t).or_refuse(KernelStage::Sew, "evaluate");
+    let new_point = rim_at(nt0)?;
     let mut new_samples = Vec::with_capacity(BRANCH_SAMPLES);
     for step in 0..BRANCH_SAMPLES {
         let fraction = step as f64 / BRANCH_SAMPLES as f64;
-        new_samples.push(new_curve.evaluate(nt0 + (nt1 - nt0) * fraction)?);
+        new_samples.push(rim_at(nt0 + (nt1 - nt0) * fraction)?);
     }
     let new_sense = turning_sense(&new_samples);
 
@@ -464,47 +511,65 @@ pub(super) fn heal_closed_band(
             Some(AnalyticSurface::RuledRevolution { frame, height, .. }) => {
                 let axial = new_point.sub(frame.origin).dot(frame.axis);
                 if !(-tolerance..=height + tolerance).contains(&axial) {
-                    return Err(refusal(&format!(
-                        "the healed rim escapes neighbour {neighbour}'s extended carrier \
+                    return Err(KernelRefusal::internal(
+                        KernelStage::Sew,
+                        "rim_escapes_carrier",
+                        refusal(&format!(
+                            "the healed rim escapes neighbour {neighbour}'s extended carrier \
                          (station {axial:.6} of {height:.6})"
-                    )));
+                        )),
+                    ));
                 }
                 Some((axial / height).clamp(0.0, 1.0))
             }
             _ => rim_iso_station(surface, &new_curve, tolerance),
         };
         let v_new = station.ok_or_else(|| {
-            refusal(&format!(
-                "the healed rim is not a `v = const` iso-curve of neighbour {neighbour}'s carrier"
-            ))
+            KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "rim_not_iso",
+                refusal(&format!(
+                    "the healed rim is not a `v = const` iso-curve of neighbour {neighbour}'s carrier"
+                )),
+            )
         })?;
         stations[index] = Some(v_new);
-        let [u_low, u_high] = surface.domain_u()?;
+        let [u_low, u_high] = surface.domain_u().or_refuse(KernelStage::Classify, "domain")?;
         let eps = 1e-6 * (u_high - u_low).abs().max(1e-12);
-        let start_u = crate::project_point_to_surface(surface, new_point)?.u;
+        let start_u = crate::project_point_to_surface(surface, new_point)
+            .or_refuse(KernelStage::Classify, "project")?
+            .u;
         if (start_u - u_low).abs() <= eps || (start_u - u_high).abs() <= eps {
             continue;
         }
-        if !surface.closed_directions()?.0 {
-            return Err(refusal(&format!(
-                "neighbour {neighbour} is not closed around the rim it would carry"
-            )));
+        if !surface.closed_directions().or_refuse(KernelStage::Classify, "domain")?.0 {
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "neighbour_not_closed",
+                refusal(&format!(
+                    "neighbour {neighbour} is not closed around the rim it would carry"
+                )),
+            ));
         }
-        let crossing = surface.evaluate(u_low, v_new)?;
-        let hit = project_point_to_curve(&new_curve, crossing)?;
+        let crossing = surface.evaluate(u_low, v_new).or_refuse(KernelStage::Classify, "evaluate")?;
+        let hit = project_point_to_curve(&new_curve, crossing).or_refuse(KernelStage::Classify, "project")?;
         if hit.distance > tolerance {
-            return Err(refusal(&format!(
-                "the healed rim misses neighbour {neighbour}'s seam by {:.3e}",
-                hit.distance
-            )));
+            return Err(KernelRefusal::internal(
+                KernelStage::Sew,
+                "rim_misses_seam",
+                refusal(&format!(
+                    "the healed rim misses neighbour {neighbour}'s seam by {:.3e}",
+                    hit.distance
+                )),
+            ));
         }
         splits.push(hit.u);
     }
     splits.sort_by(f64::total_cmp);
     let mut bounds = vec![nt0];
     for split in splits {
-        let point = new_curve.evaluate(split)?;
-        let previous = new_curve.evaluate(*bounds.last().expect("seeded"))?;
+        let point = rim_at(split)?;
+        let previous = rim_at(*bounds.last().expect("seeded"))?;
         if point.sub(previous).length() > tolerance && point.sub(new_point).length() > tolerance {
             bounds.push(split);
         }
@@ -528,7 +593,7 @@ pub(super) fn heal_closed_band(
         let id = alloc();
         solid.vertices.push(VertexRecord {
             id,
-            point: new_curve.evaluate(*bound)?,
+            point: rim_at(*bound)?,
         });
         piece_vertices.push(id);
     }
@@ -537,7 +602,7 @@ pub(super) fn heal_closed_band(
     let mut piece_curves: Vec<NurbsCurve> = Vec::with_capacity(pieces);
     let mut rest = new_curve.clone();
     for bound in &bounds[1..pieces] {
-        let (head, tail) = rest.split(*bound)?;
+        let (head, tail) = rest.split(*bound).or_refuse(KernelStage::Sew, "split")?;
         piece_curves.push(head);
         rest = tail;
     }
@@ -545,7 +610,7 @@ pub(super) fn heal_closed_band(
     let mut new_edges: Vec<u64> = Vec::with_capacity(pieces);
     for piece in 0..pieces {
         let id = alloc();
-        let [t0, t1] = piece_curves[piece].domain()?;
+        let [t0, t1] = piece_curves[piece].domain().or_refuse(KernelStage::Sew, "domain")?;
         solid.edges.push(EdgeRecord {
             id,
             curve: piece_curves[piece].clone(),
@@ -563,10 +628,14 @@ pub(super) fn heal_closed_band(
     for (index, rim) in band.rims.iter().enumerate() {
         let sense = senses[index].dot(new_sense);
         if sense.abs() <= 1e-6 * senses[index].length() * new_sense.length() {
-            return Err(refusal(&format!(
-                "the rim it leaves in neighbour {} does not turn about the healed rim",
-                rim.neighbour
-            )));
+            return Err(KernelRefusal::ill_posed(
+                KernelStage::Classify,
+                "rim_sense",
+                refusal(&format!(
+                    "the rim it leaves in neighbour {} does not turn about the healed rim",
+                    rim.neighbour
+                )),
+            ));
         }
         let forward = sense > 0.0;
         let order: Vec<usize> = if forward {
@@ -579,22 +648,33 @@ pub(super) fn heal_closed_band(
         match stations[index] {
             None => {
                 for piece in order {
-                    let mut pcurve = build_pcurve_on_surface(surface, &piece_curves[piece])?;
+                    let mut pcurve = build_pcurve_on_surface(surface, &piece_curves[piece])
+                        .or_refuse(KernelStage::Sew, "pcurve_fit")?;
                     if !forward {
-                        pcurve = pcurve.reversed()?;
+                        pcurve = pcurve.reversed().or_refuse(KernelStage::Sew, "reverse")?;
                     }
                     // The rim has to lie inside the plane's patch, or the fit
                     // has clamped onto its border.
-                    let [q0, q1] = pcurve.domain()?;
+                    let [q0, q1] = pcurve.domain().or_refuse(KernelStage::Sew, "domain")?;
                     for step in 0..=RIM_EDGE_SAMPLES {
                         let fraction = step as f64 / RIM_EDGE_SAMPLES as f64;
-                        let uv = pcurve.evaluate(q0 + (q1 - q0) * fraction)?;
-                        let on_plane = surface.evaluate(uv.x, uv.y)?;
-                        if project_point_to_curve(&new_curve, on_plane)?.distance > tolerance {
-                            return Err(refusal(&format!(
-                                "the healed rim leaves the patch of planar neighbour {}",
-                                rim.neighbour
-                            )));
+                        let uv = pcurve
+                            .evaluate(q0 + (q1 - q0) * fraction)
+                            .or_refuse(KernelStage::Sew, "evaluate")?;
+                        let on_plane = surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Sew, "evaluate")?;
+                        if project_point_to_curve(&new_curve, on_plane)
+                            .or_refuse(KernelStage::Sew, "project")?
+                            .distance
+                            > tolerance
+                        {
+                            return Err(KernelRefusal::unsupported(
+                                KernelStage::Sew,
+                                "rim_off_planar_patch",
+                                refusal(&format!(
+                                    "the healed rim leaves the patch of planar neighbour {}",
+                                    rim.neighbour
+                                )),
+                            ));
                         }
                     }
                     coedges.push(CoedgeRecord {
@@ -606,16 +686,18 @@ pub(super) fn heal_closed_band(
                 }
             }
             Some(v_new) => {
-                let [u_low, u_high] = surface.domain_u()?;
+                let [u_low, u_high] = surface.domain_u().or_refuse(KernelStage::Sew, "domain")?;
                 let span = (u_high - u_low).abs().max(1e-12);
                 let eps = 1e-6 * span;
-                let u_of = |point: Vec3| -> Result<f64, String> {
-                    Ok(crate::project_point_to_surface(surface, point)?.u)
+                let u_of = |point: Vec3| -> Result<f64, KernelRefusal> {
+                    Ok(crate::project_point_to_surface(surface, point)
+                        .or_refuse(KernelStage::Sew, "project")?
+                        .u)
                 };
                 // Which way the traversal runs in the carrier's own u,
                 // measured an eighth of a turn along it.
                 let eighth = (nt1 - nt0) / 8.0;
-                let ahead = new_curve.evaluate(if forward { nt0 + eighth } else { nt1 - eighth })?;
+                let ahead = rim_at(if forward { nt0 + eighth } else { nt1 - eighth })?;
                 let mut u = u_of(new_point)?;
                 let ascending = (u_of(ahead)? - u + 0.5 * span).rem_euclid(span) > 0.5 * span;
                 for piece in order {
@@ -626,7 +708,7 @@ pub(super) fn heal_closed_band(
                     if !ascending && (u - u_low).abs() <= eps {
                         u = u_high;
                     }
-                    let end_raw = u_of(new_curve.evaluate(end_parameter)?)?;
+                    let end_raw = u_of(rim_at(end_parameter)?)?;
                     let delta = if ascending {
                         let delta = (end_raw - u).rem_euclid(span);
                         if delta <= eps { span } else { delta }
@@ -636,23 +718,27 @@ pub(super) fn heal_closed_band(
                     };
                     let end_u = u + delta;
                     if end_u < u_low - eps || end_u > u_high + eps {
-                        return Err(refusal(&format!(
-                            "the healed rim crosses neighbour {}'s seam inside one coedge",
-                            rim.neighbour
-                        )));
+                        return Err(KernelRefusal::internal(
+                            KernelStage::Sew,
+                            "seam_inside_coedge",
+                            refusal(&format!(
+                                "the healed rim crosses neighbour {}'s seam inside one coedge",
+                                rim.neighbour
+                            )),
+                        ));
                     }
                     coedges.push(CoedgeRecord {
                         id: alloc(),
                         edge_id: new_edges[piece],
                         forward,
-                        pcurve: make_line(Vec3::new(u, v_new, 0.0), Vec3::new(end_u, v_new, 0.0))?,
+                        pcurve: make_line(Vec3::new(u, v_new, 0.0), Vec3::new(end_u, v_new, 0.0))
+                            .or_refuse(KernelStage::Sew, "make_line")?,
                     });
                     u = end_u;
                 }
             }
         }
-        let (shell, position) = find_face(&solid, rim.neighbour)
-            .ok_or_else(|| format!("{op}: missing face {}", rim.neighbour))?;
+        let (shell, position) = find_face(&solid, rim.neighbour).ok_or_else(|| missing_face(rim.neighbour))?;
         let loop_record = &mut solid.shells[shell].faces[position].loops[rim.loop_index];
         let count = loop_record.coedges.len();
         let last = *rim.run.last().expect("a run has a coedge");
@@ -690,10 +776,14 @@ pub(super) fn heal_closed_band(
         if (start_hit && !collapsed.contains(&edge.start_vertex_id))
             || (end_hit && !collapsed.contains(&edge.end_vertex_id))
         {
-            return Err(refusal(&format!(
-                "edge {} meets the band away from its neighbours' seam",
-                edge.id
-            )));
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Sew,
+                "edge_off_seam",
+                refusal(&format!(
+                    "edge {} meets the band away from its neighbours' seam",
+                    edge.id
+                )),
+            ));
         }
         if start_hit {
             edge.start_vertex_id = new_vertex_id;
@@ -702,28 +792,37 @@ pub(super) fn heal_closed_band(
             edge.end_vertex_id = new_vertex_id;
         }
         if start_hit && end_hit {
-            return Err(refusal(&format!("edge {} would collapse onto the rim", edge.id)));
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Sew,
+                "edge_collapse",
+                refusal(&format!("edge {} would collapse onto the rim", edge.id)),
+            ));
         }
         if edge.curve.straight_segment(tolerance).is_some() {
             let redundant = edge.curve.control_points.len() > 2;
             let anchor = if start_hit {
-                edge.curve.evaluate(edge.t1)?
+                edge.curve.evaluate(edge.t1).or_refuse(KernelStage::Sew, "evaluate")?
             } else {
-                edge.curve.evaluate(edge.t0)?
+                edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Sew, "evaluate")?
             };
             let (from, to) = if start_hit { (new_point, anchor) } else { (anchor, new_point) };
-            edge.curve = make_line(from, to)?;
-            [edge.t0, edge.t1] = edge.curve.domain()?;
+            edge.curve = make_line(from, to).or_refuse(KernelStage::Sew, "make_line")?;
+            [edge.t0, edge.t1] = edge.curve.domain().or_refuse(KernelStage::Sew, "domain")?;
             if redundant {
                 refit.insert(edge.id);
             }
         } else {
-            let projection = project_point_to_curve(&edge.curve, new_point)?;
+            let projection =
+                project_point_to_curve(&edge.curve, new_point).or_refuse(KernelStage::Sew, "project")?;
             if projection.distance > tolerance {
-                return Err(refusal(&format!(
-                    "curved edge {} does not reach the healed rim (nearest point {:.3e} away)",
-                    edge.id, projection.distance
-                )));
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Sew,
+                    "curved_edge_short",
+                    refusal(&format!(
+                        "curved edge {} does not reach the healed rim (nearest point {:.3e} away)",
+                        edge.id, projection.distance
+                    )),
+                ));
             }
             if start_hit {
                 edge.t0 = projection.u;
@@ -731,7 +830,11 @@ pub(super) fn heal_closed_band(
                 edge.t1 = projection.u;
             }
             if edge.t1 <= edge.t0 {
-                return Err(refusal(&format!("curved edge {} would collapse", edge.id)));
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Sew,
+                    "curved_edge_collapse",
+                    refusal(&format!("curved edge {} would collapse", edge.id)),
+                ));
             }
             refit.insert(edge.id);
         }
@@ -751,13 +854,22 @@ pub(super) fn heal_closed_band(
                 continue;
             }
             let edge = &edges_by_id[&coedge.edge_id];
-            let middle = edge.curve.evaluate(0.5 * (edge.t0 + edge.t1))?;
-            let distance = crate::project_point_to_surface(&face.surface, middle)?.distance;
+            let middle = edge
+                .curve
+                .evaluate(0.5 * (edge.t0 + edge.t1))
+                .or_refuse(KernelStage::Validate, "evaluate")?;
+            let distance = crate::project_point_to_surface(&face.surface, middle)
+                .or_refuse(KernelStage::Validate, "project")?
+                .distance;
             if distance > tolerance {
-                return Err(refusal(&format!(
-                    "growing edge {} to the healed rim takes it {distance:.3e} off face {}",
-                    edge.id, face.id
-                )));
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Validate,
+                    "grown_edge_off_face",
+                    refusal(&format!(
+                        "growing edge {} to the healed rim takes it {distance:.3e} off face {}",
+                        edge.id, face.id
+                    )),
+                ));
             }
         }
     }
@@ -821,13 +933,21 @@ pub(super) fn heal_closed_band(
     let before = super::delete_faces::euler_characteristic(original);
     let after = super::delete_faces::euler_characteristic(&solid);
     if before != after {
-        return Err(refusal(&format!(
-            "closing it changes the Euler characteristic {before} -> {after}"
-        )));
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "euler",
+            refusal(&format!(
+                "closing it changes the Euler characteristic {before} -> {after}"
+            )),
+        ));
     }
     let issues = solid.validate();
     if !issues.is_empty() {
-        return Err(format!("{op}: closed-band heal failed validation: {issues:?}"));
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "validation",
+            format!("{op}: closed-band heal failed validation: {issues:?}"),
+        ));
     }
     Ok(solid)
 }

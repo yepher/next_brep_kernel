@@ -504,13 +504,9 @@ pub fn solid_scale(solid: &BrepSolid) -> f64 {
 /// * a refusal message,
 /// * a comparison against a derived band that *tightens* an existing gate,
 ///
-/// and nowhere else.  It must never be `max`-ed into an acceptance band, a weld
+/// and nowhere else. It must never be `max`-ed into an acceptance band, a weld
 /// radius or a search radius, because a construction would then certify its own
-/// error: the sloppier the fit, the wider the band that judges it.  That is the
-/// self-certification failure `per-entity-tolerances.md`'s invariant I1 excludes
-/// structurally, and it is why this type deliberately exposes no
-/// `f64`-producing "band to use" accessor — only [`Self::deviation`] (what
-/// happened), [`Self::band`] (what was demanded), and the verdict between them.
+/// error: the sloppier the fit, the wider the band that judges it.
 ///
 /// # Where it lives
 ///
@@ -712,9 +708,9 @@ pub fn offset_construction_band(scale: f64) -> f64 {
 /// no factor, and this function returns exactly the worst thing it saw.
 ///
 /// If a later slice does persist these values and does enforce an ordering
-/// invariant across a recompute (`per-entity-tolerances.md` S3), that slice
-/// should reintroduce a named padding constant *at the invariant it protects*,
-/// with the comparison it protects named — not here, and not silently.
+/// invariant across a recompute, that slice should reintroduce a named padding
+/// constant *at the invariant it protects*, with the comparison it protects
+/// named — not here, and not silently.
 pub fn vertex_tolerance_from_edges(
     endpoint_gaps: impl IntoIterator<Item = f64>,
     incident_edge_deviations: impl IntoIterator<Item = f64>,

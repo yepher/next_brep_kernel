@@ -137,6 +137,7 @@ impl<'a> SolidBuilder<'a> {
         let Ok(pcurve) = crate::build_pcurve_on_surface_stations(
             surface,
             &sample_trim,
+            &[],
             pcurve_tol,
             SUPPLIED_STATIONS,
             3,
@@ -171,9 +172,10 @@ impl<'a> SolidBuilder<'a> {
             crate::measure_edge_against_pcurve_image(surface, candidate, &edge, forward, band)
         };
         let measured = measure(&pcurve);
-        // The derived pcurve this would replace, measured on the same footing.
-        // This is also the only place the derived lane is ever verified at all.
-        let derived = build_pcurve_on_surface_range(
+        // The derived pcurve this would replace, FITTED rather than built: the
+        // fit is read for its report whether or not it is on its bar, because
+        // the question below is about the input, not the fit.
+        let derived = crate::fit_pcurve_on_surface_range(
             surface,
             &edge.curve,
             edge.t0,
@@ -184,16 +186,16 @@ impl<'a> SolidBuilder<'a> {
         .ok();
         let derived_deviation = derived
             .as_ref()
-            .and_then(|candidate| measure(candidate).ok())
+            .and_then(|fit| measure(&fit.curve).ok())
             .map(|measured| measured.deviation());
         // Does the edge's 3D curve lie on THIS carrier at all?
         //
-        // A projection's residual against the curve it was projected FROM is
-        // exactly the curve's own distance from the surface: the pcurve's image
-        // is on the carrier by construction, so whatever separates them is the
-        // curve standing off it. That makes `derived_deviation` the answer to
-        // the only question that decides this, asked of the 3D curve itself
-        // rather than of the two candidates.
+        // The fit's `off_surface` is the curve's own distance from the surface
+        // at every station the fit inverted — the standoff no pcurve can
+        // remove, read directly from the input. Until 2026-09-26 this was read
+        // off the derived pcurve's deviation instead, which is the same number
+        // only while the fit tracks the curve, and a refused derived fit
+        // (`None`) read as "on the carrier", the opposite of what it says.
         //
         // Comparing the two candidates instead is CIRCULAR and was measured to
         // be: the derived pcurve is a projection of the 3D curve, so it tracks
@@ -208,9 +210,12 @@ impl<'a> SolidBuilder<'a> {
         // own exporter writes, and it is why a round trip stays lossless. Where
         // it does NOT, it cannot define a trim on this face at all, and the
         // supplied pcurve, which lies on the carrier by construction, is the
-        // better statement of where the boundary runs.
-        let curve_is_on_carrier =
-            derived_deviation.is_none_or(|deviation| deviation <= CARRIER_INCIDENCE * scale);
+        // better statement of where the boundary runs. A curve the derived
+        // lane could not fit at all (`None`) is not known to be on the
+        // carrier, and is not treated as if it were.
+        let curve_is_on_carrier = derived
+            .as_ref()
+            .is_some_and(|fit| fit.report.off_surface <= CARRIER_INCIDENCE * scale);
         // Every offered coedge reports its whole measurement row, accepted or
         // not, under the trace switch. A criterion that cleanly separates the
         // cases someone chose to predict, while leaving a populated middle, is

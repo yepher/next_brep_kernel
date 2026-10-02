@@ -179,16 +179,18 @@ pub fn swept_envelope_volume(plan: &SweptEnvelope) -> f64 {
 
 /// Sample every curve of a run end to end, `per_curve` points each plus the
 /// run's final point.
-fn run_samples(curves: &[NurbsCurve], per_curve: usize) -> Result<Vec<Vec3>, String> {
+fn run_samples(curves: &[NurbsCurve], per_curve: usize) -> Result<Vec<Vec3>, KernelRefusal> {
     let mut samples = Vec::with_capacity(curves.len() * per_curve + 1);
     for curve in curves {
-        let [start, end] = curve.domain()?;
+        let [start, end] = curve.domain().or_refuse(KernelStage::Collect, "domain")?;
         for index in 0..per_curve {
-            samples.push(curve.evaluate(start + (end - start) * index as f64 / per_curve as f64)?);
+            samples.push(curve.evaluate(start + (end - start) * index as f64 / per_curve as f64).or_refuse(KernelStage::Collect, "evaluate")?);
         }
     }
-    let last = curves.last().ok_or("envelope: empty curve run")?;
-    samples.push(last.evaluate(last.domain()?[1])?);
+    let last = curves.last().ok_or_else(|| {
+        KernelRefusal::input(KernelStage::Collect, "empty_run", "envelope: empty curve run")
+    })?;
+    samples.push(last.evaluate(last.domain().or_refuse(KernelStage::Collect, "domain")?[1]).or_refuse(KernelStage::Collect, "evaluate")?);
     Ok(samples)
 }
 
@@ -198,7 +200,7 @@ fn run_samples(curves: &[NurbsCurve], per_curve: usize) -> Result<Vec<Vec3>, Str
 /// The fit is three points and the verdict is all of them, which is what makes
 /// this a measurement rather than an assumption — a spline through three points
 /// of a circle fits the same centre and fails the residual.
-fn fit_circle(samples: &[Vec3]) -> Result<Option<FittedCircle>, String> {
+fn fit_circle(samples: &[Vec3]) -> Result<Option<FittedCircle>, KernelRefusal> {
     if samples.len() < 5 {
         return Ok(None);
     }
@@ -274,7 +276,7 @@ pub fn recognize_swept_envelope(
     profile: &[NurbsCurve],
     path: &SweepPath,
     placement_mode: SectionPlacement,
-) -> Result<Result<SweptEnvelope, String>, String> {
+) -> Result<Result<SweptEnvelope, String>, KernelRefusal> {
     let path_samples = run_samples(&path.curves, 16)?;
     let Some(path_circle) = fit_circle(&path_samples)? else {
         return Ok(Err("its path is not a circular arc".into()));
@@ -300,12 +302,12 @@ pub fn recognize_swept_envelope(
     // circle — a partial arc cannot close — so the full turn is checked rather
     // than assumed, and a section that is a circular arc plus something else has
     // already failed the residual above.
-    let last = profile
-        .last()
-        .ok_or_else(|| "envelope: empty section".to_string())?;
+    let last = profile.last().ok_or_else(|| {
+        KernelRefusal::input(KernelStage::Collect, "empty_section", "envelope: empty section")
+    })?;
     let closure = last
-        .evaluate(last.domain()?[1])?
-        .sub(profile[0].evaluate(profile[0].domain()?[0])?)
+        .evaluate(last.domain().or_refuse(KernelStage::Classify, "domain")?[1]).or_refuse(KernelStage::Classify, "evaluate")?
+        .sub(profile[0].evaluate(profile[0].domain().or_refuse(KernelStage::Classify, "domain")?[0]).or_refuse(KernelStage::Classify, "evaluate")?)
         .length();
     if closure > CIRCLE_RESIDUAL_BAR * section_circle.radius {
         return Ok(Err(format!(
@@ -329,7 +331,7 @@ pub fn recognize_swept_envelope(
         )));
     }
     let start = path_samples[0];
-    let radial = start.sub(path_circle.centre).normalized()?;
+    let radial = start.sub(path_circle.centre).normalized().or_refuse(KernelStage::Classify, "normalized")?;
     // `Rigid` carries the section from where it was DRAWN, so it has to be drawn
     // centred on the path and square to it for the sweep to be a revolve;
     // `Transplant` MOVES it onto the path and squares it, so a circle drawn
@@ -388,17 +390,24 @@ pub const SWEEP_ENVELOPE_REFUSAL: &str = "sweepSolid: the swept envelope";
 /// merely TANGENT to the axis (there is no lemon); two for a turn under half a
 /// revolution. A turn in `[π, 2π)` is refused by name — the far lobe then
 /// OVERLAPS the near one and the union is no longer two disjoint revolves.
-pub fn build_swept_envelope(plan: &SweptEnvelope) -> Result<Vec<BrepSolid>, String> {
+pub fn build_swept_envelope(plan: &SweptEnvelope) -> Result<Vec<BrepSolid>, KernelRefusal> {
     use std::f64::consts::{PI, TAU};
     if !(plan.turn > 0.0 && plan.turn <= TAU + 1e-9) {
-        return Err(format!(
-            "{SWEEP_ENVELOPE_REFUSAL} needs a turn in (0, 2π]; this path turns {:.6} rad",
-            plan.turn
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "turn_range",
+            format!(
+                "{SWEEP_ENVELOPE_REFUSAL} needs a turn in (0, 2π]; this path turns {:.6} rad",
+                plan.turn
+            ),
         ));
     }
     let full = plan.turn >= TAU - 1e-9;
     if full && plan.tangent() {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "horn_torus",
+            format!(
             "{SWEEP_ENVELOPE_REFUSAL} of a section exactly as wide as its bend (ρ·κ = {:.6}, the \
              section reaching {:.3e} of its own radius past the axis) carried ALL the way round \
              is a HORN torus: the tube touches the axis at one point and the solid is PINCHED \
@@ -407,16 +416,21 @@ pub fn build_swept_envelope(plan: &SweptEnvelope) -> Result<Vec<BrepSolid>, Stri
              Sweep less than a full turn, where the same section builds, or widen the bend",
             plan.ratio(),
             plan.chord_half_length() / plan.minor
+            ),
         ));
     }
     if !full && plan.turn >= PI && !plan.tangent() {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "lobe_overlap",
+            format!(
             "{SWEEP_ENVELOPE_REFUSAL} of a section that crosses the axis (ρ·κ = {:.6}) sweeps a \
              SECOND lobe at the azimuths half a turn from the path, and this path turns {:.6} rad \
              — past π that lobe runs back into the first and the union is no longer two disjoint \
              revolves. Sweep the run in pieces of less than half a turn, or all the way round",
             plan.ratio(),
             plan.turn
+            ),
         ));
     }
     let turn = if full { TAU } else { plan.turn };
@@ -445,23 +459,23 @@ pub fn build_swept_envelope(plan: &SweptEnvelope) -> Result<Vec<BrepSolid>, Stri
 /// chord — or, for a section merely tangent to the axis, the whole section
 /// circle split at the tangency and at the outer point (there is no chord to
 /// close with, and a revolve may touch its axis at a boundary VERTEX).
-fn near_profile(plan: &SweptEnvelope, section_centre: Vec3) -> Result<Vec<NurbsCurve>, String> {
+fn near_profile(plan: &SweptEnvelope, section_centre: Vec3) -> Result<Vec<NurbsCurve>, KernelRefusal> {
     use std::f64::consts::PI;
     let (u, w) = (plan.radial, plan.axis);
     if plan.tangent() {
         return Ok(vec![
-            make_arc(section_centre, u, w, plan.minor, -PI, 0.0)?,
-            make_arc(section_centre, u, w, plan.minor, 0.0, PI)?,
+            make_arc(section_centre, u, w, plan.minor, -PI, 0.0).or_refuse(KernelStage::Fragment, "make_arc")?,
+            make_arc(section_centre, u, w, plan.minor, 0.0, PI).or_refuse(KernelStage::Fragment, "make_arc")?,
         ]);
     }
     let phi = (-plan.major / plan.minor).acos();
     let half = plan.chord_half_length();
     Ok(vec![
-        make_arc(section_centre, u, w, plan.minor, -phi, phi)?,
+        make_arc(section_centre, u, w, plan.minor, -phi, phi).or_refuse(KernelStage::Fragment, "make_arc")?,
         make_line(
             plan.centre.add(w.scale(half)),
             plan.centre.sub(w.scale(half)),
-        )?,
+        ).or_refuse(KernelStage::Fragment, "make_line")?,
     ])
 }
 
@@ -469,17 +483,17 @@ fn near_profile(plan: &SweptEnvelope, section_centre: Vec3) -> Result<Vec<NurbsC
 /// axis chord. It already lies in the half-plane at azimuth π, so revolving it
 /// through the same `+Θ` carries it over `[π, π+Θ]` — where the section's far
 /// side really does sweep.
-fn far_profile(plan: &SweptEnvelope, section_centre: Vec3) -> Result<Vec<NurbsCurve>, String> {
+fn far_profile(plan: &SweptEnvelope, section_centre: Vec3) -> Result<Vec<NurbsCurve>, KernelRefusal> {
     use std::f64::consts::TAU;
     let (u, w) = (plan.radial, plan.axis);
     let phi = (-plan.major / plan.minor).acos();
     let half = plan.chord_half_length();
     Ok(vec![
-        make_arc(section_centre, u, w, plan.minor, phi, TAU - phi)?,
+        make_arc(section_centre, u, w, plan.minor, phi, TAU - phi).or_refuse(KernelStage::Fragment, "make_arc")?,
         make_line(
             plan.centre.sub(w.scale(half)),
             plan.centre.add(w.scale(half)),
-        )?,
+        ).or_refuse(KernelStage::Fragment, "make_line")?,
     ])
 }
 
@@ -491,9 +505,16 @@ fn revolve_lobe(
     centre: Vec3,
     axis: Vec3,
     turn: f64,
-) -> Result<BrepSolid, String> {
-    let solid = crate::revolve_profile_brep(profile, centre, axis, turn)
-        .map_err(|error| format!("{SWEEP_ENVELOPE_REFUSAL} could not be revolved: {error}"))?;
+) -> Result<BrepSolid, KernelRefusal> {
+    // The revolve is still a stringly builder: its text is kept and classed
+    // Internal here, at the consuming site.
+    let solid = crate::revolve_profile_brep(profile, centre, axis, turn).map_err(|error| {
+        KernelRefusal::internal(
+            KernelStage::Fragment,
+            "revolve",
+            format!("{SWEEP_ENVELOPE_REFUSAL} could not be revolved: {error}"),
+        )
+    })?;
     crate::accept_sound(solid, "sweepSolid")
 }
 
@@ -506,14 +527,18 @@ pub fn sweep_envelope_bodies(
     profile: &[NurbsCurve],
     path: &SweepPath,
     placement_mode: SectionPlacement,
-) -> Result<Vec<BrepSolid>, String> {
+) -> Result<Vec<BrepSolid>, KernelRefusal> {
     match recognize_swept_envelope(profile, path, placement_mode)? {
         Ok(plan) => build_swept_envelope(&plan),
-        Err(reason) => Err(format!(
+        Err(reason) => Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "envelope_configuration",
+            format!(
             "{SWEEP_ENVELOPE_REFUSAL} trimmed at its own self-intersection is built for a CIRCLE \
              carried along one circular planar arc, and this sweep is not that: {reason}. Nothing \
              else has a closed form to gate the trim with, so it is refused rather than \
              approximated"
+            ),
         )),
     }
 }

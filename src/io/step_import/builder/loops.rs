@@ -1,5 +1,31 @@
 use super::*;
 
+/// The largest distance between `pcurve`'s image and the FOOT of the edge
+/// point it stands for (the edge point projected onto `surface`), over 1025
+/// evenly spaced fractions. The deviation from the edge point reads a
+/// tangential slip `d` at a station `g` off the carrier as only `d²/(2g)`;
+/// this reads it whole, and is what tells a file's residual (image on the
+/// feet) from a fitter's miss.
+fn image_to_foot(
+    surface: &NurbsSurface,
+    pcurve: &NurbsCurve,
+    curve: &NurbsCurve,
+    t0: f64,
+    t1: f64,
+    forward: bool,
+) -> Result<f64, String> {
+    let [p0, p1] = pcurve.domain()?;
+    let mut worst = 0.0_f64;
+    for index in 0..=1024 {
+        let fraction = index as f64 / 1024.0;
+        let t = if forward { t0 + (t1 - t0) * fraction } else { t1 - (t1 - t0) * fraction };
+        let foot = crate::project_point_to_surface(surface, curve.evaluate(t)?)?;
+        let uv = pcurve.evaluate(p0 + (p1 - p0) * fraction)?;
+        worst = worst.max(surface.evaluate_extended(uv.x, uv.y)?.sub(foot.point).length());
+    }
+    Ok(worst)
+}
+
 impl<'a> SolidBuilder<'a> {
     /// Build a loop's coedges, deriving pcurves by projection, placing seam
     /// coedges on opposite domain boundaries and re-synthesising collapsed pole
@@ -7,6 +33,7 @@ impl<'a> SolidBuilder<'a> {
     pub(super) fn build_loop(
         &mut self,
         surface: &NurbsSurface,
+        face_ref: usize,
         surface_ref: usize,
         specs: &[(u64, bool)],
     ) -> Result<LoopRecord, String> {
@@ -110,17 +137,88 @@ impl<'a> SolidBuilder<'a> {
             // importer did for every coedge before this lane existed.
             let supplied =
                 self.supplied_loop_pcurve(surface, surface_ref, *edge_id, *forward, pcurve_tol)?;
-            let edge = self.edge_record(*edge_id);
+            let edge = self.edge_record(*edge_id).clone();
             let mut pcurve = match supplied {
                 Some(pcurve) => pcurve,
-                None => build_pcurve_on_surface_range(
-                    surface,
-                    &edge.curve,
-                    edge.t0,
-                    edge.t1,
-                    *forward,
-                    pcurve_tol,
-                )?,
+                None => {
+                    // Fitted at the size-derived ask first, as the importer did
+                    // until 2026-09-26: that is the refinement the corpus's
+                    // off-carrier trims were built and tessellated at. A fit
+                    // the detector reads off its bar (over the 1e-7 floor plus
+                    // the stations' standoff) is refitted at the floor and the
+                    // fit with the smaller residual is kept. Chasing every trim
+                    // to the floor instead spent 2000 samples on curves off
+                    // their carriers and returned worse fits than the ask did
+                    // (`abc_00000012` face #299 edge 179, `abc_00000011` #585:
+                    // 2.06e-4 at the ask, 0.250 mm at the floor, measured
+                    // 2026-09-26).
+                    let mut fit = crate::fit_pcurve_on_surface_range(
+                        surface,
+                        &edge.curve,
+                        edge.t0,
+                        edge.t1,
+                        *forward,
+                        pcurve_tol,
+                    )?;
+                    let mut refitted = false;
+                    if fit.report.residual > trim_detector_bar(&fit.report)
+                        && pcurve_tol > crate::PCURVE_REFINEMENT_TOLERANCE
+                    {
+                        let floor = crate::fit_pcurve_on_surface_range(
+                            surface,
+                            &edge.curve,
+                            edge.t0,
+                            edge.t1,
+                            *forward,
+                            crate::PCURVE_REFINEMENT_TOLERANCE,
+                        )?;
+                        if floor.report.residual < fit.report.residual {
+                            fit = floor;
+                            refitted = true;
+                        }
+                    }
+                    if fit.report.residual > trim_detector_bar(&fit.report) {
+                        let report = fit.report;
+                        let image_to_foot =
+                            image_to_foot(surface, &fit.curve, &edge.curve, edge.t0, edge.t1, *forward)?;
+                        // Whose miss: the image sits on the stations' feet
+                        // (the residual is the file's curve standing off its
+                        // carrier) or it does not (the fitter's).
+                        let fitter = image_to_foot > crate::PCURVE_REFINEMENT_TOLERANCE;
+                        // Accepted whatever it reads, and named: the importer
+                        // before the bar returned this fit unmeasured, so a
+                        // refusal here loses a body it imported. `abc 00008080`
+                        // face #163 edge 476 shipped at 3.794e-3 (a line 3.6e-4
+                        // off its 2×1 carrier, 514 nodes) before the bar and
+                        // after; the fitter's miss is the next slice's to fix,
+                        // not the body's to lose (2026-09-26 ruling).
+                        self.bounded.push(readings::BoundedTrim {
+                            face_ref,
+                            surface_ref,
+                            edge_id: *edge_id,
+                            residual: report.residual,
+                            standoff: report.off_surface,
+                            image_to_foot,
+                            samples: report.samples,
+                            exit: format!("{:?}", report.exit),
+                            fitter,
+                        });
+                        self.capture_stage(*edge_id, || {
+                            format!(
+                                "trim off its bar on face #{face_ref}: {:.3e} against a floor of {:.1e}, the file's curve {:.3e} off the carrier, image {:.3e} off its feet ({}; {:?} at {} samples{})",
+                                report.residual,
+                                crate::PCURVE_REFINEMENT_TOLERANCE,
+                                report.off_surface,
+                                image_to_foot,
+                                if fitter { "the fitter's miss" } else { "the file's residual" },
+                                report.exit,
+                                report.samples,
+                                if refitted { ", refitted at the floor" } else { "" }
+                            )
+                        });
+                    }
+                    fit.curve
+                }
             };
             if edge.degenerate {
                 // Projection at a surface singularity has many equally valid
@@ -408,7 +506,15 @@ impl<'a> SolidBuilder<'a> {
                 continue;
             };
             let point = row.control_points[0].point()?;
-            if point.sub(self.vertex_point(edge.start_vertex_id)).length() > pcurve_tol {
+            // An IDENTITY band (is the row's start this loop's pole vertex?),
+            // not a fit ask: the expression the fit ask carried until
+            // 2026-09-26, kept here so the pole rescue reads as before.
+            let pole_identity = {
+                let scale = surface_scale(surface)?;
+                (1e-6 * (1.0 + scale))
+                    .min(0.5 * crate::KernelTolerances::for_scale(scale, 1e-7).pcurve_consistency)
+            };
+            if point.sub(self.vertex_point(edge.start_vertex_id)).length() > pole_identity {
                 continue;
             }
             let mut collapsed = true;

@@ -35,7 +35,7 @@
 use std::collections::HashSet;
 
 use crate::feature_pipeline::features::common;
-use crate::feature_pipeline::{AddedSolid, FeatureContext, FeatureResult};
+use crate::feature_pipeline::{AddedSolid, FeatureContext, FeatureRefusal, FeatureResult};
 use crate::delete_faces_and_heal;
 
 pub fn execute(ctx: &FeatureContext) -> FeatureResult {
@@ -45,7 +45,7 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     }
 }
 
-fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     let mut result = FeatureResult::empty(ctx.id.clone(), ctx.feature_type.clone());
 
     // `faces` is a reference_selection of FACE names (contract rule 1).
@@ -72,6 +72,9 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         return Ok(result); // Soft no-op — faces from multiple solids.
     }
     let target_handle = resolved[0].0;
+    // The feature proceeds on the faces that resolved: a miss is reported as
+    // a typed partial fulfilment beside `unresolved`, never silently.
+    result.note_partial_resolution(&names);
 
     // Dedup the face ids (a name listed twice, or two names for one id) preserving
     // order — the chain heals each id once.

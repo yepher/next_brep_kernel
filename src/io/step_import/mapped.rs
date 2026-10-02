@@ -217,8 +217,7 @@ pub(super) fn mapped_item_transform(
 /// The operator form is read ONLY here, on the mapped-item path. A NAUO
 /// placement still comes from a pair of `AXIS2_PLACEMENT_3D`s
 /// (`bodies::resolve_rep_rel_transform`); reading an operator THERE is separate,
-/// unimplemented work with its own fixtures to author (`exchange-breadth.md`
-/// item 3 records it).
+/// unimplemented work with its own fixtures to author.
 fn placement_matrix(resolver: &Resolver, id: usize) -> Option<Mat4> {
     if let Ok(frame) = resolver.placement(id) {
         return Some(frame_matrix(&frame));

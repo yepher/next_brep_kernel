@@ -79,6 +79,7 @@
 //! bit-identical to the code it replaced; the only edits were the `op` prefix
 //! becoming a parameter and the carrier growth becoming a callback.
 
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use crate::topology::{EdgeRecord, FaceRecord};
 use crate::{
     build_pcurve_on_surface, build_pcurve_on_surface_range, make_plane, BrepSolid, KnotVector,
@@ -106,9 +107,9 @@ pub(crate) struct Plane {
     pub(crate) normal: Vec3,
 }
 
-fn surface_domain_mid(surface: &NurbsSurface) -> Result<(f64, f64), String> {
-    let ku = KnotVector::new(surface.knots_u.clone(), surface.degree_u)?;
-    let kv = KnotVector::new(surface.knots_v.clone(), surface.degree_v)?;
+fn surface_domain_mid(surface: &NurbsSurface) -> Result<(f64, f64), KernelRefusal> {
+    let ku = KnotVector::new(surface.knots_u.clone(), surface.degree_u).or_refuse(KernelStage::Refine, "new")?;
+    let kv = KnotVector::new(surface.knots_v.clone(), surface.degree_v).or_refuse(KernelStage::Refine, "new")?;
     let [u0, u1] = ku.domain();
     let [v0, v1] = kv.domain();
     Ok(((u0 + u1) * 0.5, (v0 + v1) * 0.5))
@@ -133,31 +134,31 @@ pub(crate) fn plane_of_surface(
     surface: &NurbsSurface,
     tolerance: f64,
     op: &str,
-) -> Result<Plane, String> {
+) -> Result<Plane, KernelRefusal> {
     let (u_mid, v_mid) = surface_domain_mid(surface)?;
-    let derivatives = surface.derivatives(u_mid, v_mid, 1)?;
+    let derivatives = surface.derivatives(u_mid, v_mid, 1).or_refuse(KernelStage::Refine, "derivatives")?;
     let origin = derivatives[0][0];
     let du = derivatives[1][0];
     let dv = derivatives[0][1];
     let raw_normal = du.cross(dv);
     if raw_normal.length() <= PARALLEL_EPS {
-        return Err(format!("{op}: degenerate face surface"));
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "retrim_degenerate_surface", format!("{op}: degenerate face surface")));
     }
-    let normal = raw_normal.normalized()?;
+    let normal = raw_normal.normalized().or_refuse(KernelStage::Refine, "normalized")?;
     // Confirm the whole control net is coplanar; otherwise it is a genuinely
     // curved carrier that this planar slice does not extend.
     for row in &surface.control_points {
         for control in row {
-            let point = control.point()?;
+            let point = control.point().or_refuse(KernelStage::Refine, "point")?;
             if point.sub(origin).dot(normal).abs() > tolerance {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Refine, "retrim_curved_face", format!(
                     "{op}: face is not planar (curved neighbours are deferred in this slice)"
-                ));
+                )));
             }
         }
     }
-    let u_dir = du.normalized()?;
-    let v_dir = normal.cross(u_dir).normalized()?;
+    let u_dir = du.normalized().or_refuse(KernelStage::Refine, "normalized")?;
+    let v_dir = normal.cross(u_dir).normalized().or_refuse(KernelStage::Refine, "normalized")?;
     Ok(Plane {
         origin,
         u_dir,
@@ -189,16 +190,16 @@ pub(crate) fn boundary_samples(
     face: &FaceRecord,
     edges: &HashMap<u64, EdgeRecord>,
     op: &str,
-) -> Result<Vec<Vec3>, String> {
+) -> Result<Vec<Vec3>, KernelRefusal> {
     let mut points: Vec<Vec3> = Vec::new();
     for loop_record in &face.loops {
         for coedge in &loop_record.coedges {
             let edge = edges
                 .get(&coedge.edge_id)
-                .ok_or_else(|| format!("{op}: missing edge {}", coedge.edge_id))?;
+                .ok_or_else(|| format!("{op}: missing edge {}", coedge.edge_id)).or_refuse(KernelStage::Refine, "retrim_missing_edge")?;
             for step in 0..=4 {
                 let t = edge.t0 + (edge.t1 - edge.t0) * (step as f64 / 4.0);
-                points.push(edge.curve.evaluate(t)?);
+                points.push(edge.curve.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?);
             }
         }
     }
@@ -229,13 +230,13 @@ pub(crate) fn rebuild_loop_pcurves(
     surface: &NurbsSurface,
     tolerance: f64,
     op: &str,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     for loop_record in &mut face.loops {
         for coedge in &mut loop_record.coedges {
             let edge = edges
                 .get(&coedge.edge_id)
-                .ok_or_else(|| format!("{op}: missing edge {}", coedge.edge_id))?;
-            let [d0, d1] = edge.curve.domain()?;
+                .ok_or_else(|| format!("{op}: missing edge {}", coedge.edge_id)).or_refuse(KernelStage::Refine, "retrim_missing_edge")?;
+            let [d0, d1] = edge.curve.domain().or_refuse(KernelStage::Refine, "domain")?;
             let span = (d1 - d0).max(1e-12);
             let is_subrange =
                 (edge.t0 - d0).abs() > 1e-9 * span || (edge.t1 - d1).abs() > 1e-9 * span;
@@ -247,11 +248,11 @@ pub(crate) fn rebuild_loop_pcurves(
                     edge.t1,
                     coedge.forward,
                     tolerance,
-                )?
+                ).or_refuse(KernelStage::Refine, "build_pcurve_on_surface_range")?
             } else {
-                let mut pcurve = build_pcurve_on_surface(surface, &edge.curve)?;
+                let mut pcurve = build_pcurve_on_surface(surface, &edge.curve).or_refuse(KernelStage::Refine, "build_pcurve_on_surface")?;
                 if !coedge.forward {
-                    pcurve = pcurve.reversed()?;
+                    pcurve = pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")?;
                 }
                 pcurve
             };
@@ -280,7 +281,7 @@ pub(crate) fn retrim_planar_face(
     edges: &HashMap<u64, EdgeRecord>,
     scale: f64,
     op: &str,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let mut u_min = f64::INFINITY;
     let mut u_max = f64::NEG_INFINITY;
     let mut v_min = f64::INFINITY;
@@ -295,7 +296,7 @@ pub(crate) fn retrim_planar_face(
         v_max = v_max.max(v);
     }
     if !(u_min.is_finite() && u_max.is_finite() && v_min.is_finite() && v_max.is_finite()) {
-        return Err(format!("{op}: empty face boundary"));
+        return Err(KernelRefusal::internal(KernelStage::Refine, "retrim_empty_boundary", format!("{op}: empty face boundary")));
     }
     let margin = ((u_max - u_min).max(v_max - v_min) * 0.25).max(scale * 1e-3);
     let new_origin = plane
@@ -304,7 +305,7 @@ pub(crate) fn retrim_planar_face(
         .add(plane.v_dir.scale(v_min - margin));
     let width = (u_max - u_min) + 2.0 * margin;
     let height = (v_max - v_min) + 2.0 * margin;
-    let surface = make_plane(new_origin, plane.u_dir, plane.v_dir, width, height)?;
+    let surface = make_plane(new_origin, plane.u_dir, plane.v_dir, width, height).or_refuse(KernelStage::Refine, "make_plane")?;
     rebuild_loop_pcurves(face, edges, &surface, (scale * 1e-7).max(1e-9), op)?;
     face.surface = surface;
     Ok(())
@@ -335,9 +336,9 @@ pub(crate) fn retrim_face_in_solid<G>(
     grow: G,
     tolerance: f64,
     op: &str,
-) -> Result<(), String>
+) -> Result<(), KernelRefusal>
 where
-    G: FnOnce(&mut BrepSolid, &[Vec3]) -> Result<(), String>,
+    G: FnOnce(&mut BrepSolid, &[Vec3]) -> Result<(), KernelRefusal>,
 {
     // Sample the updated boundary so the carrier can grow to cover it.
     let points = boundary_samples(&solid.shells[shell].faces[face_pos], edges, op)?;

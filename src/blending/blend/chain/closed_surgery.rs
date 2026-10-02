@@ -1,3 +1,4 @@
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 
 pub(super) fn chain_surgery(
@@ -5,7 +6,7 @@ pub(super) fn chain_surgery(
     segments: &[ChainSegment<'_>],
     rows: ChainRows,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let mut result = solid.clone();
     let mut take_id = crate::blend::edge::fresh_id_source(solid);
     let [u_start, u_end] = rows.u_domain;
@@ -76,7 +77,7 @@ pub(super) fn chain_surgery(
                 .edges
                 .iter()
                 .find(|edge| edge.id == spoke)
-                .ok_or("blend: chain spoke edge missing")?;
+                .ok_or(KernelRefusal::internal(KernelStage::Sew, "chain_spoke_edge", "blend: chain spoke edge missing"))?;
             let vertex_point = result
                 .vertices
                 .iter()
@@ -86,7 +87,7 @@ pub(super) fn chain_surgery(
             let Some((crossing_support, crossing_spoke, escalated)) =
                 spoke_crossing(solid, support, spoke_record, vertex_point)?
             else {
-                return Err("blend: support does not cross a chain spoke".into());
+                return Err(KernelRefusal::internal(KernelStage::Sew, "support_misses_spoke", "blend: support does not cross a chain spoke"));
             };
             crossings.note(escalated);
             junctions.push(SideJunction {
@@ -109,7 +110,7 @@ pub(super) fn chain_surgery(
     let mut side_crossing_vertices: Vec<Vec<u64>> = Vec::new();
     for (side, plan) in plans.iter().enumerate() {
         let support = if side == 0 { &rows.cr } else { &rows.cs };
-        let seam_point = support.evaluate(u_start)?;
+        let seam_point = support.evaluate(u_start).or_refuse(KernelStage::Refine, "evaluate")?;
         let seam_vertex = take_id();
         result.vertices.push(VertexRecord {
             id: seam_vertex,
@@ -123,7 +124,7 @@ pub(super) fn chain_surgery(
             let vertex = take_id();
             result.vertices.push(VertexRecord {
                 id: vertex,
-                point: support.evaluate(junction.crossing_support)?,
+                point: support.evaluate(junction.crossing_support).or_refuse(KernelStage::Refine, "evaluate")?,
             });
             crossing_vertices.push(vertex);
             cuts.push((junction.crossing_support, vertex, junction.junction));
@@ -143,11 +144,11 @@ pub(super) fn chain_surgery(
             let (a, vertex_a) = window[0];
             let (b, vertex_b) = window[1];
             if b - a <= 1e-9 {
-                return Err("blend: degenerate support piece between crossings".into());
+                return Err(KernelRefusal::internal(KernelStage::Sew, "degenerate_support_piece", "blend: degenerate support piece between crossings"));
             }
             let piece_curve = {
                 let (_, tail) = if a > u_start + 1e-12 {
-                    support.split(a)?
+                    support.split(a).or_refuse(KernelStage::Refine, "split")?
                 } else {
                     (support.clone(), support.clone())
                 };
@@ -157,13 +158,13 @@ pub(super) fn chain_surgery(
                     support.clone()
                 };
                 if b < u_end - 1e-12 {
-                    tail.split(b)?.0
+                    tail.split(b).or_refuse(KernelStage::Refine, "split")?.0
                 } else {
                     tail
                 }
             };
             let edge_id = take_id();
-            let [piece_t0, piece_t1] = piece_curve.domain()?;
+            let [piece_t0, piece_t1] = piece_curve.domain().or_refuse(KernelStage::Refine, "domain")?;
             result.edges.push(EdgeRecord {
                 id: edge_id,
                 curve: piece_curve,
@@ -185,8 +186,8 @@ pub(super) fn chain_surgery(
     }
 
     // Blend seam edge between the two rim seam vertices.
-    let seam_curve = rows.surface.iso_curve_u(u_start)?;
-    let [seam_t0, seam_t1] = seam_curve.domain()?;
+    let seam_curve = rows.surface.iso_curve_u(u_start).or_refuse(KernelStage::Refine, "iso_curve_u")?;
+    let [seam_t0, seam_t1] = seam_curve.domain().or_refuse(KernelStage::Refine, "domain")?;
     let blend_seam_id = take_id();
     result.edges.push(EdgeRecord {
         id: blend_seam_id,
@@ -218,7 +219,7 @@ pub(super) fn chain_surgery(
                         })
                 })
                 .flatten()
-                .ok_or("blend: crossing vertex lost")?;
+                .ok_or(KernelRefusal::internal(KernelStage::Sew, "crossing_vertex", "blend: crossing vertex lost"))?;
             trim_edge_at(
                 &mut result,
                 junction.spoke_edge_id,
@@ -296,7 +297,7 @@ pub(super) fn chain_surgery(
                         .iter()
                         .flat_map(|shell| &shell.faces)
                         .find(|face| face.id == face_id)
-                        .ok_or("blend: mate face lost during chain surgery")?;
+                        .ok_or(KernelRefusal::internal(KernelStage::Sew, "mate_face", "blend: mate face lost during chain surgery"))?;
                     face.surface.clone()
                 };
                 let loop_coedges = {
@@ -368,7 +369,7 @@ pub(super) fn chain_surgery(
                                 .edges
                                 .iter()
                                 .find(|edge| edge.id == piece.edge_id)
-                                .ok_or("blend: support piece edge lost")?;
+                                .ok_or(KernelRefusal::internal(KernelStage::Sew, "support_piece_edge", "blend: support piece edge lost"))?;
                             (edge.curve.clone(), edge.start_vertex_id, edge.end_vertex_id)
                         };
                         let base = project_piece_pcurve(
@@ -384,7 +385,7 @@ pub(super) fn chain_surgery(
                             pcurve: if chain_forward {
                                 base
                             } else {
-                                base.reversed()?
+                                base.reversed().or_refuse(KernelStage::Refine, "reversed")?
                             },
                         });
                     }
@@ -394,7 +395,7 @@ pub(super) fn chain_surgery(
                     .iter_mut()
                     .flat_map(|shell| &mut shell.faces)
                     .find(|face| face.id == face_id)
-                    .ok_or("blend: mate face lost during chain surgery")?;
+                    .ok_or(KernelRefusal::internal(KernelStage::Sew, "mate_face", "blend: mate face lost during chain surgery"))?;
                 face.loops[loop_index].coedges = new_coedges;
             }
             continue;
@@ -443,14 +444,14 @@ pub(super) fn chain_surgery(
                         ids.push(coedge_id);
                     }
                 }
-                (loop_index.ok_or("blend: face lost its chain coedges")?, ids)
+                (loop_index.ok_or(KernelRefusal::internal(KernelStage::Sew, "chain_coedges", "blend: face lost its chain coedges"))?, ids)
             };
             let face = result
                 .shells
                 .iter_mut()
                 .flat_map(|shell| &mut shell.faces)
                 .find(|face| face.id == face_id)
-                .ok_or("blend: mate face lost during chain surgery")?;
+                .ok_or(KernelRefusal::internal(KernelStage::Sew, "mate_face", "blend: mate face lost during chain surgery"))?;
             let loop_record = &mut face.loops[loop_index];
             let positions: Vec<usize> = loop_record
                 .coedges
@@ -460,7 +461,7 @@ pub(super) fn chain_surgery(
                 .map(|(position, _)| position)
                 .collect();
             if positions.is_empty() {
-                return Err("blend: chain coedges missing from mate loop".into());
+                return Err(KernelRefusal::internal(KernelStage::Sew, "chain_coedges", "blend: chain coedges missing from mate loop"));
             }
             let old_forward = loop_record.coedges[positions[0]].forward;
             // Sense: the support pieces run in chain direction; whether
@@ -505,7 +506,7 @@ pub(super) fn chain_surgery(
                     let epsilon = 1e-9;
                     let portion = {
                         let (_, tail) = if w0 > u_start + epsilon {
-                            whole.split(w0)?
+                            whole.split(w0).or_refuse(KernelStage::Refine, "split")?
                         } else {
                             (whole.clone(), whole.clone())
                         };
@@ -515,7 +516,7 @@ pub(super) fn chain_surgery(
                             whole.clone()
                         };
                         if w1 < u_end - epsilon {
-                            tail.split(w1)?.0
+                            tail.split(w1).or_refuse(KernelStage::Refine, "split")?.0
                         } else {
                             tail
                         }
@@ -527,7 +528,7 @@ pub(super) fn chain_surgery(
                         pcurve: if chain_forward {
                             portion
                         } else {
-                            portion.reversed()?
+                            portion.reversed().or_refuse(KernelStage::Refine, "reversed")?
                         },
                     });
                     continue;
@@ -564,7 +565,7 @@ pub(super) fn chain_surgery(
                     pcurve: if chain_forward {
                         pcurve
                     } else {
-                        pcurve.reversed()?
+                        pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")?
                     },
                 });
             }
@@ -594,7 +595,7 @@ pub(super) fn chain_surgery(
     // follows the winding (loops run CCW around the face normal).
     let v0_forward = !side_use_forward[0];
     if side_use_forward[1] != v0_forward {
-        return Err("blend: chain sides have inconsistent orientations".into());
+        return Err(KernelRefusal::internal(KernelStage::Sew, "chain_side_orientation", "blend: chain sides have inconsistent orientations"));
     }
     let same_sense = v0_forward;
     let loop_id = take_id();
@@ -610,14 +611,14 @@ pub(super) fn chain_surgery(
                     0.0,
                     piece.window[1],
                     0.0,
-                )?,
+                ).or_refuse(KernelStage::Refine, "parameter_line")?,
             });
         }
         coedges.push(CoedgeRecord {
             id: take_id(),
             edge_id: blend_seam_id,
             forward: true,
-            pcurve: crate::sweep_topology::parameter_line(u_end, 0.0, u_end, 1.0)?,
+            pcurve: crate::sweep_topology::parameter_line(u_end, 0.0, u_end, 1.0).or_refuse(KernelStage::Refine, "parameter_line")?,
         });
         for piece in side_edges[1].iter().rev() {
             coedges.push(CoedgeRecord {
@@ -629,14 +630,14 @@ pub(super) fn chain_surgery(
                     1.0,
                     piece.window[0],
                     1.0,
-                )?,
+                ).or_refuse(KernelStage::Refine, "parameter_line")?,
             });
         }
         coedges.push(CoedgeRecord {
             id: take_id(),
             edge_id: blend_seam_id,
             forward: false,
-            pcurve: crate::sweep_topology::parameter_line(u_start, 1.0, u_start, 0.0)?,
+            pcurve: crate::sweep_topology::parameter_line(u_start, 1.0, u_start, 0.0).or_refuse(KernelStage::Refine, "parameter_line")?,
         });
     } else {
         // Mirror winding: v=1 side forward, v=0 side reversed.
@@ -650,14 +651,14 @@ pub(super) fn chain_surgery(
                     1.0,
                     piece.window[1],
                     1.0,
-                )?,
+                ).or_refuse(KernelStage::Refine, "parameter_line")?,
             });
         }
         coedges.push(CoedgeRecord {
             id: take_id(),
             edge_id: blend_seam_id,
             forward: false,
-            pcurve: crate::sweep_topology::parameter_line(u_end, 1.0, u_end, 0.0)?,
+            pcurve: crate::sweep_topology::parameter_line(u_end, 1.0, u_end, 0.0).or_refuse(KernelStage::Refine, "parameter_line")?,
         });
         for piece in side_edges[0].iter().rev() {
             coedges.push(CoedgeRecord {
@@ -669,14 +670,14 @@ pub(super) fn chain_surgery(
                     0.0,
                     piece.window[0],
                     0.0,
-                )?,
+                ).or_refuse(KernelStage::Refine, "parameter_line")?,
             });
         }
         coedges.push(CoedgeRecord {
             id: take_id(),
             edge_id: blend_seam_id,
             forward: true,
-            pcurve: crate::sweep_topology::parameter_line(u_start, 0.0, u_start, 1.0)?,
+            pcurve: crate::sweep_topology::parameter_line(u_start, 0.0, u_start, 1.0).or_refuse(KernelStage::Refine, "parameter_line")?,
         });
     }
     let mut loops = vec![LoopRecord {
@@ -703,7 +704,7 @@ pub(super) fn chain_surgery(
             id: end_vertex,
             point: crease.end,
         });
-        let [crease_t0, crease_t1] = crease.curve.domain()?;
+        let [crease_t0, crease_t1] = crease.curve.domain().or_refuse(KernelStage::Refine, "domain")?;
         result.edges.push(EdgeRecord {
             id: crease_edge,
             curve: crease.curve,
@@ -730,7 +731,7 @@ pub(super) fn chain_surgery(
                 id: 0,
                 edge_id: crease_edge,
                 forward: false,
-                pcurve: crease.second.reversed()?,
+                pcurve: crease.second.reversed().or_refuse(KernelStage::Refine, "reversed")?,
             },
         ])?;
         let coedges = if outer * forward_first < 0.0 {
@@ -745,7 +746,7 @@ pub(super) fn chain_surgery(
                     id: take_id(),
                     edge_id: crease_edge,
                     forward: false,
-                    pcurve: crease.second.reversed()?,
+                    pcurve: crease.second.reversed().or_refuse(KernelStage::Refine, "reversed")?,
                 },
             ]
         } else {
@@ -760,7 +761,7 @@ pub(super) fn chain_surgery(
                     id: take_id(),
                     edge_id: crease_edge,
                     forward: false,
-                    pcurve: crease.first.reversed()?,
+                    pcurve: crease.first.reversed().or_refuse(KernelStage::Refine, "reversed")?,
                 },
             ]
         };
@@ -786,7 +787,7 @@ pub(super) fn chain_surgery(
                 .iter()
                 .any(|face| face.id == segments[0].first.face.id)
         })
-        .ok_or("blend: mate shell lost during chain surgery")?;
+        .ok_or(KernelRefusal::internal(KernelStage::Sew, "mate_shell", "blend: mate shell lost during chain surgery"))?;
     result.shells[shell_index].faces.push(blend_face);
 
     // ---- drop the chain edges and orphaned vertices -------------------
@@ -813,15 +814,15 @@ pub(super) fn chain_surgery(
 /// and reading both off the same sampler makes that true by measurement rather
 /// than by a convention this surgery would otherwise have to restate (it winds
 /// the outer loop two different ways already).
-fn signed_area(coedges: &[CoedgeRecord]) -> Result<f64, String> {
+fn signed_area(coedges: &[CoedgeRecord]) -> Result<f64, KernelRefusal> {
     const SAMPLES: usize = 24;
     let mut twice_area = 0.0;
     for coedge in coedges {
-        let [t0, t1] = coedge.pcurve.domain()?;
+        let [t0, t1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
         let mut previous: Option<crate::Vec3> = None;
         for index in 0..=SAMPLES {
             let t = t0 + (t1 - t0) * index as f64 / SAMPLES as f64;
-            let point = coedge.pcurve.evaluate(t)?;
+            let point = coedge.pcurve.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?;
             if let Some(before) = previous {
                 twice_area += before.x * point.y - point.x * before.y;
             }

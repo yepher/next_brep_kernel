@@ -29,6 +29,7 @@
 //! Planar carriers only. On a curved one the image of a parameter-space segment
 //! is not the span of an existing rim, which is the thing being restored.
 
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 use crate::{NurbsCurve, NurbsSurface};
 
@@ -53,7 +54,7 @@ pub(super) fn close_vacated_rims(
     source_face: &FaceRecord,
     source_faces: &[&FaceRecord],
     omitted: &HashSet<u64>,
-) -> Result<VacatedRimReport, String> {
+) -> Result<VacatedRimReport, KernelRefusal> {
     let mut report = VacatedRimReport::default();
     if omitted.is_empty() {
         return Ok(report);
@@ -66,7 +67,7 @@ pub(super) fn close_vacated_rims(
     else {
         return Ok(report);
     };
-    if !face.surface.is_affine()? {
+    if !face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
         return Ok(report);
     }
     let mut edited = face.clone();
@@ -182,24 +183,24 @@ fn bridge(
     (start, length): &(usize, usize),
     count: usize,
     edge_by_id: &HashMap<u64, EdgeRecord>,
-) -> Result<Bridge, String> {
+) -> Result<Bridge, KernelRefusal> {
     let before_coedge = &coedges[(start + count - 1) % count];
     let after_coedge = &coedges[(start + length) % count];
     let before = before_coedge.pcurve.clone();
     let after = after_coedge.pcurve.clone();
-    let [_, before_end] = before.domain()?;
-    let [after_start, _] = after.domain()?;
-    let from = before.evaluate(before_end)?;
-    let to = after.evaluate(after_start)?;
+    let [_, before_end] = before.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let [after_start, _] = after.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let from = before.evaluate(before_end).or_refuse(KernelStage::Refine, "evaluate")?;
+    let to = after.evaluate(after_start).or_refuse(KernelStage::Refine, "evaluate")?;
     let chord = to.sub(from);
     let span = chord.length();
     // The same band, because a chord shorter than it has no direction to test
     // against it: the floor is the continuation test's own precondition rather
     // than a second tolerance.
     if span <= CONTINUATION_BAND {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "offset_shell_vacated_rim_closes", format!(
             "the {length} vacated rim(s) from index {start} close on themselves (chord {span:.3e})"
-        ));
+        )));
     }
     let direction = chord.scale(1.0 / span);
     let worst = [
@@ -210,11 +211,11 @@ fn bridge(
     .map(|tangent| tangent.cross(direction).length())
     .fold(0.0f64, f64::max);
     if worst > CONTINUATION_BAND {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "offset_shell_vacated_rim_chord", format!(
             "the {length} vacated rim(s) from index {start} would be bridged by a chord that is not \
              the continuation of the rims either side (worst sin θ {worst:.3e} against a band of \
              {CONTINUATION_BAND:.0e}, chord {span:.4})"
-        ));
+        )));
     }
     // The bridge joins the vertices those two rims already meet the run at, so
     // it re-closes the loop rather than introducing ends of its own.
@@ -222,13 +223,13 @@ fn bridge(
         edge_by_id.get(&before_coedge.edge_id),
         edge_by_id.get(&after_coedge.edge_id),
     ) else {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "offset_shell_vacated_rim_neighbour", format!(
             "the {length} vacated rim(s) from index {start} sit beside a rim whose edge the carrier \
              does not carry"
-        ));
+        )));
     };
     Ok(Bridge {
-        pcurve: crate::make_line(from, to)?,
+        pcurve: crate::make_line(from, to).or_refuse(KernelStage::Refine, "make_line")?,
         start_vertex_id: if before_coedge.forward {
             before_edge.end_vertex_id
         } else {
@@ -251,20 +252,20 @@ struct Bridge {
 
 /// Unit tangent of a pcurve at one end, `backwards` reading the end that
 /// arrives there.
-fn tangent_at(curve: &NurbsCurve, parameter: f64, backwards: bool) -> Result<Vec3, String> {
-    let [t0, t1] = curve.domain()?;
+fn tangent_at(curve: &NurbsCurve, parameter: f64, backwards: bool) -> Result<Vec3, KernelRefusal> {
+    let [t0, t1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
     let step = ((t1 - t0) * 1e-4).max(1e-12);
     let other = if backwards {
         (parameter - step).max(t0)
     } else {
         (parameter + step).min(t1)
     };
-    let from = curve.evaluate(parameter)?;
-    let to = curve.evaluate(other)?;
+    let from = curve.evaluate(parameter).or_refuse(KernelStage::Refine, "evaluate")?;
+    let to = curve.evaluate(other).or_refuse(KernelStage::Refine, "evaluate")?;
     let delta = if backwards { from.sub(to) } else { to.sub(from) };
     let length = delta.length();
     if length <= 0.0 {
-        return Err("a rim with no direction at its end".into());
+        return Err(KernelRefusal::internal(KernelStage::Refine, "offset_shell_vacated_rim_direction", "a rim with no direction at its end"));
     }
     Ok(delta.scale(1.0 / length))
 }
@@ -276,7 +277,7 @@ fn rebuild_loop(
     replacements: &[((usize, usize), Bridge)],
     surface: &NurbsSurface,
     next_edge_id: &mut u64,
-) -> Result<(Vec<CoedgeRecord>, Vec<EdgeRecord>), String> {
+) -> Result<(Vec<CoedgeRecord>, Vec<EdgeRecord>), KernelRefusal> {
     let count = coedges.len();
     let mut replaced_at = HashMap::<usize, &Bridge>::default();
     let mut dropped = HashSet::<usize>::default();
@@ -291,14 +292,14 @@ fn rebuild_loop(
     for (index, coedge) in coedges.iter().enumerate() {
         if let Some(bridged) = replaced_at.get(&index) {
             let pcurve = &bridged.pcurve;
-            let [t0, t1] = pcurve.domain()?;
-            let start = pcurve.evaluate(t0)?;
-            let end = pcurve.evaluate(t1)?;
+            let [t0, t1] = pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+            let start = pcurve.evaluate(t0).or_refuse(KernelStage::Refine, "evaluate")?;
+            let end = pcurve.evaluate(t1).or_refuse(KernelStage::Refine, "evaluate")?;
             let curve = crate::make_line(
-                surface.evaluate(start.x, start.y)?,
-                surface.evaluate(end.x, end.y)?,
-            )?;
-            let [c0, c1] = curve.domain()?;
+                surface.evaluate(start.x, start.y).or_refuse(KernelStage::Refine, "evaluate")?,
+                surface.evaluate(end.x, end.y).or_refuse(KernelStage::Refine, "evaluate")?,
+            ).or_refuse(KernelStage::Refine, "make_line")?;
+            let [c0, c1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
             edges.push(EdgeRecord {
                 id: *next_edge_id,
                 curve,

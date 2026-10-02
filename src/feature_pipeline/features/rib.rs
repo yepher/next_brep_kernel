@@ -97,7 +97,7 @@
 //! (`consumeProfileSketch`).
 
 use crate::feature_pipeline::features::common;
-use crate::feature_pipeline::{FeatureContext, FeatureResult};
+use crate::feature_pipeline::{FeatureContext, FeatureRefusal, FeatureResult};
 use crate::{
     rib_from_profile, NurbsCurve, PointClass, RibExtrusion, RibNames, SolidClassifier, Vec3,
 };
@@ -109,7 +109,7 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     }
 }
 
-fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     let mut result = FeatureResult::empty(ctx.id.clone(), ctx.feature_type.clone());
 
     // Resolve the target BY NAME first (before the profile). A miss is a structured
@@ -136,7 +136,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     let profile =
         common::resolve_path(ctx, &profile_name).map_err(|error| format!("rib: {error}"))?;
     if profile.is_empty() {
-        return Err(format!("rib: profile '{profile_name}' has no curves"));
+        return Err(format!("rib: profile '{profile_name}' has no curves").into());
     }
     // V1: OPEN straight-polyline profiles only — reject arcs (degree > 1), matching
     // the `edgeIsStraight` throw. `rib_from_profile` rejects a CLOSED chain and
@@ -169,7 +169,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     };
 
     // Thicken + grow up to the part. Short borrow — no held registry.
-    let fused = crate::with_registered_solid_str(target_handle, |target| {
+    let fused = crate::with_registered_solid_typed(target_handle, |target| {
         rib_from_profile(
             target,
             &profile,
@@ -241,7 +241,7 @@ fn read_extrusion(ctx: &FeatureContext) -> Result<RibExtrusion, String> {
         Some(other) => Err(format!(
             "rib: unknown extrusion direction '{other}' (expected PARALLEL_TO_SKETCH or \
              NORMAL_TO_SKETCH)"
-        )),
+        ).into()),
     }
 }
 
@@ -293,7 +293,7 @@ fn resolve_extrude_dir(
         "AUTO" => auto_material_side(profile, axis, extrusion, target_handle),
         other => Err(format!(
             "rib: unknown extrude direction option '{other}' (expected AUTO, NORMAL, or -NORMAL)"
-        )),
+        ).into()),
     }
 }
 

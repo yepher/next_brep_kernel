@@ -25,10 +25,14 @@ pub fn round_convex_corner(
     corner: Vec3,
     radius: f64,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
     if !(radius > 0.0) {
-        return Err("round_convex_corner: radius must be positive".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "radius",
+            "round_convex_corner: radius must be positive",
+        ));
     }
     let mut result = solid.clone();
 
@@ -45,7 +49,11 @@ pub fn round_convex_corner(
     };
 
     if result.vertices.is_empty() {
-        return Err("round_convex_corner: solid has no vertices".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "empty_solid",
+            "round_convex_corner: solid has no vertices",
+        ));
     }
 
     // 1. The three planar faces whose plane passes through `corner`; collect
@@ -228,9 +236,13 @@ pub fn round_convex_corner(
             }
         }
         if curved_wall_face_ids.is_empty() && antiparallel_pair.is_none() {
-            return Err(format!(
-                "round_convex_corner: expected 3 or more planar faces at the corner, found {}",
-                normals.len()
+            return Err(KernelRefusal::input(
+                KernelStage::Classify,
+                "planar_walls",
+                format!(
+                    "round_convex_corner: expected 3 or more planar faces at the corner, found {}",
+                    normals.len()
+                ),
             ));
         }
         if !curved_wall_face_ids.is_empty() {
@@ -238,7 +250,10 @@ pub fn round_convex_corner(
                 || other_curved != 0
                 || !(normals.len() == 2 || antiparallel_pair.is_some())
             {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "curved_wall_mix",
+                    format!(
                     "round_convex_corner: star corner with a curved (non-planar) wall carrier is \
                      only supported as two planar walls + one cylindrical wall — found {} planar, \
                      {} cylindrical and {} other curved wall carrier(s) through the corner \
@@ -246,6 +261,7 @@ pub fn round_convex_corner(
                     normals.len(),
                     cylinders.len(),
                     other_curved
+                    ),
                 ));
             }
             let cyl = &cylinders[0];
@@ -255,6 +271,10 @@ pub fn round_convex_corner(
                 // curved-mixed closure with either antiparallel member dropped.
                 let k = 3 - i - j;
                 let mut mixed_reasons: Vec<String> = Vec::new();
+                // Both attempts run the same detector; the LAST refusal's
+                // class carries the joined text, so the inner class survives
+                // the wrap.
+                let mut carried: Option<KernelRefusal> = None;
                 for wall in [normals[i], normals[j]] {
                     match round_mixed_concave_curved_corner(
                         solid,
@@ -268,17 +288,28 @@ pub fn round_convex_corner(
                         name,
                     ) {
                         Ok(done) => return Ok(done),
-                        Err(why) => mixed_reasons.push(why),
+                        Err(why) => {
+                            mixed_reasons.push(why.message.clone());
+                            carried = Some(why);
+                        }
                     }
                 }
-                return Err(format!(
+                let message = format!(
                     "round_convex_corner: star corner with a curved (non-planar) wall \
                      carrier shows an antiparallel wall-plane pair (a mixed-convexity \
                      overshoot signature — no corner-ball root exists for a genuine \
                      trihedral corner here), and the mixed-convexity curved-wall closure \
                      refused: {} (§6.9.7 curved-wall vertex blend)",
                     mixed_reasons.join(" / ")
-                ));
+                );
+                return Err(match carried {
+                    Some(why) => why.with_message(|_| message),
+                    None => KernelRefusal::internal(
+                        KernelStage::Classify,
+                        "antiparallel_attempts",
+                        message,
+                    ),
+                });
             }
             let candidates = curved_wall_ball_candidates(
                 corner,
@@ -290,11 +321,13 @@ pub fn round_convex_corner(
                 cyl.radius,
                 cyl.outward_away,
             )
-            .map_err(|why| {
-                format!(
+            .map_err(|error| {
+                error.with_message(|why| {
+                    format!(
                     "round_convex_corner: star corner with a curved (non-planar) wall carrier: \
                      {why} (§6.9.7 curved-wall vertex blend)"
-                )
+                    )
+                })
             })?;
             // The valid root is PROVEN by the tangent vertices the three edge
             // fillets left behind: all three contact points C + r·nᵢ must be
@@ -329,15 +362,17 @@ pub fn round_convex_corner(
                     cyl.outward_away,
                     name,
                 )
-                .map_err(|mixed| {
-                    format!(
+                .map_err(|error| {
+                    error.with_message(|mixed| {
+                        format!(
                         "round_convex_corner: star corner with a curved (non-planar) wall \
                          carrier: no corner-ball root has all three convex-fillet tangent \
                          vertices (not an all-convex curved-wall corner with its three \
                          incident edges filleted), and the corner is not a supported \
                          mixed-convexity curved-wall corner ({mixed}) (§6.9.7 curved-wall \
                          vertex blend)"
-                    )
+                        )
+                    })
                 });
             };
             curved_centre = Some(*centre);
@@ -383,7 +418,13 @@ pub fn round_convex_corner(
             // The pre-slice line was `solve_small(..)?`, so this refusal text
             // was `solve_small`'s own. Kept verbatim: this slice moves no
             // message.
-            .map_err(|_| "solve_small: singular matrix".to_string())?;
+            .map_err(|_| {
+                KernelRefusal::ill_posed(
+                    KernelStage::Classify,
+                    "singular_tangency",
+                    "solve_small: singular matrix",
+                )
+            })?;
         offset_pair_diag::plane_triple(
             "convex::corner_ball",
             corner,
@@ -405,7 +446,11 @@ pub fn round_convex_corner(
             }
         }
         let d = crate::fit::solve_small::<3>(ata, atb, 3).map_err(|_| {
-            "round_convex_corner: tangency normal equations are singular".to_string()
+            KernelRefusal::ill_posed(
+                KernelStage::Classify,
+                "singular_tangency_lsq",
+                "round_convex_corner: tangency normal equations are singular",
+            )
         })?;
         let c = corner.add(Vec3::new(d[0], d[1], d[2]));
         let worst = normals.iter().fold(0.0f64, |acc, nrm| {
@@ -452,17 +497,23 @@ pub fn round_convex_corner(
             // exactly this tangent-vertex existence test — and the planar
             // mixed-concave machinery would misread its cylinder wall.)
             return round_mixed_concave_corner(solid, corner, radius, &normals, name).map_err(
-                |mixed| {
-                    format!(
+                |error| {
+                    error.with_message(|mixed| {
+                        format!(
                         "round_convex_corner: no convex tangent vertex near {ideal:?}, and the \
                          corner is not a supported mixed-convexity trihedral corner ({mixed})"
-                    )
+                        )
+                    })
                 },
             );
         }
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "concave_star_n4",
+            format!(
             "round_convex_corner: no existing tangent vertex near {ideal:?} (a star corner \
              with concave incident edges is unsupported for N>3 walls)"
+            ),
         ));
     }
     let t_id_set: HashSet<u64> = t_ids.iter().copied().collect();
@@ -608,10 +659,14 @@ pub fn round_convex_corner(
                 continue;
             }
             if face.loops.len() != 1 {
-                return Err(format!(
-                    "round_convex_corner: fillet face {} has {} loops",
-                    face.id,
-                    face.loops.len()
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Fragment,
+                    "multi_loop",
+                    format!(
+                        "round_convex_corner: fillet face {} has {} loops",
+                        face.id,
+                        face.loops.len()
+                    ),
                 ));
             }
             let coedges = &face.loops[0].coedges;
@@ -633,11 +688,15 @@ pub fn round_convex_corner(
                 }
             }
             if border_tvs.len() != 2 {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Fragment,
+                    "tangent_vertex_pair",
+                    format!(
                     "round_convex_corner: fillet face {} borders {} tangent vertices \
                      (expected exactly 2); acute geometry too degenerate to rebuild",
                     face.id,
                     border_tvs.len()
+                    ),
                 ));
             }
             let bpt0 = *vpoint.get(&border_tvs[0]).unwrap();
@@ -652,9 +711,13 @@ pub fn round_convex_corner(
             // fillet body to keep.  This trims/rebuilds the corner end at the
             // tangent circle regardless of how the sequential fillets cut it.
             let mut axis = bpt0.sub(c).cross(bpt1.sub(c)).normalized().map_err(|_| {
-                format!(
-                    "round_convex_corner: fillet face {} tangent points are colinear with C",
-                    face.id
+                KernelRefusal::ill_posed(
+                    KernelStage::Fragment,
+                    "colinear_tangents",
+                    format!(
+                        "round_convex_corner: fillet face {} tangent points are colinear with C",
+                        face.id
+                    ),
                 )
             })?;
             if corner.sub(c).dot(axis) < 0.0 {
@@ -670,57 +733,93 @@ pub fn round_convex_corner(
                 })
                 .collect();
             let anchor = (0..n).find(|&i| !is_corner[i]).ok_or_else(|| {
-                format!(
-                    "round_convex_corner: fillet face {} is all corner-end",
-                    face.id
+                KernelRefusal::unsupported(
+                    KernelStage::Fragment,
+                    "all_corner_end",
+                    format!(
+                        "round_convex_corner: fillet face {} is all corner-end",
+                        face.id
+                    ),
                 )
             })?;
             let (prefix, run, suffix) = partition_corner_loop(coedges, &is_corner, anchor);
             if run.is_empty() {
-                return Err(format!(
-                    "round_convex_corner: fillet face {} has no corner-end coedge",
-                    face.id
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Fragment,
+                    "no_corner_run",
+                    format!(
+                        "round_convex_corner: fillet face {} has no corner-end coedge",
+                        face.id
+                    ),
                 ));
             }
             // T_a: traversal-end vertex of the coedge before the run.
             let before = prefix.last().ok_or_else(|| {
-                format!(
-                    "round_convex_corner: fillet face {} corner run has no predecessor",
-                    face.id
+                KernelRefusal::internal(
+                    KernelStage::Fragment,
+                    "run_predecessor",
+                    format!(
+                        "round_convex_corner: fillet face {} corner run has no predecessor",
+                        face.id
+                    ),
                 )
             })?;
             let (bs, be) = *edge_ends.get(&before.edge_id).unwrap();
             let t_a = if before.forward { be } else { bs };
-            let uv_a = before.pcurve.evaluate(1.0)?;
+            let uv_a = before
+                .pcurve
+                .evaluate(1.0)
+                .or_refuse(KernelStage::Fragment, "evaluate")?;
             // The coedge after the run (wraps to prefix[0] if the run trails).
             let after = suffix.first().or_else(|| prefix.first()).ok_or_else(|| {
-                format!(
-                    "round_convex_corner: fillet face {} corner run has no successor",
-                    face.id
+                KernelRefusal::internal(
+                    KernelStage::Fragment,
+                    "run_successor",
+                    format!(
+                        "round_convex_corner: fillet face {} corner run has no successor",
+                        face.id
+                    ),
                 )
             })?;
             let (as_, ae) = *edge_ends.get(&after.edge_id).unwrap();
             let t_b = if after.forward { as_ } else { ae };
-            let uv_b = after.pcurve.evaluate(0.0)?;
+            let uv_b = after
+                .pcurve
+                .evaluate(0.0)
+                .or_refuse(KernelStage::Fragment, "evaluate")?;
 
             if !t_id_set.contains(&t_a) || !t_id_set.contains(&t_b) || t_a == t_b {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Fragment,
+                    "run_ends",
+                    format!(
                     "round_convex_corner: fillet face {} corner ends are not two distinct tangent vertices ({t_a},{t_b})",
                     face.id
+                    ),
                 ));
             }
 
             // Fresh tangent-circle arc T_a -> T_b (radius-r arc centered at C).
             let ta_pt = *vpoint.get(&t_a).unwrap();
             let tb_pt = *vpoint.get(&t_b).unwrap();
-            let x_axis = ta_pt.sub(c).normalized()?;
+            let x_axis = ta_pt
+                .sub(c)
+                .normalized()
+                .or_refuse(KernelStage::Fragment, "normalized")?;
             let rb = tb_pt.sub(c);
-            let y_axis = rb.sub(x_axis.scale(rb.dot(x_axis))).normalized()?;
+            let y_axis = rb
+                .sub(x_axis.scale(rb.dot(x_axis)))
+                .normalized()
+                .or_refuse(KernelStage::Fragment, "normalized")?;
             // Sweep the ACTUAL angle Tₐ–C–T_b (= angle between the two face
             // normals); only 90° for orthogonal corners.  make_arc segments it
             // (up to a full turn) so any convex angle in (0, π) is exact.
-            let sweep = x_axis.dot(rb.normalized()?).clamp(-1.0, 1.0).acos();
-            let arc = crate::make_arc(c, x_axis, y_axis, radius, 0.0, sweep)?;
+            let sweep = x_axis
+                .dot(rb.normalized().or_refuse(KernelStage::Fragment, "normalized")?)
+                .clamp(-1.0, 1.0)
+                .acos();
+            let arc = crate::make_arc(c, x_axis, y_axis, radius, 0.0, sweep)
+                .or_refuse(KernelStage::Fragment, "make_arc")?;
             let arc_id = next_id();
             fresh_edges.push(EdgeRecord {
                 id: arc_id,
@@ -740,7 +839,8 @@ pub fn round_convex_corner(
                 id: next_id(),
                 edge_id: arc_id,
                 forward: true,
-                pcurve: crate::sweep_topology::parameter_line(uv_a.x, uv_a.y, uv_b.x, uv_b.y)?,
+                pcurve: crate::sweep_topology::parameter_line(uv_a.x, uv_a.y, uv_b.x, uv_b.y)
+                    .or_refuse(KernelStage::Fragment, "parameter_line")?,
             };
             let mut rebuilt = prefix;
             rebuilt.push(fresh_co);
@@ -753,8 +853,12 @@ pub fn round_convex_corner(
         }
     }
     if fillet_count != n_faces {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "fillet_count",
+            format!(
             "round_convex_corner: expected {n_faces} fillet faces at the corner, found {fillet_count}"
+            ),
         ));
     }
     let octant_shell = fillet_shell.unwrap();
@@ -781,7 +885,11 @@ pub fn round_convex_corner(
                 .iter()
                 .find(|v| v.point.sub(ideal).length() < 1e-6)
                 .ok_or_else(|| {
-                    format!("round_convex_corner: no octant tangent vertex near {ideal:?}")
+                    KernelRefusal::internal(
+                        KernelStage::Fragment,
+                        "octant_vertex",
+                        format!("round_convex_corner: no octant tangent vertex near {ideal:?}"),
+                    )
                 })?;
             oct_ids[k] = found.id;
             oct_pts[k] = found.point;
@@ -842,7 +950,11 @@ pub fn round_convex_corner(
     // 6. Validate; surface the issues to the caller if any.
     let issues = result.validate();
     if !issues.is_empty() {
-        return Err(format!("round_convex_corner: {issues:?}"));
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "validate",
+            format!("round_convex_corner: {issues:?}"),
+        ));
     }
     Ok(result)
 }

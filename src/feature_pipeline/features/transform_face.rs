@@ -112,15 +112,22 @@
 //! while every FACE name still survives. It says so in the result's `notes`
 //! rather than changing the answer silently.
 
+use crate::face_refusal_slugs::{PIVOT_GEOMETRY, RIGID_SCALE};
 use std::collections::HashSet;
 
 use crate::feature_pipeline::features::common;
-use crate::feature_pipeline::{AddedSolid, FeatureContext, FeatureResult, SceneMap};
-use crate::{move_faces, rotate_faces, BrepSolid, Vec3};
+use crate::feature_pipeline::{AddedSolid, FeatureContext, FeatureRefusal, FeatureResult, SceneMap};
+use crate::{move_faces, rotate_faces, BrepSolid, KernelRefusal, KernelStage, Vec3};
 
 /// Stations per boundary edge in [`selection_centre`]. A power of two, so a
 /// rational circle split into quarter spans is sampled at its span ends — the
 /// points where an axis-aligned circle reaches its bounds.
+/// [`FeatureResult::refused_step`] of a Transform Face whose ROTATION refused
+/// (a turn alone, or the first half of rotate-then-translate).
+pub const REFUSED_STEP_ROTATION: &str = "rotation";
+/// … whose TRANSLATION refused (a move alone, or the second half).
+pub const REFUSED_STEP_TRANSLATION: &str = "translation";
+
 pub const CENTRE_SAMPLES: usize = 64;
 
 pub fn execute(ctx: &FeatureContext) -> FeatureResult {
@@ -299,7 +306,7 @@ fn transform_vec3(ctx: &FeatureContext, key: &str, default: [f64; 3]) -> Result<
     )
 }
 
-fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     let mut result = FeatureResult::empty(ctx.id.clone(), ctx.feature_type.clone());
 
     let names = common::reference_name_array(ctx.param("faces"));
@@ -311,16 +318,24 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     else {
         return Ok(result); // Only unresolved names, or faces on several solids.
     };
+    // The feature proceeds on the faces that resolved: a miss is reported as
+    // a typed partial fulfilment beside `unresolved`, never silently.
+    result.note_partial_resolution(&names);
 
     // The motion. Scale first: a document that scales is refused before
     // anything else is read, because no reading of the rest makes it rigid.
     let scale = transform_vec3(ctx, "scale", [1.0; 3])?;
     if scale != [1.0; 3] {
-        return Err(format!(
-            "transformFace: `transform.scale` is {scale:?}, but a face transform is a RIGID \
-             motion — a scaled carrier is a different surface, not a moved one — so scale must \
-             be [1, 1, 1]; refusing"
-        ));
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            RIGID_SCALE,
+            format!(
+                "transformFace: `transform.scale` is {scale:?}, but a face transform is a RIGID \
+                 motion — a scaled carrier is a different surface, not a moved one — so scale must \
+                 be [1, 1, 1]; refusing"
+            ),
+        )
+        .into());
     }
     let position = transform_vec3(ctx, "position", [0.0; 3])?;
     let rotation_deg = transform_vec3(ctx, "rotationEuler", [0.0; 3])?;
@@ -346,7 +361,13 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         Some((axis, angle)) => {
             let pivot = match ctx.param("pivot") {
                 None | Some(serde_json::Value::Null) => selection_centre(&solid, &face_ids)
-                    .ok_or("transformFace: the selected faces carry no geometry to centre a pivot on")?,
+                    .ok_or_else(|| {
+                        KernelRefusal::input(
+                            KernelStage::Collect,
+                            PIVOT_GEOMETRY,
+                            "transformFace: the selected faces carry no geometry to centre a pivot on",
+                        )
+                    })?,
                 Some(value) => {
                     let [x, y, z] = common::vec3_from_value(ctx.env, Some(value), "pivot", [0.0; 3])?;
                     Vec3::new(x, y, z)
@@ -355,25 +376,54 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
             Some((pivot, axis, angle))
         }
     };
+    // Every motion step records itself on refusal (`refused_step`), so the
+    // app names the motion the user asked for without reading this text.
+    let refused_at = |error: KernelRefusal, step: &str| {
+        let mut refused = ctx.fail(error);
+        refused.refused_step = Some(step.to_string());
+        refused
+    };
     let moved = match turn {
-        None => move_faces(&solid, &face_ids, translation)?,
+        None => match move_faces(&solid, &face_ids, translation) {
+            Ok(moved) => moved,
+            Err(error) => return Ok(refused_at(error, REFUSED_STEP_TRANSLATION)),
+        },
         Some((pivot, axis, angle)) => {
             if !translates {
-                rotate_faces(&solid, &face_ids, pivot, axis, angle)?
+                match rotate_faces(&solid, &face_ids, pivot, axis, angle) {
+                    Ok(turned) => turned,
+                    Err(error) => return Ok(refused_at(error, REFUSED_STEP_ROTATION)),
+                }
             } else {
                 // ROTATE-THEN-TRANSLATE, each step named on refusal (module doc).
-                let turned = rotate_faces(&solid, &face_ids, pivot, axis, angle).map_err(|error| {
-                    format!(
-                        "transformFace: the ROTATION step of this rotate-then-translate motion \
-                         refused — {error}"
-                    )
-                })?;
-                move_faces(&turned, &face_ids, translation).map_err(|error| {
-                    format!(
-                        "transformFace: the TRANSLATION step of this rotate-then-translate \
-                         motion, applied to the faces as the rotation left them, refused — {error}"
-                    )
-                })?
+                // The primitive's class rides through the step's wrap.
+                // The refused step is also RECORDED on the result
+                // (`FeatureResult::refused_step`), so a reader need not parse it
+                // out of this text.
+                let turned = match rotate_faces(&solid, &face_ids, pivot, axis, angle) {
+                    Ok(turned) => turned,
+                    Err(error) => {
+                        let error = error.with_message(|error| {
+                            format!(
+                                "transformFace: the ROTATION step of this rotate-then-translate motion \
+                                 refused — {error}"
+                            )
+                        });
+                        return Ok(refused_at(error, REFUSED_STEP_ROTATION));
+                    }
+                };
+                match move_faces(&turned, &face_ids, translation) {
+                    Ok(moved) => moved,
+                    Err(error) => {
+                        let error = error.with_message(|error| {
+                            format!(
+                                "transformFace: the TRANSLATION step of this rotate-then-translate \
+                                 motion, applied to the faces as the rotation left them, refused — {error}"
+                            )
+                        });
+                        return Ok(refused_at(error, REFUSED_STEP_TRANSLATION));
+                    }
+                }
             }
         }
     };
@@ -409,10 +459,17 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                     ));
                     body
                 }
+                // The acceptance's refusal stays the primary one — its class
+                // is what the boundary reports — and the re-cut's decline is
+                // appended as context.
                 Err(reason) => {
-                    return Err(format!(
-                        "{refusal}. The re-cut road was offered it too and declined: {reason}"
-                    ))
+                    return Err(refusal
+                        .with_message(|refusal| {
+                            format!(
+                                "{refusal}. The re-cut road was offered it too and declined: {reason}"
+                            )
+                        })
+                        .into())
                 }
             }
         }

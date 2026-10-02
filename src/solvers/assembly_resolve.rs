@@ -1,7 +1,7 @@
-//! Assembly selection resolution (build-spec §5) — a selection reference
-//! resolved to an ANALYTIC frame read from the exact BREP surfaces/curves,
-//! never from tessellation (the retired app's polyline-PCA approximation is
-//! the wart this module kills):
+//! Assembly selection resolution — a selection reference resolved to an
+//! ANALYTIC frame read from the exact BREP surfaces/curves, never from
+//! tessellation (the retired app's polyline-PCA approximation is the wart
+//! this module kills):
 //!
 //! - planar face → plane (origin + OUTWARD unit normal, plane-z convention)
 //! - cylindrical/conical face → axis (origin + direction), radius when the
@@ -25,18 +25,18 @@
 //! world→local INVERSE transform to [`SelectionGeometry::transformed`] to
 //! obtain the COMPONENT-LOCAL frame the assembly solver's mate inputs require
 //! ([`MateKind`](crate::MateKind): `*_a`/`*_b` geometry is local to the owning
-//! body, which the solver poses — requirements §4.1).
+//! body, which the solver poses).
 //!
 //! # Lane seam — component lookup
 //!
 //! [`split_component_namespace`] only PARSES the `ACOMP…:` prefix chain off a
 //! namespaced topology name. Mapping that chain to the owning component's
 //! resident solids and its world→local inverse transform is the scene
-//! component registry's job (build-spec §10 item 2, built in parallel); the
-//! resolvers here deliberately take `(solid, entity)` plus a transform
-//! argument instead of a registry. Vertices carry no kernel names (the
-//! renderer's `VertexRef` convention is owning solid + position), so vertex
-//! selections arrive as a position and snap to the nearest topology vertex.
+//! component registry's job (built in parallel); the resolvers here
+//! deliberately take `(solid, entity)` plus a transform argument instead of a
+//! registry. Vertices carry no kernel names (the renderer's `VertexRef`
+//! convention is owning solid + position), so vertex selections arrive as a
+//! position and snap to the nearest topology vertex.
 
 use crate::topology::{BrepSolid, EdgeRecord, FaceRecord};
 use crate::{AffineTransform, AnalyticSurface, MateAxis, MatePlane, NurbsCurve, Vec3};
@@ -93,8 +93,8 @@ pub enum SelectionGeometry {
 }
 
 /// Typed resolution failure. [`Self::status`] maps each variant onto the
-/// constraint status vocabulary (requirements §5) so the constraint lifecycle
-/// reports it without string-matching messages.
+/// constraint status vocabulary so the constraint lifecycle reports it
+/// without string-matching messages.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum ResolveError {
     /// No such entity on the solid (or no vertex within snap distance).
@@ -160,8 +160,8 @@ impl SelectionGeometry {
         })
     }
 
-    /// The per-kind anchor point (requirements §4.1 point marshaling): plane /
-    /// axis / line origin, sphere / circle center, the point itself.
+    /// The per-kind anchor point: plane / axis / line origin, sphere / circle
+    /// center, the point itself.
     pub fn representative_point(&self) -> Vec3 {
         match *self {
             SelectionGeometry::Plane { origin, .. }

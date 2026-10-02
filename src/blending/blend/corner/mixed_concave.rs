@@ -39,11 +39,15 @@ fn detect_mixed_concave_corner(
     corner: Vec3,
     radius: f64,
     normals: &[Vec3],
-) -> Result<MixedConcaveCorner, String> {
+) -> Result<MixedConcaveCorner, KernelRefusal> {
     if normals.len() != 3 {
-        return Err(format!(
-            "mixed corner supports exactly 3 planar walls, found {}",
-            normals.len()
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Collect,
+            "wall_count",
+            format!(
+                "mixed corner supports exactly 3 planar walls, found {}",
+                normals.len()
+            ),
         ));
     }
     let find_vertex = |ideal: Vec3| -> Option<(u64, Vec3)> {
@@ -181,9 +185,13 @@ fn detect_mixed_concave_corner(
             b_axis_closest: acb,
         });
     }
-    Err(format!(
-        "no supported single-concave-edge trihedral configuration: {}",
-        reasons.join("; ")
+    Err(KernelRefusal::unsupported(
+        KernelStage::Classify,
+        "mixed_concave_config",
+        format!(
+            "no supported single-concave-edge trihedral configuration: {}",
+            reasons.join("; ")
+        ),
     ))
 }
 
@@ -216,7 +224,7 @@ pub(super) fn round_mixed_concave_corner(
     radius: f64,
     normals: &[Vec3],
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
     let mc = detect_mixed_concave_corner(solid, corner, radius, normals)?;
@@ -291,9 +299,11 @@ pub(super) fn round_mixed_concave_corner(
             }
             if touches(face, mc.v_a.0) && touches(face, mc.v_b.0) {
                 if q_face_id.is_some() {
-                    return Err(
-                        "round_mixed_concave_corner: multiple concave-fillet candidates".into(),
-                    );
+                    return Err(KernelRefusal::ill_posed(
+                        KernelStage::Classify,
+                        "concave_candidates",
+                        "round_mixed_concave_corner: multiple concave-fillet candidates",
+                    ));
                 }
                 q_face_id = Some(face.id);
                 q_shell = si;
@@ -313,15 +323,26 @@ pub(super) fn round_mixed_concave_corner(
         }
     }
     let q_face_id = q_face_id.ok_or_else(|| {
-        "round_mixed_concave_corner: concave fillet face not found (no non-planar face \
-         touches both tangency vertices)"
-            .to_string()
+        KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "concave_face",
+            "round_mixed_concave_corner: concave fillet face not found (no non-planar face \
+         touches both tangency vertices)",
+        )
     })?;
     let cyl_a_face_id = cyl_a_face_id.ok_or_else(|| {
-        "round_mixed_concave_corner: wall-A cap fillet does not end on its junction arc".to_string()
+        KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "cap_fillet_a",
+            "round_mixed_concave_corner: wall-A cap fillet does not end on its junction arc",
+        )
     })?;
     let cyl_b_face_id = cyl_b_face_id.ok_or_else(|| {
-        "round_mixed_concave_corner: wall-B cap fillet does not end on its junction arc".to_string()
+        KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "cap_fillet_b",
+            "round_mixed_concave_corner: wall-B cap fillet does not end on its junction arc",
+        )
     })?;
 
     // The convex fillets' surviving coedge senses on the junction arcs (the
@@ -356,10 +377,14 @@ pub(super) fn round_mixed_concave_corner(
             .find(|f| f.id == q_face_id)
             .unwrap();
         if face.loops.len() != 1 {
-            return Err(format!(
-                "round_mixed_concave_corner: concave fillet face {} has {} loops",
-                face.id,
-                face.loops.len()
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Fragment,
+                "multi_loop",
+                format!(
+                    "round_mixed_concave_corner: concave fillet face {} has {} loops",
+                    face.id,
+                    face.loops.len()
+                ),
             ));
         }
         let is_corner: Vec<bool> = face.loops[0]
@@ -432,9 +457,11 @@ pub(super) fn round_mixed_concave_corner(
                 continue; // untouched cap region, or all-junk face handled below
             }
             if cap_rebuilt {
-                return Err(
-                    "round_mixed_concave_corner: multiple cap faces carry a corner run".into(),
-                );
+                return Err(KernelRefusal::ill_posed(
+                    KernelStage::Classify,
+                    "cap_faces",
+                    "round_mixed_concave_corner: multiple cap faces carry a corner run",
+                ));
             }
             let (rebuilt, edge) = rebuild_mixed_corner_run(
                 "round_mixed_concave_corner",
@@ -454,7 +481,11 @@ pub(super) fn round_mixed_concave_corner(
         }
     }
     let fresh_w_arc = fresh_w_arc.ok_or_else(|| {
-        "round_mixed_concave_corner: no cap face carries the corner run".to_string()
+        KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "cap_run",
+            "round_mixed_concave_corner: no cap face carries the corner run",
+        )
     })?;
 
     // ---- 5. Leftover notch junk: planar faces whose EVERY loop vertex lies
@@ -588,7 +619,11 @@ pub(super) fn round_mixed_concave_corner(
     // ---- 8. Validate; surface the issues to the caller if any.
     let issues = result.validate();
     if !issues.is_empty() {
-        return Err(format!("round_mixed_concave_corner: {issues:?}"));
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "validate",
+            format!("round_mixed_concave_corner: {issues:?}"),
+        ));
     }
     Ok(result)
 }
@@ -611,7 +646,7 @@ pub(crate) fn round_concave_chain_corner(
     selected_edges: [u64; 2],
     radius: f64,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
     let ctx = "round_concave_chain_corner";
@@ -631,13 +666,23 @@ pub(crate) fn round_concave_chain_corner(
     let first = faces_of(selected_edges[0]);
     let second = faces_of(selected_edges[1]);
     if first.len() != 2 || second.len() != 2 {
-        return Err(format!("{ctx}: selected corner edges are not manifold"));
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "manifold_edges",
+            format!("{ctx}: selected corner edges are not manifold"),
+        ));
     }
     let cap = first
         .iter()
         .find(|face| second.iter().any(|other| other.id == face.id))
         .copied()
-        .ok_or_else(|| format!("{ctx}: selected corner edges have no common cap face"))?;
+        .ok_or_else(|| {
+            KernelRefusal::input(
+                KernelStage::Collect,
+                "common_cap",
+                format!("{ctx}: selected corner edges have no common cap face"),
+            )
+        })?;
     let wall_a = first
         .iter()
         .find(|face| face.id != cap.id)
@@ -648,17 +693,23 @@ pub(crate) fn round_concave_chain_corner(
         .find(|face| face.id != cap.id)
         .copied()
         .unwrap();
-    let outward = |face: &FaceRecord| -> Result<Vec3, String> {
+    let outward = |face: &FaceRecord| -> Result<Vec3, KernelRefusal> {
         if !matches!(
             face.surface.analytic(),
             Some(crate::AnalyticSurface::Plane { .. })
         ) {
-            return Err(format!(
-                "{ctx}: horn-torus closure requires planar cap and walls"
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "planar_rim",
+                format!("{ctx}: horn-torus closure requires planar cap and walls"),
             ));
         }
-        let projection = crate::project_point_to_surface(&face.surface, corner)?;
-        let normal = face.surface.normal(projection.u, projection.v)?;
+        let projection = crate::project_point_to_surface(&face.surface, corner)
+            .or_refuse(KernelStage::Classify, "project")?;
+        let normal = face
+            .surface
+            .normal(projection.u, projection.v)
+            .or_refuse(KernelStage::Classify, "normal")?;
         Ok(if face.same_sense {
             normal
         } else {
@@ -667,8 +718,10 @@ pub(crate) fn round_concave_chain_corner(
     };
     let (nc, na, nb) = (outward(cap)?, outward(wall_a)?, outward(wall_b)?);
     if nc.dot(na).abs() > 1e-6 || nc.dot(nb).abs() > 1e-6 || na.dot(nb).abs() > 1e-6 {
-        return Err(format!(
-            "{ctx}: only orthogonal planar re-entrant rims are supported"
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "orthogonal_rim",
+            format!("{ctx}: only orthogonal planar re-entrant rims are supported"),
         ));
     }
 
@@ -677,13 +730,19 @@ pub(crate) fn round_concave_chain_corner(
     let w_b = corner.sub(nb.scale(radius));
     let centre_a = q.sub(na.scale(radius));
     let centre_b = q.sub(nb.scale(radius));
-    let find_vertex = |point: Vec3| -> Result<(u64, Vec3), String> {
+    let find_vertex = |point: Vec3| -> Result<(u64, Vec3), KernelRefusal> {
         solid
             .vertices
             .iter()
             .find(|vertex| vertex.point.sub(point).length() < 1e-6 * (1.0 + radius))
             .map(|vertex| (vertex.id, vertex.point))
-            .ok_or_else(|| format!("{ctx}: expected corner vertex near {point:?}"))
+            .ok_or_else(|| {
+                KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "corner_vertex",
+                    format!("{ctx}: expected corner vertex near {point:?}"),
+                )
+            })
     };
     let qv = find_vertex(q)?;
     let wav = find_vertex(w_a)?;
@@ -703,7 +762,7 @@ pub(crate) fn round_concave_chain_corner(
             .flat_map(|lp| &lp.coedges)
             .any(|co| co.edge_id == edge_id)
     };
-    let blend_for = |edge_id: u64| -> Result<(u64, usize), String> {
+    let blend_for = |edge_id: u64| -> Result<(u64, usize), KernelRefusal> {
         let matches = solid
             .shells
             .iter()
@@ -713,9 +772,13 @@ pub(crate) fn round_concave_chain_corner(
             .map(|(face, si)| (face.id, si))
             .collect::<Vec<_>>();
         if matches.len() != 1 {
-            return Err(format!(
-                "{ctx}: expected one blend face on junction arc {edge_id}, found {}",
-                matches.len()
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "junction_blend",
+                format!(
+                    "{ctx}: expected one blend face on junction arc {edge_id}, found {}",
+                    matches.len()
+                ),
             ));
         }
         Ok(matches[0])
@@ -757,7 +820,13 @@ pub(crate) fn round_concave_chain_corner(
             };
             projection.distance < 1e-6 * (1.0 + radius) && normal.dot(nc).abs() > 1.0 - 1e-6
         })
-        .ok_or_else(|| format!("{ctx}: trimmed cap face not found"))?;
+        .ok_or_else(|| {
+            KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "cap_face",
+                format!("{ctx}: trimmed cap face not found"),
+            )
+        })?;
     let local = 1.01 * radius + 1e-6;
     let is_corner = cap_face.loops[0]
         .coedges
@@ -783,7 +852,7 @@ pub(crate) fn round_concave_chain_corner(
 
     let degenerate = EdgeRecord {
         id: next_id(),
-        curve: crate::make_line(qv.1, qv.1)?,
+        curve: crate::make_line(qv.1, qv.1).or_refuse(KernelStage::Fragment, "make_line")?,
         t0: 0.0,
         t1: 1.0,
         start_vertex_id: qv.0,
@@ -839,7 +908,11 @@ pub(crate) fn round_concave_chain_corner(
         .map(|face| face.id)
         .collect();
     if junk.is_empty() {
-        return Err(format!("{ctx}: no planar cutter end-cap found"));
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "cutter_end_cap",
+            format!("{ctx}: no planar cutter end-cap found"),
+        ));
     }
 
     result.edges.push(fresh_w_arc);
@@ -874,7 +947,11 @@ pub(crate) fn round_concave_chain_corner(
 
     let issues = result.validate();
     if !issues.is_empty() {
-        return Err(format!("{ctx}: {issues:?}"));
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "validate",
+            format!("{ctx}: {issues:?}"),
+        ));
     }
     Ok(result)
 }

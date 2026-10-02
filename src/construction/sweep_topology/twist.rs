@@ -47,7 +47,7 @@ pub(super) fn closing_twist(
     axis: Vec3,
     requested: f64,
     floor: f64,
-) -> Result<ClosingTwist, String> {
+) -> Result<ClosingTwist, KernelRefusal> {
     use std::f64::consts::TAU;
     if requested == 0.0 {
         return Ok(ClosingTwist {
@@ -56,7 +56,11 @@ pub(super) fn closing_twist(
         });
     }
     if !requested.is_finite() {
-        return Err("sweepSolid: twist angle must be finite".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "twist_finite",
+            "sweepSolid: twist angle must be finite",
+        ));
     }
     let symmetry = section_symmetry(section, axis_point, axis, floor)?;
     let order = symmetry.len();
@@ -94,7 +98,10 @@ pub(super) fn closing_twist(
             step.to_degrees()
         )
     };
-    Err(format!(
+    Err(KernelRefusal::input(
+        KernelStage::Classify,
+        "twist_closure",
+        format!(
         "{SWEEP_TWIST_CLOSURE_REFUSAL}: the section comes back from one lap rolled about the path \
          by the requested {:.6}° (the frame's own roll, its holonomy, is closed separately by the \
          counter-twist), and a roll that does not carry the section onto itself leaves the last \
@@ -105,6 +112,7 @@ pub(super) fn closing_twist(
         requested.to_degrees(),
         below.to_degrees(),
         above.to_degrees(),
+        ),
     ))
 }
 
@@ -124,12 +132,16 @@ fn section_symmetry(
     axis_point: Vec3,
     axis: Vec3,
     floor: f64,
-) -> Result<Vec<usize>, String> {
+) -> Result<Vec<usize>, KernelRefusal> {
     use std::f64::consts::TAU;
     let count = section.len();
-    let axis = axis
-        .normalized()
-        .map_err(|_| "sweepSolid: the path tangent is degenerate at its start".to_string())?;
+    let axis = axis.normalized().map_err(|_| {
+        KernelRefusal::internal(
+            KernelStage::Classify,
+            "symmetry_axis",
+            "sweepSolid: the path tangent is degenerate at its start",
+        )
+    })?;
     let radial = |point: Vec3| {
         let offset = point.sub(axis_point);
         offset.sub(axis.scale(offset.dot(axis)))
@@ -139,7 +151,7 @@ fn section_symmetry(
     let mut farthest = (0, 0);
     for (curve_index, curve) in section.iter().enumerate() {
         for (control_index, control) in curve.control_points.iter().enumerate() {
-            let distance = radial(control.point()?).length();
+            let distance = radial(control.point().or_refuse(KernelStage::Classify, "control_point")?).length();
             if distance > reach {
                 reach = distance;
                 farthest = (curve_index, control_index);
@@ -178,13 +190,13 @@ fn section_symmetry(
                 continue 'shift;
             }
         }
-        let from = radial(section[farthest.0].control_points[farthest.1].point()?);
-        let to = radial(section[(farthest.0 + shift) % count].control_points[farthest.1].point()?);
+        let from = radial(section[farthest.0].control_points[farthest.1].point().or_refuse(KernelStage::Classify, "control_point")?);
+        let to = radial(section[(farthest.0 + shift) % count].control_points[farthest.1].point().or_refuse(KernelStage::Classify, "control_point")?);
         let angle = axis.dot(from.cross(to)).atan2(from.dot(to)).rem_euclid(TAU);
         for index in 0..count {
             let (a, b) = (&section[index], &section[(index + shift) % count]);
             for (x, y) in a.control_points.iter().zip(&b.control_points) {
-                if rotate(x.point()?, angle).sub(y.point()?).length() > floor {
+                if rotate(x.point().or_refuse(KernelStage::Classify, "control_point")?, angle).sub(y.point().or_refuse(KernelStage::Classify, "control_point")?).length() > floor {
                     continue 'shift;
                 }
             }

@@ -75,7 +75,8 @@
 //! Everything here RECORDS. Nothing here widens a band. See
 //! [`crate::MeasuredTolerance`]'s "direction rule".
 
-use crate::topology::{adaptive_coedge_error, EdgeRecord};
+use crate::{KernelRefusal, KernelStage, OrRefuse};
+use crate::topology::{coedge_error_floored, EdgeRecord};
 use crate::{MeasuredTolerance, NurbsCurve, NurbsSurface, OffsetEvaluator, OffsetNormal, Vec3};
 
 /// The grid used by [`measure_surface_fit_against_pointwise_offset`], and the
@@ -108,8 +109,8 @@ pub fn measure_edge_against_pcurve_image(
     edge: &EdgeRecord,
     forward: bool,
     band: f64,
-) -> Result<MeasuredTolerance, String> {
-    let adaptive = adaptive_coedge_error(surface, pcurve, &edge.curve, edge, forward, band)?;
+) -> Result<MeasuredTolerance, KernelRefusal> {
+    let adaptive = coedge_error_floored(surface, pcurve, &edge.curve, edge, forward, band).or_refuse(KernelStage::Validate, "coedge_error_floored")?;
     let spans = span_midpoint_error(surface, pcurve, edge, forward)?;
     Ok(MeasuredTolerance::new(adaptive.max(spans), band))
 }
@@ -129,12 +130,12 @@ pub fn span_midpoint_error(
     pcurve: &NurbsCurve,
     edge: &EdgeRecord,
     forward: bool,
-) -> Result<f64, String> {
+) -> Result<f64, KernelRefusal> {
     let span = edge.t1 - edge.t0;
     if !span.is_finite() || span.abs() <= 0.0 {
         return Ok(0.0);
     }
-    let [q0, q1] = pcurve.domain()?;
+    let [q0, q1] = pcurve.domain().or_refuse(KernelStage::Validate, "domain")?;
     // Distinct interior breakpoints of the curve, clipped to the edge's own
     // parameter range. Repeated knots (a degree-1 curve clamps its ends) collapse
     // to one, so a span is a real interval and its midpoint a real interior point.
@@ -161,9 +162,9 @@ pub fn span_midpoint_error(
         } else {
             (edge.t1 - midpoint) / span
         };
-        let uv = pcurve.evaluate(q0 + (q1 - q0) * fraction)?;
-        let on_surface = surface.evaluate_extended(uv.x, uv.y)?;
-        let on_curve = edge.curve.evaluate(midpoint)?;
+        let uv = pcurve.evaluate(q0 + (q1 - q0) * fraction).or_refuse(KernelStage::Validate, "evaluate")?;
+        let on_surface = surface.evaluate_extended(uv.x, uv.y).or_refuse(KernelStage::Validate, "evaluate_extended")?;
+        let on_curve = edge.curve.evaluate(midpoint).or_refuse(KernelStage::Validate, "evaluate")?;
         worst = worst.max(on_surface.sub(on_curve).length());
     }
     Ok(worst)
@@ -190,14 +191,14 @@ pub fn measure_surface_fit_against_pointwise_offset(
     fitted: &NurbsSurface,
     distance: f64,
     band: f64,
-) -> Result<MeasuredTolerance, String> {
+) -> Result<MeasuredTolerance, KernelRefusal> {
     let evaluator = OffsetEvaluator::new(
         "measure_offset_fit",
         source,
         OffsetNormal::FaceStable { same_sense },
     );
-    let [u0, u1] = source.domain_u()?;
-    let [v0, v1] = source.domain_v()?;
+    let [u0, u1] = source.domain_u().or_refuse(KernelStage::Validate, "domain_u")?;
+    let [v0, v1] = source.domain_v().or_refuse(KernelStage::Validate, "domain_v")?;
     let mut worst = 0.0f64;
     for iu in 0..FIT_SAMPLES {
         let u = u0 + (u1 - u0) * (iu as f64 + FIT_OFFSET_U) / FIT_SAMPLES as f64;
@@ -206,8 +207,8 @@ pub fn measure_surface_fit_against_pointwise_offset(
             // `offset_surface`'s positive distance moves OPPOSITE the face
             // normal while the evaluator's moves ALONG it; the negation is the
             // fit's own, repeated here verbatim rather than re-derived.
-            let want = evaluator.at(u, v, -distance)?.point;
-            let got = fitted.evaluate(u, v)?;
+            let want = evaluator.at(u, v, -distance).or_refuse(KernelStage::Validate, "at")?.point;
+            let got = fitted.evaluate(u, v).or_refuse(KernelStage::Validate, "evaluate")?;
             worst = worst.max(got.sub(want).length());
         }
     }

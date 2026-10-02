@@ -102,16 +102,22 @@ fn classify_fragment(
     // This never flips In<->Out; it only recovers the boundary verdict a
     // coplanar overlap should have produced.
     if let Some(on_normal) = classifier.coincident_on_normal(fragment.test_point).or_refuse(KernelStage::Select, "coincident_on_normal")? {
-        if debug {
-            eprintln!(
-                "frag src_face={} coincident-On rescue {:?} -> On",
-                fragment.source_face_id, primary.class
-            );
+        // Proximity to another face's interior does not establish surface
+        // coincidence: a thin transverse strip can lie entirely inside the
+        // noise band beside a cylinder. Only parallel tangent planes admit
+        // the broader On rescue; otherwise preserve the tight classification.
+        if face_normal(fragment)?.cross(on_normal).length() <= 1e-4 {
+            if debug {
+                eprintln!(
+                    "frag src_face={} coincident-On rescue {:?} -> On",
+                    fragment.source_face_id, primary.class
+                );
+            }
+            return Ok(crate::PointClassification {
+                class: PointClass::On,
+                on_normal: Some(on_normal),
+            });
         }
-        return Ok(crate::PointClassification {
-            class: PointClass::On,
-            on_normal: Some(on_normal),
-        });
     }
     if fragment.extra_test_points.is_empty() {
         return Ok(primary);
@@ -748,4 +754,5 @@ pub(super) fn select_fragments_nary(
     }
     Ok(selected)
 }
+
 

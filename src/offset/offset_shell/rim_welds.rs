@@ -1,3 +1,4 @@
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 
 /// A closed edge sampled as a circle: center, unit axis, radius. `None` when
@@ -8,14 +9,14 @@ pub(super) struct RimCircle {
     radius: f64,
 }
 
-pub(super) fn fit_rim_circle(edge: &EdgeRecord, tolerance: f64) -> Result<Option<RimCircle>, String> {
+pub(super) fn fit_rim_circle(edge: &EdgeRecord, tolerance: f64) -> Result<Option<RimCircle>, KernelRefusal> {
     let samples = 48;
     let mut points = Vec::with_capacity(samples);
     for index in 0..samples {
         let fraction = index as f64 / samples as f64;
         points.push(
             edge.curve
-                .evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction)?,
+                .evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction).or_refuse(KernelStage::Sew, "evaluate")?,
         );
     }
     let count = points.len() as f64;
@@ -71,17 +72,17 @@ pub(super) fn isoline_forward(
     pcurve: &crate::NurbsCurve,
     surface: &crate::NurbsSurface,
     curve: &crate::NurbsCurve,
-) -> Result<bool, String> {
+) -> Result<bool, KernelRefusal> {
     let mut deviation_forward = 0.0f64;
     let mut deviation_reversed = 0.0f64;
     for sample in 0..=32 {
         let fraction = sample as f64 / 32.0;
-        let uv = pcurve.evaluate(fraction)?;
-        let on_surface = surface.evaluate(uv.x, uv.y)?;
+        let uv = pcurve.evaluate(fraction).or_refuse(KernelStage::Sew, "evaluate")?;
+        let on_surface = surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Sew, "evaluate")?;
         deviation_forward =
-            deviation_forward.max(on_surface.sub(curve.evaluate(fraction)?).length());
+            deviation_forward.max(on_surface.sub(curve.evaluate(fraction).or_refuse(KernelStage::Sew, "evaluate")?).length());
         deviation_reversed =
-            deviation_reversed.max(on_surface.sub(curve.evaluate(1.0 - fraction)?).length());
+            deviation_reversed.max(on_surface.sub(curve.evaluate(1.0 - fraction).or_refuse(KernelStage::Sew, "evaluate")?).length());
     }
     Ok(deviation_forward <= deviation_reversed)
 }
@@ -95,16 +96,16 @@ pub(super) fn isoline_forward(
 pub(super) fn planar_surface_frame(
     surface: &crate::NurbsSurface,
     tolerance: f64,
-) -> Result<Option<(Vec3, Vec3)>, String> {
-    let [u0, u1] = surface.domain_u()?;
-    let [v0, v1] = surface.domain_v()?;
-    let origin = surface.evaluate((u0 + u1) * 0.5, (v0 + v1) * 0.5)?;
+) -> Result<Option<(Vec3, Vec3)>, KernelRefusal> {
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Sew, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Sew, "domain_v")?;
+    let origin = surface.evaluate((u0 + u1) * 0.5, (v0 + v1) * 0.5).or_refuse(KernelStage::Sew, "evaluate")?;
     let mut points = Vec::new();
     for iu in 0..=6 {
         for iv in 0..=6 {
             let u = u0 + (u1 - u0) * iu as f64 / 6.0;
             let v = v0 + (v1 - v0) * iv as f64 / 6.0;
-            points.push(surface.evaluate(u, v)?);
+            points.push(surface.evaluate(u, v).or_refuse(KernelStage::Sew, "evaluate")?);
         }
     }
     // A summed cross product cancels on rotationally sampled grids (the
@@ -137,8 +138,8 @@ pub(super) fn planar_surface_frame(
 
 /// Geometric planarity: whether every sampled surface point lies on one plane
 /// within `tolerance`.
-pub(super) fn surface_is_planar(surface: &crate::NurbsSurface, tolerance: f64) -> Result<bool, String> {
-    if surface.is_affine()? {
+pub(super) fn surface_is_planar(surface: &crate::NurbsSurface, tolerance: f64) -> Result<bool, KernelRefusal> {
+    if surface.is_affine().or_refuse(KernelStage::Sew, "is_affine")? {
         return Ok(true);
     }
     Ok(planar_surface_frame(surface, tolerance)?.is_some())
@@ -175,7 +176,7 @@ pub(super) fn weld_coplanar_rim_pair_annuli(
     solid: &mut BrepSolid,
     face_images: &mut Vec<OffsetShellFaceImageRecord>,
     tolerance: f64,
-) -> Result<usize, String> {
+) -> Result<usize, KernelRefusal> {
     let use_counts = crate::topology::edge_use_counts(solid);
     let mut orphans = Vec::new();
     for edge in &solid.edges {
@@ -302,7 +303,7 @@ pub(super) fn weld_coplanar_rim_pair_annuli(
                     .saturating_sub(1) as usize,
             )
             .map(|image| image.source_face_id)
-            .ok_or_else(|| "offset_shell: rim pair owner lost provenance".to_string())?;
+            .ok_or_else(|| "offset_shell: rim pair owner lost provenance".to_string()).or_refuse(KernelStage::Sew, "offset_shell_rim_pair_owner_lost_provenance")?;
         // Exactness upgrade with full fallback: swap each fitted-polyline rim
         // for its owner surface's exact isoline where possible, so the
         // annulus trims (and the shell's volume) are exact, not chord-sagged.
@@ -333,7 +334,7 @@ pub(super) fn weld_coplanar_rim_pair_annuli(
         let Ok(u_direction) = axis.perpendicular() else {
             continue;
         };
-        let v_direction = axis.cross(u_direction).normalized()?;
+        let v_direction = axis.cross(u_direction).normalized().or_refuse(KernelStage::Sew, "normalized")?;
         let extent = outer_circle.radius * 3.0;
         let plane = crate::make_plane(
             outer_circle
@@ -344,7 +345,7 @@ pub(super) fn weld_coplanar_rim_pair_annuli(
             v_direction,
             extent,
             extent,
-        )?;
+        ).or_refuse(KernelStage::Sew, "make_plane")?;
         // Manifold rule: the annulus traces each rim opposite its single use.
         let Some(outer_pcurve) = boundary_pcurve(outer_edge, !outer_forward, &plane, tolerance)?
         else {
@@ -382,8 +383,8 @@ pub(super) fn weld_coplanar_rim_pair_annuli(
                 name: None,
             })
         };
-        let outer_area = loop_area(&outer_pcurve, outer_edge.id, !outer_forward)?;
-        let mut inner_area = loop_area(&inner_pcurve, inner_edge.id, !inner_forward)?;
+        let outer_area = loop_area(&outer_pcurve, outer_edge.id, !outer_forward).or_refuse(KernelStage::Sew, "loop_area")?;
+        let mut inner_area = loop_area(&inner_pcurve, inner_edge.id, !inner_forward).or_refuse(KernelStage::Sew, "loop_area")?;
         let mut inner_wall_forward = !inner_forward;
         if outer_area.signum() == inner_area.signum() {
             // The two owning components disagree about their global sense.
@@ -407,8 +408,8 @@ pub(super) fn weld_coplanar_rim_pair_annuli(
             }
             inner_wall_forward = inner_forward;
             inner_pcurve = boundary_pcurve(inner_edge, inner_wall_forward, &plane, tolerance)?
-                .ok_or_else(|| "offset_shell: annulus inner rim left its plane".to_string())?;
-            inner_area = loop_area(&inner_pcurve, inner_edge.id, inner_wall_forward)?;
+                .ok_or_else(|| "offset_shell: annulus inner rim left its plane".to_string()).or_refuse(KernelStage::Sew, "offset_shell_annulus_inner_rim_left_its")?;
+            inner_area = loop_area(&inner_pcurve, inner_edge.id, inner_wall_forward).or_refuse(KernelStage::Sew, "loop_area")?;
             if outer_area.signum() == inner_area.signum() {
                 os_debug!("PAIR skip: inner-component flip did not fix the winding");
                 continue;
@@ -511,18 +512,18 @@ pub(super) fn weld_coplanar_rim_pair_annuli(
 pub(super) fn claim_bore_end_rings(
     solid: &BrepSolid,
     face_images: &mut [OffsetShellFaceImageRecord],
-) -> Result<usize, String> {
+) -> Result<usize, KernelRefusal> {
     let faces = solid
         .shells
         .iter()
         .flat_map(|shell| &shell.faces)
         .collect::<Vec<_>>();
     if faces.len() != face_images.len() {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Sew, "offset_shell_provenance_count", format!(
             "offset_shell: {} faces but {} provenance records",
             faces.len(),
             face_images.len()
-        ));
+        )));
     }
     let mut users = HashMap::<u64, Vec<usize>>::default();
     for (index, face) in faces.iter().enumerate() {
@@ -543,7 +544,7 @@ pub(super) fn claim_bore_end_rings(
                 same_sense: true,
                 loops: vec![loop_record.clone()],
                 name: None,
-            })?
+            }).or_refuse(KernelStage::Sew, "parameter_space_area")?
             .abs();
         }
         let inner = usize::from(areas[1] < areas[0]);
@@ -662,12 +663,12 @@ impl RimBandOutcome {
 }
 
 /// Where two edge curves coincide geometrically: `Some(reversed)`.
-fn same_edge_geometry(first: &EdgeRecord, second: &EdgeRecord, tolerance: f64) -> Result<Option<bool>, String> {
-    let ends = |edge: &EdgeRecord| -> Result<[Vec3; 3], String> {
+fn same_edge_geometry(first: &EdgeRecord, second: &EdgeRecord, tolerance: f64) -> Result<Option<bool>, KernelRefusal> {
+    let ends = |edge: &EdgeRecord| -> Result<[Vec3; 3], KernelRefusal> {
         Ok([
-            edge.curve.evaluate(edge.t0)?,
-            edge.curve.evaluate((edge.t0 + edge.t1) * 0.5)?,
-            edge.curve.evaluate(edge.t1)?,
+            edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Sew, "evaluate")?,
+            edge.curve.evaluate((edge.t0 + edge.t1) * 0.5).or_refuse(KernelStage::Sew, "evaluate")?,
+            edge.curve.evaluate(edge.t1).or_refuse(KernelStage::Sew, "evaluate")?,
         ])
     };
     let [a0, am, a1] = ends(first)?;
@@ -716,7 +717,7 @@ pub(super) fn weld_free_form_rim_bands(
     carriers: &[Carrier],
     source: &BrepSolid,
     tolerance: f64,
-) -> Result<RimBandOutcome, String> {
+) -> Result<RimBandOutcome, KernelRefusal> {
     let mut residuals = RimBandResiduals::default();
     let use_counts = crate::topology::edge_use_counts(solid);
     let one_use = solid
@@ -783,19 +784,19 @@ pub(super) fn weld_free_form_rim_bands(
             // inside the source along part of the rim and outside along the
             // rest, which is the MIXED rim. Anything else is the miter two
             // retained faces' offsets cut into each other's images.
-            let point = image.curve.evaluate((image.t0 + image.t1) * 0.5)?;
+            let point = image.curve.evaluate((image.t0 + image.t1) * 0.5).or_refuse(KernelStage::Sew, "evaluate")?;
             let on_opening = [image.t0, image.t1]
                 .into_iter()
                 .map(|parameter| {
-                    let end = image.curve.evaluate(parameter)?;
+                    let end = image.curve.evaluate(parameter).or_refuse(KernelStage::Sew, "evaluate")?;
                     let mut nearest = f64::INFINITY;
                     for carrier in carriers.iter().filter(|carrier| matches!(carrier.kind, OffsetFaceRole::Wall)) {
                         let opening = &carrier.solid.shells[0].faces[0];
-                        nearest = nearest.min(project_point_to_surface(&opening.surface, end)?.distance);
+                        nearest = nearest.min(project_point_to_surface(&opening.surface, end).or_refuse(KernelStage::Sew, "project_point_to_surface")?.distance);
                     }
                     Ok(nearest)
                 })
-                .collect::<Result<Vec<_>, String>>()?
+                .collect::<Result<Vec<_>, KernelRefusal>>()?
                 .into_iter()
                 .fold(f64::INFINITY, f64::min);
             let reason = if on_opening <= tolerance {
@@ -821,10 +822,10 @@ pub(super) fn weld_free_form_rim_bands(
         let Some(face) = source_face(carriers[carrier_index].source_face_id) else {
             return Ok(RimBandOutcome::default());
         };
-        let [q0, q1] = pcurve.domain()?;
-        let at = |q: f64| -> Result<Vec3, String> {
-            let uv = pcurve.evaluate(q)?;
-            face.surface.evaluate(uv.x, uv.y)
+        let [q0, q1] = pcurve.domain().or_refuse(KernelStage::Sew, "domain")?;
+        let at = |q: f64| -> Result<Vec3, KernelRefusal> {
+            let uv = pcurve.evaluate(q).or_refuse(KernelStage::Sew, "evaluate")?;
+            face.surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Sew, "evaluate")
         };
         let (start, middle, end) = (at(q0)?, at((q0 + q1) * 0.5)?, at(q1)?);
         let mut rim = None;
@@ -832,10 +833,10 @@ pub(super) fn weld_free_form_rim_bands(
             if edge.degenerate || use_counts.get(&edge.id).copied().unwrap_or(0) != 2 {
                 continue;
             }
-            let (a, b) = (edge.curve.evaluate(edge.t0)?, edge.curve.evaluate(edge.t1)?);
+            let (a, b) = (edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Sew, "evaluate")?, edge.curve.evaluate(edge.t1).or_refuse(KernelStage::Sew, "evaluate")?);
             let ends_match = (a.sub(start).length() <= tolerance && b.sub(end).length() <= tolerance)
                 || (a.sub(end).length() <= tolerance && b.sub(start).length() <= tolerance);
-            if ends_match && crate::project_point_to_curve(&edge.curve, middle)?.distance <= tolerance {
+            if ends_match && crate::project_point_to_curve(&edge.curve, middle).or_refuse(KernelStage::Sew, "project_point_to_curve")?.distance <= tolerance {
                 rim = Some(edge.id);
                 break;
             }
@@ -875,7 +876,7 @@ pub(super) fn weld_free_form_rim_bands(
             .iter()
             .flat_map(|shell| &shell.faces)
             .find(|face| face.id == *cap_id)
-            .ok_or_else(|| "offset_shell: rim band cap vanished".to_string())?;
+            .ok_or_else(|| "offset_shell: rim band cap vanished".to_string()).or_refuse(KernelStage::Sew, "offset_shell_rim_band_cap_vanished")?;
         if cap.loops.len() != 1
             || !cap.loops[0]
                 .coedges
@@ -887,21 +888,23 @@ pub(super) fn weld_free_form_rim_bands(
         }
     }
 
-    let vertex_point = |solid: &BrepSolid, id: u64| -> Result<Vec3, String> {
+    let vertex_point = |solid: &BrepSolid, id: u64| -> Result<Vec3, KernelRefusal> {
         solid
             .vertices
             .iter()
             .find(|vertex| vertex.id == id)
             .map(|vertex| vertex.point)
             .ok_or_else(|| format!("offset_shell: rim band vertex {id} missing"))
+            .or_refuse(KernelStage::Sew, "offset_shell_rim_band_vertex_missing")
     };
-    let edge_record = |solid: &BrepSolid, id: u64| -> Result<EdgeRecord, String> {
+    let edge_record = |solid: &BrepSolid, id: u64| -> Result<EdgeRecord, KernelRefusal> {
         solid
             .edges
             .iter()
             .find(|edge| edge.id == id)
             .cloned()
             .ok_or_else(|| format!("offset_shell: rim band edge {id} missing"))
+            .or_refuse(KernelStage::Sew, "offset_shell_rim_band_edge_missing")
     };
 
     // A rim vertex's images from its two faces must be ONE vertex of the chain.
@@ -929,7 +932,7 @@ pub(super) fn weld_free_form_rim_bands(
                         edge.end_vertex_id
                     })
                 })
-                .collect::<Result<Vec<_>, String>>()?;
+                .collect::<Result<Vec<_>, KernelRefusal>>()?;
             if image_vertices.len() == 2 && image_vertices[0] != image_vertices[1] {
                 let gap = vertex_point(solid, image_vertices[0])?
                     .sub(vertex_point(solid, image_vertices[1])?)
@@ -964,7 +967,7 @@ pub(super) fn weld_free_form_rim_bands(
     let mut bands: Vec<(u64, FaceRecord)> = Vec::new();
     for pair in &pairs {
         let face = source_face(carriers[pair.carrier].source_face_id)
-            .ok_or_else(|| "offset_shell: rim band source face vanished".to_string())?;
+            .ok_or_else(|| "offset_shell: rim band source face vanished".to_string()).or_refuse(KernelStage::Sew, "offset_shell_rim_band_source_face_vanished")?;
         let carrier_surface = &carriers[pair.carrier].solid.shells[0].faces[0].surface;
         let (rim_sheet, image_sheet) =
             crate::offset::unify_offset_sheet_bases(&face.surface, carrier_surface)?;
@@ -974,7 +977,7 @@ pub(super) fn weld_free_form_rim_bands(
             &pair.pcurve,
             fit_tolerance,
             "offsetShell rim band",
-        )?;
+        ).or_refuse(KernelStage::Sew, "image_curve_pair")?;
         let shared = rail.curve.degree == image_rail.curve.degree
             && rail.curve.knots.len() == image_rail.curve.knots.len()
             && rail.curve.knots.iter().zip(&image_rail.curve.knots).all(|(a, b)| (a - b).abs() <= 1e-12)
@@ -987,7 +990,7 @@ pub(super) fn weld_free_form_rim_bands(
             && (rail.t0 - image_rail.t0).abs() <= 1e-12
             && (rail.t1 - image_rail.t1).abs() <= 1e-12;
         if !shared {
-            return Err("offset_shell: a rim band's two rails do not share a basis".into());
+            return Err(KernelRefusal::internal(KernelStage::Sew, "offset_shell_rim_band_basis", "offset_shell: a rim band's two rails do not share a basis"));
         }
         let band = crate::NurbsSurface::new(
             rail.curve.degree,
@@ -1000,28 +1003,28 @@ pub(super) fn weld_free_form_rim_bands(
                 .zip(&image_rail.curve.control_points)
                 .map(|(a, b)| vec![*a, *b])
                 .collect(),
-        )?;
+        ).or_refuse(KernelStage::Sew, "new")?;
         let (s_a, s_b) = (rail.t0, rail.t1);
         let rim = edge_record(solid, pair.rim)?;
         let image = edge_record(solid, pair.image)?;
-        let nearest = |solid: &BrepSolid, edge: &EdgeRecord, point: Vec3| -> Result<u64, String> {
+        let nearest = |solid: &BrepSolid, edge: &EdgeRecord, point: Vec3| -> Result<u64, KernelRefusal> {
             let start = vertex_point(solid, edge.start_vertex_id)?.sub(point).length();
             let end = vertex_point(solid, edge.end_vertex_id)?.sub(point).length();
             Ok(if start <= end { edge.start_vertex_id } else { edge.end_vertex_id })
         };
-        let rim_a = nearest(solid, &rim, band.evaluate(s_a, 0.0)?)?;
-        let rim_b = nearest(solid, &rim, band.evaluate(s_b, 0.0)?)?;
-        let image_a = nearest(solid, &image, band.evaluate(s_a, 1.0)?)?;
-        let image_b = nearest(solid, &image, band.evaluate(s_b, 1.0)?)?;
+        let rim_a = nearest(solid, &rim, band.evaluate(s_a, 0.0).or_refuse(KernelStage::Sew, "evaluate")?)?;
+        let rim_b = nearest(solid, &rim, band.evaluate(s_b, 0.0).or_refuse(KernelStage::Sew, "evaluate")?)?;
+        let image_a = nearest(solid, &image, band.evaluate(s_a, 1.0).or_refuse(KernelStage::Sew, "evaluate")?)?;
+        let image_b = nearest(solid, &image, band.evaluate(s_b, 1.0).or_refuse(KernelStage::Sew, "evaluate")?)?;
         if rim_a == rim_b || image_a == image_b {
-            return Err("offset_shell: a closed rim needs a seam this rim band does not build".into());
+            return Err(KernelRefusal::unsupported(KernelStage::Sew, "offset_shell_rim_band_seam", "offset_shell: a closed rim needs a seam this rim band does not build"));
         }
         for (s, t, vertex) in [(s_a, 0.0, rim_a), (s_b, 0.0, rim_b), (s_a, 1.0, image_a), (s_b, 1.0, image_b)] {
             residuals.endpoint = residuals
                 .endpoint
-                .max(band.evaluate(s, t)?.sub(vertex_point(solid, vertex)?).length());
+                .max(band.evaluate(s, t).or_refuse(KernelStage::Sew, "evaluate")?.sub(vertex_point(solid, vertex)?).length());
         }
-        let mut ruling = |from: u64, to: u64| -> Result<u64, String> {
+        let mut ruling = |from: u64, to: u64| -> Result<u64, KernelRefusal> {
             if let Some(id) = rulings.get(&(from, to)) {
                 return Ok(*id);
             }
@@ -1029,7 +1032,7 @@ pub(super) fn weld_free_form_rim_bands(
             next_edge_id += 1;
             new_edges.push(EdgeRecord {
                 id,
-                curve: crate::make_line(vertex_point(solid, from)?, vertex_point(solid, to)?)?,
+                curve: crate::make_line(vertex_point(solid, from)?, vertex_point(solid, to)?).or_refuse(KernelStage::Sew, "make_line")?,
                 t0: 0.0,
                 t1: 1.0,
                 start_vertex_id: from,
@@ -1045,12 +1048,12 @@ pub(super) fn weld_free_form_rim_bands(
         let line = |u0: f64, v0: f64, u1: f64, v1: f64| {
             crate::make_line(Vec3::new(u0, v0, 0.0), Vec3::new(u1, v1, 0.0))
         };
-        let starts_at = |edge: &EdgeRecord, point: Vec3| -> Result<bool, String> {
-            Ok(edge.curve.evaluate(edge.t0)?.sub(point).length()
-                <= edge.curve.evaluate(edge.t1)?.sub(point).length())
+        let starts_at = |edge: &EdgeRecord, point: Vec3| -> Result<bool, KernelRefusal> {
+            Ok(edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Sew, "evaluate")?.sub(point).length()
+                <= edge.curve.evaluate(edge.t1).or_refuse(KernelStage::Sew, "evaluate")?.sub(point).length())
         };
-        let rim_forward = starts_at(&rim, band.evaluate(s_a, 0.0)?)?;
-        let image_forward = starts_at(&image, band.evaluate(s_b, 1.0)?)?;
+        let rim_forward = starts_at(&rim, band.evaluate(s_a, 0.0).or_refuse(KernelStage::Sew, "evaluate")?)?;
+        let image_forward = starts_at(&image, band.evaluate(s_b, 1.0).or_refuse(KernelStage::Sew, "evaluate")?)?;
         let mut coedge = |edge_id: u64, forward: bool, pcurve: crate::NurbsCurve| {
             let record = CoedgeRecord {
                 id: next_coedge_id,
@@ -1062,10 +1065,10 @@ pub(super) fn weld_free_form_rim_bands(
             record
         };
         let coedges = vec![
-            coedge(rim.id, rim_forward, line(s_a, 0.0, s_b, 0.0)?),
-            coedge(ruling_b, true, line(s_b, 0.0, s_b, 1.0)?),
-            coedge(image.id, image_forward, line(s_b, 1.0, s_a, 1.0)?),
-            coedge(ruling_a, false, line(s_a, 1.0, s_a, 0.0)?),
+            coedge(rim.id, rim_forward, line(s_a, 0.0, s_b, 0.0).or_refuse(KernelStage::Sew, "line")?),
+            coedge(ruling_b, true, line(s_b, 0.0, s_b, 1.0).or_refuse(KernelStage::Sew, "line")?),
+            coedge(image.id, image_forward, line(s_b, 1.0, s_a, 1.0).or_refuse(KernelStage::Sew, "line")?),
+            coedge(ruling_a, false, line(s_a, 1.0, s_a, 0.0).or_refuse(KernelStage::Sew, "line")?),
         ];
         let mut band_face = FaceRecord {
             id: 0,
@@ -1074,7 +1077,7 @@ pub(super) fn weld_free_form_rim_bands(
             loops: vec![LoopRecord { id: 1, coedges }],
             name: None,
         };
-        if parameter_space_area(&band_face)? < 0.0 {
+        if parameter_space_area(&band_face).or_refuse(KernelStage::Sew, "parameter_space_area")? < 0.0 {
             band_face.same_sense = false;
         }
         bands.push((pair.cap_face, band_face));
@@ -1103,11 +1106,11 @@ pub(super) fn weld_free_form_rim_bands(
         residuals.bar
     );
     if residuals.endpoint > residuals.bar || residuals.edge_to_carrier > residuals.bar {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Sew, "offset_shell_rim_band_miss", format!(
             "offset_shell: a ruled rim band misses its edges (endpoint {:.3e}, edge-to-band {:.3e}) \
              past twice the intersection-fit contract {:.3e}",
             residuals.endpoint, residuals.edge_to_carrier, residuals.bar
-        ));
+        )));
     }
 
     // Commit: each cap gives way to its bands, in the cap's shell, and the shells
@@ -1120,7 +1123,7 @@ pub(super) fn weld_free_form_rim_bands(
     };
     let mut unions = Vec::new();
     for pair in &pairs {
-        let cap_shell = shell_of(solid, pair.cap_face).ok_or_else(|| "offset_shell: cap shell missing".to_string())?;
+        let cap_shell = shell_of(solid, pair.cap_face).ok_or_else(|| "offset_shell: cap shell missing".to_string()).or_refuse(KernelStage::Sew, "offset_shell_cap_shell_missing")?;
         for edge_id in [pair.rim, pair.image] {
             for face_id in faces_using(solid, edge_id) {
                 if let Some(shell) = shell_of(solid, face_id) {
@@ -1133,11 +1136,11 @@ pub(super) fn weld_free_form_rim_bands(
     }
     let welded = bands.len();
     for (cap_id, mut band) in bands {
-        let cap_shell = shell_of(solid, cap_id).ok_or_else(|| "offset_shell: cap shell missing".to_string())?;
+        let cap_shell = shell_of(solid, cap_id).ok_or_else(|| "offset_shell: cap shell missing".to_string()).or_refuse(KernelStage::Sew, "offset_shell_cap_shell_missing")?;
         let cap_source = face_images
             .get(cap_id.saturating_sub(1) as usize)
             .map(|image| image.source_face_id)
-            .ok_or_else(|| "offset_shell: cap provenance missing".to_string())?;
+            .ok_or_else(|| "offset_shell: cap provenance missing".to_string()).or_refuse(KernelStage::Sew, "offset_shell_cap_provenance_missing")?;
         band.id = face_images.len() as u64 + 1;
         face_images.push(OffsetShellFaceImageRecord {
             role: OffsetFaceRole::Wall,

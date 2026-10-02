@@ -1,4 +1,5 @@
 use super::*;
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 
 #[path = "face_offset_plan.rs"]
 mod plan;
@@ -44,7 +45,7 @@ fn offset_ruled_carrier(
     surface: &NurbsSurface,
     signed_distance: f64,
     tolerance: f64,
-) -> Result<NurbsSurface, String> {
+) -> Result<NurbsSurface, KernelRefusal> {
     let Some(AnalyticSurface::RuledRevolution {
         frame,
         rho0,
@@ -52,7 +53,11 @@ fn offset_ruled_carrier(
         height,
     }) = surface.analytic()
     else {
-        return Err("offset_ruled_carrier: face carrier is not a ruled revolution".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Classify,
+            "carrier_kind",
+            "offset_ruled_carrier: face carrier is not a ruled revolution",
+        ));
     };
     let (frame, rho0, rho1, height) = (frame.clone(), *rho0, *rho1, *height);
     let slope = (rho1 - rho0) / height;
@@ -60,9 +65,11 @@ fn offset_ruled_carrier(
     let rho0_new = rho0 + grow;
     let rho1_new = rho1 + grow;
     if rho0_new <= tolerance || rho1_new <= tolerance {
-        return Err(
-            "offset (push): the ruled carrier collapses to or past its axis — refusing".into(),
-        );
+        return Err(KernelRefusal::input(
+            KernelStage::Classify,
+            "axis_collapse",
+            "offset (push): the ruled carrier collapses to or past its axis — refusing",
+        ));
     }
     // Revolve the grown generatrix over the SAME axial span + seam azimuth.
     let start = frame.origin.add(frame.x_axis.scale(rho0_new));
@@ -70,18 +77,19 @@ fn offset_ruled_carrier(
         .origin
         .add(frame.axis.scale(height))
         .add(frame.x_axis.scale(rho1_new));
-    let generatrix = make_line(start, end)?;
+    let generatrix = make_line(start, end).or_refuse(KernelStage::Classify, "make_line")?;
     make_revolution(frame.origin, frame.axis, &generatrix, std::f64::consts::TAU)
+        .or_refuse(KernelStage::Classify, "make_revolution")
 }
 
 /// The face's OUTWARD unit normal at its parameter-domain midpoint, oriented by
 /// `same_sense` (the convention `push_face::planar_face_normal` uses).
-fn outward_normal_mid(face: &FaceRecord) -> Result<(Vec3, Vec3), String> {
-    let [u0, u1] = face.surface.domain_u()?;
-    let [v0, v1] = face.surface.domain_v()?;
+fn outward_normal_mid(face: &FaceRecord) -> Result<(Vec3, Vec3), KernelRefusal> {
+    let [u0, u1] = face.surface.domain_u().or_refuse(KernelStage::Classify, "domain_u")?;
+    let [v0, v1] = face.surface.domain_v().or_refuse(KernelStage::Classify, "domain_v")?;
     let (um, vm) = (0.5 * (u0 + u1), 0.5 * (v0 + v1));
-    let point = face.surface.evaluate(um, vm)?;
-    let mut normal = face.surface.normal(um, vm)?;
+    let point = face.surface.evaluate(um, vm).or_refuse(KernelStage::Classify, "evaluate")?;
+    let mut normal = face.surface.normal(um, vm).or_refuse(KernelStage::Classify, "normal")?;
     if !face.same_sense {
         normal = normal.scale(-1.0);
     }
@@ -102,9 +110,13 @@ pub fn offset_ruled_face(
     solid: &BrepSolid,
     face_id: u64,
     distance: f64,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     if !distance.is_finite() {
-        return Err("offset_ruled_face: distance must be finite".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "distance",
+            "offset_ruled_face: distance must be finite",
+        ));
     }
     if let Some(directory) = census_directory() {
         record_push_census(&directory, solid, face_id, distance);
@@ -113,11 +125,20 @@ pub fn offset_ruled_face(
     let tolerance = (scale * 1e-7).max(1e-9);
     let plane_tolerance = (scale * 1e-6).max(1e-7);
 
-    let (pshell, pface) =
-        find_face(solid, face_id).ok_or_else(|| format!("offset_ruled_face: no face {face_id}"))?;
+    let (pshell, pface) = find_face(solid, face_id).ok_or_else(|| {
+        KernelRefusal::input(
+            KernelStage::Collect,
+            "face_id",
+            format!("offset_ruled_face: no face {face_id}"),
+        )
+    })?;
     let pushed = &solid.shells[pshell].faces[pface];
     let Some(AnalyticSurface::RuledRevolution { frame, .. }) = pushed.surface.analytic() else {
-        return Err("offset_ruled_face: the pushed face is not a cylinder or cone".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "not_ruled",
+            "offset_ruled_face: the pushed face is not a cylinder or cone",
+        ));
     };
     let (frame_origin, frame_axis) = (frame.origin, frame.axis);
 
@@ -130,7 +151,11 @@ pub fn offset_ruled_face(
         d.sub(frame_axis.scale(d.dot(frame_axis)))
     };
     if radial.length() <= tolerance {
-        return Err("offset_ruled_face: degenerate radial direction (face on the axis)".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Classify,
+            "radial_direction",
+            "offset_ruled_face: degenerate radial direction (face on the axis)",
+        ));
     }
     let outward_sign = if mid_normal.dot(radial) >= 0.0 { 1.0 } else { -1.0 };
     let signed_distance = distance * outward_sign;
@@ -245,7 +270,13 @@ pub fn offset_ruled_face(
             let coedge = &loop_record.coedges[coedge_index];
             let edge = *edge_by_id
                 .get(&coedge.edge_id)
-                .ok_or_else(|| format!("offset_ruled_face: missing edge {}", coedge.edge_id))?;
+                .ok_or_else(|| {
+                    KernelRefusal::internal(
+                        KernelStage::Classify,
+                        "missing_edge",
+                        format!("offset_ruled_face: missing edge {}", coedge.edge_id),
+                    )
+                })?;
             if hole_edges.contains(&edge.id) {
                 continue; // rebuilt whole, by the pre-pass above.
             }
@@ -280,9 +311,20 @@ pub fn offset_ruled_face(
             let neighbour = *incident
                 .iter()
                 .find(|f| **f != face_id)
-                .ok_or_else(|| format!("offset_ruled_face: edge {} has no neighbour", edge.id))?;
-            let (nshell, nface) = find_face(solid, neighbour)
-                .ok_or_else(|| format!("offset_ruled_face: missing neighbour {neighbour}"))?;
+                .ok_or_else(|| {
+                    KernelRefusal::internal(
+                        KernelStage::Classify,
+                        "no_neighbour",
+                        format!("offset_ruled_face: edge {} has no neighbour", edge.id),
+                    )
+                })?;
+            let (nshell, nface) = find_face(solid, neighbour).ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Classify,
+                    "missing_neighbour",
+                    format!("offset_ruled_face: missing neighbour {neighbour}"),
+                )
+            })?;
             let neighbour_surface = &solid.shells[nshell].faces[nface].surface;
             let is_plane =
                 matches!(neighbour_surface.analytic(), Some(AnalyticSurface::Plane { .. }));
@@ -290,21 +332,28 @@ pub fn offset_ruled_face(
                 ruled_neighbour_is_coaxial(neighbour_surface, frame_origin, frame_axis, scale);
             let is_curved = !is_plane && !is_coaxial_ruled;
             let separated = || {
-                "offset_ruled_face: the pushed carrier no longer meets a neighbour \
-                 (the push separated them, or the rim left the neighbour's domain) — refusing"
-                    .to_string()
+                KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "separated",
+                    "offset_ruled_face: the pushed carrier no longer meets a neighbour \
+                 (the push separated them, or the rim left the neighbour's domain) — refusing",
+                )
             };
             // New rim = offset carrier ∩ neighbour carrier, the branch nearest
             // the old edge.
-            let old_mid = edge.curve.evaluate(0.5 * (edge.t0 + edge.t1))?;
+            let old_mid = edge.curve.evaluate(0.5 * (edge.t0 + edge.t1)).or_refuse(KernelStage::Refine, "evaluate")?;
             let mut marched = false;
             let curves = if is_curved {
                 if edge.start_vertex_id != edge.end_vertex_id {
-                    return Err(format!(
+                    return Err(KernelRefusal::unsupported(
+                        KernelStage::Classify,
+                        "open_curved_rim",
+                        format!(
                         "offset_ruled_face: the rim against curved neighbour {neighbour} is an \
                          OPEN arc (edge {}); an arc's corner is a triple point solved against a \
                          PLANE only — deferred (refusing)",
                         edge.id
+                    ),
                     ));
                 }
                 let policy = MarchPolicy {
@@ -335,8 +384,21 @@ pub fn offset_ruled_face(
                         found.curves()
                     }
                     Err(ReintersectRefusal::Separated) => return Err(separated()),
+                    // A residual past the gate is the march declining its own answer; a
+                    // lower-level failure is a defect. Both keep the text they had.
+                    Err(other @ ReintersectRefusal::Residual { .. }) => {
+                        return Err(KernelRefusal::non_convergence(
+                            KernelStage::Refine,
+                            "reintersect_residual",
+                            format!("offset_ruled_face: {}", other.describe()),
+                        ));
+                    }
                     Err(other) => {
-                        return Err(format!("offset_ruled_face: {}", other.describe()));
+                        return Err(KernelRefusal::internal(
+                            KernelStage::Refine,
+                            "reintersect_failed",
+                            format!("offset_ruled_face: {}", other.describe()),
+                        ));
                     }
                 }
             } else {
@@ -373,10 +435,10 @@ pub fn offset_ruled_face(
                 // where its single vertex goes — the vertex is a bookkeeping
                 // split of a closed curve, not a geometric corner.
                 let seam_point = if marched {
-                    let [d0, _] = rim.domain()?;
-                    rim.evaluate(d0)?
+                    let [d0, _] = rim.domain().or_refuse(KernelStage::Refine, "domain")?;
+                    rim.evaluate(d0).or_refuse(KernelStage::Refine, "evaluate")?
                 } else {
-                    rim.evaluate(0.0)?
+                    rim.evaluate(0.0).or_refuse(KernelStage::Refine, "evaluate")?
                 };
                 new_vertex.insert(edge.start_vertex_id, seam_point);
                 new_vertex.insert(edge.end_vertex_id, seam_point);
@@ -399,17 +461,27 @@ pub fn offset_ruled_face(
                 };
                 let mut resolve = |adjacent_coedge: &CoedgeRecord,
                                    vertex_id: u64|
-                 -> Result<RimEnd, String> {
+                 -> Result<RimEnd, KernelRefusal> {
                     let adjacent = *edge_by_id.get(&adjacent_coedge.edge_id).ok_or_else(|| {
-                        format!(
+                        KernelRefusal::internal(
+                            KernelStage::Refine,
+                            "adjacent_edge",
+                            format!(
                             "offset_ruled_face: missing edge {}",
                             adjacent_coedge.edge_id
+                        ),
                         )
                     })?;
                     let old_point = vertex_pos
                         .get(&vertex_id)
                         .copied()
-                        .ok_or_else(|| format!("offset_ruled_face: missing vertex {vertex_id}"))?;
+                        .ok_or_else(|| {
+                            KernelRefusal::internal(
+                                KernelStage::Refine,
+                                "corner_vertex_pos",
+                                format!("offset_ruled_face: missing vertex {vertex_id}"),
+                            )
+                        })?;
                     let (end, point) = resolve_open_rim_end(
                         solid,
                         face_id,
@@ -424,11 +496,12 @@ pub fn offset_ruled_face(
                     // went to different roots, so refuse rather than tear.
                     match new_vertex.get(&vertex_id).copied() {
                         Some(existing) if existing.sub(point).length() > plane_tolerance => {
-                            return Err(
+                            return Err(KernelRefusal::internal(
+                                KernelStage::Refine,
+                                "corner_agreement",
                                 "offset_ruled_face: the two rims meeting at a multi-loop corner \
-                                 disagree on its new position — refusing"
-                                    .into(),
-                            )
+                                 disagree on its new position — refusing",
+                            ))
                         }
                         Some(_) => {}
                         None => {
@@ -474,8 +547,8 @@ pub fn offset_ruled_face(
     // rim is split at the carrier's own seam azimuth, so the vertex there
     // solves to parameter 0 while the arc it starts is `[0.9946, 1]`.
     for rim in &open_rims {
-        let [d0, d1] = rim.conic.domain()?;
-        let middle = project_point_to_curve(&rim.conic, rim.old_mid)?.u;
+        let [d0, d1] = rim.conic.domain().or_refuse(KernelStage::Fragment, "domain")?;
+        let middle = project_point_to_curve(&rim.conic, rim.old_mid).or_refuse(KernelStage::Fragment, "project_point_to_curve")?.u;
         let (a, b) = (rim.start.parameter(), rim.end.parameter());
         let (low, high) = if a <= b { (a, b) } else { (b, a) };
         if std::env::var("BREP_PUSH_HOLE_DEBUG").is_ok() {
@@ -502,23 +575,32 @@ pub fn offset_ruled_face(
             );
         }
         if let (RimEnd::Seam(_), RimEnd::Seam(_)) = (rim.start, rim.end) {
-            return Err(
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Fragment,
+                "seam_both_ends",
                 "offset_ruled_face: a multi-loop rim arc ends on the seam at BOTH ends — \
-                 refusing"
-                    .into(),
-            );
+                 refusing",
+            ));
         }
         let mut trimmed = rim_arc_between(&rim.conic, low, high, middle, tolerance)?;
         let start_point = *new_vertex.get(&rim.start_vertex_id).ok_or_else(|| {
-            "offset_ruled_face: a multi-loop rim corner was not relocated — refusing".to_string()
+            KernelRefusal::internal(
+                KernelStage::Fragment,
+                "corner_start_unrelocated",
+                "offset_ruled_face: a multi-loop rim corner was not relocated — refusing",
+            )
         })?;
         let end_point = *new_vertex.get(&rim.end_vertex_id).ok_or_else(|| {
-            "offset_ruled_face: a multi-loop rim corner was not relocated — refusing".to_string()
+            KernelRefusal::internal(
+                KernelStage::Fragment,
+                "corner_end_unrelocated",
+                "offset_ruled_face: a multi-loop rim corner was not relocated — refusing",
+            )
         })?;
-        let [t0, _] = trimmed.domain()?;
-        let head = trimmed.evaluate(t0)?;
+        let [t0, _] = trimmed.domain().or_refuse(KernelStage::Fragment, "domain")?;
+        let head = trimmed.evaluate(t0).or_refuse(KernelStage::Fragment, "evaluate")?;
         if head.sub(start_point).length() > head.sub(end_point).length() {
-            trimmed = trimmed.reversed()?;
+            trimmed = trimmed.reversed().or_refuse(KernelStage::Fragment, "reversed")?;
         }
         new_curve.insert(rim.edge_id, trimmed);
     }
@@ -555,16 +637,28 @@ pub fn offset_ruled_face(
     // full `iso_curve_u` meridian would wrongly span the untrimmed carrier (a
     // boolean-drilled wall's surface runs past the plate faces).
     for seam_id in &seam_edges {
-        let seam = *edge_by_id
-            .get(seam_id)
-            .ok_or_else(|| format!("offset_ruled_face: missing seam edge {seam_id}"))?;
+        let seam = *edge_by_id.get(seam_id).ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Fragment,
+                "missing_seam_edge",
+                format!("offset_ruled_face: missing seam edge {seam_id}"),
+            )
+        })?;
         let start = *new_vertex.get(&seam.start_vertex_id).ok_or_else(|| {
-            "offset_ruled_face: seam endpoint was not relocated by a rim — refusing".to_string()
+            KernelRefusal::internal(
+                KernelStage::Fragment,
+                "seam_start_unrelocated",
+                "offset_ruled_face: seam endpoint was not relocated by a rim — refusing",
+            )
         })?;
         let end = *new_vertex.get(&seam.end_vertex_id).ok_or_else(|| {
-            "offset_ruled_face: seam endpoint was not relocated by a rim — refusing".to_string()
+            KernelRefusal::internal(
+                KernelStage::Fragment,
+                "seam_end_unrelocated",
+                "offset_ruled_face: seam endpoint was not relocated by a rim — refusing",
+            )
         })?;
-        new_curve.insert(*seam_id, make_line(start, end)?);
+        new_curve.insert(*seam_id, make_line(start, end).or_refuse(KernelStage::Fragment, "make_line")?);
     }
 
     // A COAXIAL ruled neighbour also has its own straight seam meridian ending
@@ -573,12 +667,21 @@ pub fn offset_ruled_face(
     // rim vertex — which, both lying on the neighbour's straight generatrix, is
     // exactly the meridian segment.
     for ruled in &ruled_faces {
-        let (nshell, nface) = find_face(solid, *ruled)
-            .ok_or_else(|| format!("offset_ruled_face: missing ruled neighbour {ruled}"))?;
+        let (nshell, nface) = find_face(solid, *ruled).ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Fragment,
+                "missing_ruled_neighbour",
+                format!("offset_ruled_face: missing ruled neighbour {ruled}"),
+            )
+        })?;
         for loop_record in &solid.shells[nshell].faces[nface].loops {
             for coedge in &loop_record.coedges {
                 let edge = *edge_by_id.get(&coedge.edge_id).ok_or_else(|| {
-                    format!("offset_ruled_face: missing edge {}", coedge.edge_id)
+                    KernelRefusal::internal(
+                        KernelStage::Fragment,
+                        "ruled_seam_edge",
+                        format!("offset_ruled_face: missing edge {}", coedge.edge_id),
+                    )
                 })?;
                 let incident = faces_of_edge.get(&edge.id).cloned().unwrap_or_default();
                 let is_seam = incident.iter().all(|f| *f == *ruled);
@@ -587,7 +690,7 @@ pub fn offset_ruled_face(
                 if is_seam && touches_moved && !new_curve.contains_key(&edge.id) {
                     new_curve.insert(
                         edge.id,
-                        make_line(pos(edge.start_vertex_id), pos(edge.end_vertex_id))?,
+                        make_line(pos(edge.start_vertex_id), pos(edge.end_vertex_id)).or_refuse(KernelStage::Fragment, "make_line")?,
                     );
                 }
             }
@@ -604,12 +707,21 @@ pub fn offset_ruled_face(
     // sphere's is not.
     let mut new_range: HashMap<u64, (f64, f64)> = HashMap::default();
     for curved in &curved_faces {
-        let (nshell, nface) = find_face(solid, *curved)
-            .ok_or_else(|| format!("offset_ruled_face: missing curved neighbour {curved}"))?;
+        let (nshell, nface) = find_face(solid, *curved).ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Fragment,
+                "missing_curved_neighbour",
+                format!("offset_ruled_face: missing curved neighbour {curved}"),
+            )
+        })?;
         for loop_record in &solid.shells[nshell].faces[nface].loops {
             for coedge in &loop_record.coedges {
                 let edge = *edge_by_id.get(&coedge.edge_id).ok_or_else(|| {
-                    format!("offset_ruled_face: missing edge {}", coedge.edge_id)
+                    KernelRefusal::internal(
+                        KernelStage::Fragment,
+                        "curved_neighbour_edge",
+                        format!("offset_ruled_face: missing edge {}", coedge.edge_id),
+                    )
                 })?;
                 if new_curve.contains_key(&edge.id) || new_range.contains_key(&edge.id) {
                     continue;
@@ -624,21 +736,29 @@ pub fn offset_ruled_face(
                     // opposite rim, or a pole) whose vertex a rim relocated:
                     // the whole curve would have to move, which this lane does
                     // not do.
-                    return Err(format!(
+                    return Err(KernelRefusal::unsupported(
+                        KernelStage::Fragment,
+                        "closed_neighbour_edge",
+                        format!(
                         "offset_ruled_face: the push moved the vertex of curved neighbour \
                          {curved}'s CLOSED edge {} — deferred (refusing)",
                         edge.id
+                    ),
                     ));
                 }
                 let mut range = (edge.t0, edge.t1);
                 for (moved, slot) in [(start_moved, 0usize), (end_moved, 1usize)] {
                     let Some(point) = moved else { continue };
-                    let projection = project_point_to_curve(&edge.curve, point)?;
+                    let projection = project_point_to_curve(&edge.curve, point).or_refuse(KernelStage::Fragment, "project_point_to_curve")?;
                     if projection.distance > plane_tolerance {
-                        return Err(format!(
+                        return Err(KernelRefusal::unsupported(
+                            KernelStage::Fragment,
+                            "vertex_off_neighbour_edge",
+                            format!(
                             "offset_ruled_face: a relocated rim vertex left curved neighbour \
                              {curved}'s edge {} (off by {:.3e}) — refusing",
                             edge.id, projection.distance
+                        ),
                         ));
                     }
                     if slot == 0 {
@@ -663,10 +783,14 @@ pub fn offset_ruled_face(
             if new_vertex.contains_key(&edge.start_vertex_id)
                 || new_vertex.contains_key(&edge.end_vertex_id)
             {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Fragment,
+                    "third_edge_moved",
+                    format!(
                     "offset_ruled_face: relocating a curved neighbour's rim moved the end of \
                      edge {}, which this push does not rebuild — refusing",
                     edge.id
+                ),
                 ));
             }
         }
@@ -691,11 +815,12 @@ pub fn offset_ruled_face(
                 continue;
             }
             if edge.curve.straight_segment(tolerance).is_none() {
-                return Err(
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Fragment,
+                    "curved_third_edge",
                     "offset_ruled_face: the push moved the end of a CURVED edge that is not a \
-                     rebuilt rim — refusing"
-                        .into(),
-                );
+                     rebuilt rim — refusing",
+                ));
             }
             let start = pos(edge.start_vertex_id);
             let end = pos(edge.end_vertex_id);
@@ -713,32 +838,42 @@ pub fn offset_ruled_face(
                         .into_iter()
                         .find(|vertex| new_vertex.contains_key(vertex))
                         .unwrap_or(edge.start_vertex_id);
-                    return Err(format!(
+                    return Err(KernelRefusal::unsupported(
+                        KernelStage::Fragment,
+                        "pinned_corner",
+                        format!(
                         "offset_ruled_face: the push relocates rim corner vertex {stuck}, which \
                          also ends edge {} of face {neighbour} — a face this push does not \
                          re-trim, so the rim would tear away from it (refusing)",
                         edge.id
+                    ),
                     ));
                 }
                 let (nshell, nface) = find_face(solid, neighbour).ok_or_else(|| {
-                    format!("offset_ruled_face: missing neighbour {neighbour}")
+                    KernelRefusal::internal(
+                        KernelStage::Fragment,
+                        "corner_neighbour",
+                        format!("offset_ruled_face: missing neighbour {neighbour}"),
+                    )
                 })?;
                 let plane = plane_of_surface(
                     &solid.shells[nshell].faces[nface].surface,
                     plane_tolerance,
                     "offset_ruled_face",
-                )?;
+                )
+                ?;
                 for point in [start, end] {
                     if point.sub(plane.origin).dot(plane.normal).abs() > plane_tolerance {
-                        return Err(
+                        return Err(KernelRefusal::unsupported(
+                            KernelStage::Fragment,
+                            "corner_off_plane",
                             "offset_ruled_face: a relocated corner left one of its fixed \
-                             neighbour planes — refusing"
-                                .into(),
-                        );
+                             neighbour planes — refusing",
+                        ));
                     }
                 }
             }
-            corner_edges.push((edge.id, make_line(start, end)?));
+            corner_edges.push((edge.id, make_line(start, end).or_refuse(KernelStage::Fragment, "make_line")?));
         }
         for (edge_id, curve) in corner_edges {
             new_curve.insert(edge_id, curve);
@@ -755,8 +890,13 @@ pub fn offset_ruled_face(
     // Every edge this push touched, by curve, by trim range or by being added —
     // the selective re-fit's work list.
     let changed_edges = plan.changed_edges(&applied);
-    let (pshell, pface) = find_face(&result, face_id)
-        .ok_or_else(|| format!("offset_ruled_face: missing face {face_id}"))?;
+    let (pshell, pface) = find_face(&result, face_id).ok_or_else(|| {
+        KernelRefusal::internal(
+            KernelStage::Fragment,
+            "pushed_face_lookup",
+            format!("offset_ruled_face: missing face {face_id}"),
+        )
+    })?;
     // The pushed face rides the offset carrier. S′ shares the source's parameter
     // domain + seam azimuth (same make_revolution frame/span), so the face's
     // existing (u, v) pcurves stay valid when every rim stayed at its axial
@@ -790,8 +930,13 @@ pub fn offset_ruled_face(
         // The pushed carrier still has to GROW where the rim climbed past its
         // axial span — the same exact prolongation the ruled lane uses — but its
         // pcurves are re-fitted selectively, not wholesale.
-        let (gshell, gface) = find_face(&result, face_id)
-            .ok_or_else(|| format!("offset_ruled_face: missing face {face_id}"))?;
+        let (gshell, gface) = find_face(&result, face_id).ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Sew,
+                "grow_face_lookup",
+                format!("offset_ruled_face: missing face {face_id}"),
+            )
+        })?;
         let samples = boundary_samples(
             &result.shells[gshell].faces[gface],
             &final_edges,
@@ -838,19 +983,24 @@ pub fn offset_ruled_face(
         let rebuilt: HashSet<u64> = rim_edges.iter().copied().collect();
         let seams: HashSet<u64> = seam_edges.iter().copied().collect();
         let surface = result.shells[pshell].faces[pface].surface.clone();
-        let [u_start, u_end] = surface.domain_u()?;
+        let [u_start, u_end] = surface.domain_u().or_refuse(KernelStage::Sew, "domain_u")?;
         let u_period = u_end - u_start;
         for loop_record in &mut result.shells[pshell].faces[pface].loops {
             for coedge in &mut loop_record.coedges {
                 if !rebuilt.contains(&coedge.edge_id) {
                     continue;
                 }
-                let edge = final_edges
-                    .get(&coedge.edge_id)
-                    .ok_or_else(|| format!("offset_ruled_face: missing edge {}", coedge.edge_id))?;
-                let mut pcurve = build_pcurve_on_surface(&surface, &edge.curve)?;
+                let edge = final_edges.get(&coedge.edge_id).ok_or_else(|| {
+                    KernelRefusal::internal(
+                        KernelStage::Sew,
+                        "rim_pcurve_edge",
+                        format!("offset_ruled_face: missing edge {}", coedge.edge_id),
+                    )
+                })?;
+                let mut pcurve = build_pcurve_on_surface(&surface, &edge.curve)
+                    .or_refuse(KernelStage::Sew, "build_pcurve_on_surface")?;
                 if !coedge.forward {
-                    pcurve = pcurve.reversed()?;
+                    pcurve = pcurve.reversed().or_refuse(KernelStage::Sew, "reversed")?;
                 }
                 coedge.pcurve = reanchor_pcurve_u(&pcurve, &coedge.pcurve, u_period)?;
             }
@@ -863,9 +1013,13 @@ pub fn offset_ruled_face(
                 if !seams.contains(&coedge.edge_id) {
                     continue;
                 }
-                let edge = final_edges
-                    .get(&coedge.edge_id)
-                    .ok_or_else(|| format!("offset_ruled_face: missing edge {}", coedge.edge_id))?;
+                let edge = final_edges.get(&coedge.edge_id).ok_or_else(|| {
+                    KernelRefusal::internal(
+                        KernelStage::Sew,
+                        "seam_pcurve_edge",
+                        format!("offset_ruled_face: missing edge {}", coedge.edge_id),
+                    )
+                })?;
                 coedge.pcurve = reseat_seam_pcurve(&surface, &coedge.pcurve, edge, coedge.forward)?;
             }
         }
@@ -873,8 +1027,13 @@ pub fn offset_ruled_face(
 
     // The fixed caps re-trim as planar faces around their grown rim circles.
     for cap in &cap_faces {
-        let (cshell, cface) = find_face(&result, *cap)
-            .ok_or_else(|| format!("offset_ruled_face: missing cap {cap}"))?;
+        let (cshell, cface) = find_face(&result, *cap).ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Sew,
+                "missing_cap",
+                format!("offset_ruled_face: missing cap {cap}"),
+            )
+        })?;
         let plane = plane_of_surface(
             &result.shells[cshell].faces[cface].surface,
             plane_tolerance,
@@ -946,15 +1105,23 @@ pub fn offset_ruled_face(
                 }
             }
         }
-        return Err(format!(
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "validate",
+            format!(
             "offset_ruled_face: pushed solid failed validation: {issues:?}"
+        ),
         ));
     }
     if let (Ok(before), Ok(after)) =
         (solid_signed_volume(solid), solid_signed_volume(&result))
     {
         if before * after <= 0.0 {
-            return Err("offset_ruled_face: the push inverts the solid — refusing".into());
+            return Err(KernelRefusal::internal(
+                KernelStage::Validate,
+                INVERTED,
+                "offset_ruled_face: the push inverts the solid — refusing",
+            ));
         }
     }
     Ok(result)
@@ -974,42 +1141,47 @@ fn reseat_seam_pcurve(
     pcurve: &NurbsCurve,
     edge: &EdgeRecord,
     forward: bool,
-) -> Result<NurbsCurve, String> {
-    let [q0, q1] = pcurve.domain()?;
-    let (head, tail) = (pcurve.evaluate(q0)?, pcurve.evaluate(q1)?);
-    let [v0, v1] = surface.domain_v()?;
-    let station = |u: f64, target: Vec3| -> Result<f64, String> {
-        let base = surface.evaluate(u, v0)?;
-        let top = surface.evaluate(u, v1)?;
+) -> Result<NurbsCurve, KernelRefusal> {
+    let [q0, q1] = pcurve.domain().or_refuse(KernelStage::Sew, "domain")?;
+    let (head, tail) = (pcurve.evaluate(q0).or_refuse(KernelStage::Sew, "evaluate")?, pcurve.evaluate(q1).or_refuse(KernelStage::Sew, "evaluate")?);
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Sew, "domain_v")?;
+    let station = |u: f64, target: Vec3| -> Result<f64, KernelRefusal> {
+        let base = surface.evaluate(u, v0).or_refuse(KernelStage::Sew, "evaluate")?;
+        let top = surface.evaluate(u, v1).or_refuse(KernelStage::Sew, "evaluate")?;
         let direction = top.sub(base);
         let length_squared = direction.length_squared();
         if length_squared <= 0.0 {
-            return Err(
-                "offset_ruled_face: the pushed carrier's generatrix has zero length — refusing"
-                    .into(),
-            );
+            return Err(KernelRefusal::internal(
+                KernelStage::Sew,
+                "generatrix_length",
+                "offset_ruled_face: the pushed carrier's generatrix has zero length — refusing",
+            ));
         }
         Ok(v0 + (v1 - v0) * (target.sub(base).dot(direction) / length_squared))
     };
     let (at_head, at_tail) = if forward {
-        (edge.curve.evaluate(edge.t0)?, edge.curve.evaluate(edge.t1)?)
+        (edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Sew, "evaluate")?, edge.curve.evaluate(edge.t1).or_refuse(KernelStage::Sew, "evaluate")?)
     } else {
-        (edge.curve.evaluate(edge.t1)?, edge.curve.evaluate(edge.t0)?)
+        (edge.curve.evaluate(edge.t1).or_refuse(KernelStage::Sew, "evaluate")?, edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Sew, "evaluate")?)
     };
     let reseated = crate::make_line(
         Vec3::new(head.x, station(head.x, at_head)?, 0.0),
         Vec3::new(tail.x, station(tail.x, at_tail)?, 0.0),
-    )?;
+    ).or_refuse(KernelStage::Sew, "make_line")?;
     // Checked, not asserted: the reseated pcurve must land on the chord it
     // carries, at both ends and in the middle.
-    let [r0, r1] = reseated.domain()?;
+    let [r0, r1] = reseated.domain().or_refuse(KernelStage::Sew, "domain")?;
     for (parameter, target) in [(r0, at_head), (r1, at_tail)] {
-        let uv = reseated.evaluate(parameter)?;
-        let drift = surface.evaluate(uv.x, uv.y)?.sub(target).length();
+        let uv = reseated.evaluate(parameter).or_refuse(KernelStage::Sew, "evaluate")?;
+        let drift = surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Sew, "evaluate")?.sub(target).length();
         if drift > 1e-6 * (1.0 + target.length()) {
-            return Err(format!(
+            return Err(KernelRefusal::internal(
+                KernelStage::Sew,
+                "seam_reseat",
+                format!(
                 "offset_ruled_face: the reseated seam pcurve misses its own chord by \
                  {drift:.3e} — refusing"
+            ),
             ));
         }
     }
@@ -1087,17 +1259,26 @@ fn resolve_open_rim_end(
     adjacent: &EdgeRecord,
     old_point: Vec3,
     plane_tolerance: f64,
-) -> Result<(RimEnd, Vec3), String> {
+) -> Result<(RimEnd, Vec3), KernelRefusal> {
     let incident = faces_of_edge.get(&adjacent.id).cloned().unwrap_or_default();
     if incident.iter().all(|f| *f == face_id) {
-        let (pshell, pface) = find_face(solid, face_id)
-            .ok_or_else(|| format!("offset_ruled_face: missing pushed face {face_id}"))?;
+        let (pshell, pface) = find_face(solid, face_id).ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Refine,
+                "pushed_face_seam",
+                format!("offset_ruled_face: missing pushed face {face_id}"),
+            )
+        })?;
         let meridian = seam_axial_plane(&solid.shells[pshell].faces[pface].surface, adjacent)
             .ok_or_else(|| {
-                format!(
+                KernelRefusal::internal(
+                    KernelStage::Refine,
+                    "seam_meridian",
+                    format!(
                     "offset_ruled_face: the pushed face's seam (edge {}) is not a meridian of \
                      its carrier — refusing",
                     adjacent.id
+                ),
                 )
             })?;
         // The meridian's plane is a WHOLE axial plane, so it also carries the
@@ -1106,28 +1287,46 @@ fn resolve_open_rim_end(
         // which is smaller than r + r' for any push the carrier survives.
         let parameter = conic_crossing_nearest(conic, &meridian, old_point, plane_tolerance)?
             .ok_or_else(|| {
-                format!(
+                KernelRefusal::internal(
+                    KernelStage::Refine,
+                    "seam_crossing",
+                    format!(
                     "offset_ruled_face: the rebuilt rim never crosses the pushed face's own seam \
                      meridian (edge {}) — refusing",
                     adjacent.id
+                ),
                 )
             })?;
-        return Ok((RimEnd::Seam(parameter), conic.evaluate(parameter)?));
+        return Ok((RimEnd::Seam(parameter), conic.evaluate(parameter).or_refuse(KernelStage::Refine, "evaluate")?));
     }
     let other = *incident
         .iter()
         .find(|f| **f != face_id)
-        .ok_or_else(|| format!("offset_ruled_face: edge {} has no neighbour", adjacent.id))?;
-    let (nshell, nface) = find_face(solid, other)
-        .ok_or_else(|| format!("offset_ruled_face: missing neighbour {other}"))?;
+        .ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Refine,
+                "adjacent_no_neighbour",
+                format!("offset_ruled_face: edge {} has no neighbour", adjacent.id),
+            )
+        })?;
+    let (nshell, nface) = find_face(solid, other).ok_or_else(|| {
+        KernelRefusal::internal(
+            KernelStage::Refine,
+            "adjacent_neighbour",
+            format!("offset_ruled_face: missing neighbour {other}"),
+        )
+    })?;
+    // The fail-safe named above: a curved adjacent neighbour is a deferral, and
+    // `plane_of_surface`'s own text says which carrier it was.
     let plane = plane_of_surface(
         &solid.shells[nshell].faces[nface].surface,
         plane_tolerance,
         "offset_ruled_face",
-    )?;
+    )
+    .map_err(|message| KernelRefusal::unsupported(KernelStage::Refine, "curved_adjacent", message))?;
     if curve_lies_in_plane(conic, &plane, plane_tolerance)? {
-        let projection = project_point_to_curve(conic, old_point)?;
-        return Ok((RimEnd::Corner(projection.u), conic.evaluate(projection.u)?));
+        let projection = project_point_to_curve(conic, old_point).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
+        return Ok((RimEnd::Corner(projection.u), conic.evaluate(projection.u).or_refuse(KernelStage::Refine, "evaluate")?));
     }
     census_push("corner_crossings", || {
         let [d0, d1] = conic.domain().unwrap_or([f64::NAN, f64::NAN]);
@@ -1141,17 +1340,20 @@ fn resolve_open_rim_end(
     });
     let mut best: Option<(f64, f64)> = None;
     for parameter in plane_crossing_params(conic, &plane)? {
-        let distance = conic.evaluate(parameter)?.sub(old_point).length();
+        let distance = conic.evaluate(parameter).or_refuse(KernelStage::Refine, "evaluate")?.sub(old_point).length();
         if best.map(|(best, _)| distance < best).unwrap_or(true) {
             best = Some((distance, parameter));
         }
     }
     let (_, parameter) = best.ok_or_else(|| {
-        "offset_ruled_face: a multi-loop rim corner no longer meets its adjacent neighbour \
-         (the push pulled the window off it) — refusing"
-            .to_string()
+        KernelRefusal::unsupported(
+            KernelStage::Refine,
+            "window_off_neighbour",
+            "offset_ruled_face: a multi-loop rim corner no longer meets its adjacent neighbour \
+         (the push pulled the window off it) — refusing",
+        )
     })?;
-    Ok((RimEnd::Corner(parameter), conic.evaluate(parameter)?))
+    Ok((RimEnd::Corner(parameter), conic.evaluate(parameter).or_refuse(KernelStage::Refine, "evaluate")?))
 }
 
 /// TRUE when the whole curve lies in the plane (so it cannot cross it): the
@@ -1161,12 +1363,12 @@ fn curve_lies_in_plane(
     curve: &NurbsCurve,
     plane: &Plane,
     plane_tolerance: f64,
-) -> Result<bool, String> {
-    let [d0, d1] = curve.domain()?;
+) -> Result<bool, KernelRefusal> {
+    let [d0, d1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
     for step in 0..=16 {
         let t = d0 + (d1 - d0) * step as f64 / 16.0;
         if curve
-            .evaluate(t)?
+            .evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?
             .sub(plane.origin)
             .dot(plane.normal)
             .abs()
@@ -1183,10 +1385,10 @@ fn curve_lies_in_plane(
 /// are conics (a circle crosses a slot wall twice, a generatrix line crosses a
 /// slot floor once), so a sampled sign-change sweep finds every root; bisection
 /// then drives it to the last bit rather than to a fit tolerance.
-fn plane_crossing_params(curve: &NurbsCurve, plane: &Plane) -> Result<Vec<f64>, String> {
-    let [d0, d1] = curve.domain()?;
-    let signed = |t: f64| -> Result<f64, String> {
-        Ok(curve.evaluate(t)?.sub(plane.origin).dot(plane.normal))
+fn plane_crossing_params(curve: &NurbsCurve, plane: &Plane) -> Result<Vec<f64>, KernelRefusal> {
+    let [d0, d1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let signed = |t: f64| -> Result<f64, KernelRefusal> {
+        Ok(curve.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?.sub(plane.origin).dot(plane.normal))
     };
     const SAMPLES: usize = 512;
     let mut roots = Vec::new();
@@ -1244,13 +1446,13 @@ fn conic_crossing_nearest(
     plane: &Plane,
     reference: Vec3,
     plane_tolerance: f64,
-) -> Result<Option<f64>, String> {
-    let [d0, d1] = curve.domain()?;
+) -> Result<Option<f64>, KernelRefusal> {
+    let [d0, d1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
     let span = (d1 - d0).max(1e-12);
     let mut candidates: Vec<f64> = Vec::new();
     let mut ends = [false, false];
     for (slot, end) in [d0, d1].into_iter().enumerate() {
-        if curve.evaluate(end)?.sub(plane.origin).dot(plane.normal).abs() <= plane_tolerance {
+        if curve.evaluate(end).or_refuse(KernelStage::Refine, "evaluate")?.sub(plane.origin).dot(plane.normal).abs() <= plane_tolerance {
             ends[slot] = true;
             candidates.push(end);
         }
@@ -1265,7 +1467,7 @@ fn conic_crossing_nearest(
     }
     let mut best: Option<(f64, f64)> = None;
     for parameter in candidates {
-        let distance = curve.evaluate(parameter)?.sub(reference).length();
+        let distance = curve.evaluate(parameter).or_refuse(KernelStage::Refine, "evaluate")?.sub(reference).length();
         if best.map(|(known, _)| distance < known).unwrap_or(true) {
             best = Some((distance, parameter));
         }
@@ -1276,18 +1478,22 @@ fn conic_crossing_nearest(
 /// The piece of `curve` over `[from, to]`. `NurbsCurve::split` keeps the parent
 /// parameterization, so the result's own domain IS `[from, to]` — which is what
 /// the edge's `t0`/`t1` are then set from.
-fn subcurve(curve: &NurbsCurve, from: f64, to: f64) -> Result<NurbsCurve, String> {
-    let [d0, d1] = curve.domain()?;
+fn subcurve(curve: &NurbsCurve, from: f64, to: f64) -> Result<NurbsCurve, KernelRefusal> {
+    let [d0, d1] = curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
     let span = (d1 - d0).max(1e-12);
     if to - from <= 1e-9 * span {
-        return Err("offset_ruled_face: a rebuilt rim arc collapsed to a point — refusing".into());
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Fragment,
+            "arc_collapse",
+            "offset_ruled_face: a rebuilt rim arc collapsed to a point — refusing",
+        ));
     }
     let mut trimmed = curve.clone();
     if to < d1 - 1e-9 * span {
-        trimmed = trimmed.split(to)?.0;
+        trimmed = trimmed.split(to).or_refuse(KernelStage::Fragment, "split")?.0;
     }
     if from > d0 + 1e-9 * span {
-        trimmed = trimmed.split(from)?.1;
+        trimmed = trimmed.split(from).or_refuse(KernelStage::Fragment, "split")?.1;
     }
     Ok(trimmed)
 }
@@ -1315,18 +1521,19 @@ fn rim_arc_between(
     high: f64,
     middle: f64,
     tolerance: f64,
-) -> Result<NurbsCurve, String> {
-    let [d0, d1] = conic.domain()?;
+) -> Result<NurbsCurve, KernelRefusal> {
+    let [d0, d1] = conic.domain().or_refuse(KernelStage::Fragment, "domain")?;
     if middle >= low && middle <= high {
         return subcurve(conic, low, high);
     }
     // The two halves of the complement can only be ONE arc if the conic closes.
-    if conic.evaluate(d0)?.sub(conic.evaluate(d1)?).length() > tolerance {
-        return Err(
+    if conic.evaluate(d0).or_refuse(KernelStage::Fragment, "evaluate")?.sub(conic.evaluate(d1).or_refuse(KernelStage::Fragment, "evaluate")?).length() > tolerance {
+        return Err(KernelRefusal::internal(
+            KernelStage::Fragment,
+            "open_conic",
             "offset_ruled_face: a multi-loop rim arc runs outside its OPEN conic's domain — \
-             refusing"
-                .into(),
-        );
+             refusing",
+        ));
     }
     let span = (d1 - d0).max(1e-12);
     let head_is_empty = low - d0 <= 1e-9 * span;
@@ -1334,12 +1541,13 @@ fn rim_arc_between(
     match (head_is_empty, tail_is_empty) {
         (true, false) => subcurve(conic, high, d1),
         (false, true) => subcurve(conic, d0, low),
-        _ => Err(
+        _ => Err(KernelRefusal::unsupported(
+            KernelStage::Fragment,
+            "two_piece_arc",
             "offset_ruled_face: a multi-loop rim arc crosses the rebuilt conic's period \
              boundary with material on BOTH sides, so it is two pieces to join — deferred \
-             (refusing)"
-                .into(),
-        ),
+             (refusing)",
+        )),
     }
 }
 
@@ -1363,12 +1571,12 @@ fn rim_arc_between(
 fn match_closed_rim_direction(
     rim: NurbsCurve,
     previous: &EdgeRecord,
-) -> Result<NurbsCurve, String> {
-    let [d0, _] = rim.domain()?;
-    let incoming = previous.curve.derivatives(previous.t0, 1)?;
-    let rebuilt = rim.derivatives(d0, 1)?;
+) -> Result<NurbsCurve, KernelRefusal> {
+    let [d0, _] = rim.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let incoming = previous.curve.derivatives(previous.t0, 1).or_refuse(KernelStage::Refine, "derivatives")?;
+    let rebuilt = rim.derivatives(d0, 1).or_refuse(KernelStage::Refine, "derivatives")?;
     if incoming[1].dot(rebuilt[1]) < 0.0 {
-        return rim.reversed();
+        return rim.reversed().or_refuse(KernelStage::Refine, "reversed");
     }
     Ok(rim)
 }
@@ -1394,13 +1602,13 @@ fn reanchor_pcurve_u(
     pcurve: &NurbsCurve,
     previous: &NurbsCurve,
     u_period: f64,
-) -> Result<NurbsCurve, String> {
+) -> Result<NurbsCurve, KernelRefusal> {
     if !(u_period.is_finite() && u_period > 0.0) {
         return Ok(pcurve.clone());
     }
-    let [a0, a1] = pcurve.domain()?;
-    let [b0, b1] = previous.domain()?;
-    let shift = ((previous.evaluate(b0)?.x - pcurve.evaluate(a0)?.x) / u_period).round() * u_period;
+    let [a0, a1] = pcurve.domain().or_refuse(KernelStage::Sew, "domain")?;
+    let [b0, b1] = previous.domain().or_refuse(KernelStage::Sew, "domain")?;
+    let shift = ((previous.evaluate(b0).or_refuse(KernelStage::Sew, "evaluate")?.x - pcurve.evaluate(a0).or_refuse(KernelStage::Sew, "evaluate")?.x) / u_period).round() * u_period;
     let shifted = if shift == 0.0 {
         pcurve.clone()
     } else {
@@ -1408,21 +1616,25 @@ fn reanchor_pcurve_u(
             .control_points
             .iter()
             .map(|control| {
-                let mut point = control.point()?;
+                let mut point = control.point().or_refuse(KernelStage::Sew, "point")?;
                 point.x += shift;
                 Ok(crate::Vec4::from_point(point, control.w))
             })
-            .collect::<Result<Vec<_>, String>>()?;
-        NurbsCurve::new(pcurve.degree, pcurve.knots.clone(), controls)?
+            .collect::<Result<Vec<_>, KernelRefusal>>()?;
+        NurbsCurve::new(pcurve.degree, pcurve.knots.clone(), controls).or_refuse(KernelStage::Sew, "nurbs_curve")?
     };
     // Both ends must land within a quarter period of the ones they replace: a
     // rim that reversed direction, or that jumped a branch mid-curve, is not a
     // re-anchoring and must not be silently accepted.
-    let end_drift = (shifted.evaluate(a1)?.x - previous.evaluate(b1)?.x).abs();
+    let end_drift = (shifted.evaluate(a1).or_refuse(KernelStage::Sew, "evaluate")?.x - previous.evaluate(b1).or_refuse(KernelStage::Sew, "evaluate")?.x).abs();
     if end_drift > 0.25 * u_period {
-        return Err(format!(
+        return Err(KernelRefusal::internal(
+            KernelStage::Sew,
+            "pcurve_reanchor",
+            format!(
             "offset_ruled_face: a rebuilt rim traverses the carrier's periodic parameter \
              differently from the edge it replaces (end drift {end_drift}) — refusing"
+        ),
         ));
     }
     Ok(shifted)
@@ -1463,18 +1675,24 @@ pub(super) fn retrim_offset_ruled_face(
     face_id: u64,
     final_edges: &HashMap<u64, EdgeRecord>,
     tolerance: f64,
-) -> Result<(), String> {
-    let (shell, face_pos) = find_face(result, face_id)
-        .ok_or_else(|| format!("offset_ruled_face: missing ruled face {face_id}"))?;
+) -> Result<(), KernelRefusal> {
+    let (shell, face_pos) = find_face(result, face_id).ok_or_else(|| {
+        KernelRefusal::internal(
+            KernelStage::Sew,
+            "missing_ruled_face",
+            format!("offset_ruled_face: missing ruled face {face_id}"),
+        )
+    })?;
     retrim_face_in_solid(
         result,
         shell,
         face_pos,
         final_edges,
-        |solid, points| extend_ruled_neighbour_over(solid, face_id, points, tolerance),
+        |solid, points| Ok(extend_ruled_neighbour_over(solid, face_id, points, tolerance)?),
         tolerance,
         "offset_ruled_face",
     )
+    
 }
 
 /// A window through the wall bounded entirely by ONE crossing carrier.
@@ -1552,14 +1770,18 @@ fn single_neighbour_hole(
     frame_origin: Vec3,
     frame_axis: Vec3,
     scale: f64,
-) -> Result<Option<SingleNeighbourHole>, String> {
+) -> Result<Option<SingleNeighbourHole>, KernelRefusal> {
     let debug = std::env::var("BREP_PUSH_HOLE_DEBUG").is_ok();
     let mut neighbour: Option<u64> = None;
     let mut edge_ids: Vec<u64> = Vec::new();
     for coedge in &loop_record.coedges {
-        let edge = *edge_by_id
-            .get(&coedge.edge_id)
-            .ok_or_else(|| format!("offset_ruled_face: missing edge {}", coedge.edge_id))?;
+        let edge = *edge_by_id.get(&coedge.edge_id).ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Classify,
+                "hole_edge",
+                format!("offset_ruled_face: missing edge {}", coedge.edge_id),
+            )
+        })?;
         if edge.start_vertex_id == edge.end_vertex_id && loop_record.coedges.len() != 1 {
             if debug { eprintln!("HOLE reject: edge {} is closed", edge.id); }
             return Ok(None); // a closed rim among others: not one window.
@@ -1595,8 +1817,13 @@ fn single_neighbour_hole(
         if debug { eprintln!("HOLE reject: only {} edges", edge_ids.len()); }
         return Ok(None);
     }
-    let (nshell, nface) = find_face(solid, neighbour)
-        .ok_or_else(|| format!("offset_ruled_face: missing neighbour {neighbour}"))?;
+    let (nshell, nface) = find_face(solid, neighbour).ok_or_else(|| {
+        KernelRefusal::internal(
+            KernelStage::Classify,
+            "hole_neighbour",
+            format!("offset_ruled_face: missing neighbour {neighbour}"),
+        )
+    })?;
     let surface = &solid.shells[nshell].faces[nface].surface;
     if matches!(surface.analytic(), Some(AnalyticSurface::Plane { .. }))
         || ruled_neighbour_is_coaxial(surface, frame_origin, frame_axis, scale)
@@ -1616,9 +1843,13 @@ fn single_neighbour_hole(
         .collect();
     let mut pinned: Vec<(u64, u64)> = Vec::new();
     for edge_id in &edge_ids {
-        let edge = *edge_by_id
-            .get(edge_id)
-            .ok_or_else(|| format!("offset_ruled_face: missing edge {edge_id}"))?;
+        let edge = *edge_by_id.get(edge_id).ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Classify,
+                "hole_pin_edge",
+                format!("offset_ruled_face: missing edge {edge_id}"),
+            )
+        })?;
         for vertex_id in [edge.start_vertex_id, edge.end_vertex_id] {
             for other in &solid.edges {
                 if other.start_vertex_id != vertex_id && other.end_vertex_id != vertex_id {
@@ -1675,9 +1906,14 @@ fn rebuild_single_neighbour_hole(
     scale: f64,
     new_curve: &mut HashMap<u64, NurbsCurve>,
     new_vertex: &mut HashMap<u64, Vec3>,
-) -> Result<(), String> {
-    let (nshell, nface) = find_face(solid, hole.neighbour)
-        .ok_or_else(|| format!("offset_ruled_face: missing neighbour {}", hole.neighbour))?;
+) -> Result<(), KernelRefusal> {
+    let (nshell, nface) = find_face(solid, hole.neighbour).ok_or_else(|| {
+        KernelRefusal::internal(
+            KernelStage::Refine,
+            "hole_rebuild_neighbour",
+            format!("offset_ruled_face: missing neighbour {}", hole.neighbour),
+        )
+    })?;
     let neighbour_surface = &solid.shells[nshell].faces[nface].surface;
 
     // Seed the march with the WHOLE old loop: the section replacing it runs
@@ -1686,9 +1922,13 @@ fn rebuild_single_neighbour_hole(
     let mut seeds: Vec<Vec3> = Vec::new();
     let mut reference: Vec<Vec3> = Vec::new();
     for edge_id in &hole.edge_ids {
-        let edge = *edge_by_id
-            .get(edge_id)
-            .ok_or_else(|| format!("offset_ruled_face: missing edge {edge_id}"))?;
+        let edge = *edge_by_id.get(edge_id).ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Refine,
+                "hole_seed_edge",
+                format!("offset_ruled_face: missing edge {edge_id}"),
+            )
+        })?;
         let samples = edge_seeds(edge, 9)?;
         reference.extend(samples.iter().copied());
         seeds.extend(samples);
@@ -1701,22 +1941,40 @@ fn rebuild_single_neighbour_hole(
     let found = match reintersect_carriers(s_prime, neighbour_surface, &policy) {
         Ok(found) => found,
         Err(ReintersectRefusal::Separated) => {
-            return Err(
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Refine,
+                "hole_separated",
                 "offset_ruled_face: the pushed carrier no longer meets a neighbour \
-                 (the push separated them, or the rim left the neighbour's domain) — refusing"
-                    .into(),
-            )
+                 (the push separated them, or the rim left the neighbour's domain) — refusing",
+            ))
         }
-        Err(other) => return Err(format!("offset_ruled_face: {}", other.describe())),
+        Err(other @ ReintersectRefusal::Residual { .. }) => {
+            return Err(KernelRefusal::non_convergence(
+                KernelStage::Refine,
+                "hole_reintersect_residual",
+                format!("offset_ruled_face: {}", other.describe()),
+            ))
+        }
+        Err(other) => {
+            return Err(KernelRefusal::internal(
+                KernelStage::Refine,
+                "hole_reintersect_failed",
+                format!("offset_ruled_face: {}", other.describe()),
+            ))
+        }
     };
     if found.lane != RimLane::Marched {
         // An analytic section has no polyline to cut, and the exact lanes that
         // produce one already have their own arc rebuild. Refusing here keeps
         // this lane from re-deciding a case the closed forms own.
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Refine,
+            "hole_closed_form",
+            format!(
             "offset_ruled_face: the window bounded by face {} re-intersects in CLOSED FORM, \
              whose arc rebuild is the analytic lane's — deferred (refusing)",
             hole.neighbour
+        ),
         ));
     }
     if std::env::var("BREP_PUSH_HOLE_DEBUG").is_ok() {
@@ -1734,7 +1992,13 @@ fn rebuild_single_neighbour_hole(
     // share a surface and so come back as two branches of one section set.
     let section = found
         .nearest_section(&reference)
-        .map_err(|error| format!("offset_ruled_face: {error}"))?;
+        .map_err(|error| {
+            KernelRefusal::internal(
+                KernelStage::Refine,
+                "nearest_section",
+                format!("offset_ruled_face: {error}"),
+            )
+        })?;
 
     // Corners first, so every arc is cut against the same relocated vertices.
     //
@@ -1745,16 +2009,24 @@ fn rebuild_single_neighbour_hole(
     // the neighbour's own re-trim then reports as "a relocated rim vertex left
     // curved neighbour N's edge" — a refusal where a correct answer exists.
     for edge_id in &hole.edge_ids {
-        let edge = *edge_by_id
-            .get(edge_id)
-            .ok_or_else(|| format!("offset_ruled_face: missing edge {edge_id}"))?;
+        let edge = *edge_by_id.get(edge_id).ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Fragment,
+                "hole_corner_edge",
+                format!("offset_ruled_face: missing edge {edge_id}"),
+            )
+        })?;
         for vertex_id in [edge.start_vertex_id, edge.end_vertex_id] {
             if new_vertex.contains_key(&vertex_id) {
                 continue;
             }
-            let old = *vertex_pos
-                .get(&vertex_id)
-                .ok_or_else(|| format!("offset_ruled_face: missing vertex {vertex_id}"))?;
+            let old = *vertex_pos.get(&vertex_id).ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Fragment,
+                    "hole_corner_vertex",
+                    format!("offset_ruled_face: missing vertex {vertex_id}"),
+                )
+            })?;
             let point = match hole
                 .pinned
                 .iter()
@@ -1762,13 +2034,21 @@ fn rebuild_single_neighbour_hole(
                 .map(|(_, pin)| *pin)
             {
                 Some(pin) => {
-                    let seam = *edge_by_id
-                        .get(&pin)
-                        .ok_or_else(|| format!("offset_ruled_face: missing edge {pin}"))?;
+                    let seam = *edge_by_id.get(&pin).ok_or_else(|| {
+                        KernelRefusal::internal(
+                            KernelStage::Fragment,
+                            "hole_pin_seam",
+                            format!("offset_ruled_face: missing edge {pin}"),
+                        )
+                    })?;
                     let plane = seam_axial_plane(neighbour_surface, seam).ok_or_else(|| {
-                        format!(
+                        KernelRefusal::unsupported(
+                            KernelStage::Fragment,
+                            "pinned_non_revolution",
+                            format!(
                             "offset_ruled_face: the window's corner is pinned to edge {pin} of a \
                              neighbour that is not a surface of revolution — refusing"
+                        ),
                         )
                     })?;
                     // The correct crossing is inside the window itself, so the
@@ -1800,22 +2080,35 @@ fn rebuild_single_neighbour_hole(
                     curve_plane_crossing_near(&section.curve, &plane, old, reach)
                         .map(|(_, point)| point)
                         .ok_or_else(|| {
-                            format!(
+                            KernelRefusal::internal(
+                                KernelStage::Fragment,
+                                "pinned_seam_crossing",
+                                format!(
                                 "offset_ruled_face: the rebuilt window never crosses the seam \
                                  (edge {pin}) its corner is pinned to — refusing"
+                            ),
                             )
                         })?
                 }
-                None => section_corner(section, old)
-                    .map_err(|error| format!("offset_ruled_face: {error}"))?,
+                None => section_corner(section, old).map_err(|error| {
+                    KernelRefusal::internal(
+                        KernelStage::Fragment,
+                        "section_corner",
+                        format!("offset_ruled_face: {error}"),
+                    )
+                })?,
             };
             new_vertex.insert(vertex_id, point);
         }
     }
     for edge_id in &hole.edge_ids {
-        let edge = *edge_by_id
-            .get(edge_id)
-            .ok_or_else(|| format!("offset_ruled_face: missing edge {edge_id}"))?;
+        let edge = *edge_by_id.get(edge_id).ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Fragment,
+                "hole_arc_edge",
+                format!("offset_ruled_face: missing edge {edge_id}"),
+            )
+        })?;
         let from = new_vertex[&edge.start_vertex_id];
         let to = new_vertex[&edge.end_vertex_id];
         // A closed edge asks `arc_of_section` for the whole section, whose
@@ -1831,8 +2124,13 @@ fn rebuild_single_neighbour_hole(
         } else {
             arc_length_stations(edge, 3, true)?[1]
         };
-        let arc = arc_of_section(section, from, to, through, tolerance)
-            .map_err(|error| format!("offset_ruled_face: {error}"))?;
+        let arc = arc_of_section(section, from, to, through, tolerance).map_err(|error| {
+            KernelRefusal::internal(
+                KernelStage::Fragment,
+                "arc_of_section",
+                format!("offset_ruled_face: {error}"),
+            )
+        })?;
         new_curve.insert(edge.id, arc);
     }
     Ok(())
@@ -1874,24 +2172,33 @@ fn refit_changed_pcurves(
     final_edges: &HashMap<u64, EdgeRecord>,
     changed: &HashSet<u64>,
     tolerance: f64,
-) -> Result<(), String> {
-    let (shell, face_pos) = find_face(result, face_id)
-        .ok_or_else(|| format!("offset_ruled_face: missing face {face_id}"))?;
+) -> Result<(), KernelRefusal> {
+    let (shell, face_pos) = find_face(result, face_id).ok_or_else(|| {
+        KernelRefusal::internal(
+            KernelStage::Sew,
+            "refit_face",
+            format!("offset_ruled_face: missing face {face_id}"),
+        )
+    })?;
     let surface = result.shells[shell].faces[face_pos].surface.clone();
-    let [u_start, u_end] = surface.domain_u()?;
+    let [u_start, u_end] = surface.domain_u().or_refuse(KernelStage::Sew, "domain_u")?;
     let u_period = u_end - u_start;
     for loop_record in &mut result.shells[shell].faces[face_pos].loops {
         for coedge in &mut loop_record.coedges {
             if !changed.contains(&coedge.edge_id) {
                 continue;
             }
-            let edge = final_edges
-                .get(&coedge.edge_id)
-                .ok_or_else(|| format!("offset_ruled_face: missing edge {}", coedge.edge_id))?;
+            let edge = final_edges.get(&coedge.edge_id).ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Sew,
+                    "refit_edge",
+                    format!("offset_ruled_face: missing edge {}", coedge.edge_id),
+                )
+            })?;
             // Same subrange rule as `offset_retrim::rebuild_loop_pcurves`, so a rim that is
             // a strict piece of a full-domain curve keeps the range-aware fit it
             // has always had.
-            let [d0, d1] = edge.curve.domain()?;
+            let [d0, d1] = edge.curve.domain().or_refuse(KernelStage::Sew, "domain")?;
             let span = (d1 - d0).max(1e-12);
             let is_subrange =
                 (edge.t0 - d0).abs() > 1e-9 * span || (edge.t1 - d1).abs() > 1e-9 * span;
@@ -1903,11 +2210,11 @@ fn refit_changed_pcurves(
                     edge.t1,
                     coedge.forward,
                     tolerance,
-                )?
+                ).or_refuse(KernelStage::Sew, "build_pcurve_on_surface_range")?
             } else {
-                let mut pcurve = build_pcurve_on_surface(&surface, &edge.curve)?;
+                let mut pcurve = build_pcurve_on_surface(&surface, &edge.curve).or_refuse(KernelStage::Sew, "build_pcurve_on_surface")?;
                 if !coedge.forward {
-                    pcurve = pcurve.reversed()?;
+                    pcurve = pcurve.reversed().or_refuse(KernelStage::Sew, "reversed")?;
                 }
                 pcurve
             };
@@ -1919,16 +2226,22 @@ fn refit_changed_pcurves(
 
 /// The curve in `curves` whose midpoint is nearest `reference` (branch selection
 /// for a surface∩surface intersection that returns more than one component).
-fn nearest_curve(curves: &[NurbsCurve], reference: Vec3) -> Result<NurbsCurve, String> {
+fn nearest_curve(curves: &[NurbsCurve], reference: Vec3) -> Result<NurbsCurve, KernelRefusal> {
     let mut best: Option<(f64, &NurbsCurve)> = None;
     for curve in curves {
-        let mid = curve.evaluate(0.5)?;
+        let mid = curve.evaluate(0.5).or_refuse(KernelStage::Refine, "evaluate")?;
         let d = mid.sub(reference).length();
         if best.map(|(best_d, _)| d < best_d).unwrap_or(true) {
             best = Some((d, curve));
         }
     }
     best.map(|(_, curve)| curve.clone())
-        .ok_or_else(|| "offset_ruled_face: empty intersection".into())
+        .ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Refine,
+                "empty_intersection",
+                "offset_ruled_face: empty intersection",
+            )
+        })
 }
 

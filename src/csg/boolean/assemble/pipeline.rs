@@ -21,6 +21,7 @@ fn assemble_fragments_impl(
     let mut assembler = Assembler {
         tolerance,
         vertices: Vec::new(),
+        vertex_aliases: HashMap::default(),
         edges: Vec::new(),
         edge_use_counts: HashMap::default(),
         edge_first_forward: HashMap::default(),
@@ -209,6 +210,7 @@ fn assemble_fragments_impl(
     }
     if allow_open {
         return Ok(BrepSolid {
+            mass_properties_cache: Default::default(),
             id: 1,
             vertices: assembler.vertices,
             edges: assembler.edges,
@@ -323,6 +325,7 @@ fn assemble_fragments_impl(
         // early above), so it never touches a currently succeeding boolean.
         if !allow_open {
             let provisional = BrepSolid {
+                mass_properties_cache: Default::default(),
                 id: 1,
                 vertices: assembler.vertices.clone(),
                 edges: assembler.edges.clone(),
@@ -452,6 +455,7 @@ fn assemble_fragments_impl(
         )));
     }
     let solid = BrepSolid {
+        mass_properties_cache: Default::default(),
         id: 1,
         vertices: assembler.vertices,
         edges: assembler.edges,

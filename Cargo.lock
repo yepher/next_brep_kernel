@@ -3,9 +3,20 @@
 version = 4
 
 [[package]]
-name = "BREP_kernel"
-version = "0.6.0"
+name = "BREP_RANSAC"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b30f8beab699df1d0cded8b92895d7a1adfe65ed8c7b0323c1740b5894b950a"
 dependencies = [
+ "serde",
+ "web-time",
+]
+
+[[package]]
+name = "BREP_kernel"
+version = "0.7.0"
+dependencies = [
+ "BREP_RANSAC",
  "rayon",
  "rustc-hash",
  "serde",

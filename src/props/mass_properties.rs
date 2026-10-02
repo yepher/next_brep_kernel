@@ -45,6 +45,14 @@ enum Integrand {
     ProductYZ,
 }
 
+/// A bounded, per-solid memo for exact area and volume. Geometry edits are
+/// detected by the face-set content identity; callers never invalidate it.
+/// The contents are private so external code cannot supply a fabricated result.
+#[derive(Clone, Debug, Default)]
+pub struct MassPropertiesCache {
+    entry: std::cell::Cell<Option<(FaceSetIdentity, MassProperties)>>,
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct MassProperties {
     pub surface_area: f64,

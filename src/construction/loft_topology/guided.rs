@@ -2,18 +2,26 @@ use super::*;
 
 /// Mean of a section's sampled curve points — the section CENTROID used both
 /// to place the section on the guide and to project it onto the guide.
-fn guided_section_centroid(curves: &[NurbsCurve]) -> Result<Vec3, String> {
+fn guided_section_centroid(curves: &[NurbsCurve]) -> Result<Vec3, KernelRefusal> {
     let mut sum = Vec3::default();
     let mut count = 0usize;
     for curve in curves {
-        let [start, end] = curve.domain()?;
+        let [start, end] = curve.domain().or_refuse(KernelStage::Collect, "domain")?;
         for index in 0..16 {
-            sum = sum.add(curve.evaluate(start + (end - start) * index as f64 / 16.0)?);
+            sum = sum.add(
+                curve
+                    .evaluate(start + (end - start) * index as f64 / 16.0)
+                    .or_refuse(KernelStage::Collect, "evaluate")?,
+            );
             count += 1;
         }
     }
     if count == 0 {
-        return Err("guidedLoft: a section has no sampleable curves".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "empty_section",
+            "guidedLoft: a section has no sampleable curves",
+        ));
     }
     Ok(sum.scale(1.0 / count as f64))
 }
@@ -37,7 +45,7 @@ pub fn loft_profile_brep_guided(
     sections: &[Vec<NurbsCurve>],
     guide: &NurbsCurve,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     loft_profile_brep_guided_core(sections, guide, name, false)
 }
 
@@ -58,7 +66,7 @@ pub fn loft_profile_brep_guided_frame(
     sections: &[Vec<NurbsCurve>],
     guide: &NurbsCurve,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     loft_profile_brep_guided_core(sections, guide, name, true)
 }
 
@@ -75,12 +83,16 @@ struct GuidedFrames {
 impl GuidedFrames {
     /// Index of the frame at normalized parameter `t` (must be one of the
     /// parameters the strip was marched over).
-    fn index_of(&self, t: f64) -> Result<usize, String> {
+    fn index_of(&self, t: f64) -> Result<usize, KernelRefusal> {
         let lower = self.params.partition_point(|p| *p < t - 1e-9);
         if lower < self.params.len() && (self.params[lower] - t).abs() <= 1e-9 {
             Ok(lower)
         } else {
-            Err(format!("guidedLoft: no frame marched at parameter {t}"))
+            Err(KernelRefusal::internal(
+                KernelStage::Refine,
+                "frame_index",
+                format!("guidedLoft: no frame marched at parameter {t}"),
+            ))
         }
     }
 }
@@ -96,7 +108,7 @@ fn guided_frames(
     g1: f64,
     station_params: &[f64],
     section_params: &[f64],
-) -> Result<GuidedFrames, String> {
+) -> Result<GuidedFrames, KernelRefusal> {
     let mut params: Vec<f64> = station_params
         .iter()
         .chain(section_params.iter())
@@ -109,18 +121,31 @@ fn guided_frames(
     let mut points = Vec::with_capacity(count);
     let mut tangents = Vec::with_capacity(count);
     for (index, t) in params.iter().enumerate() {
-        let derivatives = guide.derivatives(g0 + (g1 - g0) * t, 1)?;
-        let tangent = derivatives[1]
-            .normalized()
-            .map_err(|_| format!("guidedLoft: guide tangent is degenerate at station {index}"))?;
+        let derivatives = guide
+            .derivatives(g0 + (g1 - g0) * t, 1)
+            .or_refuse(KernelStage::Refine, "guide_derivatives")?;
+        let tangent = derivatives[1].normalized().map_err(|_| {
+            KernelRefusal::input(
+                KernelStage::Classify,
+                "guide_tangent",
+                format!("guidedLoft: guide tangent is degenerate at station {index}"),
+            )
+        })?;
         points.push(derivatives[0]);
         tangents.push(tangent);
     }
 
     let mut r_axes = Vec::with_capacity(count);
     let mut s_axes = Vec::with_capacity(count);
-    let r0 = tangents[0].perpendicular()?; // any unit vector ⟂ T0
-    s_axes.push(tangents[0].cross(r0).normalized()?);
+    let r0 = tangents[0]
+        .perpendicular()
+        .or_refuse(KernelStage::Refine, "frame_start")?; // any unit vector ⟂ T0
+    s_axes.push(
+        tangents[0]
+            .cross(r0)
+            .normalized()
+            .or_refuse(KernelStage::Refine, "frame_start")?,
+    );
     r_axes.push(r0);
     for index in 0..count - 1 {
         let t_next = tangents[index + 1];
@@ -142,8 +167,19 @@ fn guided_frames(
         let r_next = r_candidate
             .sub(t_next.scale(r_candidate.dot(t_next)))
             .normalized()
-            .map_err(|_| format!("guidedLoft: frame degenerated at station {index}"))?;
-        s_axes.push(t_next.cross(r_next).normalized()?);
+            .map_err(|_| {
+                KernelRefusal::internal(
+                    KernelStage::Refine,
+                    "frame_march",
+                    format!("guidedLoft: frame degenerated at station {index}"),
+                )
+            })?;
+        s_axes.push(
+            t_next
+                .cross(r_next)
+                .normalized()
+                .or_refuse(KernelStage::Refine, "frame_march")?,
+        );
         r_axes.push(r_next);
     }
     Ok(GuidedFrames {
@@ -160,36 +196,51 @@ fn loft_profile_brep_guided_core(
     guide: &NurbsCurve,
     name: Option<&str>,
     rotate_to_frame: bool,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     // Loft carries no face names; accept `name` for ABI symmetry with the other
     // builders (the app stamps names onto the emitted face order).
     let _ = name;
     let tolerance = 1e-6;
     let section_count = sections.len();
     if section_count < 2 {
-        return Err("guidedLoft: need at least 2 sections".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "section_count",
+            "guidedLoft: need at least 2 sections",
+        ));
     }
 
     let curve_count = validate_sections(sections, tolerance, "guidedLoft", true)?;
 
     // --- 2. Guide validity + centroid projection to arc-params uᵢ ∈ [0, 1].
-    let [g0, g1] = guide.domain()?;
+    let [g0, g1] = guide.domain().or_refuse(KernelStage::Collect, "guide")?;
     if (g1 - g0).abs() <= tolerance {
-        return Err("guidedLoft: guide domain is degenerate".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "guide_domain",
+            "guidedLoft: guide domain is degenerate",
+        ));
     }
-    let guide_start = guide.evaluate(g0)?;
+    let guide_start = guide.evaluate(g0).or_refuse(KernelStage::Collect, "guide")?;
     let mut guide_extent = 0.0_f64;
     for index in 1..=8 {
-        let point = guide.evaluate(g0 + (g1 - g0) * index as f64 / 8.0)?;
+        let point = guide
+            .evaluate(g0 + (g1 - g0) * index as f64 / 8.0)
+            .or_refuse(KernelStage::Collect, "guide")?;
         guide_extent = guide_extent.max(point.sub(guide_start).length());
     }
     if guide_extent <= tolerance {
-        return Err("guidedLoft: guide curve is degenerate (no spatial extent)".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "guide_extent",
+            "guidedLoft: guide curve is degenerate (no spatial extent)",
+        ));
     }
     let mut u_list = Vec::with_capacity(section_count);
     for section in sections {
         let centroid = guided_section_centroid(section)?;
-        let projection = crate::project_point_to_curve(guide, centroid)?;
+        let projection = crate::project_point_to_curve(guide, centroid)
+            .or_refuse(KernelStage::Classify, "project")?;
         let u = ((projection.u - g0) / (g1 - g0)).clamp(0.0, 1.0);
         u_list.push(u);
     }
@@ -201,7 +252,11 @@ fn loft_profile_brep_guided_core(
     let increasing = u_list.windows(2).all(|pair| pair[1] > pair[0] + tolerance);
     let decreasing = u_list.windows(2).all(|pair| pair[1] < pair[0] - tolerance);
     if !increasing && !decreasing {
-        return Err("guidedLoft: sections do not project monotonically onto the guide".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Classify,
+            "monotone_projection",
+            "guidedLoft: sections do not project monotonically onto the guide",
+        ));
     }
     let mut ordered_sections: Vec<Vec<NurbsCurve>> = sections.to_vec();
     let mut ordered_u = u_list;
@@ -212,7 +267,11 @@ fn loft_profile_brep_guided_core(
     let u_first = ordered_u[0];
     let u_last = ordered_u[section_count - 1];
     if u_last - u_first <= tolerance {
-        return Err("guidedLoft: sections project to coincident guide stations".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Classify,
+            "coincident_stations",
+            "guidedLoft: sections project to coincident guide stations",
+        ));
     }
 
     // --- 3. Sample the guide at M = max(24, 6·nSections) stations spanning the
@@ -265,11 +324,10 @@ fn loft_profile_brep_guided_core(
                         }
                     })
                     .collect();
-                local_section.push(NurbsCurve::new(
-                    curve.degree,
-                    curve.knots.clone(),
-                    control_points,
-                )?);
+                local_section.push(
+                    NurbsCurve::new(curve.degree, curve.knots.clone(), control_points)
+                        .or_refuse(KernelStage::Refine, "local_curve")?,
+                );
             }
             localized.push(local_section);
         }
@@ -289,7 +347,13 @@ fn loft_profile_brep_guided_core(
         let u_hi = ordered_u[interval + 1];
         let span = u_hi - u_lo;
         if span <= tolerance {
-            return Err("guidedLoft: sections project to coincident guide stations".into());
+            // The same text as the whole-run check above; this one re-checks
+            // each bracketing pair behind the strict-monotonicity gate.
+            return Err(KernelRefusal::input(
+                KernelStage::Classify,
+                "coincident_interval",
+                "guidedLoft: sections project to coincident guide stations",
+            ));
         }
         let f = ((t - u_lo) / span).clamp(0.0, 1.0);
         let section_lo = &blend_sources[interval];
@@ -313,11 +377,10 @@ fn loft_profile_brep_guided_core(
                     w: a.w * (1.0 - f) + b.w * f,
                 })
                 .collect();
-            blended.push(NurbsCurve::new(
-                curve_lo.degree,
-                curve_lo.knots.clone(),
-                control_points,
-            )?);
+            blended.push(
+                NurbsCurve::new(curve_lo.degree, curve_lo.knots.clone(), control_points)
+                    .or_refuse(KernelStage::Refine, "blend_curve")?,
+            );
         }
         let placed: Vec<NurbsCurve> = if let Some(frames) = &frames {
             // Reconstruct frame-local coordinates through the station's frame.
@@ -347,17 +410,18 @@ fn loft_profile_brep_guided_core(
                         }
                     })
                     .collect();
-                placed.push(NurbsCurve::new(
-                    curve.degree,
-                    curve.knots.clone(),
-                    control_points,
-                )?);
+                placed.push(
+                    NurbsCurve::new(curve.degree, curve.knots.clone(), control_points)
+                        .or_refuse(KernelStage::Refine, "placed_curve")?,
+                );
             }
             placed
         } else {
             // Rigidly translate the blend so its centroid lands on G(t).
             let blended_centroid = guided_section_centroid(&blended)?;
-            let guide_point = guide.evaluate(g0 + (g1 - g0) * t)?;
+            let guide_point = guide
+                .evaluate(g0 + (g1 - g0) * t)
+                .or_refuse(KernelStage::Refine, "guide_station")?;
             let delta = guide_point.sub(blended_centroid);
             let mut placed = Vec::with_capacity(curve_count);
             for curve in &blended {
@@ -371,11 +435,10 @@ fn loft_profile_brep_guided_core(
                         w: point.w,
                     })
                     .collect();
-                placed.push(NurbsCurve::new(
-                    curve.degree,
-                    curve.knots.clone(),
-                    control_points,
-                )?);
+                placed.push(
+                    NurbsCurve::new(curve.degree, curve.knots.clone(), control_points)
+                        .or_refuse(KernelStage::Refine, "translated_curve")?,
+                );
             }
             placed
         };
@@ -383,6 +446,10 @@ fn loft_profile_brep_guided_core(
     }
 
     // --- 4. Loft through the guided sections (side walls + planar end caps).
-    loft_profile_brep(&blended_sections)
-        .map_err(|error| format!("guidedLoft: loft through guided sections failed: {error}"))
+    // The inner loft's own class rides through the wrapper.
+    loft_profile_brep(&blended_sections).map_err(|error| {
+        error.with_message(|error| {
+            format!("guidedLoft: loft through guided sections failed: {error}")
+        })
+    })
 }

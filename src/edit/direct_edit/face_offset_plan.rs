@@ -1,4 +1,5 @@
 use super::*;
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 
 // ---------------------------------------------------------------------------
 // The rebuild PLAN `offset_ruled_face`'s classification step produces and its
@@ -135,7 +136,7 @@ impl RebuildPlan {
     }
 
     /// Apply to a fresh clone; the input is never mutated.
-    pub(super) fn apply(&self, solid: &BrepSolid) -> Result<(BrepSolid, AppliedTopology), String> {
+    pub(super) fn apply(&self, solid: &BrepSolid) -> Result<(BrepSolid, AppliedTopology), KernelRefusal> {
         let mut result = solid.clone();
         for edge in &mut result.edges {
             if let Some(curve) = self.curves.get(&edge.id) {
@@ -143,7 +144,7 @@ impl RebuildPlan {
                 // (`NurbsCurve::split` preserves knot values), so the edge range
                 // comes from the curve. Every whole-curve rebuild — the closed rims,
                 // the seam lines — still lands on [0, 1] exactly as before.
-                let [d0, d1] = curve.domain()?;
+                let [d0, d1] = curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
                 edge.curve = curve.clone();
                 edge.t0 = d0;
                 edge.t1 = d1;
@@ -175,11 +176,15 @@ impl RebuildPlan {
         let vertex_exists = |solid: &BrepSolid, id: u64| solid.vertices.iter().any(|v| v.id == id);
         let mut next_edge = result.edges.iter().map(|e| e.id).max().map_or(1, |id| id + 1);
         for planned in &self.added_edges {
-            let [d0, d1] = planned.curve.domain()?;
+            let [d0, d1] = planned.curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
             let (start, end) = (applied.vertex(planned.start), applied.vertex(planned.end));
             for id in [start, end] {
                 if !vertex_exists(&result, id) {
-                    return Err(format!("offset_ruled_face: the plan adds an edge at missing vertex {id}"));
+                    return Err(KernelRefusal::internal(
+                        KernelStage::Fragment,
+                        "plan_edge_vertex",
+                        format!("offset_ruled_face: the plan adds an edge at missing vertex {id}"),
+                    ));
                 }
             }
             result.edges.push(EdgeRecord {
@@ -198,13 +203,23 @@ impl RebuildPlan {
         for (edge_id, end, vertex) in &self.reattached {
             let id = applied.vertex(*vertex);
             if !vertex_exists(&result, id) {
-                return Err(format!("offset_ruled_face: the plan re-attaches edge {edge_id} to missing vertex {id}"));
+                return Err(KernelRefusal::internal(
+                    KernelStage::Fragment,
+                    "plan_reattach_vertex",
+                    format!("offset_ruled_face: the plan re-attaches edge {edge_id} to missing vertex {id}"),
+                ));
             }
             let edge = result
                 .edges
                 .iter_mut()
                 .find(|edge| edge.id == *edge_id)
-                .ok_or_else(|| format!("offset_ruled_face: the plan re-attaches missing edge {edge_id}"))?;
+                .ok_or_else(|| {
+                    KernelRefusal::internal(
+                        KernelStage::Fragment,
+                        "plan_reattach_edge",
+                        format!("offset_ruled_face: the plan re-attaches missing edge {edge_id}"),
+                    )
+                })?;
             match end {
                 EdgeEnd::Start => edge.start_vertex_id = id,
                 EdgeEnd::End => edge.end_vertex_id = id,
@@ -237,7 +252,11 @@ impl RebuildPlan {
             let mut taken: HashSet<u64> = HashSet::default();
             for planned in &self.faces {
                 let (shell, position) = find_face(&result, planned.face_id).ok_or_else(|| {
-                    format!("offset_ruled_face: the plan rewrites missing face {}", planned.face_id)
+                    KernelRefusal::internal(
+                        KernelStage::Fragment,
+                        "plan_face",
+                        format!("offset_ruled_face: the plan rewrites missing face {}", planned.face_id),
+                    )
                 })?;
                 let face = &result.shells[shell].faces[position];
                 let own: Vec<CoedgeRecord> = face
@@ -265,11 +284,15 @@ impl RebuildPlan {
                             Some(coedge) => coedge,
                             None => {
                                 let edge = edges.get(&edge_id).ok_or_else(|| {
-                                    format!("offset_ruled_face: the plan's loop uses missing edge {edge_id}")
+                                    KernelRefusal::internal(
+                                        KernelStage::Fragment,
+                                        "plan_loop_edge",
+                                        format!("offset_ruled_face: the plan's loop uses missing edge {edge_id}"),
+                                    )
                                 })?;
-                                let mut pcurve = build_pcurve_on_surface(&surface, &edge.curve)?;
+                                let mut pcurve = build_pcurve_on_surface(&surface, &edge.curve).or_refuse(KernelStage::Fragment, "build_pcurve_on_surface")?;
                                 if !use_.forward {
-                                    pcurve = pcurve.reversed()?;
+                                    pcurve = pcurve.reversed().or_refuse(KernelStage::Fragment, "reversed")?;
                                 }
                                 let coedge = CoedgeRecord {
                                     id: next_coedge,
@@ -301,10 +324,18 @@ impl RebuildPlan {
         if !self.removed_faces.is_empty() {
             for face_id in &self.removed_faces {
                 if self.faces.iter().any(|planned| planned.face_id == *face_id) {
-                    return Err(format!("offset_ruled_face: the plan both rewrites and removes face {face_id}"));
+                    return Err(KernelRefusal::internal(
+                        KernelStage::Fragment,
+                        "plan_rewrite_and_remove",
+                        format!("offset_ruled_face: the plan both rewrites and removes face {face_id}"),
+                    ));
                 }
                 if find_face(&result, *face_id).is_none() {
-                    return Err(format!("offset_ruled_face: the plan removes missing face {face_id}"));
+                    return Err(KernelRefusal::internal(
+                        KernelStage::Fragment,
+                        "plan_remove_face",
+                        format!("offset_ruled_face: the plan removes missing face {face_id}"),
+                    ));
                 }
             }
             for shell in &mut result.shells {

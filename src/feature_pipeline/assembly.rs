@@ -1,7 +1,6 @@
-//! Assembly constraint state, lifecycle, and solver mapping — build-spec §4,
-//! §6, §7 (Wave-2 lane E).
+//! Assembly constraint state, lifecycle, and solver mapping.
 //!
-//! # The `assembly` block (spec §7)
+//! # The `assembly` block
 //!
 //! Constraints are kernel history state: a top-level `assembly` block on the
 //! history request — `{ constraints: [ { type, inputParams, persistentData,
@@ -9,7 +8,7 @@
 //! document. The pre-purge envelope keys (`assemblyConstraints` /
 //! `assemblyConstraintIdCounter`) are NOT read (no-backwards-compat).
 //!
-//! # Lifecycle (spec §6), run at the tail of every history execution
+//! # Lifecycle, run at the tail of every history execution
 //!
 //! 1. VALIDATE ([`lifecycle`]): disabled → `status:'disabled'`; unknown type →
 //!    an error entry without aborting the rest; duplicate detection across the
@@ -17,9 +16,8 @@
 //!    perpendicular, tangent} via order-independent selection-pair signatures.
 //! 2. MAP ([`mapping`]): each element ref resolves through
 //!    `solvers/assembly_resolve` to an analytic frame in the owning component's
-//!    LOCAL space; constraints become [`crate::MateKind`] mates per the spec §4
-//!    table. Unresolvable/unsupported selections fail that constraint only
-//!    (status from [`crate::ResolveError::status`]); the solve continues.
+//!    LOCAL space. Unresolvable/unsupported selections fail that constraint
+//!    only (status from [`crate::ResolveError::status`]); the solve continues.
 //! 3. SOLVE: ONE [`crate::solve_assembly`] call over every mapped constraint;
 //!    per-mate residuals/statuses + solver diagnostics merge into each
 //!    constraint's `persistentData`; distance/angle first-solve initialization
@@ -76,7 +74,6 @@ pub use constraints::{
 pub use mapping::transform_to_pose_params;
 
 // ===========================================================================
-// The persisted state — spec §7, clean shape
 // ===========================================================================
 
 /// The document's `assembly` block: the ordered constraint list plus the
@@ -149,7 +146,7 @@ impl ConstraintEntry {
     }
 
     /// A numeric param, expression-capable (a string evaluates against the
-    /// part's expression scope — requirements §3). Absent → `default`.
+    /// part's expression scope). Absent → `default`.
     pub fn number(&self, key: &str, env: &Env, default: f64) -> Result<f64, String> {
         match self.input_params.get(key) {
             None | Some(serde_json::Value::Null) => Ok(default),
@@ -212,7 +209,7 @@ impl ConstraintEntry {
 }
 
 // ===========================================================================
-// History-tail hook (spec §6 scheduling: solve at the END of every run)
+// History-tail hook
 // ===========================================================================
 
 /// Run the request's assembly constraints against the just-built scene and

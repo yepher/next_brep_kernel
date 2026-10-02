@@ -27,6 +27,7 @@
 //! torus whose inner equator, lies outside the selected trim offsets perfectly
 //! well over the sheet actually being thickened.
 
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use crate::offset_carve::{carve_folded_trim, dropped_sweep as carve_dropped_sweep};
 use crate::offset_regularity::{scan_offset_regularity, ScanBudget, TrimRegion};
 use crate::sweep_topology::parameter_line;
@@ -64,11 +65,11 @@ fn ensure_offsets_regular(
     surface: &NurbsSurface,
     loops: &[Vec<NurbsCurve>],
     distances: &[f64],
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let region = TrimRegion::from_pcurve_loops(surface, loops)
-        .map_err(|error| format!("thickenSheet: {error}"))?;
+        .map_err(|error| error.with_message(|error| format!("thickenSheet: {error}")))?;
     let scan = scan_offset_regularity(surface, &region, distances, FOLD_FACTOR, ScanBudget::SHEET)
-        .map_err(|error| format!("thickenSheet: {error}"))?;
+        .map_err(|error| error.with_message(|error| format!("thickenSheet: {error}")))?;
     let Some(worst) = scan.worst.filter(|worst| worst.factor <= FOLD_FACTOR) else {
         return Ok(());
     };
@@ -79,7 +80,7 @@ fn ensure_offsets_regular(
         ),
         Err(_) => String::new(),
     };
-    Err(format!(
+    Err(KernelRefusal::unsupported(KernelStage::Refine, "thicken_fold_inside_trim", format!(
         "thickenSheet: offset by {:.6} self-intersects — inside the selected trim the sheet's \
          concave curvature radius {:.6} at (u={:.6}, v={:.6}){} is not larger than the offset \
          distance (fold factor {:.3e})",
@@ -89,7 +90,7 @@ fn ensure_offsets_regular(
         worst.v,
         where_3d,
         worst.factor
-    ))
+    )))
 }
 
 /// Parameter-space validation of the trim loops: closure, degeneracy, pinches
@@ -102,43 +103,43 @@ fn validate_trim_loops(
     loops: &[Vec<NurbsCurve>],
     uv_tolerance: f64,
     minimum_area: f64,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     for (loop_index, loop_curves) in loops.iter().enumerate() {
         let count = loop_curves.len();
         let mut starts = Vec::with_capacity(count);
         let mut ends = Vec::with_capacity(count);
         for curve in loop_curves {
-            let [q0, q1] = curve.domain()?;
-            starts.push(curve.evaluate(q0)?);
-            ends.push(curve.evaluate(q1)?);
+            let [q0, q1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+            starts.push(curve.evaluate(q0).or_refuse(KernelStage::Refine, "evaluate")?);
+            ends.push(curve.evaluate(q1).or_refuse(KernelStage::Refine, "evaluate")?);
         }
         for index in 0..count {
             let next_index = (index + 1) % count;
             let gap = planar_gap(ends[index], starts[next_index]);
             if gap > uv_tolerance {
-                return Err(format!(
+                return Err(KernelRefusal::input(KernelStage::Collect, "thicken_open_loop", format!(
                     "thickenSheet: loop {loop_index} is open — pcurve {index} ends at \
                      (u={:.6}, v={:.6}) but pcurve {next_index} starts at (u={:.6}, v={:.6}) \
                      (parameter-space gap {gap:.3e})",
                     ends[index].x, ends[index].y, starts[next_index].x, starts[next_index].y
-                ));
+                )));
             }
         }
         if count == 1 {
-            let [q0, q1] = loop_curves[0].domain()?;
-            let middle = loop_curves[0].evaluate((q0 + q1) * 0.5)?;
+            let [q0, q1] = loop_curves[0].domain().or_refuse(KernelStage::Refine, "domain")?;
+            let middle = loop_curves[0].evaluate((q0 + q1) * 0.5).or_refuse(KernelStage::Refine, "evaluate")?;
             if planar_gap(middle, starts[0]) <= uv_tolerance {
-                return Err(format!(
+                return Err(KernelRefusal::input(KernelStage::Collect, "thicken_degenerate_loop", format!(
                     "thickenSheet: loop {loop_index} is degenerate (zero parameter-space extent)"
-                ));
+                )));
             }
         } else {
             for index in 0..count {
                 if planar_gap(ends[index], starts[index]) <= uv_tolerance {
-                    return Err(format!(
+                    return Err(KernelRefusal::input(KernelStage::Collect, "thicken_pinched_loop", format!(
                         "thickenSheet: pcurve {index} of loop {loop_index} closes on itself \
                          inside a multi-curve loop (pinched loop)"
-                    ));
+                    )));
                 }
             }
         }
@@ -148,16 +149,16 @@ fn validate_trim_loops(
         }
         if loop_index == 0 {
             if area <= minimum_area {
-                return Err(format!(
+                return Err(KernelRefusal::input(KernelStage::Collect, "thicken_outer_winding", format!(
                     "thickenSheet: outer loop must run counter-clockwise in (u, v) \
                      (signed area {area:.3e})"
-                ));
+                )));
             }
         } else if area >= -minimum_area {
-            return Err(format!(
+            return Err(KernelRefusal::input(KernelStage::Collect, "thicken_hole_winding", format!(
                 "thickenSheet: hole loop {loop_index} must run clockwise in (u, v) \
                  (signed area {area:.3e})"
-            ));
+            )));
         }
     }
     Ok(())
@@ -189,7 +190,7 @@ fn offset_sheet(
     surface: &NurbsSurface,
     loops: &[Vec<NurbsCurve>],
     distance: f64,
-) -> Result<NurbsSurface, String> {
+) -> Result<NurbsSurface, KernelRefusal> {
     if distance == 0.0 {
         return Ok(surface.clone());
     }
@@ -225,13 +226,13 @@ fn offset_sheet(
         &crate::CarrierExtension::uniform(0.0),
     )?;
     if matches!(lane, crate::OffsetSurfaceLane::Reparameterised) {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "thicken_reparameterised_carrier", format!(
             "thickenSheet: the offset carrier for distance {distance:.6} was re-parameterized \
              (the apex-cone pinch retrim pulled a sample row back to the offset's own apex), so \
              the trim's pcurves no longer name the pointwise offset of the selected region — the \
              selected trim reaches past the pinch and offsetting only its own sub-domain is not \
              yet supported"
-        ));
+        )));
     }
     Ok(offset)
 }
@@ -241,7 +242,7 @@ fn offset_sheet(
 /// (same degree, knots, and per-column weights); with equal weights the
 /// homogeneous ruling evaluates to the exact pointwise segment
 /// (1−w)·bottom(s) + w·top(s).
-fn ruled_wall(bottom: &NurbsCurve, top: &NurbsCurve) -> Result<NurbsSurface, String> {
+fn ruled_wall(bottom: &NurbsCurve, top: &NurbsCurve) -> Result<NurbsSurface, KernelRefusal> {
     if bottom.degree != top.degree
         || bottom.knots.len() != top.knots.len()
         || bottom
@@ -255,7 +256,7 @@ fn ruled_wall(bottom: &NurbsCurve, top: &NurbsCurve) -> Result<NurbsSurface, Str
             .zip(&top.control_points)
             .any(|(a, b)| (a.w - b.w).abs() > 1e-9)
     {
-        return Err("thickenSheet: internal error — offset sheet basis mismatch".into());
+        return Err(KernelRefusal::internal(KernelStage::Refine, "thicken_basis_mismatch", "thickenSheet: internal error — offset sheet basis mismatch"));
     }
     let rows = bottom
         .control_points
@@ -270,6 +271,7 @@ fn ruled_wall(bottom: &NurbsCurve, top: &NurbsCurve) -> Result<NurbsSurface, Str
         vec![0.0, 0.0, 1.0, 1.0],
         rows,
     )
+    .or_refuse(KernelStage::Refine, "new")
 }
 
 const GAUSS_X: [f64; 8] = [
@@ -297,8 +299,8 @@ const GAUSS_W: [f64; 8] = [
 /// integrated per knot span with 8-point Gauss.  Summed over a closed loop
 /// this is the loop's signed (u, v) area — the orientation oracle for the
 /// outer-CCW / hole-CW convention.
-fn pcurve_signed_area(curve: &NurbsCurve) -> Result<f64, String> {
-    let [q0, q1] = curve.domain()?;
+fn pcurve_signed_area(curve: &NurbsCurve) -> Result<f64, KernelRefusal> {
+    let [q0, q1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
     let mut breaks = vec![q0];
     for &knot in &curve.knots {
         if knot > q0 + 1e-12 && knot < q1 - 1e-12 && (knot - breaks[breaks.len() - 1]).abs() > 1e-12
@@ -312,7 +314,7 @@ fn pcurve_signed_area(curve: &NurbsCurve) -> Result<f64, String> {
         let half = (pair[1] - pair[0]) * 0.5;
         let middle = (pair[1] + pair[0]) * 0.5;
         for index in 0..GAUSS_X.len() {
-            let derivatives = curve.derivatives(middle + half * GAUSS_X[index], 1)?;
+            let derivatives = curve.derivatives(middle + half * GAUSS_X[index], 1).or_refuse(KernelStage::Refine, "derivatives")?;
             let point = derivatives[0];
             let tangent = derivatives[1];
             area += GAUSS_W[index] * half * 0.5 * (point.x * tangent.y - point.y * tangent.x);
@@ -365,12 +367,12 @@ fn boundary_images(
     eps_u: f64,
     eps_v: f64,
     fit_tolerance: f64,
-) -> Result<BoundaryImages, String> {
+) -> Result<BoundaryImages, KernelRefusal> {
     if base_affine {
-        let [q0, q1] = pcurve.domain()?;
+        let [q0, q1] = pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
         return Ok(BoundaryImages {
-            bottom: affine_image_curve(bottom, pcurve)?,
-            top: affine_image_curve(top, pcurve)?,
+            bottom: affine_image_curve(bottom, pcurve).or_refuse(KernelStage::Refine, "affine_image_curve")?,
+            top: affine_image_curve(top, pcurve).or_refuse(KernelStage::Refine, "affine_image_curve")?,
             t0: q0,
             t1: q1,
             dir: true,
@@ -385,8 +387,8 @@ fn boundary_images(
             if (ua - ub).abs() <= eps_u && (va - vb).abs() > eps_v {
                 let u_constant = (ua + ub) * 0.5;
                 return Ok(BoundaryImages {
-                    bottom: bottom.iso_curve_u(u_constant)?,
-                    top: top.iso_curve_u(u_constant)?,
+                    bottom: bottom.iso_curve_u(u_constant).or_refuse(KernelStage::Refine, "iso_curve_u")?,
+                    top: top.iso_curve_u(u_constant).or_refuse(KernelStage::Refine, "iso_curve_u")?,
                     t0: va.min(vb),
                     t1: va.max(vb),
                     dir: vb > va,
@@ -395,8 +397,8 @@ fn boundary_images(
             if (va - vb).abs() <= eps_v && (ua - ub).abs() > eps_u {
                 let v_constant = (va + vb) * 0.5;
                 return Ok(BoundaryImages {
-                    bottom: bottom.iso_curve_v(v_constant)?,
-                    top: top.iso_curve_v(v_constant)?,
+                    bottom: bottom.iso_curve_v(v_constant).or_refuse(KernelStage::Refine, "iso_curve_v")?,
+                    top: top.iso_curve_v(v_constant).or_refuse(KernelStage::Refine, "iso_curve_v")?,
                     t0: ua.min(ub),
                     t1: ua.max(ub),
                     dir: ub > ua,
@@ -407,7 +409,7 @@ fn boundary_images(
     // The general trim: no closed form, so fit the composed curve on both
     // sheets and let the ladder measure itself.
     let (bottom_image, top_image) =
-        image_curve_pair(bottom, top, pcurve, fit_tolerance, "thickenSheet")?;
+        image_curve_pair(bottom, top, pcurve, fit_tolerance, "thickenSheet").or_refuse(KernelStage::Refine, "image_curve_pair")?;
     let forward = bottom_image.t0 <= bottom_image.t1;
     Ok(BoundaryImages {
         bottom: bottom_image.curve,
@@ -468,12 +470,12 @@ pub fn thicken_trimmed_sheet(
     loops: &[Vec<NurbsCurve>],
     thickness: f64,
     symmetric: bool,
-) -> Result<Vec<BrepSolid>, String> {
+) -> Result<Vec<BrepSolid>, KernelRefusal> {
     if !thickness.is_finite() || thickness.abs() <= 1e-12 {
-        return Err("thickenSheet: thickness must be a nonzero finite value".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "thicken_thickness", "thickenSheet: thickness must be a nonzero finite value"));
     }
     if loops.is_empty() || loops.iter().any(|loop_curves| loop_curves.is_empty()) {
-        return Err("thickenSheet: at least one non-empty pcurve loop is required".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "thicken_no_loop", "thickenSheet: at least one non-empty pcurve loop is required"));
     }
     let (distance_bottom, distance_top) = if symmetric {
         (-thickness.abs() * 0.5, thickness.abs() * 0.5)
@@ -497,15 +499,12 @@ pub fn thicken_trimmed_sheet(
     if let Some(recognized) = band::recognize(surface, loops, distance_bottom, distance_top)? {
         return Ok(vec![band::build(&recognized)?]);
     }
-    let (closed_u, closed_v) = surface.closed_directions()?;
+    let (closed_u, closed_v) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
     if closed_u || closed_v {
-        return Err(
-            "thickenSheet: closed sheets are not supported (split the patch at its seam first)"
-                .into(),
-        );
+        return Err(KernelRefusal::unsupported(KernelStage::Collect, "thicken_closed_sheet", "thickenSheet: closed sheets are not supported (split the patch at its seam first)"));
     }
-    let [u0, u1] = surface.domain_u()?;
-    let [v0, v1] = surface.domain_v()?;
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
     let uv_tolerance = 1e-7 * (u1 - u0).max(v1 - v0);
     let minimum_area = 1e-10 * (u1 - u0) * (v1 - v0);
     // Loop validation runs BEFORE the regularity gate: the gate now reads the
@@ -535,10 +534,10 @@ pub fn thicken_trimmed_sheet(
             // curvature radius and the `(u, v)`.  The carve's own reason rides
             // along so the cause is not lost, but it never replaces the
             // refusal, and it never turns a fold into a build.
-            ensure_offsets_regular(surface, loops, &[distance_bottom, distance_top]).map_err(
-                |refusal| format!("{refusal}; the fold could not be carved out either: {why}"),
-            )?;
-            return Err(format!("thickenSheet: {why}"));
+            ensure_offsets_regular(surface, loops, &[distance_bottom, distance_top]).map_err(|refusal| {
+                refusal.with_message(|refusal| format!("{refusal}; the fold could not be carved out either: {why}"))
+            })?;
+            return Err(why.with_message(|why| format!("thickenSheet: {why}")));
         }
     };
     let regions: Vec<Vec<Vec<NurbsCurve>>> = match &carved {
@@ -611,7 +610,7 @@ pub fn thicken_trimmed_sheet(
             }) {
                 continue;
             }
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(KernelStage::Refine, "thicken_fold_drop_sweeps_material", format!(
                 "thickenSheet: the fold covers part of the selected trim, and the part that \
                  would be dropped sweeps material the result does not contain — the normal at \
                  (u={:.6}, v={:.6}) reaches ({:.6}, {:.6}, {:.6}) at {:.0}% of the {:.6} offset, \
@@ -628,7 +627,7 @@ pub fn thicken_trimmed_sheet(
                 swept.fraction * 100.0,
                 swept.displacement,
                 bodies.len()
-            ));
+            )));
         }
     }
     Ok(bodies)
@@ -645,9 +644,9 @@ fn thicken_one_region(
     loops: &[Vec<NurbsCurve>],
     distance_bottom: f64,
     distance_top: f64,
-) -> Result<BrepSolid, String> {
-    let [u0, u1] = surface.domain_u()?;
-    let [v0, v1] = surface.domain_v()?;
+) -> Result<BrepSolid, KernelRefusal> {
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
 
     let bottom = offset_sheet(surface, loops, distance_bottom)?;
     let top = offset_sheet(surface, loops, distance_top)?;
@@ -657,7 +656,7 @@ fn thicken_one_region(
     let (bottom, top) = crate::offset::unify_offset_sheet_bases(&bottom, &top)?;
     let eps_u = 1e-9 * (u1 - u0);
     let eps_v = 1e-9 * (v1 - v0);
-    let base_affine = surface.is_affine()?;
+    let base_affine = surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")?;
     // Fit-accuracy bar for the general image ladder.  `intersection_fit` is
     // the kernel's single NAMED "maximum geometric error accepted while
     // fitting" field (`geometry/tolerance.rs`), sized to this sheet — an
@@ -668,8 +667,8 @@ fn thicken_one_region(
         .control_points
         .iter()
         .flatten()
-        .map(|control| control.point())
-        .collect::<Result<Vec<_>, String>>()?;
+        .map(|control| control.point().or_refuse(KernelStage::Refine, "point"))
+        .collect::<Result<Vec<_>, KernelRefusal>>()?;
     let fit_tolerance =
         crate::KernelTolerances::for_scale(crate::model_scale(sheet_points), 1e-7).intersection_fit;
 
@@ -688,8 +687,8 @@ fn thicken_one_region(
         // `validate_trim_loops`, ahead of the regularity gate.
         let mut starts = Vec::with_capacity(count);
         for curve in loop_curves {
-            let [q0, _] = curve.domain()?;
-            starts.push(curve.evaluate(q0)?);
+            let [q0, _] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+            starts.push(curve.evaluate(q0).or_refuse(KernelStage::Refine, "evaluate")?);
         }
 
         // ---- Junction vertices: junction j = start of pcurve j. ----
@@ -698,8 +697,8 @@ fn thicken_one_region(
         let mut bottom_points = Vec::with_capacity(count);
         let mut top_points = Vec::with_capacity(count);
         for start in &starts {
-            let bottom_point = bottom.evaluate(start.x, start.y)?;
-            let top_point = top.evaluate(start.x, start.y)?;
+            let bottom_point = bottom.evaluate(start.x, start.y).or_refuse(KernelStage::Refine, "evaluate")?;
+            let top_point = top.evaluate(start.x, start.y).or_refuse(KernelStage::Refine, "evaluate")?;
             vertices.push(VertexRecord {
                 id: next_id,
                 point: bottom_point,
@@ -768,7 +767,7 @@ fn thicken_one_region(
         for junction in 0..count {
             edges.push(EdgeRecord {
                 id: next_id,
-                curve: make_line(bottom_points[junction], top_points[junction])?,
+                curve: make_line(bottom_points[junction], top_points[junction]).or_refuse(KernelStage::Refine, "make_line")?,
                 t0: 0.0,
                 t1: 1.0,
                 start_vertex_id: bottom_vertex_ids[junction],
@@ -802,22 +801,22 @@ fn thicken_one_region(
                 (
                     bottom_edge_ids[index],
                     image.dir,
-                    parameter_line(s_start, 0.0, s_end, 0.0)?,
+                    parameter_line(s_start, 0.0, s_end, 0.0).or_refuse(KernelStage::Refine, "parameter_line")?,
                 ),
                 (
                     vertical_edge_ids[next_index],
                     true,
-                    parameter_line(s_end, 0.0, s_end, 1.0)?,
+                    parameter_line(s_end, 0.0, s_end, 1.0).or_refuse(KernelStage::Refine, "parameter_line")?,
                 ),
                 (
                     top_edge_ids[index],
                     !image.dir,
-                    parameter_line(s_end, 1.0, s_start, 1.0)?,
+                    parameter_line(s_end, 1.0, s_start, 1.0).or_refuse(KernelStage::Refine, "parameter_line")?,
                 ),
                 (
                     vertical_edge_ids[index],
                     false,
-                    parameter_line(s_start, 1.0, s_start, 0.0)?,
+                    parameter_line(s_start, 1.0, s_start, 0.0).or_refuse(KernelStage::Refine, "parameter_line")?,
                 ),
             ] {
                 coedges.push(CoedgeRecord {
@@ -865,7 +864,7 @@ fn thicken_one_region(
                 id: next_id,
                 edge_id: bottom_edge_ids[index],
                 forward: !images[index].dir,
-                pcurve: loop_curves[index].reversed()?,
+                pcurve: loop_curves[index].reversed().or_refuse(KernelStage::Refine, "reversed")?,
             });
             next_id += 1;
         }
@@ -891,10 +890,7 @@ fn thicken_one_region(
                 .length()
                 <= 1e-7 * scale
             {
-                return Err(
-                    "thickenSheet: sheet boundary is degenerate (coincident junction vertices)"
-                        .into(),
-                );
+                return Err(KernelRefusal::input(KernelStage::Collect, "thicken_degenerate_boundary", "thickenSheet: sheet boundary is degenerate (coincident junction vertices)"));
             }
         }
     }
@@ -920,6 +916,7 @@ fn thicken_one_region(
 
     let shell_id = next_id;
     let solid = BrepSolid {
+        mass_properties_cache: Default::default(),
         id: next_id + 1,
         vertices,
         edges,
@@ -931,15 +928,15 @@ fn thicken_one_region(
     };
     let issues = solid.validate();
     if !issues.is_empty() {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Validate, "thicken_validate", format!(
             "thickenSheet: assembled solid failed validation: {issues:?}"
-        ));
+        )));
     }
-    let volume = crate::solid_signed_volume(&solid)?;
+    let volume = crate::solid_signed_volume(&solid).or_refuse(KernelStage::Refine, "solid_signed_volume")?;
     if volume <= 0.0 {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Validate, "thicken_orientation", format!(
             "thickenSheet: internal orientation error (signed volume {volume})"
-        ));
+        )));
     }
     // The sheet's two offset faces can reach past the source's curvature
     // radius and cross each other, or one of them can fold through itself,
@@ -966,17 +963,17 @@ pub fn thicken_face_sheet(
     surface: &NurbsSurface,
     thickness: f64,
     symmetric: bool,
-) -> Result<Vec<BrepSolid>, String> {
+) -> Result<Vec<BrepSolid>, KernelRefusal> {
     if !thickness.is_finite() || thickness.abs() <= 1e-12 {
-        return Err("thickenSheet: thickness must be a nonzero finite value".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "thicken_thickness", "thickenSheet: thickness must be a nonzero finite value"));
     }
-    let [u0, u1] = surface.domain_u()?;
-    let [v0, v1] = surface.domain_v()?;
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
     let rectangle = vec![
-        parameter_line(u0, v0, u1, v0)?,
-        parameter_line(u1, v0, u1, v1)?,
-        parameter_line(u1, v1, u0, v1)?,
-        parameter_line(u0, v1, u0, v0)?,
+        parameter_line(u0, v0, u1, v0).or_refuse(KernelStage::Refine, "parameter_line")?,
+        parameter_line(u1, v0, u1, v1).or_refuse(KernelStage::Refine, "parameter_line")?,
+        parameter_line(u1, v1, u0, v1).or_refuse(KernelStage::Refine, "parameter_line")?,
+        parameter_line(u0, v1, u0, v0).or_refuse(KernelStage::Refine, "parameter_line")?,
     ];
     thicken_trimmed_sheet(surface, &[rectangle], thickness, symmetric)
 }

@@ -42,7 +42,7 @@
 use std::collections::HashSet;
 
 use crate::feature_pipeline::features::common;
-use crate::feature_pipeline::{FeatureContext, FeatureResult};
+use crate::feature_pipeline::{FeatureContext, FeatureRefusal, FeatureResult};
 use crate::{BooleanOperation, BooleanOptions, BrepSolid};
 
 pub fn execute(ctx: &FeatureContext) -> FeatureResult {
@@ -102,7 +102,7 @@ fn fold_boolean(
     targets: &[(String, u32)],
     operation: BooleanOperation,
     options: &BooleanOptions,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, FeatureRefusal> {
     let mut current = base;
     for (name, handle) in targets {
         let operand = crate::register_solid_value(current);
@@ -110,7 +110,11 @@ fn fold_boolean(
             crate::boolean_operation(target, running, operation, options)
         });
         crate::free_registered_solid(operand);
-        current = folded.map_err(|error| format!("boolean {operation:?} on '{name}' failed: {error}"))?;
+        // The boolean's class rides through the feature's wrap: a degeneracy
+        // refused by the kernel is a degeneracy at the feature boundary.
+        current = folded.map_err(|error: crate::KernelRefusal| {
+            error.with_message(|error| format!("boolean {operation:?} on '{name}' failed: {error}"))
+        })?;
     }
     Ok(current)
 }
@@ -122,7 +126,7 @@ fn fold_boolean(
 /// `mergeCoplanarFaces` flag does not reach this union (it passes only
 /// `{featureID, owningFeatureID}`), so [`BooleanOptions::default`]
 /// (merge = true) is used here. Only called with ≥ 2 tools.
-fn union_tools(tools: &[(String, u32)]) -> Result<BrepSolid, String> {
+fn union_tools(tools: &[(String, u32)]) -> Result<BrepSolid, FeatureRefusal> {
     let options = BooleanOptions::default();
     let mut current = crate::with_registered_solid_str(tools[0].1, |solid| Ok(solid.clone()))?;
     for (name, handle) in &tools[1..] {
@@ -131,12 +135,14 @@ fn union_tools(tools: &[(String, u32)]) -> Result<BrepSolid, String> {
             crate::boolean_operation(accumulated, tool, BooleanOperation::Union, &options)
         });
         crate::free_registered_solid(running);
-        current = folded.map_err(|error| format!("tool union at '{name}' failed: {error}"))?;
+        current = folded.map_err(|error: crate::KernelRefusal| {
+            error.with_message(|error| format!("tool union at '{name}' failed: {error}"))
+        })?;
     }
     Ok(current)
 }
 
-fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     let mut result = FeatureResult::empty(ctx.id.clone(), ctx.feature_type.clone());
 
     let boolean = read_boolean_param(ctx);
@@ -198,7 +204,9 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                 crate::with_two_registered_solids(target_handle, tools[0].1, |target, tool| {
                     crate::boolean_operation(target, tool, BooleanOperation::Subtract, &options)
                 })
-                .map_err(|error| format!("boolean SUBTRACT failed: {error}"))?
+                .map_err(|error: crate::KernelRefusal| {
+                    error.with_message(|error| format!("boolean SUBTRACT failed: {error}"))
+                })?
             } else {
                 let union = union_tools(&tools)?;
                 let union_handle = crate::register_solid_value(union);
@@ -206,7 +214,9 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                     crate::boolean_operation(target, tool_union, BooleanOperation::Subtract, &options)
                 });
                 crate::free_registered_solid(union_handle);
-                folded.map_err(|error| format!("boolean SUBTRACT failed: {error}"))?
+                folded.map_err(|error: crate::KernelRefusal| {
+                    error.with_message(|error| format!("boolean SUBTRACT failed: {error}"))
+                })?
             };
             // The target is the sole boolean target → result takes the target's name;
             // removed = [...tools, target] (the tool-union

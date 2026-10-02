@@ -91,12 +91,26 @@ pub(super) fn flat_step_bodies(
     bodies
 }
 
-pub(super) fn build_step_body(resolver: &Resolver, body: StepBody) -> Result<BrepSolid, String> {
+/// Build one body and the trims it accepted at a residual over the fit's bar
+/// because the file's curve is not on their carriers
+/// ([`builder::readings::BoundedTrim`]); the report lane names them.
+pub(super) fn build_step_body(
+    resolver: &Resolver,
+    body: StepBody,
+) -> Result<(BrepSolid, Vec<builder::readings::BoundedTrim>), String> {
+    build_step_body_captured_or_not(resolver, body, false).map(|(solid, _, bounded)| (solid, bounded))
+}
+
+fn build_step_body_captured_or_not(
+    resolver: &Resolver,
+    body: StepBody,
+    capture: bool,
+) -> Result<(BrepSolid, Option<builder::readings::TrimCapture>, Vec<builder::readings::BoundedTrim>), String> {
     match body {
-        StepBody::SolidBrep(entity_ref) => build_solid(resolver, entity_ref),
-        StepBody::BrepWithVoids(entity_ref) => build_brep_with_voids(resolver, entity_ref),
+        StepBody::SolidBrep(entity_ref) => build_solid_inner(resolver, entity_ref, capture),
+        StepBody::BrepWithVoids(entity_ref) => build_brep_with_voids_captured(resolver, entity_ref, capture),
         StepBody::SurfaceModelShell { shell_ref, .. } => {
-            build_solid_from_shell(resolver, shell_ref)
+            build_solid_from_shell_captured(resolver, shell_ref, capture)
         }
     }
 }
@@ -106,14 +120,8 @@ pub(super) fn build_step_body(resolver: &Resolver, body: StepBody) -> Result<Bre
 pub(super) fn build_step_body_captured(
     resolver: &Resolver,
     body: StepBody,
-) -> Result<(BrepSolid, Option<builder::readings::TrimCapture>), String> {
-    match body {
-        StepBody::SolidBrep(entity_ref) => build_solid_inner(resolver, entity_ref, true),
-        StepBody::BrepWithVoids(entity_ref) => build_brep_with_voids_captured(resolver, entity_ref, true),
-        StepBody::SurfaceModelShell { shell_ref, .. } => {
-            build_solid_from_shell_captured(resolver, shell_ref, true)
-        }
-    }
+) -> Result<(BrepSolid, Option<builder::readings::TrimCapture>, Vec<builder::readings::BoundedTrim>), String> {
+    build_step_body_captured_or_not(resolver, body, true)
 }
 
 /// The colours the file's presentation entities assign to ONE built body:
@@ -272,6 +280,11 @@ pub(super) struct ImportedBodies {
     /// stated-precision consistency check; parsed here because the entity
     /// table does not outlive this function.
     pub(super) stated_precisions_mm: Vec<f64>,
+    /// Parallel to `solids` on the flat lane: the trims each body accepted at
+    /// a residual over the fit's bar because the file's curve is not on their
+    /// carriers. EMPTY on the assembly-occurrence lane, which does not carry
+    /// them yet (named in the 2026-09-26 record).
+    pub(super) bounded_trims: Vec<Vec<builder::readings::BoundedTrim>>,
 }
 
 /// [`shell_face_refs`] for the PMI reader (a sibling module).
@@ -332,6 +345,7 @@ pub(super) fn collect_step_solids(text: &str) -> Result<ImportedBodies, String> 
                 }
             }
             return Ok(ImportedBodies {
+                bounded_trims: Vec::new(),
                 solids: occurrences.solids,
                 appearances: occurrences.appearances,
                 face_refs: occurrences.face_refs,
@@ -364,14 +378,17 @@ pub(super) fn collect_step_solids(text: &str) -> Result<ImportedBodies, String> 
     let build = |body: StepBody| {
         (
             matches!(body, StepBody::SurfaceModelShell { .. }),
-            build_step_body(&resolver, body).map(|solid| {
+            build_step_body(&resolver, body).map(|(solid, bounded)| {
                 let appearance = step_body_appearance(&resolver, &styles, body, &solid);
                 let face_refs = super::pmi::body_face_refs(&resolver, body, &solid);
-                (solid, appearance, face_refs)
+                (solid, appearance, face_refs, bounded)
             }),
         )
     };
-    type BuiltBody = (bool, Result<(BrepSolid, BodyAppearance, Vec<usize>), String>);
+    type BuiltBody = (
+        bool,
+        Result<(BrepSolid, BodyAppearance, Vec<usize>, Vec<builder::readings::BoundedTrim>), String>,
+    );
     #[cfg(feature = "parallel")]
     let results: Vec<BuiltBody> = {
         use rayon::prelude::*;
@@ -385,6 +402,7 @@ pub(super) fn collect_step_solids(text: &str) -> Result<ImportedBodies, String> 
     let mut solids = Vec::new();
     let mut appearances = Vec::new();
     let mut face_refs = Vec::new();
+    let mut bounded_trims = Vec::new();
     // A mapping the structure lane refused, on a file whose structure yielded no
     // positioned solid at all: the bodies below come in UNPLACED, and the refusal
     // is what says why one of them is not where the file put it.
@@ -399,15 +417,17 @@ pub(super) fn collect_step_solids(text: &str) -> Result<ImportedBodies, String> 
             // a phantom body (e.g. 00012039's three full-torus sheets -> phantom
             // toroidal solids). Genuine multi-face sewn surface-model solids and all
             // MANIFOLD_SOLID_BREP parts (>= 2 faces) are unaffected.
-            Ok((solid, _, _))
+            Ok((solid, _, _, _))
                 if opportunistic
                     && solid.shells.iter().map(|s| s.faces.len()).sum::<usize>() <= 1 => {}
-            // Solid, appearance and face refs are pushed together — the vectors
-            // are parallel by construction, through every skip arm below.
-            Ok((solid, appearance, refs)) => {
+            // Solid, appearance, face refs and bounded trims are pushed
+            // together — the vectors are parallel by construction, through
+            // every skip arm below.
+            Ok((solid, appearance, refs, bounded)) => {
                 solids.push(solid);
                 appearances.push(appearance);
                 face_refs.push(refs);
+                bounded_trims.push(bounded);
             }
             Err(_) if opportunistic => {} // open surface-model sheet: not a solid, skip
             Err(error) => {
@@ -425,6 +445,7 @@ pub(super) fn collect_step_solids(text: &str) -> Result<ImportedBodies, String> 
         failed,
         first_error,
         stated_precisions_mm,
+        bounded_trims,
     })
 }
 
@@ -1198,7 +1219,7 @@ pub(super) fn resolve_assembly(
         for body in pd_step_bodies(entities, resolver, node.pd) {
             let base = solid_cache.entry(body).or_insert_with(|| {
                 build_step_body(resolver, body)
-                    .map(|solid| {
+                    .map(|(solid, _bounded)| {
                         let appearance = step_body_appearance(resolver, styles, body, &solid);
                         let face_refs = super::pmi::body_face_refs(resolver, body, &solid);
                         (solid, appearance, face_refs)

@@ -1,3 +1,4 @@
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -34,7 +35,7 @@ impl Bounds {
     }
 }
 
-pub(super) fn edge_sample_points(solid: &BrepSolid) -> Result<Vec<Vec3>, String> {
+pub(super) fn edge_sample_points(solid: &BrepSolid) -> Result<Vec<Vec3>, KernelRefusal> {
     let mut points = Vec::new();
     for edge in &solid.edges {
         if edge.degenerate {
@@ -44,7 +45,7 @@ pub(super) fn edge_sample_points(solid: &BrepSolid) -> Result<Vec<Vec3>, String>
             let fraction = sample as f64 / 8.0;
             points.push(
                 edge.curve
-                    .evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction)?,
+                    .evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction).or_refuse(KernelStage::Sew, "evaluate")?,
             );
         }
     }
@@ -67,7 +68,7 @@ pub(super) fn edge_sample_points(solid: &BrepSolid) -> Result<Vec<Vec3>, String>
 /// convex hull of its Cartesian control points, so net points can only ever
 /// ENLARGE the bound and never hide a real crossing; the source-separation
 /// gate and the SSI itself still reject non-intersecting pairs downstream.
-pub(super) fn carrier_extent_points(solid: &BrepSolid) -> Result<Vec<Vec3>, String> {
+pub(super) fn carrier_extent_points(solid: &BrepSolid) -> Result<Vec<Vec3>, KernelRefusal> {
     let mut points = edge_sample_points(solid)?;
     for face in solid.shells.iter().flat_map(|shell| &shell.faces) {
         let surface = &face.surface;
@@ -117,8 +118,8 @@ pub(super) fn source_faces_adjacent(first: &FaceRecord, second: &FaceRecord) -> 
 /// [`crate::OffsetNormal::Face`] lane, which this function used to write out by
 /// hand. Its two offsetting callers (`pipeline.rs`'s carrier residual probe and
 /// `carrier_rebuild.rs`'s seed) go through `offset_at` instead.
-pub(super) fn face_normal(face: &FaceRecord, u: f64, v: f64) -> Result<Vec3, String> {
-    face_offsets(face).normal(u, v)
+pub(super) fn face_normal(face: &FaceRecord, u: f64, v: f64) -> Result<Vec3, KernelRefusal> {
+    face_offsets(face).normal(u, v).or_refuse(KernelStage::Sew, "normal")
 }
 
 /// One face's pointwise offset evaluator.
@@ -145,18 +146,86 @@ pub(super) fn face_offsets(face: &FaceRecord) -> crate::OffsetEvaluator<'_> {
 /// miter probe sees no crossing.
 pub(super) const SMOOTH_JUNCTION_COS: f64 = 0.995;
 
+/// The coedge of `carrier_face` that images source use `(loop_index,
+/// use_index)` of `source_face`.
+///
+/// A carrier is trimmed with the parametric image of its source trim, loop
+/// for loop and use for use, and every consumer of that mirror indexes the
+/// carrier's loops by the source's indices. A carrier whose source trim was
+/// REBUILT over the full rectangle of its domain
+/// (`cut_rim_full_rectangle_source`) has four isoline uses instead, so the
+/// source index means nothing there: the 2026-09-06 fillet-rail document
+/// read `coedges[4]` of a four-use loop and panicked on master. The image of
+/// a source use on a rebuilt trim is the rectangle side whose isoline the
+/// source use's pcurve runs along; a use that runs along no side (a curved
+/// trim boundary, a cut rim) has no image and `None` says so — the rebuild
+/// lane itself declines a face whose retained junctions are not isolines, so
+/// a smooth junction always has one.
+pub(super) fn carrier_use_imaging(
+    carrier_face: &FaceRecord,
+    source_face: &FaceRecord,
+    loop_index: usize,
+    use_index: usize,
+) -> Result<Option<usize>, KernelRefusal> {
+    let source_loop = source_face
+        .loops
+        .get(loop_index)
+        .ok_or_else(|| format!("offset_shell: source face {} has no loop {loop_index}", source_face.id)).or_refuse(KernelStage::Sew, "offset_shell_source_face_has_no_loop")?;
+    let source_use = source_loop
+        .coedges
+        .get(use_index)
+        .ok_or_else(|| format!("offset_shell: source face {} has no use {use_index}", source_face.id)).or_refuse(KernelStage::Sew, "offset_shell_source_face_has_no_use")?;
+    let Some(carrier_loop) = carrier_face.loops.get(loop_index) else {
+        return Ok(None);
+    };
+    if carrier_loop.coedges.len() == source_loop.coedges.len() {
+        return Ok((use_index < carrier_loop.coedges.len()).then_some(use_index));
+    }
+    // A rebuilt trim: which isoline does the source use run along?
+    let [u0, u1] = source_face.surface.domain_u().or_refuse(KernelStage::Sew, "domain_u")?;
+    let [v0, v1] = source_face.surface.domain_v().or_refuse(KernelStage::Sew, "domain_v")?;
+    let band_u = 1e-9 * (u1 - u0).abs().max(1.0);
+    let band_v = 1e-9 * (v1 - v0).abs().max(1.0);
+    let [q0, q1] = source_use.pcurve.domain().or_refuse(KernelStage::Sew, "domain")?;
+    let mut on = [true; 4]; // u = u0, u = u1, v = v0, v = v1
+    for sample in 0..=8 {
+        let uv = source_use.pcurve.evaluate(q0 + (q1 - q0) * sample as f64 / 8.0).or_refuse(KernelStage::Sew, "evaluate")?;
+        on[0] &= (uv.x - u0).abs() <= band_u;
+        on[1] &= (uv.x - u1).abs() <= band_u;
+        on[2] &= (uv.y - v0).abs() <= band_v;
+        on[3] &= (uv.y - v1).abs() <= band_v;
+    }
+    let Some(side) = on.iter().position(|hit| *hit) else {
+        return Ok(None);
+    };
+    for (index, coedge) in carrier_loop.coedges.iter().enumerate() {
+        let [c0, c1] = coedge.pcurve.domain().or_refuse(KernelStage::Sew, "domain")?;
+        let (a, b) = (coedge.pcurve.evaluate(c0).or_refuse(KernelStage::Sew, "evaluate")?, coedge.pcurve.evaluate(c1).or_refuse(KernelStage::Sew, "evaluate")?);
+        let matches = match side {
+            0 => (a.x - u0).abs() <= band_u && (b.x - u0).abs() <= band_u,
+            1 => (a.x - u1).abs() <= band_u && (b.x - u1).abs() <= band_u,
+            2 => (a.y - v0).abs() <= band_v && (b.y - v0).abs() <= band_v,
+            _ => (a.y - v1).abs() <= band_v && (b.y - v1).abs() <= band_v,
+        };
+        if matches {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
 pub(super) fn uses_are_tangent(
     first: &FaceRecord,
     first_use: &CoedgeRecord,
     second: &FaceRecord,
     second_use: &CoedgeRecord,
-) -> Result<bool, String> {
-    let [first_start, first_end] = first_use.pcurve.domain()?;
-    let [second_start, second_end] = second_use.pcurve.domain()?;
+) -> Result<bool, KernelRefusal> {
+    let [first_start, first_end] = first_use.pcurve.domain().or_refuse(KernelStage::Sew, "domain")?;
+    let [second_start, second_end] = second_use.pcurve.domain().or_refuse(KernelStage::Sew, "domain")?;
     for fraction in [0.2, 0.5, 0.8] {
         let first_uv = first_use
             .pcurve
-            .evaluate(first_start + (first_end - first_start) * fraction)?;
+            .evaluate(first_start + (first_end - first_start) * fraction).or_refuse(KernelStage::Sew, "evaluate")?;
         let second_fraction = if first_use.forward == second_use.forward {
             fraction
         } else {
@@ -164,7 +233,7 @@ pub(super) fn uses_are_tangent(
         };
         let second_uv = second_use
             .pcurve
-            .evaluate(second_start + (second_end - second_start) * second_fraction)?;
+            .evaluate(second_start + (second_end - second_start) * second_fraction).or_refuse(KernelStage::Sew, "evaluate")?;
         if face_normal(first, first_uv.x, first_uv.y)?.dot(face_normal(
             second,
             second_uv.x,
@@ -177,13 +246,14 @@ pub(super) fn uses_are_tangent(
     Ok(true)
 }
 
-fn vertex_point(solid: &BrepSolid, vertex_id: u64) -> Result<Vec3, String> {
+fn vertex_point(solid: &BrepSolid, vertex_id: u64) -> Result<Vec3, KernelRefusal> {
     solid
         .vertices
         .iter()
         .find(|vertex| vertex.id == vertex_id)
         .map(|vertex| vertex.point)
         .ok_or_else(|| format!("offset_shell: missing carrier vertex {vertex_id}"))
+        .or_refuse(KernelStage::Sew, "offset_shell_missing_carrier_vertex")
 }
 
 pub(super) struct SmoothSynchronization {
@@ -195,7 +265,7 @@ pub(super) fn synchronize_smooth_offset_boundaries(
     carriers: &mut [Carrier],
     source_faces: &[&FaceRecord],
     scale: f64,
-) -> Result<SmoothSynchronization, String> {
+) -> Result<SmoothSynchronization, KernelRefusal> {
     let source_by_id = source_faces
         .iter()
         .map(|face| (face.id, *face))
@@ -250,26 +320,52 @@ pub(super) fn synchronize_smooth_offset_boundaries(
                         os_debug!("  bail: uses are not tangent");
                         continue;
                     }
+                    // The carrier's use that IMAGES the source use: the same
+                    // index while the carrier mirrors the source loop 1:1,
+                    // and the isoline side that carries the source use when
+                    // the trim was rebuilt over its full rectangle
+                    // (`cut_rim_full_rectangle_source`). A rebuilt trim with
+                    // no image of this junction bails by name.
+                    let Some(first_carrier_index) = carrier_use_imaging(
+                        &carriers[first].solid.shells[0].faces[0],
+                        first_source,
+                        first_loop_index,
+                        first_use_index,
+                    )?
+                    else {
+                        os_debug!("  bail: carrier {first}'s rebuilt trim keeps no image of edge {}", first_use.edge_id);
+                        continue;
+                    };
+                    let Some(second_carrier_index) = carrier_use_imaging(
+                        &carriers[second].solid.shells[0].faces[0],
+                        second_source,
+                        second_loop_index,
+                        second_use_index,
+                    )?
+                    else {
+                        os_debug!("  bail: carrier {second}'s rebuilt trim keeps no image of edge {}", first_use.edge_id);
+                        continue;
+                    };
                     let first_carrier_use = &carriers[first].solid.shells[0].faces[0].loops
                         [first_loop_index]
-                        .coedges[first_use_index];
+                        .coedges[first_carrier_index];
                     let second_carrier_use = &carriers[second].solid.shells[0].faces[0].loops
                         [second_loop_index]
-                        .coedges[second_use_index];
+                        .coedges[second_carrier_index];
                     let first_edge = carriers[first]
                         .solid
                         .edges
                         .iter()
                         .find(|edge| edge.id == first_carrier_use.edge_id)
                         .cloned()
-                        .ok_or_else(|| "offset_shell: missing smooth carrier edge".to_string())?;
+                        .ok_or_else(|| "offset_shell: missing smooth carrier edge".to_string()).or_refuse(KernelStage::Sew, "offset_shell_missing_smooth_carrier_edge")?;
                     let second_edge = carriers[second]
                         .solid
                         .edges
                         .iter()
                         .find(|edge| edge.id == second_carrier_use.edge_id)
                         .cloned()
-                        .ok_or_else(|| "offset_shell: missing smooth carrier edge".to_string())?;
+                        .ok_or_else(|| "offset_shell: missing smooth carrier edge".to_string()).or_refuse(KernelStage::Sew, "offset_shell_missing_smooth_carrier_edge")?;
                     let first_start =
                         vertex_point(&carriers[first].solid, first_edge.start_vertex_id)?;
                     let first_end = vertex_point(&carriers[first].solid, first_edge.end_vertex_id)?;
@@ -291,23 +387,23 @@ pub(super) fn synchronize_smooth_offset_boundaries(
                         );
                         continue;
                     }
-                    let [pcurve_start, pcurve_end] = second_carrier_use.pcurve.domain()?;
+                    let [pcurve_start, pcurve_end] = second_carrier_use.pcurve.domain().or_refuse(KernelStage::Sew, "domain")?;
                     let mut forward_gap = 0.0f64;
                     let mut reverse_gap = 0.0f64;
                     for sample in 0..=32 {
                         let fraction = sample as f64 / 32.0;
                         let uv = second_carrier_use
                             .pcurve
-                            .evaluate(pcurve_start + (pcurve_end - pcurve_start) * fraction)?;
+                            .evaluate(pcurve_start + (pcurve_end - pcurve_start) * fraction).or_refuse(KernelStage::Sew, "evaluate")?;
                         let on_surface = carriers[second].solid.shells[0].faces[0]
                             .surface
-                            .evaluate(uv.x, uv.y)?;
+                            .evaluate(uv.x, uv.y).or_refuse(KernelStage::Sew, "evaluate")?;
                         let forward_point = first_edge
                             .curve
-                            .evaluate(first_edge.t0 + (first_edge.t1 - first_edge.t0) * fraction)?;
+                            .evaluate(first_edge.t0 + (first_edge.t1 - first_edge.t0) * fraction).or_refuse(KernelStage::Sew, "evaluate")?;
                         let reverse_point = first_edge
                             .curve
-                            .evaluate(first_edge.t1 - (first_edge.t1 - first_edge.t0) * fraction)?;
+                            .evaluate(first_edge.t1 - (first_edge.t1 - first_edge.t0) * fraction).or_refuse(KernelStage::Sew, "evaluate")?;
                         forward_gap = forward_gap.max(on_surface.sub(forward_point).length());
                         reverse_gap = reverse_gap.max(on_surface.sub(reverse_point).length());
                     }
@@ -320,7 +416,7 @@ pub(super) fn synchronize_smooth_offset_boundaries(
                     }
                     replacements.push((
                         second_loop_index,
-                        second_use_index,
+                        second_carrier_index,
                         second_edge.id,
                         first_edge.id,
                         first_edge,

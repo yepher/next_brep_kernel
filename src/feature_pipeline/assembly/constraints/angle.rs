@@ -1,5 +1,5 @@
-//! Angle (`ANGL`) — hold two direction-bearing elements at a target angle
-//! (spec §4). The stored param is the DISPLAY angle (exterior-remapped when the
+//! Angle (`ANGL`) — hold two direction-bearing elements at a target angle.
+//! The stored param is the DISPLAY angle (exterior-remapped when the
 //! toggle is on); a new constraint adopts the current orientation on first
 //! solve, in that same display convention.
 

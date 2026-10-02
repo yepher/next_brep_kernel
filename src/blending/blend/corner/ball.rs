@@ -75,7 +75,7 @@ pub(in crate::blend) struct CornerFace<'a> {
 const CORNER_ITERATIONS: usize = 40;
 
 /// Offset-evaluate every face at `x` and return the per-face centres.
-fn centers(faces: &[CornerFace<'_>], x: &[f64]) -> Result<Vec<Vec3>, String> {
+fn centers(faces: &[CornerFace<'_>], x: &[f64]) -> Result<Vec<Vec3>, KernelRefusal> {
     faces
         .iter()
         .enumerate()
@@ -83,13 +83,14 @@ fn centers(faces: &[CornerFace<'_>], x: &[f64]) -> Result<Vec<Vec3>, String> {
             blend_offset(&face.face.surface)
                 .at(x[2 * index], x[2 * index + 1], face.rho)
                 .map(|sample| sample.point)
+                .or_refuse(KernelStage::Refine, "offset_at")
         })
         .collect()
 }
 
 /// Residual: every face's offset centre minus the FIRST face's, stacked.
 /// 3(N−1) rows.
-fn residual(faces: &[CornerFace<'_>], x: &[f64]) -> Result<Vec<f64>, String> {
+fn residual(faces: &[CornerFace<'_>], x: &[f64]) -> Result<Vec<f64>, KernelRefusal> {
     let centers = centers(faces, x)?;
     let mut rows = Vec::with_capacity(3 * (faces.len() - 1));
     for center in &centers[1..] {
@@ -112,11 +113,15 @@ fn norm(values: &[f64]) -> f64 {
 pub(in crate::blend) fn solve_corner_ball(
     faces: &[CornerFace<'_>],
     scale: f64,
-) -> Result<CornerBall, String> {
+) -> Result<CornerBall, KernelRefusal> {
     if faces.len() < 3 {
-        return Err(format!(
-            "corner ball: needs at least three faces at the vertex, got {}",
-            faces.len()
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "face_count",
+            format!(
+                "corner ball: needs at least three faces at the vertex, got {}",
+                faces.len()
+            ),
         ));
     }
     let unknowns = 2 * faces.len();
@@ -156,8 +161,13 @@ pub(in crate::blend) fn solve_corner_ball(
                 }
             }
         }
-        let delta = fit::solve_dense(normal_matrix, normal_rhs)
-            .map_err(|error| format!("corner ball: Gauss-Newton is singular ({error})"))?;
+        let delta = fit::solve_dense(normal_matrix, normal_rhs).map_err(|error| {
+            KernelRefusal::ill_posed(
+                KernelStage::Refine,
+                "singular_jacobian",
+                format!("corner ball: Gauss-Newton is singular ({error})"),
+            )
+        })?;
         // Step halving on the residual norm: a corner seed sits a full radius
         // from its root, far enough that an undamped step can overshoot a
         // curved carrier's domain.
@@ -212,20 +222,37 @@ pub(in crate::blend) fn solve_corner_ball(
         // fiction.  `tolerance` is the solver's own bar, so the ball is only
         // accepted where the extension cannot have moved it further than the
         // accuracy this solve claims.
-        if !offset.on_real_carrier(u, v, tolerance)? {
-            let [u0, u1] = face.face.surface.domain_u()?;
-            let [v0, v1] = face.face.surface.domain_v()?;
+        if !offset
+            .on_real_carrier(u, v, tolerance)
+            .or_refuse(KernelStage::Refine, "on_real_carrier")?
+        {
+            let [u0, u1] = face
+                .face
+                .surface
+                .domain_u()
+                .or_refuse(KernelStage::Refine, "domain")?;
+            let [v0, v1] = face
+                .face
+                .surface
+                .domain_v()
+                .or_refuse(KernelStage::Refine, "domain")?;
             trace_corner_ball("REFUSED by on_real_carrier", faces, &x, final_residual, tolerance)?;
-            return Err(format!(
-                "corner ball: the tangency on face {} converged onto a fictitious EXTENSION of \
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Refine,
+                "carrier_extension",
+                format!(
+                    "corner ball: the tangency on face {} converged onto a fictitious EXTENSION of \
                  that carrier — (u={u:.6}, v={v:.6}) against u∈[{u0:.6}, {u1:.6}], \
                  v∈[{v0:.6}, {v1:.6}], far enough past a curved direction that the evaluator's \
                  ruled continuation has left the surface. No ball of this radius is tangent to \
                  the real face here.",
-                face.face.id
+                    face.face.id
+                ),
             ));
         }
-        let sample = offset.at(u, v, face.rho)?;
+        let sample = offset
+            .at(u, v, face.rho)
+            .or_refuse(KernelStage::Refine, "offset_at")?;
         contacts.push(CornerContact {
             face_id: face.face.id,
             uv: [u, v],
@@ -242,23 +269,22 @@ pub(in crate::blend) fn solve_corner_ball(
 }
 
 /// `BREP_DEBUG_CORNER_BALL`: one line per solve outcome recording where every
-/// tangency landed relative to its support's parameter domain — the
-/// measurement `certified-construction-checks.md` asks for before any
-/// enclosure is built. Overshoot is measured the way `on_real_carrier`
-/// measures it: zero along a CLOSED direction (the evaluator wraps there, so
-/// an out-of-range parameter is the same point, not an excursion), otherwise
-/// the signed excess past `[lo, hi]`, also given as a fraction of the span.
-/// `faithful` is `on_real_carrier`'s own verdict on that contact, so a
-/// reader can separate a straight-direction excursion (a wall's carrier
-/// beyond a concave edge, which the guard accepts by design) from a curved
-/// one. No behaviour change: the line is only printed.
+/// tangency landed relative to its support's parameter domain. Overshoot is
+/// measured the way `on_real_carrier` measures it: zero along a CLOSED
+/// direction (the evaluator wraps there, so an out-of-range parameter is the
+/// same point, not an excursion), otherwise the signed excess past `[lo,
+/// hi]`, also given as a fraction of the span. `faithful` is
+/// `on_real_carrier`'s own verdict on that contact, so a reader can separate
+/// a straight-direction excursion (a wall's carrier beyond a concave edge,
+/// which the guard accepts by design) from a curved one. No behaviour change:
+/// the line is only printed.
 fn trace_corner_ball(
     verdict: &str,
     faces: &[CornerFace<'_>],
     x: &[f64],
     residual: f64,
     tolerance: f64,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     if std::env::var("BREP_DEBUG_CORNER_BALL").is_err() {
         return Ok(());
     }
@@ -269,9 +295,11 @@ fn trace_corner_ball(
     for (index, face) in faces.iter().enumerate() {
         let (u, v) = (x[2 * index], x[2 * index + 1]);
         let surface = &face.face.surface;
-        let [u0, u1] = surface.domain_u()?;
-        let [v0, v1] = surface.domain_v()?;
-        let (closed_u, closed_v) = surface.closed_directions()?;
+        let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain")?;
+        let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain")?;
+        let (closed_u, closed_v) = surface
+            .closed_directions()
+            .or_refuse(KernelStage::Refine, "closed_directions")?;
         let out = |value: f64, lo: f64, hi: f64, closed: bool| -> f64 {
             if closed {
                 0.0
@@ -286,7 +314,9 @@ fn trace_corner_ball(
         let du = out(u, u0, u1, closed_u);
         let dv = out(v, v0, v1, closed_v);
         let span = |lo: f64, hi: f64| (hi - lo).abs().max(f64::MIN_POSITIVE);
-        let faithful = blend_offset(surface).on_real_carrier(u, v, tolerance)?;
+        let faithful = blend_offset(surface)
+            .on_real_carrier(u, v, tolerance)
+            .or_refuse(KernelStage::Refine, "on_real_carrier")?;
         line.push_str(&format!(
             " | face={} u={u:.6} v={v:.6} du=[{u0:.6},{u1:.6}]{} dv=[{v0:.6},{v1:.6}]{} \
              out_u={du:.3e} out_v={dv:.3e} out_frac={:.3e} outside={} faithful={faithful}",
@@ -311,16 +341,21 @@ pub(in crate::blend) fn corner_faces<'a>(
     faces: &[&'a FaceRecord],
     rho_of: &dyn Fn(u64) -> Option<f64>,
     corner: Vec3,
-) -> Result<Vec<CornerFace<'a>>, String> {
+) -> Result<Vec<CornerFace<'a>>, KernelRefusal> {
     let mut prepared = Vec::with_capacity(faces.len());
     for face in faces {
         let rho = rho_of(face.id).ok_or_else(|| {
-            format!(
-                "corner ball: no stripe supplies a signed radius for face {}",
-                face.id
+            KernelRefusal::internal(
+                KernelStage::Collect,
+                "signed_radius",
+                format!(
+                    "corner ball: no stripe supplies a signed radius for face {}",
+                    face.id
+                ),
             )
         })?;
-        let projection = crate::project_point_to_surface(&face.surface, corner)?;
+        let projection = crate::project_point_to_surface(&face.surface, corner)
+            .or_refuse(KernelStage::Collect, "project")?;
         prepared.push(CornerFace {
             face,
             rho,

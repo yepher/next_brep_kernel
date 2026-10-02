@@ -147,20 +147,6 @@ pub(super) fn parameter_segment(u0: f64, v0: f64, u1: f64, v1: f64) -> Result<Nu
     make_line(Vec3::new(u0, v0, 0.0), Vec3::new(u1, v1, 0.0))
 }
 
-pub(super) fn translate_curve(curve: &NurbsCurve, delta: Vec3) -> Result<NurbsCurve, String> {
-    let points = curve
-        .control_points
-        .iter()
-        .map(|control| Vec4 {
-            x: control.x + control.w * delta.x,
-            y: control.y + control.w * delta.y,
-            z: control.z + control.w * delta.z,
-            w: control.w,
-        })
-        .collect();
-    NurbsCurve::new(curve.degree, curve.knots.clone(), points)
-}
-
 impl<'a> RegionBrepBuilder<'a> {
     pub(super) fn allocate_id(&mut self) -> u64 {
         let id = self.next_id;
@@ -623,6 +609,7 @@ pub fn mesh_regions_to_brep(
     let shell_id = builder.allocate_id();
     let solid_id = builder.allocate_id();
     let mut solid = BrepSolid {
+        mass_properties_cache: Default::default(),
         id: solid_id,
         vertices: builder.vertices,
         edges: builder.edges,

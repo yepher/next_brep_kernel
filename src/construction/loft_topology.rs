@@ -3,6 +3,7 @@ use crate::topology::{
     BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, ShellRecord, VertexRecord,
 };
 use crate::{interpolate_curve, make_plane, NurbsCurve, NurbsSurface, Vec3, Vec4};
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 
 #[path = "loft_topology/basic.rs"]
 mod basic;

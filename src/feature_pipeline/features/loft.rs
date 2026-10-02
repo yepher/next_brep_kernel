@@ -63,7 +63,7 @@
 use serde_json::Value;
 
 use crate::feature_pipeline::features::common;
-use crate::feature_pipeline::{FeatureContext, FeatureResult, SketchProfile};
+use crate::feature_pipeline::{FeatureContext, FeatureRefusal, FeatureResult, SketchProfile};
 use crate::{
     loft_profile_brep, loft_profile_brep_guided, loft_profile_brep_guided_frame, NurbsCurve,
 };
@@ -75,7 +75,7 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     }
 }
 
-fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // GUIDE (§5.8): the spine follows a named curve instead of the straight
     // centroid-to-centroid path. `loft_profile_brep_guided` (translation) and
     // `loft_profile_brep_guided_frame` (`rotateToGuide` — sections rotate into
@@ -97,7 +97,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         return Err(format!(
             "loft: need at least 2 section profiles, got {}",
             names.len()
-        ));
+        ).into());
     }
 
     // Resolve each section's FULL profile (outer + hole loops). A SKETCH profile
@@ -119,7 +119,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                 None => {
                     return Err(format!(
                         "loft: profile '{name}' not found (no sketch profile or resident face)"
-                    ));
+                    ).into());
                 }
             },
         };
@@ -132,7 +132,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
             return Err(format!(
                 "loft: profile '{name}' outer loop needs >= 2 curves, got {}",
                 outer.curves.len()
-            ));
+            ).into());
         }
         section_profiles.push(profile);
         from_face.push(face_sourced);
@@ -150,7 +150,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                  {region_count} region(s), section {index} ('{}') has {}",
                 names[index],
                 profile.regions.len()
-            ));
+            ).into());
         }
     }
     for region_index in 0..region_count {
@@ -163,7 +163,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                     loop_count - 1,
                     names[index],
                     profile.regions[region_index].len() - 1
-                ));
+                ).into());
             }
         }
         for loop_index in 0..loop_count {
@@ -175,7 +175,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                         "loft: all sections must have the same curve count in loop {loop_index}; \
                          section 0 has {count}, section {index} ('{}') has {got}",
                         names[index]
-                    ));
+                    ).into());
                 }
             }
         }
@@ -228,7 +228,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                 faces.len(),
                 face_names.len(),
                 side_count
-            ));
+            ).into());
         }
         for (face, name) in faces.iter_mut().zip(&face_names) {
             face.name = Some(name.clone());
@@ -306,11 +306,11 @@ fn resolve_guide(ctx: &FeatureContext) -> Result<Option<NurbsCurve>, String> {
     let chain = common::resolve_path(ctx, &name).map_err(|error| format!("loft: {error}"))?;
     match chain.len() {
         1 => Ok(Some(chain.into_iter().next().expect("one curve"))),
-        0 => Err(format!("loft: guide '{name}' resolved to no curves")),
+        0 => Err(format!("loft: guide '{name}' resolved to no curves").into()),
         other => Err(format!(
             "loft: guide '{name}' is a {other}-segment chain; the guided loft rides ONE spine \
              curve — pick a single edge, or a sketch whose open chain is one segment"
-        )),
+        ).into()),
     }
 }
 
@@ -321,7 +321,7 @@ fn loft_sections(
     sections: &[Vec<NurbsCurve>],
     guide: Option<&NurbsCurve>,
     rotate_to_guide: bool,
-) -> Result<crate::BrepSolid, String> {
+) -> Result<crate::BrepSolid, crate::KernelRefusal> {
     match (guide, rotate_to_guide) {
         (None, _) => loft_profile_brep(sections),
         (Some(guide), false) => loft_profile_brep_guided(sections, guide, None),

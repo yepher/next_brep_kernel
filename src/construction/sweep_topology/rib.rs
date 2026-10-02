@@ -6,12 +6,16 @@ use serde::{Deserialize, Serialize};
 /// weight pattern (the drafted-arc rows share one `make_arc` window, so this
 /// yields the EXACT cone patch: each ruling blends radially-corresponding
 /// points at equal weights).
-pub(super) fn ruled_between(bottom: &NurbsCurve, top: &NurbsCurve) -> Result<NurbsSurface, String> {
+pub(super) fn ruled_between(bottom: &NurbsCurve, top: &NurbsCurve) -> Result<NurbsSurface, KernelRefusal> {
     if bottom.degree != top.degree
         || bottom.control_points.len() != top.control_points.len()
         || bottom.knots.len() != top.knots.len()
     {
-        return Err("ruled_between: rows are not representation-compatible".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Fragment,
+            "ruled_rows",
+            "ruled_between: rows are not representation-compatible",
+        ));
     }
     let grid = bottom
         .control_points
@@ -26,28 +30,33 @@ pub(super) fn ruled_between(bottom: &NurbsCurve, top: &NurbsCurve) -> Result<Nur
         vec![0.0, 0.0, 1.0, 1.0],
         grid,
     )
+    .or_refuse(KernelStage::Fragment, "surface_new")
 }
 
 /// Subrange of a wall ROW curve between the projections of two junction
 /// points.  Splitting (instead of rebuilding with `make_arc`) preserves the
 /// row's parameterization exactly, so the edge is the surface's own boundary
 /// restriction and its parameter-line pcurve is pointwise exact.
-pub(super) fn arc_window_subrange(row: &NurbsCurve, start: Vec3, end: Vec3) -> Result<NurbsCurve, String> {
-    let [d0, d1] = row.domain()?;
+pub(super) fn arc_window_subrange(row: &NurbsCurve, start: Vec3, end: Vec3) -> Result<NurbsCurve, KernelRefusal> {
+    let [d0, d1] = row.domain().or_refuse(KernelStage::Fragment, "domain")?;
     let span = d1 - d0;
-    let u0 = project_point_to_curve(row, start)?.u;
-    let u1 = project_point_to_curve(row, end)?.u;
+    let u0 = project_point_to_curve(row, start).or_refuse(KernelStage::Fragment, "project_point")?.u;
+    let u1 = project_point_to_curve(row, end).or_refuse(KernelStage::Fragment, "project_point")?.u;
     if u1 <= u0 + 1e-12 {
-        return Err("draftExtrude: a drafted arc's boundary trim inverted".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Fragment,
+            "arc_trim",
+            "draftExtrude: a drafted arc's boundary trim inverted",
+        ));
     }
     let epsilon = span * 1e-9;
     let mut current = row.clone();
     if u0 > d0 + epsilon {
-        current = current.split(u0)?.1;
+        current = current.split(u0).or_refuse(KernelStage::Fragment, "split")?.1;
     }
-    let domain = current.domain()?;
+    let domain = current.domain().or_refuse(KernelStage::Fragment, "domain")?;
     if u1 < domain[1] - epsilon && u1 > domain[0] + epsilon {
-        current = current.split(u1)?.0;
+        current = current.split(u1).or_refuse(KernelStage::Fragment, "split")?.0;
     }
     Ok(current)
 }
@@ -63,18 +72,21 @@ fn wall_gradient(
     zh: Vec3,
     height: f64,
     signed_d: f64,
-) -> Result<Vec3, String> {
+) -> Result<Vec3, KernelRefusal> {
     match seg {
         SegGeom::Line { dir, normal, .. } => dir
             .cross(normal.scale(signed_d).add(zh.scale(height)))
-            .normalized(),
+            .normalized()
+            .or_refuse(KernelStage::Fragment, "normalized"),
         SegGeom::Arc {
             center, turn, ..
         } => {
             let rel = point.sub(*center);
             let radial = rel.sub(zh.scale(rel.dot(zh)));
-            let rho = radial.normalized()?;
-            rho.add(zh.scale(signed_d * turn / height)).normalized()
+            let rho = radial.normalized().or_refuse(KernelStage::Fragment, "normalized")?;
+            rho.add(zh.scale(signed_d * turn / height))
+                .normalized()
+                .or_refuse(KernelStage::Fragment, "normalized")
         }
     }
 }
@@ -98,21 +110,31 @@ pub(super) fn junction_edge_curve(
     zh: Vec3,
     height: f64,
     signed_d: f64,
-) -> Result<NurbsCurve, String> {
+) -> Result<NurbsCurve, KernelRefusal> {
     let chord = b.sub(a);
     let length = chord.length();
     if length <= 1e-12 {
-        return Err("draftExtrude: a junction edge collapsed to a point".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Fragment,
+            "junction_collapsed",
+            "draftExtrude: a junction edge collapsed to a point",
+        ));
     }
     let along = m.sub(a).dot(chord) / (length * length);
     let deviation = m.sub(a).sub(chord.scale(along)).length();
     if deviation <= length * 1e-9 {
-        return make_line(a, b);
+        return make_line(a, b).or_refuse(KernelStage::Fragment, "make_line");
     }
     // 2D frame in the conic's plane (it contains a, b, m by construction).
     let e1 = chord.scale(1.0 / length);
-    let plane_normal = chord.cross(m.sub(a)).normalized()?;
-    let e2 = plane_normal.cross(e1).normalized()?;
+    let plane_normal = chord
+        .cross(m.sub(a))
+        .normalized()
+        .or_refuse(KernelStage::Fragment, "normalized")?;
+    let e2 = plane_normal
+        .cross(e1)
+        .normalized()
+        .or_refuse(KernelStage::Fragment, "normalized")?;
     let orient = |tangent: Vec3| {
         if tangent.dot(zh) < 0.0 {
             tangent.scale(-1.0)
@@ -130,13 +152,21 @@ pub(super) fn junction_edge_curve(
     let scale0 = d0.0.hypot(d0.1);
     let scale2 = d2.0.hypot(d2.1);
     if denom.abs() <= 1e-14 * scale0 * scale2 {
-        return Err("draftExtrude: junction end tangents are parallel — no conic apex".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Fragment,
+            "conic_apex",
+            "draftExtrude: junction end tangents are parallel — no conic apex",
+        ));
     }
     // Apex: a + s·t0 = b + r·t2 solved in 2D (a = origin, b = (length, 0)).
     let s = length * d2.1 / denom;
     let apex = (s * d0.0, s * d0.1);
     if apex.1.abs() <= f64::EPSILON * length {
-        return Err("draftExtrude: junction conic apex is degenerate".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Fragment,
+            "conic_apex_degenerate",
+            "draftExtrude: junction conic apex is degenerate",
+        ));
     }
     // Barycentric coordinates of m over (a, apex, b): m = α·a + β·apex + γ·b.
     let mq = (m.sub(a).dot(e1), m.sub(a).dot(e2));
@@ -144,9 +174,13 @@ pub(super) fn junction_edge_curve(
     let gamma = (mq.0 - beta * apex.0) / length;
     let alpha = 1.0 - beta - gamma;
     if !(alpha > 0.0 && beta > 0.0 && gamma > 0.0) {
-        return Err(format!(
+        return Err(KernelRefusal::internal(
+            KernelStage::Fragment,
+            "conic_witness",
+            format!(
             "draftExtrude: junction conic witness fell outside its control triangle \
              (α={alpha:.3e} β={beta:.3e} γ={gamma:.3e})"
+            ),
         ));
     }
     let weight = beta / (2.0 * (alpha * gamma).sqrt());
@@ -160,6 +194,7 @@ pub(super) fn junction_edge_curve(
             Vec4::from_point(b, 1.0),
         ],
     )
+    .or_refuse(KernelStage::Fragment, "curve_new")
 }
 
 /// In-plane circumcircle of three coplanar points (projected onto `ex`/`ey`,
@@ -192,14 +227,18 @@ fn intersect_offset_line_circle(
     center: Vec3,
     radius: f64,
     near: Vec3,
-) -> Result<Vec3, String> {
-    let dir = line_dir.normalized()?;
+) -> Result<Vec3, KernelRefusal> {
+    let dir = line_dir.normalized().or_refuse(KernelStage::Classify, "normalized")?;
     let f = line_point.sub(center);
     let b = f.dot(dir);
     let c = f.dot(f) - radius * radius;
     let disc = b * b - c;
     if disc < -1e-9 {
-        return Err("an offset line and arc no longer meet (offset too large)".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Classify,
+            "offset_too_large",
+            "an offset line and arc no longer meet (offset too large)",
+        ));
     }
     let root = disc.max(0.0).sqrt();
     let p1 = line_point.add(dir.scale(-b + root));
@@ -221,21 +260,29 @@ fn intersect_offset_circles(
     r2: f64,
     plane_normal: Vec3,
     near: Vec3,
-) -> Result<Vec3, String> {
+) -> Result<Vec3, KernelRefusal> {
     let between = c2.sub(c1);
     let d = between.length();
     if d < 1e-9 {
-        return Err("concentric offset arcs do not meet".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Classify,
+            "concentric_arcs",
+            "concentric offset arcs do not meet",
+        ));
     }
     let axis = between.scale(1.0 / d);
     let a = (d * d + r1 * r1 - r2 * r2) / (2.0 * d);
     let h2 = r1 * r1 - a * a;
     if h2 < -1e-9 {
-        return Err("offset arcs no longer meet (offset too large)".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Classify,
+            "offset_arcs_too_large",
+            "offset arcs no longer meet (offset too large)",
+        ));
     }
     let h = h2.max(0.0).sqrt();
     let base = c1.add(axis.scale(a));
-    let perp = plane_normal.cross(axis).normalized()?;
+    let perp = plane_normal.cross(axis).normalized().or_refuse(KernelStage::Classify, "normalized")?;
     let p1 = base.add(perp.scale(h));
     let p2 = base.sub(perp.scale(h));
     Ok(if p1.sub(near).length() <= p2.sub(near).length() {
@@ -286,7 +333,7 @@ impl SegGeom {
     /// Naive offset image of a point ON this segment's primitive: lines
     /// translate along their normal; arc points scale radially onto the
     /// concentric offset circle (Err when a concave arc collapses).
-    fn offset_point(&self, point: Vec3, signed_d: f64) -> Result<Vec3, String> {
+    fn offset_point(&self, point: Vec3, signed_d: f64) -> Result<Vec3, KernelRefusal> {
         match self {
             SegGeom::Line { normal, .. } => Ok(point.add(normal.scale(signed_d))),
             SegGeom::Arc {
@@ -297,7 +344,11 @@ impl SegGeom {
             } => {
                 let r_offset = radius - signed_d * turn;
                 if r_offset <= 1e-6 {
-                    return Err("offset: distance is too large — a concave arc collapses".into());
+                    return Err(KernelRefusal::input(
+                        KernelStage::Classify,
+                        "arc_collapse",
+                        "offset: distance is too large — a concave arc collapses",
+                    ));
                 }
                 Ok(center.add(point.sub(*center).scale(r_offset / radius)))
             }
@@ -313,29 +364,37 @@ impl SegGeom {
 pub(super) fn classify_profile_segments(
     profile: &[NurbsCurve],
     plane_normal: Vec3,
-) -> Result<Vec<SegGeom>, String> {
+) -> Result<Vec<SegGeom>, KernelRefusal> {
     let tol = 1e-6;
     if profile.is_empty() {
-        return Err("offset: profile has no segments".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "profile_empty",
+            "offset: profile has no segments",
+        ));
     }
-    let np = plane_normal.normalized()?;
-    let ex = np.perpendicular()?;
-    let ey = np.cross(ex).normalized()?;
+    let np = plane_normal.normalized().or_refuse(KernelStage::Classify, "normalized")?;
+    let ex = np.perpendicular().or_refuse(KernelStage::Classify, "perpendicular")?;
+    let ey = np.cross(ex).normalized().or_refuse(KernelStage::Classify, "normalized")?;
     let mut segs = Vec::with_capacity(profile.len());
     for curve in profile {
-        let [t0, t1] = curve.domain()?;
-        let start = curve.evaluate(t0)?;
-        let end = curve.evaluate(t1)?;
+        let [t0, t1] = curve.domain().or_refuse(KernelStage::Classify, "domain")?;
+        let start = curve.evaluate(t0).or_refuse(KernelStage::Classify, "evaluate")?;
+        let end = curve.evaluate(t1).or_refuse(KernelStage::Classify, "evaluate")?;
         let chord = end.sub(start);
         let chord_len = chord.length();
         if chord_len <= tol {
-            return Err("offset: profile has a degenerate (zero-length) segment".into());
+            return Err(KernelRefusal::input(
+                KernelStage::Collect,
+                "segment_length",
+                "offset: profile has a degenerate (zero-length) segment",
+            ));
         }
         let dir = chord.scale(1.0 / chord_len);
         // A straight LINE if every interior sample lies on the chord.
         let mut is_line = true;
         for k in 1..8 {
-            let point = curve.evaluate(t0 + (t1 - t0) * k as f64 / 8.0)?;
+            let point = curve.evaluate(t0 + (t1 - t0) * k as f64 / 8.0).or_refuse(KernelStage::Classify, "evaluate")?;
             let rel = point.sub(start);
             let perpendicular = rel.sub(dir.scale(rel.dot(dir))).length();
             if perpendicular > tol * 10.0 {
@@ -348,19 +407,27 @@ pub(super) fn classify_profile_segments(
                 start,
                 end,
                 dir,
-                normal: np.cross(dir).normalized()?,
+                normal: np.cross(dir).normalized().or_refuse(KernelStage::Classify, "normalized")?,
             });
             continue;
         }
         // Otherwise it must be a circular ARC: fit a circle through start/mid/end.
-        let mid = curve.evaluate((t0 + t1) * 0.5)?;
+        let mid = curve.evaluate((t0 + t1) * 0.5).or_refuse(KernelStage::Classify, "evaluate")?;
         let (center, radius) = circumcircle(start, mid, end, ex, ey, np).ok_or_else(|| {
-            "offset: only straight lines and circular arcs are supported".to_string()
+            KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "segment_kind",
+                "offset: only straight lines and circular arcs are supported",
+            )
         })?;
         for k in 0..=8 {
-            let point = curve.evaluate(t0 + (t1 - t0) * k as f64 / 8.0)?;
+            let point = curve.evaluate(t0 + (t1 - t0) * k as f64 / 8.0).or_refuse(KernelStage::Classify, "evaluate")?;
             if (point.sub(center).length() - radius).abs() > tol * 10.0 {
-                return Err("offset: only straight lines and circular arcs are supported".into());
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "segment_kind",
+                    "offset: only straight lines and circular arcs are supported",
+                ));
             }
         }
         // Turning direction about the plane normal (CCW ⇒ +1 ⇒ shrink inward).
@@ -397,7 +464,7 @@ pub(super) fn offset_junction(
     next: &SegGeom,
     plane_normal: Vec3,
     signed_d: f64,
-) -> Result<Vec3, String> {
+) -> Result<Vec3, KernelRefusal> {
     let vertex = prev.end();
     if signed_d == 0.0 {
         return Ok(vertex);
@@ -411,7 +478,11 @@ pub(super) fn offset_junction(
         (SegGeom::Line { normal: na, .. }, SegGeom::Line { normal: nb, .. }) => {
             let denom = 1.0 + na.dot(*nb);
             if denom.abs() < 1e-6 {
-                return Err("offset: degenerate (near-reversal) polyline corner".into());
+                return Err(KernelRefusal::input(
+                    KernelStage::Classify,
+                    "reversal_corner",
+                    "offset: degenerate (near-reversal) polyline corner",
+                ));
             }
             Ok(vertex.add(na.add(*nb).scale(signed_d / denom)))
         }
@@ -484,9 +555,9 @@ fn offset_profile_segments(
     plane_normal: Vec3,
     signed_d: f64,
     closed: bool,
-) -> Result<Vec<NurbsCurve>, String> {
+) -> Result<Vec<NurbsCurve>, KernelRefusal> {
     let tol = 1e-6;
-    let np = plane_normal.normalized()?;
+    let np = plane_normal.normalized().or_refuse(KernelStage::Fragment, "normalized")?;
     let segs = classify_profile_segments(profile, np)?;
     let n = segs.len();
 
@@ -499,7 +570,7 @@ fn offset_profile_segments(
                 seg.offset_point(seg.end(), signed_d)?,
             ))
         })
-        .collect::<Result<_, String>>()?;
+        .collect::<Result<_, KernelRefusal>>()?;
     let junctions = if closed { n } else { n.saturating_sub(1) };
     for i in 0..junctions {
         let j = (i + 1) % n;
@@ -512,23 +583,27 @@ fn offset_profile_segments(
     let mut out = Vec::with_capacity(n);
     for (seg, (off_start, off_end)) in segs.iter().zip(&offsets) {
         match seg {
-            SegGeom::Line { .. } => out.push(make_line(*off_start, *off_end)?),
+            SegGeom::Line { .. } => out.push(make_line(*off_start, *off_end).or_refuse(KernelStage::Fragment, "make_line")?),
             SegGeom::Arc {
                 center, arc_normal, ..
             } => {
                 let radial = off_start.sub(*center);
                 let r2 = radial.length();
                 if r2 <= tol {
-                    return Err("offset: reconstructed arc has a zero radius".into());
+                    return Err(KernelRefusal::internal(
+                        KernelStage::Fragment,
+                        "arc_radius",
+                        "offset: reconstructed arc has a zero radius",
+                    ));
                 }
                 let ax = radial.scale(1.0 / r2);
-                let ay = arc_normal.cross(ax).normalized()?;
+                let ay = arc_normal.cross(ax).normalized().or_refuse(KernelStage::Fragment, "normalized")?;
                 let ve = off_end.sub(*center);
                 let mut angle = ve.dot(ay).atan2(ve.dot(ax));
                 if angle <= 1e-9 {
                     angle += std::f64::consts::TAU;
                 }
-                out.push(make_arc(*center, ax, ay, r2, 0.0, angle)?);
+                out.push(make_arc(*center, ax, ay, r2, 0.0, angle).or_refuse(KernelStage::Fragment, "make_arc")?);
             }
         }
     }
@@ -598,20 +673,32 @@ pub fn rib_from_profile(
     plane_normal: Option<Vec3>,
     extrusion: RibExtrusion,
     names: &RibNames,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let tolerance = 1e-6;
     if profile.is_empty() {
-        return Err("rib: profile needs at least 1 curve forming an open chain".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "profile_count",
+            "rib: profile needs at least 1 curve forming an open chain",
+        ));
     }
     if names.segments.len() != profile.len() {
-        return Err(format!(
-            "rib: {} segment names for {} profile curves",
-            names.segments.len(),
-            profile.len()
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "segment_names",
+            format!(
+                "rib: {} segment names for {} profile curves",
+                names.segments.len(),
+                profile.len()
+            ),
         ));
     }
     if !(thickness > 0.0) {
-        return Err("rib: thickness must be positive".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "thickness",
+            "rib: thickness must be positive",
+        ));
     }
 
     // --- 1. Extract the ordered chain vertices (segment endpoints) and verify the
@@ -619,17 +706,23 @@ pub fn rib_from_profile(
     let mut vertices = Vec::with_capacity(profile.len() + 1);
     let mut samples = Vec::new();
     for (index, curve) in profile.iter().enumerate() {
-        let [start, end] = curve.domain()?;
-        let v_start = curve.evaluate(start)?;
-        let v_end = curve.evaluate(end)?;
+        let [start, end] = curve.domain().or_refuse(KernelStage::Collect, "domain")?;
+        let v_start = curve.evaluate(start).or_refuse(KernelStage::Collect, "evaluate")?;
+        let v_end = curve.evaluate(end).or_refuse(KernelStage::Collect, "evaluate")?;
         if v_end.sub(v_start).length() <= tolerance {
-            return Err("rib: profile has a degenerate (zero-length) segment".into());
+            return Err(KernelRefusal::input(
+                KernelStage::Collect,
+                "segment_length",
+                "rib: profile has a degenerate (zero-length) segment",
+            ));
         }
         if index == 0 {
             vertices.push(v_start);
         } else if v_start.sub(*vertices.last().unwrap()).length() > tolerance {
-            return Err(format!(
-                "rib: profile chain is not connected at curve {index}"
+            return Err(KernelRefusal::input(
+                KernelStage::Collect,
+                "chain_connected",
+                format!("rib: profile chain is not connected at curve {index}"),
             ));
         }
         vertices.push(v_end);
@@ -638,18 +731,26 @@ pub fn rib_from_profile(
         // and cancel the corner bend used to derive the plane normal.
         let first_k = if index == 0 { 0 } else { 1 };
         for k in first_k..=8 {
-            samples.push(curve.evaluate(start + (end - start) * k as f64 / 8.0)?);
+            samples.push(curve.evaluate(start + (end - start) * k as f64 / 8.0).or_refuse(KernelStage::Collect, "evaluate")?);
         }
     }
     let count = vertices.len();
     if count < 2 {
-        return Err("rib: profile needs at least 2 distinct vertices".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "vertex_count",
+            "rib: profile needs at least 2 distinct vertices",
+        ));
     }
 
     // --- 2. A rib thickens an OPEN profile; a closed loop is an ordinary
     //        extrude, not a rib.
     if vertices[count - 1].sub(vertices[0]).length() <= tolerance {
-        return Err("rib: profile chain is closed; rib expects an open chain".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "chain_closed",
+            "rib: profile chain is closed; rib expects an open chain",
+        ));
     }
 
     // --- 3. The profile plane normal np.  A caller-supplied plane wins: it is the
@@ -659,9 +760,13 @@ pub fn rib_from_profile(
     //        segments), which a fully collinear chain cannot yield.  Either way
     //        the chain must lie in the plane.
     let np = match plane_normal {
-        Some(supplied) => supplied
-            .normalized()
-            .map_err(|_| "rib: the supplied profile plane normal is degenerate".to_string())?,
+        Some(supplied) => supplied.normalized().map_err(|_| {
+            KernelRefusal::input(
+                KernelStage::Collect,
+                "plane_normal",
+                "rib: the supplied profile plane normal is degenerate",
+            )
+        })?,
         None => {
             let mut normal = Vec3::default();
             for i in 1..samples.len() - 1 {
@@ -669,10 +774,15 @@ pub fn rib_from_profile(
                 let b = samples[i + 1].sub(samples[i]);
                 normal = normal.add(a.cross(b));
             }
+            // A collinear chain lies in every plane through its line: the
+            // input does not pick one, so the rib refuses rather than choosing.
             normal.normalized().map_err(|_| {
-                "rib: profile is collinear and no profile plane was supplied; cannot determine \
-                 its plane"
-                    .to_string()
+                KernelRefusal::ill_posed(
+                    KernelStage::Classify,
+                    "plane_undetermined",
+                    "rib: profile is collinear and no profile plane was supplied; cannot determine \
+                 its plane",
+                )
             })?
         }
     };
@@ -681,11 +791,15 @@ pub fn rib_from_profile(
         .iter()
         .any(|point| point.sub(origin).dot(np).abs() > tolerance * 100.0)
     {
-        return Err(if plane_normal.is_some() {
-            "rib: profile does not lie in the supplied plane".into()
-        } else {
-            "rib: profile is not planar".to_string()
-        });
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "profile_planar",
+            if plane_normal.is_some() {
+                "rib: profile does not lie in the supplied plane"
+            } else {
+                "rib: profile is not planar"
+            },
+        ));
     }
 
     // --- 4. How far to sweep before the part cuts the rib back: twice the part's
@@ -701,16 +815,23 @@ pub fn rib_from_profile(
             // caller error, not something to silently project away.
             let along = extrude_dir.sub(np.scale(extrude_dir.dot(np)));
             let along = along.normalized().map_err(|_| {
-                "rib: a Parallel-to-Sketch rib grows INSIDE its sketch plane, but the requested \
-                 direction is perpendicular to it"
-                    .to_string()
+                KernelRefusal::input(
+                    KernelStage::Collect,
+                    "direction_in_plane",
+                    "rib: a Parallel-to-Sketch rib grows INSIDE its sketch plane, but the requested \
+                 direction is perpendicular to it",
+                )
             })?;
             parallel_slab(profile, &vertices, np, along, thickness, reach)?
         }
         RibExtrusion::NormalToSketch => {
-            let along = extrude_dir
-                .normalized()
-                .map_err(|_| "rib: extrude direction is degenerate".to_string())?;
+            let along = extrude_dir.normalized().map_err(|_| {
+                KernelRefusal::input(
+                    KernelStage::Collect,
+                    "direction",
+                    "rib: extrude direction is degenerate",
+                )
+            })?;
             normal_slab(profile, np, along, thickness, reach)?
         }
     };
@@ -720,9 +841,9 @@ pub fn rib_from_profile(
     let along = match extrusion {
         RibExtrusion::ParallelToSketch => {
             let along = extrude_dir.sub(np.scale(extrude_dir.dot(np)));
-            along.normalized()?
+            along.normalized().or_refuse(KernelStage::Collect, "normalized")?
         }
-        RibExtrusion::NormalToSketch => extrude_dir.normalized()?,
+        RibExtrusion::NormalToSketch => extrude_dir.normalized().or_refuse(KernelStage::Collect, "normalized")?,
     };
 
     // Both operands go through the cut and the fuse carrying SOURCE TOKENS, not
@@ -733,9 +854,13 @@ pub fn rib_from_profile(
     let roles = slab_face_names(names, extrusion, profile.len());
     let slab_faces: usize = slab.shells.iter().map(|shell| shell.faces.len()).sum();
     if slab_faces != roles.len() {
-        return Err(format!(
-            "rib: the slab builder produced {slab_faces} faces, expected {}",
-            roles.len()
+        return Err(KernelRefusal::internal(
+            KernelStage::Fragment,
+            "slab_faces",
+            format!(
+                "rib: the slab builder produced {slab_faces} faces, expected {}",
+                roles.len()
+            ),
         ));
     }
     let (part, part_names) = tokenised(solid, TARGET_TOKEN);
@@ -749,7 +874,7 @@ pub fn rib_from_profile(
 
     let seeds = chain_probe_seeds(profile)?;
     let rib = up_to_next(&part, &slab, &seeds, along, reach)
-        .map_err(|error| sources.detokenise(&error))?;
+        .map_err(|error| error.with_message(|error| sources.detokenise(error)))?;
     let Some(rib) = rib else {
         // Every bit of the sweep was already material: the rib adds nothing, and
         // the part is its own answer.  Not an error — the same document with a
@@ -764,17 +889,19 @@ pub fn rib_from_profile(
         &BooleanOptions::default(),
     )
     .map_err(|error| {
-        format!(
-            "rib: union of the rib into the part failed: {}",
-            sources.detokenise(&error.to_string())
-        )
+        error.with_message(|error| {
+            format!(
+                "rib: union of the rib into the part failed: {}",
+                sources.detokenise(error)
+            )
+        })
     })?;
-    let chord = vertices[count - 1].sub(vertices[0]).normalized()?;
+    let chord = vertices[count - 1].sub(vertices[0]).normalized().or_refuse(KernelStage::Collect, "normalized")?;
     let frame = RibFrame {
         origin: vertices[0],
         thickness: match extrusion {
             RibExtrusion::ParallelToSketch => np,
-            RibExtrusion::NormalToSketch => np.cross(chord).normalized()?,
+            RibExtrusion::NormalToSketch => np.cross(chord).normalized().or_refuse(KernelStage::Collect, "normalized")?,
         },
         chord,
         growth: along,
@@ -788,7 +915,7 @@ pub fn rib_from_profile(
 /// Twice the part's bounding diagonal, measured from the chain too so a sketch
 /// standing off the part still sweeps across it.  The rib's real extent is decided
 /// by the cut in [`up_to_next`]; this only has to be generous.
-fn sweep_reach(solid: &BrepSolid, chain: &[Vec3]) -> Result<f64, String> {
+fn sweep_reach(solid: &BrepSolid, chain: &[Vec3]) -> Result<f64, KernelRefusal> {
     let mut min = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
     let mut max = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
     let mut extend = |point: Vec3| {
@@ -801,7 +928,7 @@ fn sweep_reach(solid: &BrepSolid, chain: &[Vec3]) -> Result<f64, String> {
     for face in solid.shells.iter().flat_map(|shell| &shell.faces) {
         for row in &face.surface.control_points {
             for point in row {
-                extend(point.point()?);
+                extend(point.point().or_refuse(KernelStage::Collect, "control_point")?);
             }
         }
     }
@@ -810,7 +937,11 @@ fn sweep_reach(solid: &BrepSolid, chain: &[Vec3]) -> Result<f64, String> {
     }
     let diagonal = max.sub(min).length();
     if !(diagonal > 0.0) || !diagonal.is_finite() {
-        return Err("rib: the target solid has no extent to grow the rib against".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "target_extent",
+            "rib: the target solid has no extent to grow the rib against",
+        ));
     }
     Ok(diagonal * 2.0)
 }
@@ -822,14 +953,18 @@ fn sweep_reach(solid: &BrepSolid, chain: &[Vec3]) -> Result<f64, String> {
 /// chain that average is off the chain entirely (an L's vertex centroid lands
 /// exactly on the thickened ribbon's inner corner, a knife-edge the classifier
 /// can only answer "on"), and a probe that starts on a boundary finds no piece.
-fn chain_probe_seeds(profile: &[NurbsCurve]) -> Result<Vec<Vec3>, String> {
+fn chain_probe_seeds(profile: &[NurbsCurve]) -> Result<Vec<Vec3>, KernelRefusal> {
     let mut seeds = Vec::with_capacity(profile.len());
     for curve in profile {
-        let [start, end] = curve.domain()?;
-        seeds.push(curve.evaluate(start + (end - start) * 0.5)?);
+        let [start, end] = curve.domain().or_refuse(KernelStage::Collect, "domain")?;
+        seeds.push(curve.evaluate(start + (end - start) * 0.5).or_refuse(KernelStage::Collect, "evaluate")?);
     }
     if seeds.is_empty() {
-        return Err("rib: profile has no points to grow from".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "profile_empty",
+            "rib: profile has no points to grow from",
+        ));
     }
     Ok(seeds)
 }
@@ -847,7 +982,7 @@ fn parallel_slab(
     along: Vec3,
     thickness: f64,
     reach: f64,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let offset = along.scale(reach);
     let chain_start = vertices[0];
     let chain_end = *vertices.last().expect("chain has vertices");
@@ -855,20 +990,23 @@ fn parallel_slab(
     for curve in profile {
         region.push(curve.clone());
     }
-    region.push(make_line(chain_end, chain_end.add(offset))?);
+    region.push(make_line(chain_end, chain_end.add(offset)).or_refuse(KernelStage::Fragment, "make_line")?);
     for curve in profile.iter().rev() {
-        region.push(super::extrude::translated_curve(&curve.reversed()?, offset)?);
+        region.push(super::extrude::translated_curve(&curve.reversed().or_refuse(KernelStage::Fragment, "reversed")?, offset)?);
     }
-    region.push(make_line(chain_start.add(offset), chain_start)?);
+    region.push(make_line(chain_start.add(offset), chain_start).or_refuse(KernelStage::Fragment, "make_line")?);
 
     // Centre the thickness on the sketch plane: start half a thickness under it
     // and extrude a full thickness back through.
     let base = region
         .iter()
         .map(|curve| super::extrude::translated_curve(curve, np.scale(-thickness * 0.5)))
-        .collect::<Result<Vec<_>, String>>()?;
-    extrude_profile_brep(&base, np, thickness)
-        .map_err(|error| format!("rib: sweeping the profile inside its plane failed: {error}"))
+        .collect::<Result<Vec<_>, KernelRefusal>>()?;
+    extrude_profile_brep(&base, np, thickness).map_err(|error| {
+        error.with_message(|error| {
+            format!("rib: sweeping the profile inside its plane failed: {error}")
+        })
+    })
 }
 
 /// **Normal to Sketch**: the chain thickened INSIDE its own plane (miter-offset
@@ -880,31 +1018,34 @@ fn normal_slab(
     along: Vec3,
     thickness: f64,
     reach: f64,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let half = thickness * 0.5;
     let left = offset_profile_segments(profile, np, half, false)
-        .map_err(|error| format!("rib: {error}"))?;
+        .map_err(|error| error.with_message(|error| format!("rib: {error}")))?;
     let right = offset_profile_segments(profile, np, -half, false)
-        .map_err(|error| format!("rib: {error}"))?;
+        .map_err(|error| error.with_message(|error| format!("rib: {error}")))?;
     let left_first = &left[0];
     let left_last = &left[left.len() - 1];
     let right_first = &right[0];
     let right_last = &right[right.len() - 1];
-    let left_start = left_first.evaluate(left_first.domain()?[0])?;
-    let left_end = left_last.evaluate(left_last.domain()?[1])?;
-    let right_start = right_first.evaluate(right_first.domain()?[0])?;
-    let right_end = right_last.evaluate(right_last.domain()?[1])?;
+    let left_start = left_first.evaluate(left_first.domain().or_refuse(KernelStage::Fragment, "domain")?[0]).or_refuse(KernelStage::Fragment, "evaluate")?;
+    let left_end = left_last.evaluate(left_last.domain().or_refuse(KernelStage::Fragment, "domain")?[1]).or_refuse(KernelStage::Fragment, "evaluate")?;
+    let right_start = right_first.evaluate(right_first.domain().or_refuse(KernelStage::Fragment, "domain")?[0]).or_refuse(KernelStage::Fragment, "evaluate")?;
+    let right_end = right_last.evaluate(right_last.domain().or_refuse(KernelStage::Fragment, "domain")?[1]).or_refuse(KernelStage::Fragment, "evaluate")?;
     let mut thin_loop: Vec<NurbsCurve> = Vec::with_capacity(left.len() + right.len() + 2);
     for curve in &left {
         thin_loop.push(curve.clone());
     }
-    thin_loop.push(make_line(left_end, right_end)?);
+    thin_loop.push(make_line(left_end, right_end).or_refuse(KernelStage::Fragment, "make_line")?);
     for curve in right.iter().rev() {
-        thin_loop.push(curve.reversed()?);
+        thin_loop.push(curve.reversed().or_refuse(KernelStage::Fragment, "reversed")?);
     }
-    thin_loop.push(make_line(right_start, left_start)?);
-    extrude_profile_brep(&thin_loop, along, reach)
-        .map_err(|error| format!("rib: extrude of the thickened profile failed: {error}"))
+    thin_loop.push(make_line(right_start, left_start).or_refuse(KernelStage::Fragment, "make_line")?);
+    extrude_profile_brep(&thin_loop, along, reach).map_err(|error| {
+        error.with_message(|error| {
+            format!("rib: extrude of the thickened profile failed: {error}")
+        })
+    })
 }
 
 /// SolidWorks' **Up To Next**, exactly: cut the over-long `slab` by the part and
@@ -927,7 +1068,7 @@ fn up_to_next(
     seeds: &[Vec3],
     along: Vec3,
     reach: f64,
-) -> Result<Option<BrepSolid>, String> {
+) -> Result<Option<BrepSolid>, KernelRefusal> {
     let free = match boolean_operation(
         slab,
         solid,
@@ -940,12 +1081,15 @@ fn up_to_next(
         // as itself rather than as a boolean's internal complaint.
         Err(error) => {
             // ESSENTIAL REFUSAL (see the sibling below): the cut refusing because
-            // the operands are disjoint IS "the rib met nothing".
-            return Err(format!(
+            // the operands are disjoint IS "the rib met nothing". The cut's own
+            // class rides through under the rib's text.
+            return Err(error.with_message(|error| {
+                format!(
                 "rib: RIB_UP_TO_NEXT_UNBOUNDED — the rib never reaches the part, so it has \
                  nothing to stop against (SolidWorks' Up To Next requires every part of a rib \
                  to meet a face); check the rib's direction — the cut reported: {error}"
-            ))
+                )
+            }))
         }
     };
     if free.shells.is_empty() {
@@ -955,13 +1099,13 @@ fn up_to_next(
     // Where the rib actually begins: the first point along the sweep from each
     // seed that is NOT already material. The chain can be drawn inside a wall, and
     // the rib is then the free space just beyond it.
-    let classifier = SolidClassifier::new(solid, 1e-6)?;
+    let classifier = SolidClassifier::new(solid, 1e-6).or_refuse(KernelStage::Select, "classifier")?;
     let steps = 64;
     let mut probes = Vec::new();
     for seed in seeds {
         for step in 1..=steps {
             let point = seed.add(along.scale(reach * step as f64 / steps as f64 * 0.5));
-            if classifier.classify(point)?.class == PointClass::Out {
+            if classifier.classify(point).or_refuse(KernelStage::Select, "classify")?.class == PointClass::Out {
                 probes.push(point);
                 break;
             }
@@ -978,7 +1122,8 @@ fn up_to_next(
         let grown_here = probes
             .iter()
             .map(|probe| classify_point(*probe, &piece, 1e-6))
-            .collect::<Result<Vec<_>, String>>()?
+            .collect::<Result<Vec<_>, String>>()
+            .or_refuse(KernelStage::Select, "classify_point")?
             .into_iter()
             .any(|classification| classification.class == PointClass::In);
         if !grown_here {
@@ -1001,13 +1146,14 @@ fn up_to_next(
             // sweep distance, which is exactly the bug this feature was reported
             // for. The right repair is always the rib's DIRECTION, never this
             // check.
-            return Err(
+            return Err(KernelRefusal::input(
+                KernelStage::Select,
+                "up_to_next_unbounded",
                 "rib: RIB_UP_TO_NEXT_UNBOUNDED — part of the rib never lands on the part, so \
                  it has no face to stop against (SolidWorks' Up To Next requires the whole rib \
                  to terminate on a face). Turn the rib around with `direction`, or move the \
-                 profile so its sweep meets the part"
-                    .into(),
-            );
+                 profile so its sweep meets the part",
+            ));
         }
         kept = Some(match kept {
             None => piece,
@@ -1017,7 +1163,11 @@ fn up_to_next(
                 BooleanOperation::Union,
                 &BooleanOptions::default(),
             )
-            .map_err(|error| format!("rib: joining the rib's own pieces failed: {error}"))?,
+            .map_err(|error| {
+                error.with_message(|error| {
+                    format!("rib: joining the rib's own pieces failed: {error}")
+                })
+            })?,
         });
     }
     Ok(kept)
@@ -1045,6 +1195,7 @@ fn solid_from_shell(source: &BrepSolid, shell: &ShellRecord) -> BrepSolid {
         .flat_map(|edge| [edge.start_vertex_id, edge.end_vertex_id])
         .collect();
     BrepSolid {
+        mass_properties_cache: Default::default(),
         id: source.id,
         vertices: source
             .vertices

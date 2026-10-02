@@ -132,6 +132,8 @@ mod geom;
 mod delete_face;
 #[path = "direct_edit/delete_faces.rs"]
 mod delete_faces;
+#[path = "direct_edit/refit_faces.rs"]
+mod refit_faces;
 #[path = "direct_edit/face_move.rs"]
 mod face_move;
 #[path = "direct_edit/face_move_carrier.rs"]
@@ -183,8 +185,79 @@ use open_heal::*;
 use open_heal_census::*;
 use triple_point::*;
 
+/// The slugs of the direct-edit refusals the app explains to a user (its
+/// face-transform help, `BREP_render::face_transform_help`), shared by each
+/// mint and by [`face_transform_reason`].
+pub mod face_refusal_slugs {
+    /// The motion turns the whole body inside out (`UnsupportedGeometry`).
+    pub const SOLID_INVERSION: &str = "solid_inversion";
+    /// The same, measured on the sphere lane (`UnsupportedGeometry`).
+    pub const SPHERE_SOLID_INVERSION: &str = "sphere_solid_inversion";
+    /// A push that inverts the solid (`Internal` from the offset lanes,
+    /// `InvalidInput` from the shared acceptance in `geom.rs`).
+    pub const INVERTED: &str = "inverted";
+    /// The motion carries a face through a neighbour it must meet
+    /// (`UnsupportedGeometry`).
+    pub const EDGE_INVERSION: &str = "edge_inversion";
+    /// The same, across a curved edge (`UnsupportedGeometry`).
+    pub const CURVED_EDGE_INVERSION: &str = "curved_edge_inversion";
+    /// A turn that lays the face parallel to a neighbour (`UnsupportedGeometry`).
+    pub const PARALLEL_LIMIT: &str = "parallel_limit";
+    /// A turn that lays a curved face's axis parallel to a neighbour
+    /// (`UnsupportedGeometry`).
+    pub const AXIS_PARALLEL_LIMIT: &str = "axis_parallel_limit";
+    /// A Transform Face asked to scale (`InvalidInput`).
+    pub const RIGID_SCALE: &str = "scale";
+    /// A Transform Face whose selection has no geometry for the default pivot
+    /// (`InvalidInput`).
+    pub const PIVOT_GEOMETRY: &str = "pivot_geometry";
+}
+use face_refusal_slugs::*;
+
+/// Why a Transform Face refused, as far as the app explains it — read off the
+/// refusal's CLASS and slug, never its text, so a reworded refusal keeps its
+/// explanation and a refusal that merely mentions "parallel" does not borrow
+/// one. `None` is every other refusal: the app shows the kernel's own words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaceTransformReason {
+    /// The body turns inside out.
+    InsideOut,
+    /// A face is carried past a neighbour it has to meet.
+    PastNeighbour,
+    /// A TURN lays a face (or a curved face's axis) parallel to a neighbour.
+    TurnParallel,
+    /// A face transform asked to scale.
+    RigidScale,
+    /// No geometry to centre the default pivot on.
+    NoPivot,
+}
+
+/// [`FaceTransformReason`] of a refusal, by class and slug.
+pub fn face_transform_reason(refusal: &crate::KernelRefusal) -> Option<FaceTransformReason> {
+    use crate::RefusalClass::{Internal, InvalidInput, UnsupportedGeometry};
+    use FaceTransformReason::*;
+    match &refusal.class {
+        UnsupportedGeometry { what } if what == SOLID_INVERSION || what == SPHERE_SOLID_INVERSION => {
+            Some(InsideOut)
+        }
+        Internal { what } | InvalidInput { what } if what == INVERTED => Some(InsideOut),
+        UnsupportedGeometry { what } if what == EDGE_INVERSION || what == CURVED_EDGE_INVERSION => {
+            Some(PastNeighbour)
+        }
+        UnsupportedGeometry { what } if what == PARALLEL_LIMIT || what == AXIS_PARALLEL_LIMIT => {
+            Some(TurnParallel)
+        }
+        InvalidInput { what } if what == RIGID_SCALE => Some(RigidScale),
+        InvalidInput { what } if what == PIVOT_GEOMETRY => Some(NoPivot),
+        _ => None,
+    }
+}
+
 pub use delete_face::{delete_face_and_heal, resolve_face_by_point};
 pub use delete_faces::delete_faces_and_heal;
+pub use refit_faces::{
+    refit_faces_as_one, refit_refusal_phrases, RefitCarrier, RefitReport, RefitSurfaceKind,
+};
 pub use face_move::move_faces;
 pub use face_rotate::rotate_faces;
 // The ROUTING reading: which faces a moved selection would have to open a new

@@ -10,7 +10,7 @@
 use std::f64::consts::PI;
 
 use crate::feature_pipeline::features::common;
-use crate::feature_pipeline::{FeatureContext, FeatureResult};
+use crate::feature_pipeline::{FeatureContext, FeatureRefusal, FeatureResult};
 
 pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     match build(ctx) {
@@ -19,7 +19,7 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     }
 }
 
-fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     common::require_blend_direction(ctx, "chamfer")?;
 
     let selection = common::resolve_blend_selection(ctx)?;
@@ -30,11 +30,21 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     if selection.multi_solid {
         return Err("chamfer requires the selected edges to belong to a single solid".into());
     }
-    // Nothing resolved: name misses stay `unresolved` (contract rule 1 — the caller
-    // repairs + re-dispatches), even though the established chamfer would throw here.
+    // A selection none of whose references resolve is refused by name (see
+    // the fillet feature); a partial blends what resolved and reports the
+    // misses, which stay in `unresolved` for the engine's rename hint.
     let Some(target) = selection.target else {
-        return Ok(result);
+        if result.unresolved.is_empty() {
+            return Ok(result);
+        }
+        let mut refused =
+            ctx.fail(super::fillet::unresolved_refusal("chamfer", &result.unresolved));
+        refused.unresolved = result.unresolved;
+        return Ok(refused);
     };
+    // A partial proceeds on what resolved and reports the miss as a typed
+    // fulfilment (see the fillet feature).
+    result.note_partial_resolution(&common::reference_names(ctx.param("edges")));
 
     let distance = ctx.number("distance")?;
     // A non-positive / non-finite distance is a soft no-op.
@@ -57,7 +67,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         .iter()
         .map(|edge_name| common::blend_face_name(&ctx.id, edge_name))
         .collect();
-    let blended = crate::with_registered_solid_str(target.handle, |solid| {
+    let blended = crate::with_registered_solid_typed(target.handle, |solid| {
         if let Some(d2) = d2 {
             crate::chamfer_edges_asymmetric(
                 solid,
@@ -87,7 +97,8 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
             )
         }
     })
-    .map_err(|error| format!("chamfer failed: {error}"))?;
+    // The blend's refusal keeps its class through the feature's wrap.
+    .map_err(|error| error.with_message(|error| format!("chamfer failed: {error}")))?;
 
     result.added.push(common::register_added(blended, &target.name));
     result.removed.push(target.name);

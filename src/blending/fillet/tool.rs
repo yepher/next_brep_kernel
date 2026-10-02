@@ -8,24 +8,35 @@ fn cross_section_profile(
     cross: &EdgeCross,
     radius: f64,
     chamfer: bool,
-) -> Result<Vec<NurbsCurve>, String> {
+) -> Result<Vec<NurbsCurve>, KernelRefusal> {
     let corner = cross.start;
     let cos_theta = cross.into_first.dot(cross.into_second).clamp(-1.0, 1.0);
     let theta = cos_theta.acos();
     if theta <= 1e-6 || theta >= std::f64::consts::PI - 1e-6 {
-        return Err("fillet: dihedral angle too degenerate".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Classify,
+            "dihedral_degenerate",
+            "fillet: dihedral angle too degenerate",
+        ));
     }
     let tangent_offset = radius / (theta * 0.5).tan();
     let first_tangency = corner.add(cross.into_first.scale(tangent_offset));
     let second_tangency = corner.add(cross.into_second.scale(tangent_offset));
-    let mut profile = vec![make_line(corner, first_tangency)?];
+    let line = |from: Vec3, to: Vec3| {
+        make_line(from, to).or_refuse(KernelStage::Fragment, "profile_line")
+    };
+    let mut profile = vec![line(corner, first_tangency)?];
     if chamfer {
-        profile.push(make_line(first_tangency, second_tangency)?);
+        profile.push(line(first_tangency, second_tangency)?);
     } else {
         // Ball center: along the corner bisector at distance r/sin(θ/2);
         // the arc runs from the first tangency to the second, curving
         // toward the corner.
-        let bisector = cross.into_first.add(cross.into_second).normalized()?;
+        let bisector = cross
+            .into_first
+            .add(cross.into_second)
+            .normalized()
+            .or_refuse(KernelStage::Fragment, "profile_bisector")?;
         let center = corner.add(bisector.scale(radius / (theta * 0.5).sin()));
         let x_axis = first_tangency.sub(center).scale(1.0 / radius);
         let sweep = std::f64::consts::PI - theta;
@@ -34,10 +45,14 @@ fn cross_section_profile(
         let y_axis_raw = second_tangency.sub(center).scale(1.0 / radius);
         let y_axis = y_axis_raw
             .sub(x_axis.scale(y_axis_raw.dot(x_axis)))
-            .normalized()?;
-        profile.push(make_arc(center, x_axis, y_axis, radius, 0.0, sweep)?);
+            .normalized()
+            .or_refuse(KernelStage::Fragment, "profile_arc_axis")?;
+        profile.push(
+            make_arc(center, x_axis, y_axis, radius, 0.0, sweep)
+                .or_refuse(KernelStage::Fragment, "profile_arc")?,
+        );
     }
-    profile.push(make_line(second_tangency, corner)?);
+    profile.push(line(second_tangency, corner)?);
     Ok(profile)
 }
 
@@ -51,15 +66,14 @@ pub(super) fn chamfer_cross_section_offsets(
     cross: &EdgeCross,
     d1: f64,
     d2: f64,
-) -> Result<Vec<NurbsCurve>, String> {
+) -> Result<Vec<NurbsCurve>, KernelRefusal> {
     let o = cross.start;
     let p1 = o.add(cross.into_first.scale(d1));
     let p2 = o.add(cross.into_second.scale(d2));
-    Ok(vec![
-        make_line(o, p1)?,
-        make_line(p1, p2)?,
-        make_line(p2, o)?,
-    ])
+    let line = |from: Vec3, to: Vec3| {
+        make_line(from, to).or_refuse(KernelStage::Fragment, "chamfer_profile_line")
+    };
+    Ok(vec![line(o, p1)?, line(p1, p2)?, line(p2, o)?])
 }
 
 /// Given setback `d1` on face 1 and the angle α between the chamfer face and
@@ -73,16 +87,24 @@ pub(super) fn chamfer_angle_second_distance(
     cross: &EdgeCross,
     d1: f64,
     angle_rad: f64,
-) -> Result<f64, String> {
+) -> Result<f64, KernelRefusal> {
     let e1 = cross.into_first;
     let cos_theta = cross.into_first.dot(cross.into_second).clamp(-1.0, 1.0);
     let theta = cos_theta.acos();
     if theta <= 1e-6 || theta >= std::f64::consts::PI - 1e-6 {
-        return Err("chamfer_edge_angle: dihedral angle too degenerate".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Classify,
+            "angle_dihedral_degenerate",
+            "chamfer_edge_angle: dihedral angle too degenerate",
+        ));
     }
     if !(angle_rad > 1e-9) || angle_rad >= theta - 1e-9 {
-        return Err(format!(
-            "chamfer_edge_angle: angle {angle_rad} must lie in (0, dihedral θ={theta})"
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "chamfer_angle",
+            format!(
+                "chamfer_edge_angle: angle {angle_rad} must lie in (0, dihedral θ={theta})"
+            ),
         ));
     }
     // Orthonormal basis of the cross-section plane: e1 = into_first, e2 the
@@ -90,7 +112,8 @@ pub(super) fn chamfer_angle_second_distance(
     let e2 = cross
         .into_second
         .sub(e1.scale(cross.into_second.dot(e1)))
-        .normalized()?;
+        .normalized()
+        .or_refuse(KernelStage::Classify, "chamfer_basis")?;
     // Project face 2 into (e1, e2): (cosθ, sinθ), sinθ > 0 by construction.
     let f2x = cross.into_second.dot(e1);
     let f2y = cross.into_second.dot(e2);
@@ -101,14 +124,25 @@ pub(super) fn chamfer_angle_second_distance(
     // [ ca   f2x ] [s]   [d1]      (from  d1 − s·cosα = t·f2x)
     // [ sa  −f2y ] [t] = [ 0]      (from  s·sinα      = t·f2y)
     let det = ca * (-f2y) - f2x * sa;
+    // Both remaining refusals sit BEHIND the angle check above, which
+    // bounds α strictly inside (0, θ): a parallel ray or a non-positive
+    // setback is the construction contradicting its own precondition.
     if det.abs() < 1e-12 {
-        return Err("chamfer_edge_angle: chamfer ray is parallel to face 2".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Classify,
+            "chamfer_ray_parallel",
+            "chamfer_edge_angle: chamfer ray is parallel to face 2",
+        ));
     }
     // Cramer's rule for t (the face-2 setback d2).
     let t = (ca * 0.0 - sa * d1) / det;
     if !(t > 0.0) || !t.is_finite() {
-        return Err(format!(
-            "chamfer_edge_angle: constructed a non-positive setback d2={t}"
+        return Err(KernelRefusal::internal(
+            KernelStage::Classify,
+            "chamfer_setback",
+            format!(
+                "chamfer_edge_angle: constructed a non-positive setback d2={t}"
+            ),
         ));
     }
     Ok(t)
@@ -131,9 +165,13 @@ fn tool_boolean_setup(convex: bool) -> (BooleanOperation, BooleanOptions) {
     (operation, options)
 }
 
-pub(super) fn apply_tool(solid: &BrepSolid, tool: &BrepSolid, convex: bool) -> Result<BrepSolid, String> {
+pub(super) fn apply_tool(
+    solid: &BrepSolid,
+    tool: &BrepSolid,
+    convex: bool,
+) -> Result<BrepSolid, KernelRefusal> {
     let (operation, options) = tool_boolean_setup(convex);
-    Ok(boolean_operation(solid, tool, operation, &options)?)
+    boolean_operation(solid, tool, operation, &options)
 }
 
 /// Assemble the blend boolean with the EXACT arrangement only — no
@@ -153,7 +191,7 @@ pub(super) fn apply_tool_exact(
     solid: &BrepSolid,
     tool: &BrepSolid,
     convex: bool,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let (operation, options) = tool_boolean_setup(convex);
     Ok(crate::boolean_operation_with_diagnostics(solid, tool, operation, &options)?.value)
 }
@@ -181,7 +219,7 @@ pub(super) fn fillet_or_chamfer(
     name: Option<&str>,
     ends: ToolEnds,
     lane: Lane,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     // Fuse-first operand heal (Lever A) BEFORE the §6.9 surgery, mirroring the
     // output heal below: snap the input's near-coincident / off-plane vertices
     // to exact and re-anchor incident edges, so amplified solver/intersection
@@ -234,12 +272,11 @@ pub(super) fn fillet_or_chamfer(
 /// So is a trim that left its planar carrier's chart
 /// (`blend::PLANAR_CHART_EDGE_OFF_PLANE`, `blend::PLANAR_CHART_WIDEN_UNSOUND`):
 /// the clamped body another lane would answer with is the defect itself.
-pub(super) fn is_terminal_blend_refusal(error: &str) -> bool {
-    crate::blend::is_wall_fold(error)
-        || error.starts_with(crate::blend::MARCHED_FIT_OFF_CARRIERS)
-        || error.starts_with(crate::blend::CONSUMED_SNAP_UNSOUND)
-        || error.starts_with(crate::blend::PLANAR_CHART_EDGE_OFF_PLANE)
-        || error.starts_with(crate::blend::PLANAR_CHART_WIDEN_UNSOUND)
+pub(super) fn is_terminal_blend_refusal(refusal: &KernelRefusal) -> bool {
+    crate::blend::is_wall_fold(refusal)
+        || crate::blend::is_marched_fit_off_carriers(refusal)
+        || crate::blend::is_consumed_snap(refusal)
+        || crate::blend::is_planar_chart_refusal(refusal)
 }
 
 fn fillet_or_chamfer_inner(
@@ -250,7 +287,7 @@ fn fillet_or_chamfer_inner(
     name: Option<&str>,
     ends: ToolEnds,
     lane: Lane,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     // The general §4.9 march with direct §6.9 surgery is the PRIMARY lane:
     // it constructs the blend from the rolling ball and re-trims the mates,
     // with no tool solid to run past the edge.  A straight edge between two
@@ -268,12 +305,21 @@ fn fillet_or_chamfer_inner(
         .unwrap_or(false);
     // `BREP_CUTTER_FIRST=1` restores the pre-network order for A/B
     // comparison; the general lane is otherwise first.
+    // The three lane notes below are not refusals of the shape: they say the
+    // march was not asked, and only ever reach a caller inside the ladder's
+    // combined text ("first attempt: …").  Classed as the deferral they are.
+    let lane_note = |what: &'static str, message: &str| {
+        KernelRefusal::unsupported(KernelStage::Classify, what, message)
+    };
     let general = if ends != ToolEnds::default() {
-        Err("a padded cutter was requested".to_string())
+        Err(lane_note("padded_cutter", "a padded cutter was requested"))
     } else if lane == Lane::CutterFirst {
-        Err("the cutter has the first turn in this composition".to_string())
+        Err(lane_note(
+            "cutter_first",
+            "the cutter has the first turn in this composition",
+        ))
     } else if std::env::var("BREP_CUTTER_FIRST").is_ok() {
-        Err("BREP_CUTTER_FIRST set".to_string())
+        Err(lane_note("cutter_first_env", "BREP_CUTTER_FIRST set"))
     } else if closed {
         crate::blend::blend_closed_edge(solid, edge_id, radius, chamfer, name)
     } else {
@@ -310,7 +356,11 @@ fn fillet_or_chamfer_inner(
                 Err(untrimmed) => untrimmed,
             }
         }
-        Ok(_) => "the general blend assembled an invalid solid".to_string(),
+        Ok(_) => KernelRefusal::internal(
+            KernelStage::Validate,
+            "general_invalid",
+            "the general blend assembled an invalid solid",
+        ),
         Err(error) => error,
     };
     // The rolling ball does not FIT: TERMINAL, like the mixed-convexity corner
@@ -319,7 +369,7 @@ fn fillet_or_chamfer_inner(
     // and a tool solid does not answer that question, it only removes whatever
     // its own surface encloses.  Reporting the geometric refusal beats leading
     // the user with the cutter's unrelated complaint about the edge's curve.
-    if general_error.starts_with(crate::blend::BALL_OFF_CARRIER) {
+    if crate::blend::is_ball_off_carrier(&general_error) {
         return Err(general_error);
     }
     // The wall the rolling ball sweeps FOLDS THROUGH ITSELF: terminal for the
@@ -343,14 +393,13 @@ fn fillet_or_chamfer_inner(
             let general = if closed {
                 crate::blend::blend_closed_edge(solid, edge_id, radius, chamfer, name)
             } else {
-                crate::blend::blend_smooth_chain(solid, edge_id, radius, chamfer, name).or_else(
-                    |error| {
+                crate::blend::blend_smooth_chain(solid, edge_id, radius, chamfer, name)
+                    .or_else(|error| {
                         if is_terminal_blend_refusal(&error) {
                             return Err(error);
                         }
                         crate::blend::blend_open_edge(solid, edge_id, radius, chamfer, name)
-                    },
-                )
+                    })
             };
             // Last rung of the ladder, and the same contract: an untrimmed
             // blend is a failure here too.  Nothing is left to fall through
@@ -368,10 +417,13 @@ fn fillet_or_chamfer_inner(
                     if is_terminal_blend_refusal(&error) {
                         return error;
                     }
-                    format!(
-                        "exact cutter failed: {exact_error}; general blend also failed: {error} \
-                         (first attempt: {general_error})"
-                    )
+                    // The last rung's own class survives the wrap.
+                    error.with_message(|error| {
+                        format!(
+                            "exact cutter failed: {exact_error}; general blend also failed: {error} \
+                             (first attempt: {general_error})"
+                        )
+                    })
                 })
         }
     }
@@ -408,7 +460,7 @@ fn build_exact_tool(
     overshoot: f64,
     ends: ToolEnds,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let start_pad = overshoot + ends.start.max(0.0);
     let end_pad = overshoot + ends.end.max(0.0);
     let mut tool = match &cross.path {
@@ -461,7 +513,8 @@ fn build_exact_tool(
             } else {
                 profile.to_vec()
             };
-            revolve_profile_brep(&rotated, *center, *axis, total)?
+            revolve_profile_brep(&rotated, *center, *axis, total)
+                .or_refuse(KernelStage::Fragment, "revolve_profile")?
         }
     };
     // Side faces are emitted in input-curve order; the blend wall is the
@@ -591,7 +644,7 @@ fn rotate_curve_about_axis(
     center: Vec3,
     axis: Vec3,
     angle: f64,
-) -> Result<NurbsCurve, String> {
+) -> Result<NurbsCurve, KernelRefusal> {
     let (cosine, sine) = (angle.cos(), angle.sin());
     NurbsCurve::new(
         curve.degree,
@@ -610,6 +663,7 @@ fn rotate_curve_about_axis(
             })
             .collect(),
     )
+    .or_refuse(KernelStage::Fragment, "rotate_curve")
 }
 
 /// How far the cutter for `edge_id` must run PAST the edge's CURRENT ends to
@@ -746,7 +800,7 @@ fn fillet_or_chamfer_exact(
     name: Option<&str>,
     ends: ToolEnds,
     lane: Lane,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let cross = analyze_edge(solid, edge_id, radius)?;
     let profile = cross_section_profile(&cross, radius, chamfer)?;
     // Straight edges: try a flush tool first (the workhorse box/prism case,
@@ -784,7 +838,9 @@ fn fillet_or_chamfer_exact(
     // would leave the blend wall off its supports.  Only when no rung of the
     // ladder assembles exactly do we allow that perturbed rescue, so every
     // selection that used to succeed still does.
-    let mut last_error = String::new();
+    // Every rung of the ladder below writes this before it is read: the
+    // overshoot list is never empty.  The empty seed carries no text.
+    let mut last_error = KernelRefusal::internal(KernelStage::Fragment, "cutter", String::new());
     let mut capped: Option<BrepSolid> = None;
     for exact_only in [true, false] {
         for (attempt, &overshoot) in overshoots.iter().enumerate() {
@@ -808,16 +864,27 @@ fn fillet_or_chamfer_exact(
                     if capped.is_none() {
                         capped = Some(result);
                     }
-                    last_error = format!(
-                        "the cutter left {survivors} of its own faces standing on the result \
-                         (overshoot {overshoot})"
+                    // A bulkhead standing on the result is the cut contradicting
+                    // what a complete blend is (the header above): a check that
+                    // tripped, never a refusal of the input.
+                    last_error = KernelRefusal::internal(
+                        KernelStage::Validate,
+                        "cutter_scaffold",
+                        format!(
+                            "the cutter left {survivors} of its own faces standing on the result \
+                             (overshoot {overshoot})"
+                        ),
                     );
                 }
                 Err(error) => {
                     last_error = if exact_only && attempt == 0 {
                         error
                     } else {
-                        format!("{last_error}; overshoot retry also failed: {error}")
+                        // The retry's own class survives; the earlier rung's
+                        // text is kept in front of it.
+                        error.with_message(|error| {
+                            format!("{last_error}; overshoot retry also failed: {error}")
+                        })
                     };
                 }
             }

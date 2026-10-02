@@ -96,7 +96,9 @@ pub(crate) struct GuidedLoftRequest {
     pub(crate) rotate_to_frame: bool,
 }
 
-pub(crate) fn guided_loft_dispatch(request: &GuidedLoftRequest) -> Result<BrepSolid, String> {
+pub(crate) fn guided_loft_dispatch(
+    request: &GuidedLoftRequest,
+) -> Result<BrepSolid, crate::KernelRefusal> {
     if request.rotate_to_frame {
         loft_profile_brep_guided_frame(&request.sections, &request.guide, request.name.as_deref())
     } else {

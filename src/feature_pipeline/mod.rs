@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
-use crate::{NurbsCurve, Vec3};
+use crate::{KernelRefusal, NurbsCurve, Vec3};
 
 // The scene component concept (assemblies): component records + per-instance
 // entity-name namespacing at the component boundary. See component.rs.
@@ -32,9 +32,9 @@ pub use parts_library::{
     refresh_library_entry_impl, same_build,
     PartsLibraryEntry, PartsLibraryMap, stable_json_hash,
 };
-// Assembly constraint state + lifecycle (build-spec §4/§6/§7): the `assembly`
-// history block, the ten constraint schemas, the mate-mapping + solve tail,
-// and the exported constraint-mutation ABI. See assembly.rs.
+// Assembly constraint state + lifecycle: the `assembly` history block, the
+// ten constraint schemas, the mate-mapping + solve tail, and the exported
+// constraint-mutation ABI. See assembly.rs.
 pub mod assembly;
 /// Wire-harness routing: the document's `wireHarness` block, the sided port
 /// graph, per-connection routes and the bundle solids — solved at the tail of
@@ -61,7 +61,7 @@ pub use features::transform_face::face_transform_pivot;
 // payload carrying IMPORT3D's own names, ready to become an
 // `inputParams.nativeBrep` part document. Lives WITH the feature that reads it
 // back (one naming convention, one implementation); exported for the import
-// lanes that build part documents (kernel-plan `step-assembly-import.md` §3.1).
+// lanes that build part documents.
 pub use features::import3d::{native_import_payload, native_import_payload_with_appearance};
 pub(crate) mod scene_metadata;
 // The scene-metadata isolation bracket, for out-of-crate producers that encode a
@@ -137,8 +137,8 @@ pub struct HistoryRequest {
     /// Stop BEFORE executing the feature with this id.
     #[serde(default, rename = "stopBeforeId")]
     pub stop_before_id: Option<String>,
-    /// The assembly constraint block (spec §7): `{ constraints, idCounter }`.
-    /// Absent on every non-assembly document (and omitted on re-serialize, so
+    /// The assembly constraint block: `{ constraints, idCounter }`. Absent on
+    /// every non-assembly document (and omitted on re-serialize, so
     /// componentless files persist byte-identically). Solved at the tail of
     /// every run; see `assembly.rs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -161,11 +161,11 @@ pub struct HistoryRequest {
     /// file / seed request with no `displayLod` tessellates exactly as before.
     #[serde(default = "default_display_lod", rename = "displayLod")]
     pub display_lod: f64,
-    /// The parts library block (assemblies build-spec §2.1): unique part
-    /// payloads the ACOMP instance features reference by name. Ingested into
-    /// the kernel-resident library at the start of every run (this is how a
-    /// LOADED document seeds it); SAVE serializes `parts_library_json()` back
-    /// out — never this loaded block (see parts_library.rs).
+    /// The parts library block: unique part payloads the ACOMP instance
+    /// features reference by name. Ingested into the kernel-resident library
+    /// at the start of every run (this is how a LOADED document seeds it);
+    /// SAVE serializes `parts_library_json()` back out — never this loaded
+    /// block (see parts_library.rs).
     #[serde(default, rename = "partsLibrary")]
     pub parts_library: parts_library::PartsLibraryMap,
     /// The declared-ports block: the part's connection points as DATA, a
@@ -281,6 +281,32 @@ pub struct FeatureResult {
     /// Set on a hard failure. `execute_history` records it and HALTS the
     /// remaining features (mirrors the abort-on-error loop). Never a panic.
     pub error: Option<String>,
+    /// The TYPED refusal behind `error`, when the producer that refused minted
+    /// one (`KernelRefusal`: a closed class, the stage, the same text). `error`
+    /// is always that refusal's message verbatim, so a consumer that only
+    /// reads text sees nothing new; one that dispatches on the class reads it
+    /// here. `None` on success and on a refusal from a producer that still
+    /// returns text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<KernelRefusal>,
+    /// What a SUCCESSFUL feature did with what it was asked, when that is not
+    /// "everything, exactly": the references it applied and the ones it
+    /// rejected, each with why. `None` on a refusal and on a feature that did
+    /// everything it was asked. A feature that proceeds on the subset of its
+    /// selection that resolved says so HERE, typed, instead of only in
+    /// `unresolved` (which stays populated for the rename hint). This is a
+    /// success stating what it did, not a refusal carrying a partial result —
+    /// the payload the 2026-09-11 survey rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fulfilment: Option<Fulfilment>,
+    /// Which named motion STEP of a feature refused: Transform Face records
+    /// `"rotation"` or `"translation"` (`features::transform_face::REFUSED_STEP_*`)
+    /// for a refusal from either motion, alone or in rotate-then-translate.
+    /// `None` for every other result, including a Transform Face refused before
+    /// any motion ran. The refusal's class is the step's own; this says which
+    /// step it was, which no class can. Additive: absent when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused_step: Option<String>,
     /// `reference_selection` names this feature could not resolve against the
     /// scene-map. NOT an error/halt — the caller runs a snapshot-repair pass and
     /// re-dispatches (migration-plan Stage 5 gate).
@@ -364,6 +390,9 @@ impl FeatureResult {
             added: Vec::new(),
             removed: Vec::new(),
             error: None,
+            refusal: None,
+            fulfilment: None,
+            refused_step: None,
             unresolved: Vec::new(),
             notes: Vec::new(),
             reused: false,
@@ -385,8 +414,56 @@ impl FeatureResult {
         feature_type: impl Into<String>,
         message: impl Into<String>,
     ) -> Self {
+        Self::refuse(id, feature_type, message.into())
+    }
+
+    /// The feature proceeded on the references that resolved and skipped the
+    /// ones in `unresolved`: record that as a typed partial fulfilment.
+    /// `requested` is the selection as the document names it; `applied` is
+    /// what remains after the misses. Nothing is recorded when every reference
+    /// resolved. Call it at the point the feature DECIDES to proceed, not at
+    /// resolution: a feature that no-ops or refuses on a miss has no partial.
+    pub fn note_partial_resolution(&mut self, requested: &[String]) {
+        if self.unresolved.is_empty() {
+            return;
+        }
+        let applied: Vec<String> = requested
+            .iter()
+            .filter(|name| !self.unresolved.contains(name))
+            .cloned()
+            .collect();
+        let rejected = self
+            .unresolved
+            .iter()
+            .map(|name| Rejected {
+                name: name.clone(),
+                kind: RejectedKind::Unresolved,
+                reason: "resolves to nothing on this model".into(),
+            })
+            .collect();
+        self.fulfilment = Some(Fulfilment {
+            requested: requested.to_vec(),
+            applied,
+            rejected,
+        });
+    }
+
+    /// A hard failure from either kind of producer: `error` carries the text
+    /// (the refusal's own message, verbatim, when it is typed) and `refusal`
+    /// the class and stage when there is one.
+    pub fn refuse(
+        id: impl Into<String>,
+        feature_type: impl Into<String>,
+        refusal: impl Into<FeatureRefusal>,
+    ) -> Self {
         let mut result = Self::empty(id, feature_type);
-        result.error = Some(message.into());
+        match refusal.into() {
+            FeatureRefusal::Text(message) => result.error = Some(message),
+            FeatureRefusal::Typed(refusal) => {
+                result.error = Some(refusal.message.clone());
+                result.refusal = Some(refusal);
+            }
+        }
         result
     }
 
@@ -1184,9 +1261,111 @@ impl<'a> FeatureContext<'a> {
         }
     }
 
-    /// A convenience [`FeatureResult::error`] carrying this feature's id + type.
-    pub fn fail(&self, message: impl Into<String>) -> FeatureResult {
-        FeatureResult::error(self.id.clone(), self.feature_type.clone(), message)
+    /// A convenience [`FeatureResult::refuse`] carrying this feature's id +
+    /// type: text from a stringly producer, or a typed [`KernelRefusal`].
+    pub fn fail(&self, refusal: impl Into<FeatureRefusal>) -> FeatureResult {
+        FeatureResult::refuse(self.id.clone(), self.feature_type.clone(), refusal)
+    }
+}
+
+/// What a SUCCESSFUL feature did with what it was asked, when that is not
+/// "everything, exactly" (plan: typed-refusal-reporting, item 3). Requested and
+/// applied are reference names as the document wrote them; every rejected one
+/// says which kind of rejection and why. A partial fulfilment is a different
+/// answer from the one asked for, so it is reported on the feature that made it
+/// and displayed by the app beside the feature; it is never a refusal class
+/// (a partial selection is a separate outcome) and never carries geometry.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Fulfilment {
+    pub requested: Vec<String>,
+    pub applied: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected: Vec<Rejected>,
+}
+
+impl Fulfilment {
+    /// Something asked for was not done.
+    pub fn is_partial(&self) -> bool {
+        !self.rejected.is_empty()
+    }
+
+    /// One line for a report or a tree leaf: "2 of 3 selected references
+    /// applied; `ghost` resolves to nothing on this model".
+    pub fn summary(&self) -> String {
+        let misses: Vec<String> = self
+            .rejected
+            .iter()
+            .map(|rejected| format!("`{}` {}", rejected.name, rejected.reason))
+            .collect();
+        format!(
+            "{} of {} selected reference{} applied; {}",
+            self.applied.len(),
+            self.requested.len(),
+            if self.requested.len() == 1 { "" } else { "s" },
+            misses.join("; ")
+        )
+    }
+}
+
+/// One reference a successful feature did not act on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Rejected {
+    pub name: String,
+    pub kind: RejectedKind,
+    pub reason: String,
+}
+
+/// Why a reference was rejected. Closed; a new kind is a producer that exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectedKind {
+    /// The name resolves to no entity of the scene.
+    Unresolved,
+}
+
+/// What a feature's `build` hands back when it refuses. A feature that drives
+/// a typed producer propagates the [`KernelRefusal`] whole (`?` converts it),
+/// so its class reaches [`FeatureResult::refusal`]; one that drives a stringly
+/// producer propagates the text. There is no `From<FeatureRefusal> for
+/// String`: the text of a typed refusal is read through
+/// [`FeatureRefusal::message`], never by dropping the class.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FeatureRefusal {
+    Text(String),
+    Typed(KernelRefusal),
+}
+
+impl FeatureRefusal {
+    /// The human text either way, verbatim.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Text(message) => message,
+            Self::Typed(refusal) => &refusal.message,
+        }
+    }
+}
+
+impl From<String> for FeatureRefusal {
+    fn from(message: String) -> Self {
+        Self::Text(message)
+    }
+}
+
+impl From<&str> for FeatureRefusal {
+    fn from(message: &str) -> Self {
+        Self::Text(message.to_string())
+    }
+}
+
+impl From<KernelRefusal> for FeatureRefusal {
+    fn from(refusal: KernelRefusal) -> Self {
+        Self::Typed(refusal)
+    }
+}
+
+impl std::fmt::Display for FeatureRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
     }
 }
 
@@ -1218,11 +1397,11 @@ pub fn execute_feature(
 ) -> FeatureResult {
     let id = extract_id(&descriptor.input_params);
     let feature_type = descriptor.feature_type.clone();
-    // The feature fence (build-spec §3): component geometry is valid input for
-    // sketch attach/project and assembly constraints ONLY. A modeling feature
-    // naming it as an operand fails cleanly HERE — the one altitude every
-    // feature passes through — instead of per-feature checks. Free for
-    // componentless scenes (the walk is skipped entirely).
+    // The feature fence: component geometry is valid input for sketch
+    // attach/project and assembly constraints ONLY. A modeling feature naming
+    // it as an operand fails cleanly HERE — the one altitude every feature
+    // passes through — instead of per-feature checks. Free for componentless
+    // scenes (the walk is skipped entirely).
     if let Err(message) = component::enforce_reference_fence(&feature_type, descriptor, scene) {
         return FeatureResult::error(id, feature_type, message);
     }
@@ -1268,6 +1447,7 @@ pub fn execute_feature(
         "PF" | "PUSHFACE" | "PUSH FACE" => features::push_face::execute(&ctx),
         "TF" | "TRANSFORMFACE" | "TRANSFORM FACE" => features::transform_face::execute(&ctx),
         "DF" | "DELETE FACE" | "DELETEFACE" => features::delete_face::execute(&ctx),
+        "RFS" | "REFIT FACES" | "REFITFACES" => features::refit_faces::execute(&ctx),
         "THK" | "THICKEN" => features::thicken::execute(&ctx),
         "H" | "HOLE" => features::hole::execute(&ctx),
         // --- No-kernel-op / long tail ---
@@ -1777,6 +1957,7 @@ pub fn execute_history_observed(
         // (`move_faces_json`, an MCP edit) belongs to that call, not to the
         // feature about to run: drop it rather than attribute it wrongly.
         let _ = crate::take_crossing_repairs();
+        let _ = crate::take_blend_notes();
         let feat_start = web_time::Instant::now();
         let mut result = execute_feature(descriptor, &env, &scene);
         timings.push((id.clone(), feat_start.elapsed().as_secs_f64() * 1000.0));
@@ -1789,6 +1970,10 @@ pub fn execute_history_observed(
                 .into_iter()
                 .map(|repair| repair.to_string()),
         );
+        // What a blend that shipped says about its own wall (a station ladder
+        // that ran out with its rails still off their carriers), by the same
+        // route.
+        result.notes.extend(crate::take_blend_notes());
         // `halt` reflects the feature's OWN error only — a naming collision flags
         // the feature but does NOT truncate the history (the model still renders).
         let halt = result.error.is_some();
@@ -1826,6 +2011,13 @@ pub fn execute_history_observed(
         // like the per-loop naming change (see `annotate_rename`).
         for name in &mut result.unresolved {
             *name = annotate_rename(&scene, name);
+        }
+        // The same hint on the typed report, in the same pass, so the two
+        // lists never say different things about one miss.
+        if let Some(fulfilment) = &mut result.fulfilment {
+            for rejected in &mut fulfilment.rejected {
+                rejected.name = annotate_rename(&scene, &rejected.name);
+            }
         }
 
         let produced = produced_names(&result);
@@ -1870,14 +2062,14 @@ pub fn execute_history_observed(
         }
     }
     // Orphan GC: a parts-library entry whose last ACOMP instance is gone from
-    // the request is dropped now (spec §2.1 — orphaned payloads never
-    // accumulate; the request carries the FULL feature list even under a
-    // stop point, so truncation cannot GC live entries).
+    // the request is dropped now (orphaned payloads never accumulate, the
+    // request carries the FULL feature list even under a stop point, so
+    // truncation cannot GC live entries).
     parts_library::gc_after_rebuild(request);
-    // Assembly tail (spec §6 scheduling): solve the request's constraints
-    // against the just-built scene and install the post-solve session the
-    // exported assembly ABI serves. Unconditional, so a document without an
-    // `assembly` block resets any stale session.
+    // Assembly tail: solve the request's constraints against the just-built
+    // scene and install the post-solve session the exported assembly ABI
+    // serves. Unconditional, so a document without an `assembly` block
+    // resets any stale session.
     assembly::finish_history_run(request, &mut scene, &env);
     // Wire-harness tail: route the block's connections over the ports and
     // spline segments the run published, and build the bundle solids. Its

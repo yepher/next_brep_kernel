@@ -1,7 +1,7 @@
 use super::*;
 
 // ---------------------------------------------------------------------------
-// Projected reference geometry — the in-context PROJECT lane (build-spec §3)
+// Projected reference geometry — the in-context PROJECT lane
 // ---------------------------------------------------------------------------
 
 /// Resolve the sketch's optional `projectedEdges` reference_selection: each

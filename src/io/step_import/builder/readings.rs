@@ -34,6 +34,31 @@ pub(in crate::step_import) struct TrimCapture {
     pub(in crate::step_import) faces: Vec<(u64, usize, usize)>,
 }
 
+/// A derived trim still off the fit bar (the 1e-7 floor plus its stations'
+/// standoff) after the refit at the floor: accepted into the solid at the
+/// residual it reached, as the importer before the bar accepted every fit,
+/// which `EntityTolerances` then measures as that edge's band, and named on
+/// the import report by class — the file's residual or the fitter's miss.
+#[derive(Clone, Debug)]
+pub(in crate::step_import) struct BoundedTrim {
+    /// The `ADVANCED_FACE` entity the trim belongs to.
+    pub(in crate::step_import) face_ref: usize,
+    pub(in crate::step_import) surface_ref: usize,
+    /// The built edge's id in the solid.
+    pub(in crate::step_import) edge_id: u64,
+    /// The fit's out-of-sample residual, mm — the band the edge will carry.
+    pub(in crate::step_import) residual: f64,
+    /// How far the file's curve stands off the carrier at the fit's stations.
+    pub(in crate::step_import) standoff: f64,
+    /// How far the image sits from the stations' FEET, mm.
+    pub(in crate::step_import) image_to_foot: f64,
+    pub(in crate::step_import) samples: usize,
+    pub(in crate::step_import) exit: String,
+    /// The image stands off the stations' feet by more than the floor: the
+    /// miss is the FITTER's, not the file's.
+    pub(in crate::step_import) fitter: bool,
+}
+
 impl<'a> SolidBuilder<'a> {
     pub(super) fn capture_written(
         &mut self,

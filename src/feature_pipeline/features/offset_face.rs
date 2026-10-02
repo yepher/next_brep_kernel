@@ -53,6 +53,11 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
             result.unresolved.push(name.clone());
         }
     }
+    // The resolved faces are the sheet the caller displays; a miss beside
+    // them is a typed partial fulfilment, never silent.
+    if result.unresolved.len() < names.len() {
+        result.note_partial_resolution(&names);
+    }
 
     result
 }

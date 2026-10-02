@@ -30,7 +30,7 @@ use std::collections::VecDeque;
 
 const TAU: f64 = std::f64::consts::TAU;
 
-mod parse;
+pub(crate) mod parse;
 mod supplied;
 mod bodies;
 mod assembly;
@@ -118,6 +118,58 @@ pub struct StepImportReport {
     pub diagnostics: crate::KernelDiagnostics,
 }
 
+/// The event code for a body that carries a derived trim off the fit bar (the
+/// 1e-7 floor plus its stations' standoff) after the refit at the floor, which
+/// the importer accepts as it did every fit before the bar, and the counters
+/// and measure beside it. The residual
+/// is the band `EntityTolerances` measures for that edge; the event names how
+/// many are the file's residual and how many the fitter's miss, and the worst
+/// with its numbers, so what the importer accepted before the bar silently is
+/// visible (2026-09-26).
+pub const TRIM_BOUNDED: &str = "import.trim_bounded";
+pub const TRIMS_BOUNDED: &str = "import.trims_bounded";
+pub const TRIMS_FITTER_MISS: &str = "import.trims_fitter_miss";
+pub const TRIM_BOUND_MM: &str = "import.trim_bound_mm";
+
+fn bounded_trim_diagnostics(
+    bounded: &[Vec<builder::readings::BoundedTrim>],
+    diagnostics: &mut crate::KernelDiagnostics,
+) {
+    for (index, trims) in bounded.iter().enumerate() {
+        let Some(worst) = trims
+            .iter()
+            .max_by(|a, b| a.residual.partial_cmp(&b.residual).unwrap_or(std::cmp::Ordering::Equal))
+        else {
+            continue;
+        };
+        let fitters = trims.iter().filter(|trim| trim.fitter).count();
+        diagnostics.count_n(TRIMS_BOUNDED, trims.len() as u64);
+        diagnostics.count_n(TRIMS_FITTER_MISS, fitters as u64);
+        diagnostics.measure_max(TRIM_BOUND_MM, worst.residual);
+        diagnostics.event(
+            crate::DiagnosticSeverity::Degraded,
+            crate::KernelStage::Collect,
+            TRIM_BOUNDED,
+            format!(
+                "body {index}: {} trim(s) sit off the {:.0e} mm fit bar and carry their measured residual as their band ({} of them the file's residual, the image on the stations' feet; {} the fitter's miss); worst ADVANCED_FACE #{} (surface #{}) edge {}: {:.3e} mm, its curve {:.3e} mm off the carrier, the image {:.3e} mm off its feet ({}; {} at {} samples).",
+                trims.len(),
+                crate::PCURVE_REFINEMENT_TOLERANCE,
+                trims.len() - fitters,
+                fitters,
+                worst.face_ref,
+                worst.surface_ref,
+                worst.edge_id,
+                worst.residual,
+                worst.standoff,
+                worst.image_to_foot,
+                if worst.fitter { "the fitter's miss" } else { "the file's residual" },
+                worst.exit,
+                worst.samples
+            ),
+        );
+    }
+}
+
 /// Like [`import_step`] but reports how many bodies failed and the first error,
 /// so callers can distinguish a fully- from a partially-imported assembly —
 /// and runs the stated-precision consistency check over the imported bodies,
@@ -130,8 +182,9 @@ pub struct StepImportReport {
 /// measurement nobody reads is not worth its cost on every IMPORT3D.
 pub fn import_step_report(text: &str) -> Result<StepImportReport, String> {
     let imported = collect_step_solids(text)?;
-    let diagnostics =
+    let mut diagnostics =
         precision::stated_precision_diagnostics(&imported.stated_precisions_mm, &imported.solids);
+    bounded_trim_diagnostics(&imported.bounded_trims, &mut diagnostics);
     Ok(StepImportReport {
         solids: imported.solids,
         failed: imported.failed,

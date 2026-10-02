@@ -29,7 +29,8 @@
 //! `common::finalize_solid`.
 
 use crate::feature_pipeline::features::common;
-use crate::feature_pipeline::{Axis, FeatureContext, FeatureResult, SketchProfile};
+use crate::feature_pipeline::{Axis, FeatureContext, FeatureRefusal, FeatureResult, SketchProfile};
+use crate::{KernelStage, OrRefuse};
 use crate::revolve_profile_brep_named;
 use crate::Vec3;
 use serde_json::Value;
@@ -41,7 +42,7 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     }
 }
 
-fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // Normalize a `{sketch}:FACE` display-sheet pick to the sketch profile base.
     let name = common::normalize_profile_alias(
         common::first_reference_name(ctx.param("profile"))
@@ -61,7 +62,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
             None => {
                 return Err(format!(
                     "revolve: profile '{name}' not found (no sketch profile or resident face)"
-                ));
+                ).into());
             }
         },
     };
@@ -111,7 +112,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
             return Err(format!(
                 "revolve: outer loop needs >= 2 curves, got {}",
                 outer.curves.len()
-            ));
+            ).into());
         }
         for (index, hole) in region.iter().enumerate().skip(1) {
             reject_axis_touching_hole(profile, hole, &common::hole_key(hole, index), &axis)?;
@@ -160,6 +161,9 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                         &hole_side_names,
                         &[],
                     )
+                    // The revolve stack is still stringly: its text is kept, classed
+                    // Internal at this consuming site until it mints its own refusals.
+                    .or_refuse(KernelStage::Fragment, "revolve_profile_brep")
                 },
             )?;
         }
@@ -226,7 +230,7 @@ fn reject_axis_touching_hole(
             "revolve: hole loop {key} touches or crosses the revolve axis \
              (min radial distance {min_abs:.3e}) — revolving it would self-intersect; \
              a hole must stay strictly on one side of the axis"
-        ));
+        ).into());
     }
     Ok(())
 }
@@ -276,7 +280,7 @@ fn resolve_axis(ctx: &FeatureContext, name: &str) -> Result<Axis, String> {
     }
     Err(format!(
         "revolve: axis '{name}' not found (no sketch line or resident edge)"
-    ))
+    ).into())
 }
 
 /// `consumeProfileSketch` (default true) — remove the sketch after revolving.

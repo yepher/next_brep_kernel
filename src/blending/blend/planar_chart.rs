@@ -47,9 +47,10 @@
 //! * a rebuilt trim that does not follow its own edge to the refinement floor —
 //!   [`PLANAR_CHART_WIDEN_UNSOUND`].
 //!
-//! Both are TERMINAL in the group lane, like [`crate::blend::CONSUMED_SNAP_UNSOUND`]:
+//! Both are TERMINAL in the group lane, like [`crate::blend::is_consumed_snap`]:
 //! the cutter composition is not a second opinion on a wrong body.
 
+use crate::{KernelRefusal, KernelStage, OrRefuse, RefusalClass};
 use std::collections::{HashMap, HashSet};
 
 use crate::pcurve::PCURVE_REFINEMENT_TOLERANCE;
@@ -66,6 +67,22 @@ pub(crate) const PLANAR_CHART_EDGE_OFF_PLANE: &str =
 /// [`fit_planar_charts_to_trims`].
 pub(crate) const PLANAR_CHART_WIDEN_UNSOUND: &str =
     "blend: a widened planar carrier's trim does not follow its edge —";
+
+/// The slugs of the planar-chart refusals: the off-plane edge and the widened
+/// carrier are `UnsupportedGeometry`; the widened face that carries an edge the
+/// solid does not have is `Internal` (its text is under
+/// [`PLANAR_CHART_WIDEN_UNSOUND`] too, and the fallbacks treat it the same).
+pub(crate) const PLANAR_CHART_OFF_PLANE_WHAT: &str = "planar_chart_off_plane";
+pub(crate) const PLANAR_CHART_WIDEN_WHAT: &str = "planar_chart_widen";
+pub(crate) const PLANAR_CHART_COEDGE_WHAT: &str = "planar_chart_coedge";
+
+/// Is this a refusal of a trim that left its planar chart ([`PLANAR_CHART_EDGE_OFF_PLANE`], [`PLANAR_CHART_WIDEN_UNSOUND`])?
+/// Read off the class and its slug, which the mint site and this check share.
+pub(crate) fn is_planar_chart_refusal(refusal: &KernelRefusal) -> bool {
+    matches!(&refusal.class, RefusalClass::UnsupportedGeometry { what } if what == PLANAR_CHART_OFF_PLANE_WHAT) ||
+        matches!(&refusal.class, RefusalClass::UnsupportedGeometry { what } if what == PLANAR_CHART_WIDEN_WHAT) ||
+        matches!(&refusal.class, RefusalClass::Internal { what } if what == PLANAR_CHART_COEDGE_WHAT)
+}
 
 /// Samples per edge when measuring how far a trim's edge leaves the chart.
 const CHART_SAMPLES: usize = 256;
@@ -97,7 +114,7 @@ struct Widening {
 pub(crate) fn fit_planar_charts_to_trims(
     input: &BrepSolid,
     result: &mut BrepSolid,
-) -> Result<usize, String> {
+) -> Result<usize, KernelRefusal> {
     let band = crate::blend::consumed_band(result);
     let existing: HashSet<u64> = input.edges.iter().map(|edge| edge.id).collect();
     let curves: HashMap<u64, (&NurbsCurve, f64, f64)> = result
@@ -123,14 +140,14 @@ pub(crate) fn fit_planar_charts_to_trims(
             if !touched {
                 continue;
             }
-            let [u0, u1] = face.surface.domain_u()?;
-            let [v0, v1] = face.surface.domain_v()?;
-            let origin = face.surface.evaluate(u0, v0)?;
-            let du = face.surface.evaluate(u1, v0)?.sub(origin);
-            let dv = face.surface.evaluate(u0, v1)?.sub(origin);
+            let [u0, u1] = face.surface.domain_u().or_refuse(KernelStage::Sew, "domain_u")?;
+            let [v0, v1] = face.surface.domain_v().or_refuse(KernelStage::Sew, "domain_v")?;
+            let origin = face.surface.evaluate(u0, v0).or_refuse(KernelStage::Sew, "evaluate")?;
+            let du = face.surface.evaluate(u1, v0).or_refuse(KernelStage::Sew, "evaluate")?.sub(origin);
+            let dv = face.surface.evaluate(u0, v1).or_refuse(KernelStage::Sew, "evaluate")?.sub(origin);
             let (length_u, length_v) = (du.length(), dv.length());
-            let (eu, ev) = (du.normalized()?, dv.normalized()?);
-            let normal = eu.cross(ev).normalized()?;
+            let (eu, ev) = (du.normalized().or_refuse(KernelStage::Sew, "normalized")?, dv.normalized().or_refuse(KernelStage::Sew, "normalized")?);
+            let normal = eu.cross(ev).normalized().or_refuse(KernelStage::Sew, "normalized")?;
             // The chart's own extent in its own frame, then every trim's edge.
             let (mut low_u, mut high_u) = (0.0_f64, length_u);
             let (mut low_v, mut high_v) = (0.0_f64, length_v);
@@ -142,7 +159,7 @@ pub(crate) fn fit_planar_charts_to_trims(
                 };
                 for step in 0..=CHART_SAMPLES {
                     let t = t0 + (t1 - t0) * step as f64 / CHART_SAMPLES as f64;
-                    let point = curve.evaluate(t)?.sub(origin);
+                    let point = curve.evaluate(t).or_refuse(KernelStage::Sew, "evaluate")?.sub(origin);
                     low_u = low_u.min(point.dot(eu));
                     high_u = high_u.max(point.dot(eu));
                     low_v = low_v.min(point.dot(ev));
@@ -162,12 +179,12 @@ pub(crate) fn fit_planar_charts_to_trims(
                 continue;
             }
             if off_plane > band {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Sew, PLANAR_CHART_OFF_PLANE_WHAT, format!(
                     "{PLANAR_CHART_EDGE_OFF_PLANE} face {} edge {worst_edge} is {off_plane:.3e} \
                      off the plane (band {band:.3e}), and its trim runs {excursion:.3e} outside \
                      the chart",
                     face.name.clone().unwrap_or_else(|| format!("{}", face.id)),
-                ));
+                )));
             }
             // Pad so the rebuilt trims land strictly inside the new box rather
             // than on its boundary, where the clamp would still be live.
@@ -203,7 +220,7 @@ pub(crate) fn fit_planar_charts_to_trims(
             widening.ev,
             widening.span_u,
             widening.span_v,
-        )?;
+        ).or_refuse(KernelStage::Sew, "make_plane")?;
         let face = &mut result.shells[widening.shell].faces[widening.face];
         let name = face
             .name
@@ -212,22 +229,22 @@ pub(crate) fn fit_planar_charts_to_trims(
         // Same plane, same frame: the carrier's normal must be untouched, or
         // the face's `same_sense` no longer means what it meant.
         let before = face.surface.normal(
-            0.5 * (face.surface.domain_u()?[0] + face.surface.domain_u()?[1]),
-            0.5 * (face.surface.domain_v()?[0] + face.surface.domain_v()?[1]),
-        )?;
-        let after = plane.normal(0.5 * widening.span_u, 0.5 * widening.span_v)?;
+            0.5 * (face.surface.domain_u().or_refuse(KernelStage::Sew, "domain_u")?[0] + face.surface.domain_u().or_refuse(KernelStage::Sew, "domain_u")?[1]),
+            0.5 * (face.surface.domain_v().or_refuse(KernelStage::Sew, "domain_v")?[0] + face.surface.domain_v().or_refuse(KernelStage::Sew, "domain_v")?[1]),
+        ).or_refuse(KernelStage::Sew, "normal")?;
+        let after = plane.normal(0.5 * widening.span_u, 0.5 * widening.span_v).or_refuse(KernelStage::Sew, "normal")?;
         if before.dot(after) <= 0.0 {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(KernelStage::Sew, PLANAR_CHART_WIDEN_WHAT, format!(
                 "{PLANAR_CHART_WIDEN_UNSOUND} face {name}'s widened carrier reverses its normal",
-            ));
+            )));
         }
         for coedge in face.loops.iter_mut().flat_map(|hole| &mut hole.coedges) {
             let Some((curve, t0, t1)) = curves.get(&coedge.edge_id) else {
-                return Err(format!(
+                return Err(KernelRefusal::internal(KernelStage::Sew, PLANAR_CHART_COEDGE_WHAT, format!(
                     "{PLANAR_CHART_WIDEN_UNSOUND} face {name} carries coedge {} whose edge {} is \
                      not in the solid",
                     coedge.id, coedge.edge_id,
-                ));
+                )));
             };
             coedge.pcurve = crate::build_pcurve_on_surface_range(
                 &plane,
@@ -243,25 +260,25 @@ pub(crate) fn fit_planar_charts_to_trims(
                      on the widened chart ({error})",
                     coedge.edge_id,
                 )
-            })?;
+            }).or_refuse(KernelStage::Sew, "map_err")?;
             // The trim is what the shell's closure integrates, so check the
             // rebuilt one against the edge it claims rather than against the
             // fit's own samples.
-            let [p0, p1] = coedge.pcurve.domain()?;
+            let [p0, p1] = coedge.pcurve.domain().or_refuse(KernelStage::Sew, "domain")?;
             let mut miss = 0.0_f64;
             for step in 0..=VERIFY_SAMPLES {
                 let t = p0 + (p1 - p0) * step as f64 / VERIFY_SAMPLES as f64;
-                let uv = coedge.pcurve.evaluate(t)?;
-                let point = plane.evaluate(uv.x, uv.y)?;
-                miss = miss.max(crate::project_point_to_curve(curve, point)?.distance);
+                let uv = coedge.pcurve.evaluate(t).or_refuse(KernelStage::Sew, "evaluate")?;
+                let point = plane.evaluate(uv.x, uv.y).or_refuse(KernelStage::Sew, "evaluate")?;
+                miss = miss.max(crate::project_point_to_curve(curve, point).or_refuse(KernelStage::Sew, "project_point_to_curve")?.distance);
             }
             if miss > PCURVE_REFINEMENT_TOLERANCE {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(KernelStage::Sew, PLANAR_CHART_WIDEN_WHAT, format!(
                     "{PLANAR_CHART_WIDEN_UNSOUND} face {name}'s rebuilt trim for edge {} misses it \
                      by {miss:.3e} (floor {PCURVE_REFINEMENT_TOLERANCE:.0e}); the chart ran \
                      {:.3e} short",
                     coedge.edge_id, widening.excursion,
-                ));
+                )));
             }
         }
         face.surface = plane;

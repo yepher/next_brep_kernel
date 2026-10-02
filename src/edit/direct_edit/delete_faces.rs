@@ -115,6 +115,7 @@
 //! a bore's wall with the general cap, which produces the same solid.
 
 use super::*;
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 
 /// A selection that passed the structural gate: the faces to lift off, the
 /// survivor loops their free boundary consumes, and the edges that go with
@@ -277,7 +278,11 @@ pub(super) fn enclosed_survivors(solid: &BrepSolid, face_ids: &[u64]) -> Option<
 ///   whose twelve strips are selected. Once the strips go, the walls meet in
 ///   sharp edges, and a sphere rolled against three planes stands off each of
 ///   them (at `r·√2` on a cube): nothing is left to bound it, so it cannot stay.
-fn enclosed_selection_refusal(solid: &BrepSolid, face_ids: &[u64], op: &str) -> Option<String> {
+fn enclosed_selection_refusal(
+    solid: &BrepSolid,
+    face_ids: &[u64],
+    op: &str,
+) -> Option<KernelRefusal> {
     let enclosed = enclosed_survivors(solid, face_ids)?;
     let labels = |ids: &[u64]| -> String {
         let mut labels: Vec<String> = ids
@@ -301,11 +306,15 @@ fn enclosed_selection_refusal(solid: &BrepSolid, face_ids: &[u64], op: &str) -> 
                     .all(|face| selected.contains(&face.id) || face.id == enclosed[0])
         });
     if all_but_one {
-        return Some(format!(
-            "{op}: the selection is every face of the closed shell but {} — a patch whose free \
-             boundary is that face's whole outer loop, so deleting it would leave one face with \
-             no boundary at all, and one face bounds no solid to heal to",
-            labels(&enclosed)
+        return Some(KernelRefusal::ill_posed(
+            KernelStage::Classify,
+            "all_but_one",
+            format!(
+                "{op}: the selection is every face of the closed shell but {} — a patch whose free \
+                 boundary is that face's whole outer loop, so deleting it would leave one face with \
+                 no boundary at all, and one face bounds no solid to heal to",
+                labels(&enclosed)
+            ),
         ));
     }
     let tolerance = (solid_model_scale(solid) * 1e-6).max(1e-7);
@@ -319,21 +328,29 @@ fn enclosed_selection_refusal(solid: &BrepSolid, face_ids: &[u64], op: &str) -> 
         })
         .collect();
     if !curved.is_empty() {
-        return Some(format!(
-            "{op}: {} {} bounded by the selection alone — a vertex blend whose strips are all \
-             selected cannot stay once they go, because the walls re-intersect in sharp edges \
-             that stand off it; select {} as well",
-            labels(&curved),
-            if curved.len() == 1 { "is a curved face" } else { "are curved faces" },
-            if curved.len() == 1 { "it" } else { "them" }
+        return Some(KernelRefusal::ill_posed(
+            KernelStage::Classify,
+            "enclosed_curved",
+            format!(
+                "{op}: {} {} bounded by the selection alone — a vertex blend whose strips are all \
+                 selected cannot stay once they go, because the walls re-intersect in sharp edges \
+                 that stand off it; select {} as well",
+                labels(&curved),
+                if curved.len() == 1 { "is a curved face" } else { "are curved faces" },
+                if curved.len() == 1 { "it" } else { "them" }
+            ),
         ));
     }
-    Some(format!(
-        "{op}: every face the selection borders ({}) is bounded by the selection alone, so no \
-         face is left around it to cap the opening against, and the selection does not read \
-         as a corner blend, a closed band or a planar blend network — refusing rather than \
-         deleting it one face at a time (deferred)",
-        labels(&enclosed)
+    Some(KernelRefusal::unsupported(
+        KernelStage::Classify,
+        "enclosed_survivors",
+        format!(
+            "{op}: every face the selection borders ({}) is bounded by the selection alone, so no \
+             face is left around it to cap the opening against, and the selection does not read \
+             as a corner blend, a closed band or a planar blend network — refusing rather than \
+             deleting it one face at a time (deferred)",
+            labels(&enclosed)
+        ),
     ))
 }
 
@@ -1121,7 +1138,7 @@ fn parameter_spans(surface: &NurbsSurface) -> Option<(f64, f64)> {
 }
 
 /// Signed parameter-space area of ONE loop, read on `host`'s carrier.
-fn single_loop_area(host: &FaceRecord, loop_record: &LoopRecord) -> Result<f64, String> {
+fn single_loop_area(host: &FaceRecord, loop_record: &LoopRecord) -> Result<f64, KernelRefusal> {
     parameter_space_area(&FaceRecord {
         id: host.id,
         surface: host.surface.clone(),
@@ -1129,6 +1146,7 @@ fn single_loop_area(host: &FaceRecord, loop_record: &LoopRecord) -> Result<f64, 
         loops: vec![loop_record.clone()],
         name: None,
     })
+    .or_refuse(KernelStage::Classify, "parameter_space_area")
 }
 
 /// The index of the loop that bounds the material — the widest in parameter
@@ -1216,7 +1234,7 @@ fn dropped_per_face(patch: &FacePatch) -> HashMap<(usize, usize), Vec<usize>> {
 /// [`delete_face_and_heal`](super::delete_face_and_heal) — one for the refusal
 /// that names the floor, the other because plane x sphere re-intersects and
 /// heals.
-fn cap_preconditions(solid: &BrepSolid, patch: &FacePatch, op: &str) -> Result<(), String> {
+fn cap_preconditions(solid: &BrepSolid, patch: &FacePatch, op: &str) -> Result<(), KernelRefusal> {
     // --- Every consumed loop must be a HOLE in its face --------------------
     for ((shell_position, face_position), loop_indices) in &dropped_per_face(patch) {
         let face = &solid.shells[*shell_position].faces[*face_position];
@@ -1226,11 +1244,15 @@ fn cap_preconditions(solid: &BrepSolid, patch: &FacePatch, op: &str) -> Result<(
                 .iter()
                 .any(|merge| merge.faces.contains(face_position));
         if !rebuilt && loop_indices.len() >= face.loops.len() {
-            return Err(format!(
-                "{op}: the selection is the whole boundary of {} — it is part of the \
-                 pocket, not the face the pocket was sunk into. Select it as well \
-                 (a patch is capped by the face AROUND it, which has to keep a loop).",
-                face_label(face)
+            return Err(KernelRefusal::ill_posed(
+                KernelStage::Classify,
+                "whole_boundary",
+                format!(
+                    "{op}: the selection is the whole boundary of {} — it is part of the \
+                     pocket, not the face the pocket was sunk into. Select it as well \
+                     (a patch is capped by the face AROUND it, which has to keep a loop).",
+                    face_label(face)
+                ),
             ));
         }
         if face.loops.len() < 2 {
@@ -1248,11 +1270,15 @@ fn cap_preconditions(solid: &BrepSolid, patch: &FacePatch, op: &str) -> Result<(
             .expect("the face has at least two loops here");
         for loop_index in loop_indices {
             if *loop_index == host || areas[host] * areas[*loop_index] >= 0.0 {
-                return Err(format!(
-                    "{op}: the loop the selection would leave open in {} bounds that \
-                     face's material rather than a hole in it — capping it would erase \
-                     the face (deferred)",
-                    face_label(face)
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "outer_loop_consumed",
+                    format!(
+                        "{op}: the loop the selection would leave open in {} bounds that \
+                         face's material rather than a hole in it — capping it would erase \
+                         the face (deferred)",
+                        face_label(face)
+                    ),
                 ));
             }
         }
@@ -1283,18 +1309,24 @@ fn cap_preconditions(solid: &BrepSolid, patch: &FacePatch, op: &str) -> Result<(
             };
             let mut before = 0.0;
             for face_position in &merge.faces {
-                before += crate::face_area(&solid.shells[patch.shell_index].faces[*face_position])?;
+                before += crate::face_area(&solid.shells[patch.shell_index].faces[*face_position])
+                    .or_refuse(KernelStage::Classify, "face_area")?;
             }
-            let after = crate::face_area(&rejoined)?;
-            let winding = parameter_space_area(&rejoined)?;
+            let after = crate::face_area(&rejoined).or_refuse(KernelStage::Classify, "face_area")?;
+            let winding = parameter_space_area(&rejoined)
+                .or_refuse(KernelStage::Classify, "parameter_space_area")?;
             let host_winding = loop_signed_area(host, 0)?;
             if after <= before * (1.0 + 1e-9) || winding * host_winding <= 0.0 {
-                return Err(format!(
-                    "{op}: rejoining {} across the openings its free boundary leaves \
-                     would not take in the region they enclose (area {before} -> {after}, \
-                     winding {host_winding} -> {winding}) — that boundary bounds material \
-                     rather than an opening (deferred)",
-                    face_label(host)
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "rejoin_shrinks_grown",
+                    format!(
+                        "{op}: rejoining {} across the openings its free boundary leaves \
+                         would not take in the region they enclose (area {before} -> {after}, \
+                         winding {host_winding} -> {winding}) — that boundary bounds material \
+                         rather than an opening (deferred)",
+                        face_label(host)
+                    ),
                 ));
             }
             continue;
@@ -1311,11 +1343,15 @@ fn cap_preconditions(solid: &BrepSolid, patch: &FacePatch, op: &str) -> Result<(
             after += single_loop_area(host, loop_record)?;
         }
         if (after - before) * before.signum() <= before.abs() * 1e-9 {
-            return Err(format!(
-                "{op}: rejoining {} would not take in the region its free boundary \
-                 encloses (parameter-space area {before} -> {after}) — that boundary \
-                 bounds material rather than an opening (deferred)",
-                face_label(host)
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "rejoin_shrinks",
+                format!(
+                    "{op}: rejoining {} would not take in the region its free boundary \
+                     encloses (parameter-space area {before} -> {after}) — that boundary \
+                     bounds material rather than an opening (deferred)",
+                    face_label(host)
+                ),
             ));
         }
     }
@@ -1325,7 +1361,7 @@ fn cap_preconditions(solid: &BrepSolid, patch: &FacePatch, op: &str) -> Result<(
 /// Lift `patch` off the solid and close the opening it was sunk through: drop
 /// the hole loops it consumed whole, and rejoin the faces whose loops it only
 /// cut.
-fn cap_face_patch(solid: &BrepSolid, patch: &FacePatch, op: &str) -> Result<BrepSolid, String> {
+fn cap_face_patch(solid: &BrepSolid, patch: &FacePatch, op: &str) -> Result<BrepSolid, KernelRefusal> {
     if !patch.bridges.is_empty() {
         if let Some(directory) = census_directory() {
             let mut face_ids: Vec<u64> = patch.face_ids.iter().copied().collect();
@@ -1336,9 +1372,12 @@ fn cap_face_patch(solid: &BrepSolid, patch: &FacePatch, op: &str) -> Result<Brep
                 .flat_map(|merge| &merge.faces)
                 .map(|position| solid.shells[patch.shell_index].faces[*position].id)
                 .collect();
+            // The census reads its operation as text (`closed_heal_census.rs`
+            // takes a `-> Result<BrepSolid, String>`), so the class is dropped
+            // here and here only, on the diagnostic copy.
             let operation = |body: &BrepSolid| -> Result<BrepSolid, String> {
                 let patch = classify_patch(body, &face_ids).ok_or("the copy is no longer a patch")?;
-                cap_face_patch(body, &patch, op)
+                cap_face_patch(body, &patch, op).map_err(String::from)
             };
             record_rejoin_census(&directory, solid, &face_ids, &rejoined, &operation);
         }
@@ -1400,10 +1439,14 @@ fn cap_face_patch(solid: &BrepSolid, patch: &FacePatch, op: &str) -> Result<Brep
 
     // --- The two things `validate()` will not ask for us -------------------
     if !faces_are_connected(&healed.shells[patch.shell_index].faces) {
-        return Err(format!(
-            "{op}: the selected faces are what joins two otherwise separate parts of \
-             the body — removing them would sever the solid, which this operation \
-             cannot represent (deferred)"
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Validate,
+            "severs_shell",
+            format!(
+                "{op}: the selected faces are what joins two otherwise separate parts of \
+                 the body — removing them would sever the solid, which this operation \
+                 cannot represent (deferred)"
+            ),
         ));
     }
     // Genus is not assumed either way: capping a blind pocket leaves it alone,
@@ -1411,24 +1454,36 @@ fn cap_face_patch(solid: &BrepSolid, patch: &FacePatch, op: &str) -> Result<Brep
     // Euler count over the reduced complex.
     let shift = euler_characteristic(solid) - euler_characteristic(&healed);
     if shift % 2 != 0 {
-        return Err(format!(
-            "{op}: the selection does not close into whole handles \
-             (Euler characteristic shifts by an odd {shift}) — refusing rather than \
-             emitting a solid whose genus is a guess"
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "odd_euler_shift",
+            format!(
+                "{op}: the selection does not close into whole handles \
+                 (Euler characteristic shifts by an odd {shift}) — refusing rather than \
+                 emitting a solid whose genus is a guess"
+            ),
         ));
     }
     healed.genus += shift / 2;
     if healed.genus < 0 {
-        return Err(format!(
-            "{op}: capping the selection leaves genus {}, so the solid's stated genus \
-             did not account for the feature it carries (deferred)",
-            healed.genus
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Validate,
+            "negative_genus",
+            format!(
+                "{op}: capping the selection leaves genus {}, so the solid's stated genus \
+                 did not account for the feature it carries (deferred)",
+                healed.genus
+            ),
         ));
     }
 
     let issues = healed.validate();
     if !issues.is_empty() {
-        return Err(format!("{op}: the capped solid failed validation: {issues:?}"));
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "validate",
+            format!("{op}: the capped solid failed validation: {issues:?}"),
+        ));
     }
     Ok(healed)
 }
@@ -1439,7 +1494,7 @@ fn cap_face_patch(solid: &BrepSolid, patch: &FacePatch, op: &str) -> Result<Brep
 ///
 /// The cap gate is consulted FIRST and in full — see [`cap_preconditions`] for
 /// why the failures have to read as "not a cap" here rather than as refusals.
-fn delete_one_face(solid: &BrepSolid, face_id: u64, op: &str) -> Result<BrepSolid, String> {
+fn delete_one_face(solid: &BrepSolid, face_id: u64, op: &str) -> Result<BrepSolid, KernelRefusal> {
     if let Some(patch) = classify_patch(solid, &[face_id]) {
         if cap_preconditions(solid, &patch, op).is_ok() {
             return cap_face_patch(solid, &patch, op);
@@ -1548,7 +1603,7 @@ pub(super) fn connected_components(solid: &BrepSolid, face_ids: &[u64]) -> Vec<V
 /// caps run before the chain (see the module docs). A selection that IS one
 /// patch never reaches that split, so every set the gate already accepted is
 /// answered by exactly the code it was answered by before.
-pub fn delete_faces_and_heal(solid: &BrepSolid, face_ids: &[u64]) -> Result<BrepSolid, String> {
+pub fn delete_faces_and_heal(solid: &BrepSolid, face_ids: &[u64]) -> Result<BrepSolid, KernelRefusal> {
     // The soundness floor, once, on the finished body. `validate()` is an
     // incidence test and says nothing about a shell passing through itself;
     // a re-intersected rim is exactly what can produce one, and a fold is
@@ -1559,7 +1614,7 @@ pub fn delete_faces_and_heal(solid: &BrepSolid, face_ids: &[u64]) -> Result<Brep
 
 /// The whole selection's heal, without the soundness floor: see
 /// [`delete_faces_and_heal`].
-fn delete_faces_and_heal_impl(solid: &BrepSolid, face_ids: &[u64]) -> Result<BrepSolid, String> {
+fn delete_faces_and_heal_impl(solid: &BrepSolid, face_ids: &[u64]) -> Result<BrepSolid, KernelRefusal> {
     let op = "delete_faces_and_heal";
     let mut seen: HashSet<u64> = HashSet::default();
     let face_ids: Vec<u64> = face_ids
@@ -1568,26 +1623,37 @@ fn delete_faces_and_heal_impl(solid: &BrepSolid, face_ids: &[u64]) -> Result<Bre
         .filter(|face_id| seen.insert(*face_id))
         .collect();
     if face_ids.is_empty() {
-        return Err(format!("{op}: no faces selected"));
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "selection",
+            format!("{op}: no faces selected"),
+        ));
     }
     for face_id in &face_ids {
         if find_face(solid, *face_id).is_none() {
-            return Err(format!("{op}: no face with id {face_id}"));
+            return Err(KernelRefusal::input(
+                KernelStage::Collect,
+                "face_id",
+                format!("{op}: no face with id {face_id}"),
+            ));
         }
     }
     // A strip a fillet capped takes its planar end caps with it, picked or not
     // (`blend_network_heal.rs`), so every lane below is asked about the strip
     // and its caps together.
-    let face_ids = with_owned_caps(solid, &face_ids, op)?;
+    let face_ids =
+        with_owned_caps(solid, &face_ids, op)?;
     if face_ids.len() == 1 {
         // One face is still a network when caps left standing by a second
         // round sit at its ends — a first round's cylinder whose end arcs the
         // second round's strips ran up to (`blend_network_heal.rs`). Every
         // other face is the one-face chain's, exactly as before.
         return match read_blend_network(solid, &face_ids, op) {
-            NetworkRead::Network(network) => {
-                Ok(coalesce_healed_edges(&heal_blend_network(solid, &network, op)?))
-            }
+            NetworkRead::Network(network) => Ok(coalesce_healed_edges(
+                &heal_blend_network(solid, &network, op)
+                    ?,
+            )),
+            // The gate's refusal is typed at its origin; it rides through.
             NetworkRead::Refused(reason) => Err(reason),
             NetworkRead::NotANetwork => {
                 Ok(coalesce_healed_edges(&delete_one_face(solid, face_ids[0], op)?))
@@ -1598,20 +1664,27 @@ fn delete_faces_and_heal_impl(solid: &BrepSolid, face_ids: &[u64]) -> Result<Bre
         return Ok(coalesce_healed_edges(&cap_face_patch(solid, &patch, op)?));
     }
     if let Some(group) = classify_corner_blend_group(solid, &face_ids) {
-        return Ok(coalesce_healed_edges(&heal_corner_blend_group(
-            solid, &group, op,
-        )?));
+        return Ok(coalesce_healed_edges(
+            &heal_corner_blend_group(solid, &group, op)?,
+        ));
     }
     if let Some(band) = classify_closed_band(solid, &face_ids) {
-        return Ok(coalesce_healed_edges(&heal_closed_band(solid, &band, op)?));
+        return Ok(coalesce_healed_edges(
+            &heal_closed_band(solid, &band, op)?,
+        ));
     }
     match read_blend_network(solid, &face_ids, op) {
         NetworkRead::Network(network) => {
-            return Ok(coalesce_healed_edges(&heal_blend_network(solid, &network, op)?));
+            return Ok(coalesce_healed_edges(
+                &heal_blend_network(solid, &network, op)
+                    ?,
+            ));
         }
         // A network with a face beside it that cannot stay is refused by name:
         // one face at a time has no better answer for a network.
-        NetworkRead::Refused(reason) => return Err(reason),
+        NetworkRead::Refused(reason) => {
+            return Err(reason)
+        }
         NetworkRead::NotANetwork => {}
     }
 
@@ -1659,11 +1732,13 @@ fn delete_faces_and_heal_impl(solid: &BrepSolid, face_ids: &[u64]) -> Result<Bre
     for (index, component) in chained.iter().enumerate() {
         if component.len() > 1 {
             if let Some(group) = classify_corner_blend_group(&healed, component) {
-                healed = heal_corner_blend_group(&healed, &group, op)?;
+                healed = heal_corner_blend_group(&healed, &group, op)
+                    ?;
                 continue;
             }
             if let Some(band) = classify_closed_band(&healed, component) {
-                healed = heal_closed_band(&healed, &band, op)?;
+                healed =
+                    heal_closed_band(&healed, &band, op)?;
                 continue;
             }
         }
@@ -1671,10 +1746,13 @@ fn delete_faces_and_heal_impl(solid: &BrepSolid, face_ids: &[u64]) -> Result<Bre
         // it is the whole selection.
         match read_blend_network(&healed, component, op) {
             NetworkRead::Network(network) => {
-                healed = heal_blend_network(&healed, &network, op)?;
+                healed = heal_blend_network(&healed, &network, op)
+                    ?;
                 continue;
             }
-            NetworkRead::Refused(reason) => return Err(reason),
+            NetworkRead::Refused(reason) => {
+                return Err(reason)
+            }
             NetworkRead::NotANetwork => {}
         }
         // The same refusal, asked of everything still selected rather than of

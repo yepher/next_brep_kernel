@@ -1,3 +1,4 @@
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 
 /// General closed-edge rolling-ball fillet or chamfer by direct §6.9
@@ -8,9 +9,9 @@ pub fn blend_closed_edge(
     radius: f64,
     chamfer: bool,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     if !(radius > 0.0) || !radius.is_finite() {
-        return Err("blend: radius must be positive".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "radius", "blend: radius must be positive"));
     }
     blend_closed_edge_impl(solid, edge_id, &|_| radius, chamfer, name)
 }
@@ -24,9 +25,9 @@ pub fn blend_edge_variable(
     radii: &[(f64, f64)],
     chamfer: bool,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     if radii.is_empty() || radii.iter().any(|(_, radius)| !(*radius > 0.0)) {
-        return Err("blend: every radius stop must be positive".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "radius_stop", "blend: every radius stop must be positive"));
     }
     let mut stops = radii.to_vec();
     stops.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -34,10 +35,10 @@ pub fn blend_edge_variable(
         .edges
         .iter()
         .find(|edge| edge.id == edge_id)
-        .ok_or_else(|| format!("blend: edge {edge_id} not found"))?;
+        .ok_or_else(|| format!("blend: edge {edge_id} not found")).or_refuse(KernelStage::Refine, "ok_or_else")?;
     let closed = edge.start_vertex_id == edge.end_vertex_id;
     if closed && (stops[0].1 - stops[stops.len() - 1].1).abs() > 1e-12 {
-        return Err("blend: closed edges need equal first/last radii".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "closed_edge_radii", "blend: closed edges need equal first/last radii"));
     }
     // CONSTANT stops must DEGENERATE to the exact constant-radius
     // machinery (§6.9 exact cylinder cutters where the mates allow them,
@@ -98,19 +99,19 @@ fn blend_closed_edge_impl(
     radius_at: &dyn Fn(f64) -> f64,
     chamfer: bool,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let edge = solid
         .edges
         .iter()
         .find(|edge| edge.id == edge_id)
-        .ok_or_else(|| format!("blend: edge {edge_id} not found"))?;
+        .ok_or_else(|| format!("blend: edge {edge_id} not found")).or_refuse(KernelStage::Refine, "ok_or_else")?;
     if edge.start_vertex_id != edge.end_vertex_id {
-        return Err("blend: general path currently requires a CLOSED edge".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "closed_edge", "blend: general path currently requires a CLOSED edge"));
     }
     let (face_a, loop_a, coedge_a) = locate_mate(solid, edge_id, None)?;
     let (face_b, loop_b, coedge_b) = locate_mate(solid, edge_id, Some((face_a.id, loop_a)))?;
     if face_a.id == face_b.id && loop_a == loop_b {
-        return Err("blend: edge is used twice by one loop (seam edge?)".into());
+        return Err(KernelRefusal::unsupported(KernelStage::Classify, "seam_edge", "blend: edge is used twice by one loop (seam edge?)"));
     }
 
     // Seam-structured loops force the blend seam onto that carrier's seam
@@ -127,7 +128,7 @@ fn blend_closed_edge_impl(
     let second_seam = anchored && second_face.loops[second_loop].coedges.len() > 1;
     let anchor_u = if anchored {
         // Lock onto the carrier's seam meridian: the u-domain start.
-        Some(first_face.surface.domain_u()?[0])
+        Some(first_face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?[0])
     } else {
         None
     };
@@ -198,7 +199,7 @@ fn blend_closed_edge_impl(
         // very surface this refusal exists to stop.  It is not the fallback's
         // question to answer, so the geometry is reported as-is.
         Err(march_error) if crate::blend::is_wall_fold(&march_error) => return Err(march_error),
-        Err(march_error) if march_error.starts_with(crate::blend::BALL_OFF_CARRIER) => {
+        Err(march_error) if crate::blend::is_ball_off_carrier(&march_error) => {
             // An ESCAPED march is not a non-convergence: the tangency system
             // had no solution at all, so no fallback can build the blend the
             // rolling ball never made.  Report the escape itself — routing it
@@ -234,7 +235,7 @@ fn blend_closed_edge_impl(
             })
             .map_err(|keep_error| {
                 format!("{march_error}; edge-preserving blend also failed: {keep_error}")
-            });
+            }).or_refuse(KernelStage::Refine, "map_err");
         }
     };
     // Support-out-of-trim detection (4.9.7 trigger): a tangency track that
@@ -319,9 +320,9 @@ fn blend_closed_edge_impl(
     // seam meridian somewhere mid-loop; split cs there so face2's loop can
     // keep its seam-in-one-loop structure.
     let second_split = if second_seam {
-        let seam2 = second_face.surface.domain_u()?[0];
+        let seam2 = second_face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?[0];
         let period2 = {
-            let [d0, d1] = second_face.surface.domain_u()?;
+            let [d0, d1] = second_face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
             d1 - d0
         };
         // Bracket: unwrapped uv2 track crossing seam2 + k·period.
@@ -345,7 +346,7 @@ fn blend_closed_edge_impl(
         if !inside && aligned {
             None
         } else if !inside {
-            return Err("blend: second seam crossing not bracketed by the march".into());
+            return Err(KernelRefusal::internal(KernelStage::Refine, "seam_crossing_bracket", "blend: second seam crossing not bracketed by the march"));
         } else {
             // Fit-space crossing parameter on the fitted cs (Newton via the
             // fitted pcurve so the split lands exactly where the FITTED track
@@ -369,19 +370,19 @@ fn blend_closed_edge_impl(
                     seed
                 };
             for _ in 0..NEWTON_ITERATIONS {
-                let value = rows.cs_pcurve.evaluate(p)?.x - target;
+                let value = rows.cs_pcurve.evaluate(p).or_refuse(KernelStage::Refine, "evaluate")?.x - target;
                 if value.abs() <= 1e-12 {
                     break;
                 }
                 let step = 1e-8;
-                let probed = rows.cs_pcurve.evaluate(p + step)?.x - target;
+                let probed = rows.cs_pcurve.evaluate(p + step).or_refuse(KernelStage::Refine, "evaluate")?.x - target;
                 let derivative = (probed - value) / step;
                 if derivative.abs() <= 1e-14 {
-                    return Err("blend: second seam crossing Newton stalled".into());
+                    return Err(KernelRefusal::non_convergence(KernelStage::Refine, "seam_crossing_newton", "blend: second seam crossing Newton stalled"));
                 }
                 p -= value / derivative;
             }
-            let crossing_v = rows.cs_pcurve.evaluate(p)?.y;
+            let crossing_v = rows.cs_pcurve.evaluate(p).or_refuse(KernelStage::Refine, "evaluate")?.y;
             Some(SecondSeamSplit {
                 fit_parameter: p,
                 crossing_v,
@@ -422,13 +423,13 @@ fn build_surgery(
     rows: FittedRows,
     second_split: Option<SecondSeamSplit>,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let mut result = solid.clone();
     let mut take_id = crate::blend::edge::fresh_id_source(solid);
 
     let [u_start, u_end] = rows.u_domain;
-    let cr_start = rows.cr.evaluate(u_start)?;
-    let cs_start = rows.cs.evaluate(u_start)?;
+    let cr_start = rows.cr.evaluate(u_start).or_refuse(KernelStage::Refine, "evaluate")?;
+    let cs_start = rows.cs.evaluate(u_start).or_refuse(KernelStage::Refine, "evaluate")?;
     let vertex1_id = take_id();
     let vertex2_id = take_id();
     result.vertices.push(VertexRecord {
@@ -461,8 +462,8 @@ fn build_surgery(
     if let Some(split) = &second_split {
         let p = split.fit_parameter;
         second_crossing_v = split.crossing_v;
-        let (cs_a, cs_b) = rows.cs.split(p)?;
-        let (pc_a, pc_b) = rows.cs_pcurve.split(p)?;
+        let (cs_a, cs_b) = rows.cs.split(p).or_refuse(KernelStage::Refine, "split")?;
+        let (pc_a, pc_b) = rows.cs_pcurve.split(p).or_refuse(KernelStage::Refine, "split")?;
         // Bring the wrapped second piece back into the carrier's domain.
         let mut pc_b = pc_b;
         for point in pc_b.control_points.iter_mut() {
@@ -470,7 +471,7 @@ fn build_surgery(
         }
         let w2s = take_id();
         second_seam_vertex = w2s;
-        second_seam_point = rows.cs.evaluate(p)?;
+        second_seam_point = rows.cs.evaluate(p).or_refuse(KernelStage::Refine, "evaluate")?;
         result.vertices.push(VertexRecord {
             id: w2s,
             point: second_seam_point,
@@ -513,8 +514,8 @@ fn build_surgery(
         });
         cs_pieces.push((cs_edge_id, [u_start, u_end], rows.cs_pcurve.clone()));
     }
-    let seam_curve = rows.surface.iso_curve_u(u_start)?;
-    let [seam_t0, seam_t1] = seam_curve.domain()?;
+    let seam_curve = rows.surface.iso_curve_u(u_start).or_refuse(KernelStage::Refine, "iso_curve_u")?;
+    let [seam_t0, seam_t1] = seam_curve.domain().or_refuse(KernelStage::Refine, "domain")?;
     let blend_seam_id = take_id();
     result.edges.push(EdgeRecord {
         id: blend_seam_id,
@@ -532,7 +533,7 @@ fn build_surgery(
                            mate: &BlendMate,
                            pieces: &[(u64, [f64; 2], NurbsCurve)],
                            uv_new: [f64; 2]|
-     -> Result<bool, String> {
+     -> Result<bool, KernelRefusal> {
         let v_new = uv_new[1];
         // (edge id, the START vertex is the removed one, the END vertex is).
         let seam_edge_ends: Vec<(u64, bool, bool)> = result
@@ -557,18 +558,18 @@ fn build_surgery(
             .iter_mut()
             .flat_map(|shell| &mut shell.faces)
             .find(|face| face.id == mate.face.id)
-            .ok_or("blend: mate face lost during surgery")?;
+            .ok_or(KernelRefusal::internal(KernelStage::Sew, "mate_face", "blend: mate face lost during surgery"))?;
         let loop_record = &mut face.loops[mate.loop_index];
         let position = loop_record
             .coedges
             .iter()
             .position(|coedge| coedge.edge_id == edge.id)
-            .ok_or("blend: edge coedge lost during surgery")?;
+            .ok_or(KernelRefusal::internal(KernelStage::Sew, "edge_coedge", "blend: edge coedge lost during surgery"))?;
         let old_forward = loop_record.coedges[position].forward;
         let old_seam_v = {
             let pcurve = &loop_record.coedges[position].pcurve;
-            let [d0, _] = pcurve.domain()?;
-            pcurve.evaluate(d0)?.y
+            let [d0, _] = pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+            pcurve.evaluate(d0).or_refuse(KernelStage::Refine, "evaluate")?.y
         };
         // Replacement coedges: pieces run in u order; a reversed loop use
         // takes them in reverse order, each reversed.
@@ -590,7 +591,7 @@ fn build_surgery(
                 pcurve: if old_forward {
                     pcurve.clone()
                 } else {
-                    pcurve.reversed()?
+                    pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")?
                 },
             });
         }
@@ -649,11 +650,11 @@ fn build_surgery(
                     continue;
                 };
                 if start_is_old == end_is_old {
-                    return Err(format!(
+                    return Err(KernelRefusal::ill_posed(KernelStage::Sew, "neighbour_trim_end", format!(
                         "blend: neighbour edge {} meets the blended edge at both ends; \
                          its trim end is ambiguous",
                         coedge.edge_id
-                    ));
+                    )));
                 }
                 // `forward` maps the coedge's pcurve domain start onto the
                 // edge's t0 (its start vertex).
@@ -669,11 +670,11 @@ fn build_surgery(
         }
         Ok(repaired)
     };
-    let uv1_new = rows.cr_pcurve.evaluate(u_start)?;
+    let uv1_new = rows.cr_pcurve.evaluate(u_start).or_refuse(KernelStage::Refine, "evaluate")?;
     let v1_new = uv1_new.y;
     let cr_pieces = vec![(cr_edge_id, [u_start, u_end], rows.cr_pcurve.clone())];
     let mut repaired = replace_in_face(&mut result, first, &cr_pieces, [uv1_new.x, v1_new])?;
-    let uv2_new = rows.cs_pcurve.evaluate(u_start)?;
+    let uv2_new = rows.cs_pcurve.evaluate(u_start).or_refuse(KernelStage::Refine, "evaluate")?;
     let v2_new = if second_split.is_some() {
         second_crossing_v
     } else {
@@ -687,22 +688,22 @@ fn build_surgery(
     // one of the collapsed pole rims.  Keep that pole as the companion loop so
     // containment, integration, and tessellation see the actual cap topology.
     let collapse_winding_sphere_cap =
-        |result: &mut BrepSolid, face_id: u64, support_ids: &[u64]| -> Result<(), String> {
+        |result: &mut BrepSolid, face_id: u64, support_ids: &[u64]| -> Result<(), KernelRefusal> {
             let face = result
                 .shells
                 .iter_mut()
                 .flat_map(|shell| &mut shell.faces)
                 .find(|face| face.id == face_id)
-                .ok_or("blend: sphere carrier lost during cap surgery")?;
+                .ok_or(KernelRefusal::internal(KernelStage::Sew, "sphere_carrier", "blend: sphere carrier lost during cap surgery"))?;
             if !matches!(
                 face.surface.analytic(),
                 Some(crate::AnalyticSurface::Sphere { .. })
-            ) || face.surface.closed_directions()? != (true, false)
+            ) || face.surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")? != (true, false)
             {
                 return Ok(());
             }
-            let [u0, u1] = face.surface.domain_u()?;
-            let [v0, v1] = face.surface.domain_v()?;
+            let [u0, u1] = face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+            let [v0, v1] = face.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
             let period = u1 - u0;
             let support_loop = face.loops.iter().position(|loop_record| {
                 !loop_record.coedges.is_empty()
@@ -718,9 +719,9 @@ fn build_surgery(
                 return Ok(());
             }
             let support = &face.loops[support_loop].coedges[0];
-            let [s0, s1] = support.pcurve.domain()?;
-            let support_start = support.pcurve.evaluate(s0)?;
-            let support_end = support.pcurve.evaluate(s1)?;
+            let [s0, s1] = support.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+            let support_start = support.pcurve.evaluate(s0).or_refuse(KernelStage::Refine, "evaluate")?;
+            let support_end = support.pcurve.evaluate(s1).or_refuse(KernelStage::Refine, "evaluate")?;
             let support_winding = support_end.x - support_start.x;
             if (support_winding.abs() - period).abs() > 0.05 * period {
                 return Ok(());
@@ -732,9 +733,9 @@ fn build_surgery(
                     continue;
                 }
                 for coedge in &loop_record.coedges {
-                    let [p0, p1] = coedge.pcurve.domain()?;
-                    let start = coedge.pcurve.evaluate(p0)?;
-                    let end = coedge.pcurve.evaluate(p1)?;
+                    let [p0, p1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+                    let start = coedge.pcurve.evaluate(p0).or_refuse(KernelStage::Refine, "evaluate")?;
+                    let end = coedge.pcurve.evaluate(p1).or_refuse(KernelStage::Refine, "evaluate")?;
                     let winding = end.x - start.x;
                     let at_pole = (start.y - v0).abs() <= 1e-8 || (start.y - v1).abs() <= 1e-8;
                     if at_pole
@@ -806,7 +807,7 @@ fn build_surgery(
         } else {
             (second_seam_vertex, v2_new, second_seam_point)
         };
-        let [c0, c1] = seam_edge.curve.domain()?;
+        let [c0, c1] = seam_edge.curve.domain().or_refuse(KernelStage::Refine, "domain")?;
         let clamped = target_v.clamp(c0.min(c1), c0.max(c1));
         // Using the support crossing's V as the neighbour's CURVE parameter is
         // only valid when that neighbour is the carrier's seam MERIDIAN, whose
@@ -830,13 +831,13 @@ fn build_surgery(
                 _ => {
                     repaired = true;
                     let projection =
-                        crate::project_point_to_curve(&seam_edge.curve, target_point)?;
+                        crate::project_point_to_curve(&seam_edge.curve, target_point).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
                     if projection.distance > band {
-                        return Err(format!(
+                        return Err(KernelRefusal::unsupported(KernelStage::Sew, "neighbour_off_support", format!(
                             "blend: neighbour edge {} does not pass through the blend's support \
                              start (off by {:.9}); the trim has no parameter to move to",
                             seam_edge.id, projection.distance
-                        ));
+                        )));
                     }
                     projection.u.clamp(c0.min(c1), c0.max(c1))
                 }
@@ -855,7 +856,7 @@ fn build_surgery(
     // Blend face: outward orientation matches F1's outward at the v=0 rim.
     let mid_u = (u_start + u_end) * 0.5;
     let blend_normal = raw_normal(&rows.surface, mid_u, 0.0)?;
-    let station_uv = rows.cr_pcurve.evaluate(mid_u)?;
+    let station_uv = rows.cr_pcurve.evaluate(mid_u).or_refuse(KernelStage::Refine, "evaluate")?;
     let n1 = raw_normal(&first.face.surface, station_uv.x, station_uv.y)?;
     let out1 = if first.face.same_sense {
         n1
@@ -869,13 +870,13 @@ fn build_surgery(
             id: take_id(),
             edge_id: cr_edge_id,
             forward: true,
-            pcurve: crate::sweep_topology::parameter_line(u_start, 0.0, u_end, 0.0)?,
+            pcurve: crate::sweep_topology::parameter_line(u_start, 0.0, u_end, 0.0).or_refuse(KernelStage::Refine, "parameter_line")?,
         },
         CoedgeRecord {
             id: take_id(),
             edge_id: blend_seam_id,
             forward: true,
-            pcurve: crate::sweep_topology::parameter_line(u_end, 0.0, u_end, 1.0)?,
+            pcurve: crate::sweep_topology::parameter_line(u_end, 0.0, u_end, 1.0).or_refuse(KernelStage::Refine, "parameter_line")?,
         },
     ];
     for (edge_id, window, _) in cs_pieces.iter().rev() {
@@ -883,14 +884,14 @@ fn build_surgery(
             id: take_id(),
             edge_id: *edge_id,
             forward: false,
-            pcurve: crate::sweep_topology::parameter_line(window[1], 1.0, window[0], 1.0)?,
+            pcurve: crate::sweep_topology::parameter_line(window[1], 1.0, window[0], 1.0).or_refuse(KernelStage::Refine, "parameter_line")?,
         });
     }
     coedges.push(CoedgeRecord {
         id: take_id(),
         edge_id: blend_seam_id,
         forward: false,
-        pcurve: crate::sweep_topology::parameter_line(u_start, 1.0, u_start, 0.0)?,
+        pcurve: crate::sweep_topology::parameter_line(u_start, 1.0, u_start, 0.0).or_refuse(KernelStage::Refine, "parameter_line")?,
     });
     // The coedges above trace the parameter rectangle counter-clockwise in
     // (u, v); that traversal is only the outward boundary when the blend
@@ -905,7 +906,7 @@ fn build_surgery(
         coedges.reverse();
         for coedge in &mut coedges {
             coedge.forward = !coedge.forward;
-            coedge.pcurve = coedge.pcurve.reversed()?;
+            coedge.pcurve = coedge.pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")?;
         }
     }
     let blend_face = FaceRecord {
@@ -922,7 +923,7 @@ fn build_surgery(
         .shells
         .iter()
         .position(|shell| shell.faces.iter().any(|face| face.id == first.face.id))
-        .ok_or("blend: mate shell lost during surgery")?;
+        .ok_or(KernelRefusal::internal(KernelStage::Sew, "mate_shell", "blend: mate shell lost during surgery"))?;
     result.shells[shell_index].faces.push(blend_face);
 
     let used_edges: std::collections::HashSet<u64> = result
@@ -953,14 +954,14 @@ fn build_surgery(
     if repaired {
         let problems = result.validate();
         if !problems.is_empty() {
-            return Err(format!(
+            return Err(KernelRefusal::internal(KernelStage::Validate, "neighbour_trim_closure", format!(
                 "blend: the repaired neighbour trim did not close ({} issue(s), first: {})",
                 problems.len(),
                 problems
                     .first()
                     .map(|issue| issue.message.as_str())
                     .unwrap_or("unknown")
-            ));
+            )));
         }
     }
     Ok(result)

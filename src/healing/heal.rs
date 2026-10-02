@@ -45,6 +45,7 @@
 //!   large part carrying a genuinely tiny feature cannot have that feature
 //!   fused away.
 
+use crate::KernelRefusal;
 use crate::topology::BrepSolid;
 use crate::{solid_scale, AnalyticSurface, KernelTolerances, Vec3};
 use rustc_hash::FxHashMap as HashMap;
@@ -141,7 +142,7 @@ fn visit_heal_pairs(points: &[Vec3], heal_tol: f64, mut visit: impl FnMut(usize,
 pub(crate) fn heal_operands(
     solid: &mut BrepSolid,
     policy: &KernelTolerances,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     if solid.vertices.len() < 2 {
         return Ok(());
     }
@@ -154,7 +155,7 @@ pub(crate) fn heal_operands(
     let original = solid.clone();
     let before = original.validate_with_tolerances(policy).len();
 
-    let moved = heal_operands_inner(solid, heal_tol)?;
+    let moved = heal_operands_inner(solid, heal_tol, policy.model)?;
     let debug = std::env::var("BREP_DEBUG_BOOL").is_ok();
     if !moved {
         // Nothing was dirty enough to touch — output is byte-identical.
@@ -190,7 +191,7 @@ pub(crate) fn heal_operands(
 }
 
 /// Returns `true` iff at least one vertex position actually changed.
-fn heal_operands_inner(solid: &mut BrepSolid, heal_tol: f64) -> Result<bool, String> {
+fn heal_operands_inner(solid: &mut BrepSolid, heal_tol: f64, model: f64) -> Result<bool, KernelRefusal> {
     let n = solid.vertices.len();
 
     // ----- incident planar planes, per vertex id -----
@@ -268,6 +269,7 @@ fn heal_operands_inner(solid: &mut BrepSolid, heal_tol: f64) -> Result<bool, Str
     // ----- decide each cluster's representative point -----
     let mut new_point: Vec<Vec3> = points.clone();
     let mut any_move = false;
+    let mut measured = crate::EntityTolerances::with_floor(solid, model);
     for members in clusters.values() {
         // Base position: the centroid of the cluster (a single vertex keeps its
         // own position as the base).
@@ -294,9 +296,34 @@ fn heal_operands_inner(solid: &mut BrepSolid, heal_tol: f64) -> Result<bool, Str
 
         // Project the base onto the common intersection of its incident planes
         // (regularized so under-constrained directions keep the base coord).
-        let target = plane_snap(base, &planes);
+        let mut target = plane_snap(base, &planes);
 
         let is_fuse = members.len() > 1;
+        if is_fuse {
+            // Proximity proposes a correspondence; it does not authorize
+            // moving already consistent vertices across an intentional wall.
+            // Bound each movement by its measured endpoint/plane discrepancy.
+            let budgets: Vec<f64> = members.iter().map(|&m| {
+                let plane_error = planes_by_vertex.get(&ids[m]).into_iter()
+                    .flatten().map(|(normal, offset)| (normal.dot(points[m]) - offset).abs())
+                    .fold(0.0_f64, f64::max);
+                measured.vertex(ids[m]).max(plane_error).max(model).min(heal_tol)
+            }).collect();
+            let fits = |candidate: Vec3| members.iter().zip(&budgets)
+                .all(|(&m, &budget)| candidate.sub(points[m]).length() <= budget);
+            if !fits(target) {
+                // An accurate member can anchor a noisy one when the centroid
+                // would unnecessarily displace the accurate endpoint.
+                let mut anchors: Vec<usize> = (0..members.len()).collect();
+                anchors.sort_by(|&a, &b| budgets[a].total_cmp(&budgets[b])
+                    .then_with(|| ids[members[a]].cmp(&ids[members[b]])));
+                let replacement = anchors.into_iter()
+                    .map(|index| plane_snap(points[members[index]], &planes))
+                    .find(|&candidate| fits(candidate));
+                let Some(replacement) = replacement else { continue; };
+                target = replacement;
+            }
+        }
         // Off-plane distance of the base from its incident planes.
         let off_plane = planes
             .iter()

@@ -27,6 +27,8 @@
 //! Evaluation is a binary search plus one Horner evaluation of a degree ≤ 5
 //! polynomial — cheap enough to call per march station.
 
+use crate::{KernelRefusal, KernelStage};
+
 /// One user segment of a composite radius law, spanning `length` of abscissa.
 #[derive(Clone, Debug)]
 pub enum LawSegment {
@@ -82,7 +84,7 @@ pub struct RadiusLaw {
 
 impl RadiusLaw {
     /// A constant law: `radius` everywhere on `[0, length]`.
-    pub fn constant(length: f64, radius: f64) -> Result<Self, String> {
+    pub fn constant(length: f64, radius: f64) -> Result<Self, KernelRefusal> {
         Self::from_segments(&[LawSegment::Constant { length, radius }])
     }
 
@@ -93,22 +95,30 @@ impl RadiusLaw {
     /// vertex (`edge_lengths.len() + 1`).  Interpolation is monotone C1
     /// (PCHIP): every vertex radius is met exactly and the law never
     /// overshoots the given radii.
-    pub fn from_vertex_radii(edge_lengths: &[f64], vertex_radii: &[f64]) -> Result<Self, String> {
+    pub fn from_vertex_radii(edge_lengths: &[f64], vertex_radii: &[f64]) -> Result<Self, KernelRefusal> {
         if edge_lengths.is_empty() {
-            return Err("radius_law: at least one chain edge length is required".into());
+            return Err(KernelRefusal::input(
+                KernelStage::Collect,
+                "chain_edges",
+                "radius_law: at least one chain edge length is required",
+            ));
         }
         if vertex_radii.len() != edge_lengths.len() + 1 {
-            return Err(format!(
-                "radius_law: need exactly one radius per chain vertex (edges + 1): \
-                 {} edges need {} radii, got {}",
-                edge_lengths.len(),
-                edge_lengths.len() + 1,
-                vertex_radii.len()
+            return Err(KernelRefusal::input(
+                KernelStage::Collect,
+                "vertex_radii_count",
+                format!(
+                    "radius_law: need exactly one radius per chain vertex (edges + 1): \
+                     {} edges need {} radii, got {}",
+                    edge_lengths.len(),
+                    edge_lengths.len() + 1,
+                    vertex_radii.len()
+                ),
             ));
         }
         for length in edge_lengths {
             if !(length.is_finite() && *length > 0.0) {
-                return Err("radius_law: segment length must be positive and finite".into());
+                return Err(segment_length_refusal());
             }
         }
         let mut points = Vec::with_capacity(vertex_radii.len());
@@ -123,9 +133,13 @@ impl RadiusLaw {
 
     /// Compose a law from consecutive segments with smooth junction
     /// transitions (see the module docs for the transition model).
-    pub fn from_segments(segments: &[LawSegment]) -> Result<Self, String> {
+    pub fn from_segments(segments: &[LawSegment]) -> Result<Self, KernelRefusal> {
         if segments.is_empty() {
-            return Err("radius_law: at least one segment is required".into());
+            return Err(KernelRefusal::input(
+                KernelStage::Collect,
+                "segments",
+                "radius_law: at least one segment is required",
+            ));
         }
         // 1. Validate and normalize each segment into an evaluator with an
         //    absolute abscissa span.
@@ -258,19 +272,33 @@ enum SegmentEval {
     },
 }
 
-fn check_radius(radius: f64) -> Result<(), String> {
+fn check_radius(radius: f64) -> Result<(), KernelRefusal> {
     if !(radius.is_finite() && radius > 0.0) {
-        return Err("radius_law: every radius must be positive and finite".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "radius",
+            "radius_law: every radius must be positive and finite",
+        ));
     }
     Ok(())
 }
 
+/// The one refusal every segment kind shares: a span that is not a positive
+/// finite length.  Minted once so the three sites carry one class and slug.
+fn segment_length_refusal() -> KernelRefusal {
+    KernelRefusal::input(
+        KernelStage::Collect,
+        "segment_length",
+        "radius_law: segment length must be positive and finite",
+    )
+}
+
 impl SegmentEval {
-    fn build(segment: &LawSegment, s0: f64) -> Result<Self, String> {
+    fn build(segment: &LawSegment, s0: f64) -> Result<Self, KernelRefusal> {
         match segment {
             LawSegment::Constant { length, radius } => {
                 if !(length.is_finite() && *length > 0.0) {
-                    return Err("radius_law: segment length must be positive and finite".into());
+                    return Err(segment_length_refusal());
                 }
                 check_radius(*radius)?;
                 Ok(Self::Constant {
@@ -285,7 +313,7 @@ impl SegmentEval {
                 end_radius,
             } => {
                 if !(length.is_finite() && *length > 0.0) {
-                    return Err("radius_law: segment length must be positive and finite".into());
+                    return Err(segment_length_refusal());
                 }
                 check_radius(*start_radius)?;
                 check_radius(*end_radius)?;
@@ -298,21 +326,26 @@ impl SegmentEval {
             }
             LawSegment::Interpolated { points } => {
                 if points.len() < 2 {
-                    return Err(
-                        "radius_law: an interpolated segment needs at least two points".into()
-                    );
+                    return Err(KernelRefusal::input(
+                        KernelStage::Collect,
+                        "interpolation_points",
+                        "radius_law: an interpolated segment needs at least two points",
+                    ));
                 }
                 if points[0].0 != 0.0 {
-                    return Err(
-                        "radius_law: interpolation abscissas must start at exactly 0".into()
-                    );
+                    return Err(KernelRefusal::input(
+                        KernelStage::Collect,
+                        "interpolation_start",
+                        "radius_law: interpolation abscissas must start at exactly 0",
+                    ));
                 }
                 for pair in points.windows(2) {
                     if !(pair[1].0.is_finite() && pair[1].0 > pair[0].0) {
-                        return Err(
-                            "radius_law: interpolation abscissas must be strictly increasing"
-                                .into(),
-                        );
+                        return Err(KernelRefusal::input(
+                            KernelStage::Collect,
+                            "interpolation_monotone",
+                            "radius_law: interpolation abscissas must be strictly increasing",
+                        ));
                     }
                 }
                 for (_, radius) in points {

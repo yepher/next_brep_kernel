@@ -1,5 +1,5 @@
-//! Coincident (`COIN`) — two elements touch (spec §4): exactly one planar side
-//! → point-on-plane, anything else → the representative points coincide.
+//! Coincident (`COIN`) — two elements touch: exactly one planar side →
+//! point-on-plane, anything else → the representative points coincide.
 
 use super::super::mapping::{
     local_point, mate, require_plane, ConstraintFailure, MappedConstraint, ResolvedElement,
@@ -38,7 +38,7 @@ pub(in crate::feature_pipeline::assembly) fn map(
     b: &ResolvedElement,
 ) -> Result<MappedConstraint, ConstraintFailure> {
     // Exactly one planar side → point-on-plane; anything else → the
-    // representative points coincide (spec §4).
+    // representative points coincide.
     let mapped = match (&a.world, &b.world) {
         (SelectionGeometry::Plane { origin, normal }, other)
             if !matches!(other, SelectionGeometry::Plane { .. }) =>

@@ -1,4 +1,4 @@
-//! Distance (`DIST`) — hold two elements at a target separation (spec §4).
+//! Distance (`DIST`) — hold two elements at a target separation.
 //!
 //! SIGN CONVENTION (shared verbatim with the viewport arrow's drag — the two
 //! must never disagree): when a pairing involves a planar face, that face is
@@ -101,8 +101,7 @@ pub(in crate::feature_pipeline::assembly) fn map(
         // normal — `d = (P_b − P_a)·n̂_a`, exactly what the mate's residual
         // measures, so the authored target maps through verbatim (negative =
         // plane B behind face A). First solve adopts the current SIGNED
-        // separation (requirements §6) — honest about the side, and satisfied
-        // without motion.
+        // separation — honest about the side, and satisfied without motion.
         (Side::Plane, Side::Plane) => {
             let (wa, _) = require_direction(a)?;
             let (wb, _) = require_direction(b)?;

@@ -1,3 +1,4 @@
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 
 /// Fitted rows + end caps for an OPEN smooth chain.
@@ -30,7 +31,7 @@ pub(super) fn blend_open_smooth_chain(
     radius: f64,
     chamfer: bool,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let segments = &chain.segments;
     let last_seg = segments.len() - 1;
     let samples = march_chain(segments, radius, true, CHAIN_PER_SEGMENT, FoldPolicy::Refuse)?;
@@ -55,7 +56,7 @@ pub(super) fn blend_open_smooth_chain(
     let raw_params: Vec<f64> = global.iter().map(|(parameter, _)| *parameter).collect();
     for pair in raw_params.windows(2) {
         if pair[1] - pair[0] <= 1e-12 {
-            return Err("blend: open chain produced coincident row parameters".into());
+            return Err(KernelRefusal::internal(KernelStage::Refine, "coincident_rows", "blend: open chain produced coincident row parameters"));
         }
     }
     // Normalise the global chord parameter onto [0, 1]: interpolate_homogeneous
@@ -80,14 +81,14 @@ pub(super) fn blend_open_smooth_chain(
             w: station.weight,
         });
     }
-    let cr = fit::interpolate_homogeneous(&samples_cr, degree, &params)?;
-    let cs = fit::interpolate_homogeneous(&samples_cs, degree, &params)?;
+    let cr = fit::interpolate_homogeneous(&samples_cr, degree, &params).or_refuse(KernelStage::Refine, "interpolate_homogeneous")?;
+    let cs = fit::interpolate_homogeneous(&samples_cs, degree, &params).or_refuse(KernelStage::Refine, "interpolate_homogeneous")?;
     let mid = if chamfer {
         None
     } else {
-        Some(fit::interpolate_homogeneous(&samples_mid, degree, &params)?)
+        Some(fit::interpolate_homogeneous(&samples_mid, degree, &params).or_refuse(KernelStage::Refine, "interpolate_homogeneous")?)
     };
-    let u_domain = cr.domain()?;
+    let u_domain = cr.domain().or_refuse(KernelStage::Refine, "domain")?;
     let surface = crate::blend::rows::surface_from_rows(degree, &cr, &cs, mid.as_ref(), false)?;
 
     // Per-segment mate pcurves (uv1/uv2) over each segment's full window in
@@ -107,7 +108,7 @@ pub(super) fn blend_open_smooth_chain(
             .iter()
             .map(|parameter| (parameter - low) / (high - low))
             .collect();
-        let fit_uv = |select: &dyn Fn(&Station) -> [f64; 2]| -> Result<NurbsCurve, String> {
+        let fit_uv = |select: &dyn Fn(&Station) -> [f64; 2]| -> Result<NurbsCurve, KernelRefusal> {
             let points: Vec<Vec4> = window
                 .iter()
                 .map(|sample| {
@@ -115,7 +116,7 @@ pub(super) fn blend_open_smooth_chain(
                     Vec4::from_point(Vec3::new(uv[0], uv[1], 0.0), 1.0)
                 })
                 .collect();
-            fit::interpolate_homogeneous(&points, degree, &normalized)
+            fit::interpolate_homogeneous(&points, degree, &normalized).or_refuse(KernelStage::Refine, "interpolate_homogeneous")
         };
         // The window bounds are stored in the NORMALISED global space so
         // pcurve_portion maps the surgery's piece windows onto the fit.
@@ -143,7 +144,7 @@ pub(super) fn blend_open_smooth_chain(
             let uv = if side == 0 { station.uv1 } else { station.uv2 };
             points.push(Vec4::from_point(Vec3::new(uv[0], uv[1], 0.0), 1.0));
         }
-        whole_pcurves[side] = Some(fit::interpolate_homogeneous(&points, degree, &params)?);
+        whole_pcurves[side] = Some(fit::interpolate_homogeneous(&points, degree, &params).or_refuse(KernelStage::Refine, "interpolate_homogeneous")?);
     }
 
     // Placeholder pcurves for FittedRows (the open-chain ends cross via 3D
@@ -175,7 +176,7 @@ pub(super) fn blend_open_smooth_chain(
         let second_edge_id = boundary_edge_at_vertex(solid, second_face, corner, segment.edge.id)?;
         if first_edge_id == second_edge_id {
             return Err(
-                "blend: open chain end mates share their boundary edge (unsupported)".into(),
+                KernelRefusal::unsupported(KernelStage::Classify, "shared_end_boundary", "blend: open chain end mates share their boundary edge (unsupported)"),
             );
         }
         let end_face = end_face_id(
@@ -189,12 +190,12 @@ pub(super) fn blend_open_smooth_chain(
             .edges
             .iter()
             .find(|candidate| candidate.id == first_edge_id)
-            .ok_or("blend: end boundary edge missing")?;
+            .ok_or(KernelRefusal::internal(KernelStage::Sew, "end_boundary_edge", "blend: end boundary edge missing"))?;
         let second_boundary = solid
             .edges
             .iter()
             .find(|candidate| candidate.id == second_edge_id)
-            .ok_or("blend: end boundary edge missing")?;
+            .ok_or(KernelRefusal::internal(KernelStage::Sew, "end_boundary_edge", "blend: end boundary edge missing"))?;
         let (cr_parameter, first_edge_parameter, _, cr_escalated) =
             support_crossing(solid, &rows.cr, first_boundary, at_start)?;
         let (cs_parameter, second_edge_parameter, _, cs_escalated) =
@@ -204,7 +205,7 @@ pub(super) fn blend_open_smooth_chain(
             .iter()
             .flat_map(|shell| &shell.faces)
             .find(|face| face.id == end_face)
-            .ok_or("blend: end face missing")?;
+            .ok_or(KernelRefusal::internal(KernelStage::Sew, "end_face", "blend: end face missing"))?;
         let (transverse, blend_pcurve, end_pcurve) =
             transverse_curve(&rows, end_record, cr_parameter, cs_parameter)?;
         ends.push(EndSurgery {
@@ -223,7 +224,7 @@ pub(super) fn blend_open_smooth_chain(
     }
     let [start_end, finish_end] = match <[EndSurgery; 2]>::try_from(ends) {
         Ok(pair) => pair,
-        Err(_) => return Err("blend: open chain needs exactly two ends".into()),
+        Err(_) => return Err(KernelRefusal::internal(KernelStage::Refine, "open_chain_ends", "blend: open chain needs exactly two ends")),
     };
 
     let FittedRows {
@@ -251,7 +252,7 @@ fn open_chain_surgery(
     segments: &[ChainSegment<'_>],
     rows: OpenChainRows,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
     let OpenChainRows {
         surface,
@@ -316,15 +317,14 @@ fn open_chain_surgery(
             };
             if face_before.id == face_after.id {
                 return Err(
-                    "blend: open smooth chain with a carrier-seam junction is not yet supported"
-                        .into(),
+                    KernelRefusal::unsupported(KernelStage::Classify, "open_chain_seam_junction", "blend: open smooth chain with a carrier-seam junction is not yet supported"),
                 );
             }
             let spoke_record = solid
                 .edges
                 .iter()
                 .find(|edge| edge.id == spoke)
-                .ok_or("blend: chain spoke edge missing")?;
+                .ok_or(KernelRefusal::internal(KernelStage::Sew, "chain_spoke_edge", "blend: chain spoke edge missing"))?;
             let vertex_point = result
                 .vertices
                 .iter()
@@ -334,7 +334,7 @@ fn open_chain_surgery(
             let Some((crossing_support, crossing_spoke, escalated)) =
                 spoke_crossing(solid, support, spoke_record, vertex_point)?
             else {
-                return Err("blend: support does not cross a chain spoke".into());
+                return Err(KernelRefusal::internal(KernelStage::Sew, "support_misses_spoke", "blend: support does not cross a chain spoke"));
             };
             crossings.note(escalated);
             junctions.push(SideJunction {
@@ -360,17 +360,17 @@ fn open_chain_surgery(
             (start_end.cs_parameter, finish_end.cs_parameter)
         };
         if finish_param - start_param <= 1e-9 {
-            return Err("blend: open chain support has no forward span".into());
+            return Err(KernelRefusal::internal(KernelStage::Sew, "support_forward_span", "blend: open chain support has no forward span"));
         }
         let start_vertex = take_id();
         result.vertices.push(VertexRecord {
             id: start_vertex,
-            point: support.evaluate(start_param)?,
+            point: support.evaluate(start_param).or_refuse(KernelStage::Refine, "evaluate")?,
         });
         let finish_vertex = take_id();
         result.vertices.push(VertexRecord {
             id: finish_vertex,
-            point: support.evaluate(finish_param)?,
+            point: support.evaluate(finish_param).or_refuse(KernelStage::Refine, "evaluate")?,
         });
         rim_vertices[side] = [start_vertex, finish_vertex];
         let mut cut_vertex: HashMap<usize, u64> = HashMap::default();
@@ -379,7 +379,7 @@ fn open_chain_surgery(
             let vertex = take_id();
             result.vertices.push(VertexRecord {
                 id: vertex,
-                point: support.evaluate(junction.crossing_support)?,
+                point: support.evaluate(junction.crossing_support).or_refuse(KernelStage::Refine, "evaluate")?,
             });
             cut_vertex.insert(junction.junction, vertex);
             cuts.push((junction.crossing_support, vertex));
@@ -394,14 +394,14 @@ fn open_chain_surgery(
             let (a, vertex_a) = window[0];
             let (b, vertex_b) = window[1];
             if b - a <= 1e-9 {
-                return Err("blend: degenerate open-chain support piece".into());
+                return Err(KernelRefusal::internal(KernelStage::Sew, "degenerate_support_piece", "blend: degenerate open-chain support piece"));
             }
             let piece_curve = {
-                let (_, tail) = support.split(a)?;
-                tail.split(b)?.0
+                let (_, tail) = support.split(a).or_refuse(KernelStage::Refine, "split")?;
+                tail.split(b).or_refuse(KernelStage::Refine, "split")?.0
             };
             let edge_id = take_id();
-            let [piece_t0, piece_t1] = piece_curve.domain()?;
+            let [piece_t0, piece_t1] = piece_curve.domain().or_refuse(KernelStage::Refine, "domain")?;
             result.edges.push(EdgeRecord {
                 id: edge_id,
                 curve: piece_curve,
@@ -424,7 +424,7 @@ fn open_chain_surgery(
 
     // ---- transverse edges at the two free ends ----------------------
     let transverse_a_id = take_id();
-    let ta_domain = start_end.transverse_curve.domain()?;
+    let ta_domain = start_end.transverse_curve.domain().or_refuse(KernelStage::Refine, "domain")?;
     result.edges.push(EdgeRecord {
         id: transverse_a_id,
         curve: start_end.transverse_curve.clone(),
@@ -436,7 +436,7 @@ fn open_chain_surgery(
         name: None,
     });
     let transverse_b_id = take_id();
-    let tb_domain = finish_end.transverse_curve.domain()?;
+    let tb_domain = finish_end.transverse_curve.domain().or_refuse(KernelStage::Refine, "domain")?;
     result.edges.push(EdgeRecord {
         id: transverse_b_id,
         curve: finish_end.transverse_curve.clone(),
@@ -479,7 +479,7 @@ fn open_chain_surgery(
             .iter()
             .flat_map(|shell| &shell.faces)
             .find(|face| face.id == end.end_face_id)
-            .ok_or("blend: end face lost during surgery")?;
+            .ok_or(KernelRefusal::internal(KernelStage::Sew, "end_face", "blend: end face lost during surgery"))?;
         let mut located = None;
         'search: for (loop_index, loop_record) in face.loops.iter().enumerate() {
             let count = loop_record.coedges.len();
@@ -510,7 +510,7 @@ fn open_chain_surgery(
             }
         }
         let Some((loop_index, x_coedge_id, y_coedge_id, x_is_first)) = located else {
-            return Err("blend: open chain end-face corner not found".into());
+            return Err(KernelRefusal::internal(KernelStage::Sew, "end_face_corner", "blend: open chain end-face corner not found"));
         };
         end_plans.push((
             end.end_face_id,
@@ -604,7 +604,7 @@ fn open_chain_surgery(
                         ids.push(coedge_id);
                     }
                 }
-                (loop_index.ok_or("blend: face lost its chain coedges")?, ids)
+                (loop_index.ok_or(KernelRefusal::internal(KernelStage::Sew, "chain_coedges", "blend: face lost its chain coedges"))?, ids)
             };
             let chain_forward = {
                 let segment = segments
@@ -636,8 +636,8 @@ fn open_chain_surgery(
             for piece in ordered {
                 let pcurve = if let Some(whole) = &whole_pcurves[side] {
                     let [w0, w1] = piece.window;
-                    let (_, tail) = whole.split(w0)?;
-                    tail.split(w1)?.0
+                    let (_, tail) = whole.split(w0).or_refuse(KernelStage::Refine, "split")?;
+                    tail.split(w1).or_refuse(KernelStage::Refine, "split")?.0
                 } else {
                     let midpoint = (piece.window[0] + piece.window[1]) * 0.5;
                     let nearest = fitted
@@ -659,7 +659,7 @@ fn open_chain_surgery(
                     pcurve: if chain_forward {
                         pcurve
                     } else {
-                        pcurve.reversed()?
+                        pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")?
                     },
                 });
             }
@@ -668,7 +668,7 @@ fn open_chain_surgery(
                 .iter_mut()
                 .flat_map(|shell| &mut shell.faces)
                 .find(|face| face.id == face_id)
-                .ok_or("blend: mate face lost during open chain surgery")?;
+                .ok_or(KernelRefusal::internal(KernelStage::Sew, "mate_face", "blend: mate face lost during open chain surgery"))?;
             let loop_record = &mut face.loops[loop_index];
             let positions: Vec<usize> = loop_record
                 .coedges
@@ -678,7 +678,7 @@ fn open_chain_surgery(
                 .map(|(position, _)| position)
                 .collect();
             if positions.is_empty() {
-                return Err("blend: chain coedges missing from mate loop".into());
+                return Err(KernelRefusal::internal(KernelStage::Sew, "chain_coedges", "blend: chain coedges missing from mate loop"));
             }
             let first_position = positions[0];
             let mut kept: Vec<CoedgeRecord> = Vec::new();
@@ -710,7 +710,7 @@ fn open_chain_surgery(
         let pcurve = if forward {
             transverse_end_pcurve
         } else {
-            transverse_end_pcurve.reversed()?
+            transverse_end_pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")?
         };
         let coedge_id = take_id();
         let mut transverse_coedge = Some(CoedgeRecord {
@@ -724,17 +724,17 @@ fn open_chain_surgery(
             .iter_mut()
             .flat_map(|shell| &mut shell.faces)
             .find(|face| face.id == end_face)
-            .ok_or("blend: end face lost during surgery")?;
+            .ok_or(KernelRefusal::internal(KernelStage::Sew, "end_face", "blend: end face lost during surgery"))?;
         let loop_record = &mut face.loops[loop_index];
         let count = loop_record.coedges.len();
         let seg_index = loop_record
             .coedges
             .iter()
             .position(|coedge| coedge.id == x_coedge_id)
-            .ok_or("blend: end-face corner coedge lost during surgery")?;
+            .ok_or(KernelRefusal::internal(KernelStage::Sew, "end_face_corner", "blend: end-face corner coedge lost during surgery"))?;
         let y_index = (seg_index + 1) % count;
         if loop_record.coedges[y_index].id != y_coedge_id {
-            return Err("blend: end-face corner pair no longer adjacent".into());
+            return Err(KernelRefusal::internal(KernelStage::Sew, "end_face_corner", "blend: end-face corner pair no longer adjacent"));
         }
         let mut rebuilt = Vec::with_capacity(count + 1);
         for index in 0..count {
@@ -752,7 +752,7 @@ fn open_chain_surgery(
     // mate's use — manifold pairing).
     let mid_seg = segments.len() / 2;
     let (low_mid, high_mid, pc1_mid) = &pcurves1[mid_seg];
-    let mid_uv = pc1_mid.evaluate(0.5)?;
+    let mid_uv = pc1_mid.evaluate(0.5).or_refuse(KernelStage::Refine, "evaluate")?;
     let mate_normal = raw_normal(&segments[mid_seg].first.face.surface, mid_uv.x, mid_uv.y)?;
     let out1 = if segments[mid_seg].first.face.same_sense {
         mate_normal
@@ -781,7 +781,7 @@ fn open_chain_surgery(
                     0.0,
                     piece.window[1],
                     0.0,
-                )?,
+                ).or_refuse(KernelStage::Refine, "parameter_line")?,
             });
         }
         coedges.push(CoedgeRecord {
@@ -800,14 +800,14 @@ fn open_chain_surgery(
                     1.0,
                     piece.window[0],
                     1.0,
-                )?,
+                ).or_refuse(KernelStage::Refine, "parameter_line")?,
             });
         }
         coedges.push(CoedgeRecord {
             id: take_id(),
             edge_id: transverse_a_id,
             forward: false,
-            pcurve: start_end.transverse_blend_pcurve.reversed()?,
+            pcurve: start_end.transverse_blend_pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")?,
         });
     } else {
         for piece in side_edges[0].iter().rev() {
@@ -820,7 +820,7 @@ fn open_chain_surgery(
                     0.0,
                     piece.window[0],
                     0.0,
-                )?,
+                ).or_refuse(KernelStage::Refine, "parameter_line")?,
             });
         }
         coedges.push(CoedgeRecord {
@@ -839,14 +839,14 @@ fn open_chain_surgery(
                     1.0,
                     piece.window[1],
                     1.0,
-                )?,
+                ).or_refuse(KernelStage::Refine, "parameter_line")?,
             });
         }
         coedges.push(CoedgeRecord {
             id: take_id(),
             edge_id: transverse_b_id,
             forward: false,
-            pcurve: finish_end.transverse_blend_pcurve.reversed()?,
+            pcurve: finish_end.transverse_blend_pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")?,
         });
     }
     let blend_face = FaceRecord {
@@ -868,7 +868,7 @@ fn open_chain_surgery(
                 .iter()
                 .any(|face| face.id == segments[0].first.face.id)
         })
-        .ok_or("blend: mate shell lost during open chain surgery")?;
+        .ok_or(KernelRefusal::internal(KernelStage::Sew, "mate_shell", "blend: mate shell lost during open chain surgery"))?;
     result.shells[shell_index].faces.push(blend_face);
 
     // ---- drop chain edges and prune orphan vertices -----------------

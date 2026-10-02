@@ -3,9 +3,10 @@
 use rustc_hash::FxHashSet;
 
 use crate::feature_pipeline::{
+    FeatureRefusal,
     AddedSolid, Axis, EdgeRef, FaceRef, FeatureContext, FeatureResult, Frame, SketchProfile,
 };
-use crate::{AffineTransform, BooleanOperation, BooleanOptions, BrepSolid, NurbsCurve, Vec3, transform_brep};
+use crate::{AffineTransform, BooleanOperation, BooleanOptions, BrepSolid, KernelRefusal, KernelStage, NurbsCurve, OrRefuse, Vec3, transform_brep};
 
 /// Rotate a solid a half turn (180°) about the local X axis. This is a PROPER
 /// rotation (determinant +1), so `transform_brep` preserves face winding and every
@@ -1291,7 +1292,9 @@ pub fn resolve_sweep_path(
         segment_names.push(segment.name);
         axes.push(segment.axis);
     }
-    crate::SweepPath::new(curves, segment_names)?.with_screw_axes(axes)
+    crate::SweepPath::new(curves, segment_names)?
+        .with_screw_axes(axes)
+        .map_err(String::from)
 }
 
 pub fn resolve_path_chain(
@@ -1697,7 +1700,7 @@ pub fn hole_face_name(id: &str, key: &str, segment: Option<&str>) -> String {
 
 /// Boolean-subtract `cutter` from `body` with `merge_coplanar_faces` — the
 /// hole-cut boolean (register both, subtract, free both).
-pub fn subtract_solid(body: BrepSolid, cutter: BrepSolid) -> Result<BrepSolid, String> {
+pub fn subtract_solid(body: BrepSolid, cutter: BrepSolid) -> Result<BrepSolid, KernelRefusal> {
     let options = BooleanOptions {
         merge_coplanar_faces: true,
         ..BooleanOptions::default()
@@ -1709,8 +1712,7 @@ pub fn subtract_solid(body: BrepSolid, cutter: BrepSolid) -> Result<BrepSolid, S
     });
     crate::free_registered_solid(body_handle);
     crate::free_registered_solid(cutter_handle);
-    // Lossy exit: the feature pipeline is still stringly (typed-refusal slice 3).
-    cut.map_err(String::from)
+    cut
 }
 
 /// The straight-sweep hole cutter: the hole loop extruded into a prism that
@@ -1723,8 +1725,8 @@ pub fn hole_prism(
     direction: Vec3,
     distance: f64,
     depth: usize,
-) -> Result<BrepSolid, String> {
-    let dir = direction.normalized()?;
+) -> Result<BrepSolid, KernelRefusal> {
+    let dir = direction.normalized().or_input(KernelStage::Collect, "direction")?;
     let span = distance.abs();
     let margin = span.max(1.0) * (depth as f64 + 1.0);
     let start_t = distance.min(0.0) - margin;
@@ -1732,7 +1734,7 @@ pub fn hole_prism(
     let offset = dir.scale(start_t);
     let mut curves = Vec::with_capacity(hole_curves.len());
     for curve in hole_curves {
-        curves.push(translate_curve(curve, offset)?);
+        curves.push(translate_curve(curve, offset).or_refuse(KernelStage::Collect, "translate_curve")?);
     }
     crate::extrude_profile_brep(&curves, dir, length)
 }
@@ -1778,17 +1780,21 @@ pub fn subtract_region_holes(
     feature: &str,
     id: &str,
     segment: Option<&str>,
-    build: &mut dyn FnMut(usize, usize) -> Result<BrepSolid, String>,
-) -> Result<BrepSolid, String> {
+    build: &mut dyn FnMut(usize, usize) -> Result<BrepSolid, KernelRefusal>,
+) -> Result<BrepSolid, FeatureRefusal> {
     for group in hole_nesting(profile, region)? {
         let key = hole_key(&region[group.index], group.index);
-        let Some(cutter) = hole_cutter(region, &group, id, segment, build)
-            .map_err(|error| format!("{feature}: hole {key} cut failed: {error}"))?
+        // The cutter's and the cut's refusals keep their class through the
+        // feature's wrap.
+        let Some(cutter) = hole_cutter(region, &group, id, segment, build).map_err(|error| {
+            error.with_message(|error| format!("{feature}: hole {key} cut failed: {error}"))
+        })?
         else {
             continue;
         };
-        body = subtract_solid(body, cutter)
-            .map_err(|error| format!("{feature}: hole {key} cut failed: {error}"))?;
+        body = subtract_solid(body, cutter).map_err(|error| {
+            error.with_message(|error| format!("{feature}: hole {key} cut failed: {error}"))
+        })?;
     }
     Ok(body)
 }
@@ -1807,8 +1813,8 @@ fn hole_cutter(
     group: &HoleGroup,
     id: &str,
     segment: Option<&str>,
-    build: &mut dyn FnMut(usize, usize) -> Result<BrepSolid, String>,
-) -> Result<Option<BrepSolid>, String> {
+    build: &mut dyn FnMut(usize, usize) -> Result<BrepSolid, KernelRefusal>,
+) -> Result<Option<BrepSolid>, KernelRefusal> {
     if region[group.index].curves.len() < 2 {
         return Ok(None);
     }
@@ -1824,7 +1830,9 @@ fn hole_cutter(
             continue;
         };
         cutter = subtract_solid(cutter, child_cutter).map_err(|error| {
-            format!("island {} carve from hole {} failed: {error}", child.index, group.index)
+            error.with_message(|error| {
+                format!("island {} carve from hole {} failed: {error}", child.index, group.index)
+            })
         })?;
     }
     Ok(Some(cutter))

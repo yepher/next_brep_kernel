@@ -1,5 +1,5 @@
-//! The constraint run lifecycle (build-spec §6): validate → map → ONE
-//! `solve_assembly` call → status/diagnostics merge → pose write-back.
+//! The constraint run lifecycle: validate → map → ONE `solve_assembly`
+//! call → status/diagnostics merge → pose write-back.
 
 use std::collections::BTreeMap;
 
@@ -138,8 +138,8 @@ pub fn run_constraints(
             continue;
         }
 
-        // Duplicate marking (requirements §4.3): every member of an
-        // overlapping-family signature group is marked and skipped.
+        // Duplicate marking: every member of an overlapping-family
+        // signature group is marked and skipped.
         if def.duplicate_family {
             let signature = mapping::pair_signature(&elements);
             if let Some(members) = duplicate_of.get(&signature) {

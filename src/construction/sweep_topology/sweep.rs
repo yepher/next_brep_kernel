@@ -23,7 +23,7 @@ pub fn sweep_profile_along_path(
     profile: &[NurbsCurve],
     path: &NurbsCurve,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     // 32 stations is the original fixed sampling — golden parity pins the
     // emitted geometry to it — and it stays the count for every path whose
     // tangent turns through at most a full turn. A path that turns further
@@ -64,21 +64,29 @@ pub fn sweep_profile_twisted(
     path: &NurbsCurve,
     twist_angle: f64,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     use std::f64::consts::{FRAC_PI_2, TAU};
 
     if !twist_angle.is_finite() {
-        return Err("sweep_profile_twisted: twist angle must be finite".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "twist_finite",
+            "sweep_profile_twisted: twist angle must be finite",
+        ));
     }
     // 16 turns is where the 1024-station cap meets 16 stations/quarter-turn;
     // beyond it the cap would degrade the twist sampling density silently.
     const MAX_TURNS: f64 = 16.0;
     if twist_angle.abs() > MAX_TURNS * TAU {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Collect,
+            "twist_cap",
+            format!(
             "sweep_profile_twisted: twist of {:.3} turns exceeds the {MAX_TURNS}-turn \
              limit the 1024-station cap can resolve at 16 stations per quarter turn; \
              split the sweep or reduce the twist",
             twist_angle.abs() / TAU
+            ),
         ));
     }
     let quarter_turns = (twist_angle.abs() / FRAC_PI_2).ceil() as usize;
@@ -92,7 +100,7 @@ pub fn sweep_profile_twisted(
         None,
         SectionPlacement::Transplant,
     )
-    .map_err(|error| format!("sweep_profile_twisted: {error}"))
+    .map_err(|error| error.with_message(|error| format!("sweep_profile_twisted: {error}")))
 }
 
 /// The station budget of a single-curve path sweep, from how far the path's
@@ -207,7 +215,7 @@ pub fn sweep_profile_along_path_anchored(
     path: &NurbsCurve,
     name: Option<&str>,
     anchor: ProfileAnchor,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     sweep_profile_along_path_stations(
         profile,
         path,
@@ -228,19 +236,27 @@ pub fn sweep_profile_twisted_anchored(
     twist_angle: f64,
     name: Option<&str>,
     anchor: ProfileAnchor,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     use std::f64::consts::{FRAC_PI_2, TAU};
 
     if !twist_angle.is_finite() {
-        return Err("sweep_profile_twisted: twist angle must be finite".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "twist_finite",
+            "sweep_profile_twisted: twist angle must be finite",
+        ));
     }
     const MAX_TURNS: f64 = 16.0;
     if twist_angle.abs() > MAX_TURNS * TAU {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Collect,
+            "twist_cap",
+            format!(
             "sweep_profile_twisted: twist of {:.3} turns exceeds the {MAX_TURNS}-turn \
              limit the 1024-station cap can resolve at 16 stations per quarter turn; \
              split the sweep or reduce the twist",
             twist_angle.abs() / TAU
+            ),
         ));
     }
     let quarter_turns = (twist_angle.abs() / FRAC_PI_2).ceil() as usize;
@@ -254,7 +270,7 @@ pub fn sweep_profile_twisted_anchored(
         Some(anchor),
         SectionPlacement::Transplant,
     )
-    .map_err(|error| format!("sweep_profile_twisted: {error}"))
+    .map_err(|error| error.with_message(|error| format!("sweep_profile_twisted: {error}")))
 }
 
 /// Sweep a CLOSED PLANAR profile along a CHAIN of path curves joined
@@ -299,11 +315,15 @@ pub fn sweep_profile_along_chain(
     anchor: Option<ProfileAnchor>,
     placement_mode: SectionPlacement,
     corner_advice: &str,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     use std::f64::consts::{FRAC_PI_2, TAU};
 
     if path.is_empty() {
-        return Err("sweepSolid: path chain is empty".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "chain_empty",
+            "sweepSolid: path chain is empty",
+        ));
     }
     // A bend TIGHTER than the section is the envelope lane's, not the loft's, and
     // it is asked BEFORE the single-curve shortcut below — that shortcut lands in
@@ -337,15 +357,23 @@ pub fn sweep_profile_along_chain(
     // `Rigid` — takes the same station law the single-curve twisted builder
     // uses, so density scales with twist identically on a chained path.
     if !twist_angle.is_finite() {
-        return Err("sweep_profile_along_chain: twist angle must be finite".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "twist_finite",
+            "sweep_profile_along_chain: twist angle must be finite",
+        ));
     }
     const MAX_TURNS: f64 = 16.0;
     if twist_angle.abs() > MAX_TURNS * TAU {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Collect,
+            "twist_cap",
+            format!(
             "sweep_profile_along_chain: twist of {:.3} turns exceeds the {MAX_TURNS}-turn \
              limit the 1024-station cap can resolve at 16 stations per quarter turn; \
              split the sweep or reduce the twist",
             twist_angle.abs() / TAU
+            ),
         ));
     }
     // A CLOSED SPATIAL path lays its counter-twist down on top of the requested
@@ -387,7 +415,7 @@ pub fn sweep_profile_along_chain_with_stations(
     path: &SweepPath,
     stations: usize,
     corner_advice: &str,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     sweep_profile_along_chain_stations(
         profile,
         path,
@@ -404,44 +432,58 @@ pub fn sweep_profile_along_chain_with_stations(
 /// the path sweep's §1 block, extracted bit-identically: 16 samples per curve,
 /// closure at `tolerance`, Newell normal, boundary-sample-mean origin,
 /// planarity at `tolerance * 100`, `pu = np.perpendicular()`, `pv = np × pu`.
-pub fn profile_anchor(profile: &[NurbsCurve]) -> Result<ProfileAnchor, String> {
+pub fn profile_anchor(profile: &[NurbsCurve]) -> Result<ProfileAnchor, KernelRefusal> {
     let tolerance = 1e-6;
     if profile.len() < 2 {
-        return Err("sweepSolid: profile needs at least 2 curves forming a closed loop".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "profile_count",
+            "sweepSolid: profile needs at least 2 curves forming a closed loop",
+        ));
     }
     let mut samples = Vec::new();
     for (index, curve) in profile.iter().enumerate() {
-        let [start, end] = curve.domain()?;
+        let [start, end] = curve.domain().or_refuse(KernelStage::Collect, "domain")?;
         let next = &profile[(index + 1) % profile.len()];
-        let next_start = next.domain()?[0];
+        let next_start = next.domain().or_refuse(KernelStage::Collect, "domain")?[0];
         if curve
-            .evaluate(end)?
-            .sub(next.evaluate(next_start)?)
+            .evaluate(end).or_refuse(KernelStage::Collect, "evaluate")?
+            .sub(next.evaluate(next_start).or_refuse(KernelStage::Collect, "evaluate")?)
             .length()
             > tolerance
         {
-            return Err(format!(
-                "sweepSolid: profile is not closed at curve {index}"
+            return Err(KernelRefusal::input(
+                KernelStage::Collect,
+                "profile_closed",
+                format!("sweepSolid: profile is not closed at curve {index}"),
             ));
         }
         for sample in 0..16 {
-            samples.push(curve.evaluate(start + (end - start) * sample as f64 / 16.0)?);
+            samples.push(curve.evaluate(start + (end - start) * sample as f64 / 16.0).or_refuse(KernelStage::Collect, "evaluate")?);
         }
     }
     let normal = crate::polygon::newell_normal(&samples);
     let centroid = samples.iter().fold(Vec3::default(), |sum, &point| sum.add(point));
-    let np = normal
-        .normalized()
-        .map_err(|_| "sweepSolid: profile is degenerate (zero enclosed area)".to_string())?;
+    let np = normal.normalized().map_err(|_| {
+        KernelRefusal::input(
+            KernelStage::Collect,
+            "profile_area",
+            "sweepSolid: profile is degenerate (zero enclosed area)",
+        )
+    })?;
     let origin = centroid.scale(1.0 / samples.len() as f64);
     if samples
         .iter()
         .any(|point| point.sub(origin).dot(np).abs() > tolerance * 100.0)
     {
-        return Err("sweepSolid: profile is not planar".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "profile_planar",
+            "sweepSolid: profile is not planar",
+        ));
     }
-    let pu = np.perpendicular()?;
-    let pv = np.cross(pu).normalized()?;
+    let pu = np.perpendicular().or_refuse(KernelStage::Collect, "perpendicular")?;
+    let pv = np.cross(pu).normalized().or_refuse(KernelStage::Collect, "normalized")?;
     Ok(ProfileAnchor {
         origin,
         normal: np,
@@ -465,13 +507,17 @@ fn sweep_profile_along_path_stations(
     twist_angle: f64,
     anchor: Option<ProfileAnchor>,
     placement_mode: SectionPlacement,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     // Loft carries no face names; the app stamps them onto the emitted face
     // order.  Accept `name` for ABI symmetry with the other builders.
     let _ = name;
     let tolerance = 1e-6;
     if stations < 2 {
-        return Err("sweepSolid: need at least 2 stations".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "stations",
+            "sweepSolid: need at least 2 stations",
+        ));
     }
 
     // --- 1. Validate the profile: closed + planar; derive (origin, np, pu, pv).
@@ -483,19 +529,27 @@ fn sweep_profile_along_path_stations(
     let placement = resolve_placement(profile, anchor, placement_mode)?;
 
     // --- 2. Sample the path; require a non-degenerate tangent at every station.
-    let [t0, t1] = path.domain()?;
+    let [t0, t1] = path.domain().or_refuse(KernelStage::Collect, "domain")?;
     if (t1 - t0).abs() <= tolerance {
-        return Err("sweepSolid: path domain is degenerate".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "path_domain",
+            "sweepSolid: path domain is degenerate",
+        ));
     }
     let mut points = Vec::with_capacity(stations);
     let mut tangents = Vec::with_capacity(stations);
     let mut curvatures = Vec::with_capacity(stations);
     for index in 0..stations {
         let t = t0 + (t1 - t0) * index as f64 / (stations - 1) as f64;
-        let derivatives = path.derivatives_small(t, 2)?;
-        let tangent = derivatives[1]
-            .normalized()
-            .map_err(|_| format!("sweepSolid: path tangent is degenerate at station {index}"))?;
+        let derivatives = path.derivatives_small(t, 2).or_refuse(KernelStage::Collect, "derivatives")?;
+        let tangent = derivatives[1].normalized().map_err(|_| {
+            KernelRefusal::input(
+                KernelStage::Classify,
+                "path_tangent",
+                format!("sweepSolid: path tangent is degenerate at station {index}"),
+            )
+        })?;
         points.push(derivatives[0]);
         tangents.push(tangent);
         curvatures.push(curvature_vector(derivatives[1], derivatives[2]));
@@ -559,13 +613,13 @@ fn place_section(
     placement_mode: SectionPlacement,
     start: Vec3,
     tangent: Vec3,
-) -> Result<(Vec<NurbsCurve>, Vec3), String> {
+) -> Result<(Vec<NurbsCurve>, Vec3), KernelRefusal> {
     if placement_mode == SectionPlacement::Rigid {
         return Ok((profile.to_vec(), placement.normal));
     }
     let ProfileAnchor { origin, pu, pv, .. } = placement;
-    let r0 = tangent.perpendicular()?;
-    let s0 = tangent.cross(r0).normalized()?;
+    let r0 = tangent.perpendicular().or_refuse(KernelStage::Fragment, "perpendicular")?;
+    let s0 = tangent.cross(r0).normalized().or_refuse(KernelStage::Fragment, "normalized")?;
     let mut placed = Vec::with_capacity(profile.len());
     for curve in profile {
         let control_points = curve
@@ -579,12 +633,12 @@ fn place_section(
                     .add(s0.scale(local.dot(pv)));
                 Ok(Vec4::from_point(world, control.w))
             })
-            .collect::<Result<Vec<_>, String>>()?;
-        placed.push(NurbsCurve::new(
-            curve.degree,
-            curve.knots.clone(),
-            control_points,
-        )?);
+            .collect::<Result<Vec<_>, String>>()
+            .or_refuse(KernelStage::Fragment, "control_point")?;
+        placed.push(
+            NurbsCurve::new(curve.degree, curve.knots.clone(), control_points)
+                .or_refuse(KernelStage::Fragment, "curve_new")?,
+        );
     }
     Ok((placed, tangent))
 }
@@ -602,7 +656,7 @@ fn resolve_placement(
     profile: &[NurbsCurve],
     anchor: Option<ProfileAnchor>,
     placement_mode: SectionPlacement,
-) -> Result<ProfileAnchor, String> {
+) -> Result<ProfileAnchor, KernelRefusal> {
     let computed = profile_anchor(profile)?;
     Ok(match placement_mode {
         // RIGID never transplants, so there is no frame to borrow: every loop
@@ -649,13 +703,21 @@ fn sweep_profile_along_chain_stations(
     placement_mode: SectionPlacement,
     corner_advice: &str,
     corners: CornerPolicy,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let chain = path.curves.as_slice();
     if chain.is_empty() {
-        return Err("sweepSolid: path chain is empty".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "chain_empty",
+            "sweepSolid: path chain is empty",
+        ));
     }
     if stations < 2 {
-        return Err("sweepSolid: need at least 2 stations".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "stations",
+            "sweepSolid: need at least 2 stations",
+        ));
     }
     // Profile first, matching the single-curve sampler's order of complaint.
     let placement = resolve_placement(profile, anchor, placement_mode)?;
@@ -681,7 +743,10 @@ fn sweep_profile_along_chain_stations(
                 if bodies.len() == 1 {
                     return Ok(bodies.remove(0));
                 }
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Fragment,
+                    "envelope_two_bodies",
+                    format!(
                     "{}: a section that crosses the path's axis (ρ·κ = {:.6}) sweeps TWO \
                      bodies — the near lobe over the path's own azimuths and the far lobe half \
                      a turn from them, meeting only along the axis — and this entry returns one \
@@ -689,6 +754,7 @@ fn sweep_profile_along_chain_stations(
                     SWEEP_ENVELOPE_REFUSAL,
                     plan.ratio(),
                     bodies.len()
+                    ),
                 ));
             }
             Err(reason) => reason,
@@ -718,15 +784,16 @@ fn sweep_profile_along_chain_stations(
             // exactly as it rolls its own counter-twist. An OPEN cornered run does
             // not have that construction and is refused.
             if twist_angle != 0.0 && !path.closed {
-                return Err(
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "cornered_twist",
                     "sweepSolid: a CORNERED path cannot carry a twist — its corners are mitred \
                      from exact pieces that meet on the joint's bisector plane, and a twist laid \
                      down along the path would roll the two sides of that plane apart, so they \
                      would no longer share one loop there. Only a CLOSED frame rolls a twist along \
                      the middle of its sides. Sweep the run without the twist; a \
-                     tangent-continuous (smooth) path is skinned through stations and carries one"
-                        .into(),
-                );
+                     tangent-continuous (smooth) path is skinned through stations and carries one",
+                ));
             }
             let (section, section_normal, _) =
                 mitre_section(profile, placement, placement_mode, path)?;
@@ -767,7 +834,10 @@ fn sweep_profile_along_chain_stations(
             " A path that MIXES the two — corners at some joints and curved segments elsewhere              — is in neither lane: every segment straight is mitred (open or closed), every              joint tangent-continuous is skinned, and nothing builds one construction for some              joints and the other for the rest."
                 .to_string()
         };
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "corner",
+            format!(
             "the path must be tangent-continuous: segments '{}' and '{}' meet at a {:.1}° \
              corner{curved}. The profile is skinned between sampled stations along the path, so a \
              corner would be ROUNDED OFF rather than mitred, and a mitre needs two STRAIGHT \
@@ -776,6 +846,7 @@ fn sweep_profile_along_chain_stations(
             path.name(corner.before),
             path.name(corner.after),
             corner.tangent_break.to_degrees()
+            ),
         ));
     }
 
@@ -838,7 +909,7 @@ impl RingFrame {
 }
 
 /// The ring frame a path's stations close on, read off its classification.
-fn ring_frame(path: &SweepPath, tangents: &[Vec3]) -> Result<RingFrame, String> {
+fn ring_frame(path: &SweepPath, tangents: &[Vec3]) -> Result<RingFrame, KernelRefusal> {
     Ok(match (path.closed, path.planar) {
         (false, _) => RingFrame::Open,
         (true, Some(normal)) => RingFrame::Planar(ring_normal(normal, tangents)?),
@@ -924,7 +995,7 @@ pub fn sweep_closure(
     placement_mode: SectionPlacement,
     stations: usize,
     twist_angle: f64,
-) -> Result<Option<SweepClosure>, String> {
+) -> Result<Option<SweepClosure>, KernelRefusal> {
     if !path.closed {
         return Ok(None);
     }
@@ -956,7 +1027,7 @@ fn ring_closing_twist(
     points: &[Vec3],
     tangents: &[Vec3],
     twist_angle: f64,
-) -> Result<ClosingTwist, String> {
+) -> Result<ClosingTwist, KernelRefusal> {
     let lap: f64 = (0..points.len())
         .map(|index| points[(index + 1) % points.len()].sub(points[index]).length())
         .sum();
@@ -972,18 +1043,24 @@ fn mitre_section(
     placement: ProfileAnchor,
     placement_mode: SectionPlacement,
     path: &SweepPath,
-) -> Result<(Vec<NurbsCurve>, Vec3, Vec3), String> {
-    let [t0, t1] = path.curves[0].domain()?;
-    let start = path.curves[0].evaluate(t0)?;
+) -> Result<(Vec<NurbsCurve>, Vec3, Vec3), KernelRefusal> {
+    let [t0, t1] = path.curves[0].domain().or_refuse(KernelStage::Collect, "domain")?;
+    let start = path.curves[0].evaluate(t0).or_refuse(KernelStage::Collect, "evaluate")?;
     // The CHORD direction, which is both the first station's tangent (a
     // straight segment's derivative is its chord) and the direction the
     // mitre builder sweeps along, so the placed section is square to the
     // same vector the construction uses.
     let tangent = path.curves[0]
-        .evaluate(t1)?
+        .evaluate(t1).or_refuse(KernelStage::Collect, "evaluate")?
         .sub(start)
         .normalized()
-        .map_err(|_| "sweepSolid: path segment 0 has zero length".to_string())?;
+        .map_err(|_| {
+            KernelRefusal::input(
+                KernelStage::Collect,
+                "segment_length",
+                "sweepSolid: path segment 0 has zero length",
+            )
+        })?;
     let (section, section_normal) =
         place_section(profile, placement, placement_mode, start, tangent)?;
     Ok((section, section_normal, tangent))
@@ -1016,7 +1093,7 @@ fn station_frames(
     closure: RingFrame,
     screw: Option<(&[usize], &SweepPath)>,
     requested: ClosingTwist,
-) -> Result<(Vec<Vec3>, Vec<Vec3>, Option<SweepClosure>), String> {
+) -> Result<(Vec<Vec3>, Vec<Vec3>, Option<SweepClosure>), KernelRefusal> {
     match closure {
         RingFrame::Open => {
             let (r_axes, s_axes) = transported_frames(points, tangents, screw)?;
@@ -1033,10 +1110,13 @@ fn station_frames(
                     .sub(tangent.scale(normal.dot(*tangent)))
                     .normalized()
                     .map_err(|_| {
-                        "sweepSolid: the closed path's plane normal is parallel to its tangent"
-                            .to_string()
+                        KernelRefusal::internal(
+                            KernelStage::Classify,
+                            "planar_frame",
+                            "sweepSolid: the closed path's plane normal is parallel to its tangent",
+                        )
                     })?;
-                s_axes.push(tangent.cross(r).normalized()?);
+                s_axes.push(tangent.cross(r).normalized().or_refuse(KernelStage::Classify, "normalized")?);
                 r_axes.push(r);
             }
             if requested.twist != 0.0 {
@@ -1094,10 +1174,14 @@ fn ring_closure_frames(
     tangents: &[Vec3],
     screw: Option<(&[usize], &SweepPath)>,
     requested: ClosingTwist,
-) -> Result<(Vec<Vec3>, Vec<Vec3>, SweepClosure), String> {
+) -> Result<(Vec<Vec3>, Vec<Vec3>, SweepClosure), KernelRefusal> {
     let stations = points.len();
     if stations < 2 {
-        return Err("sweepSolid: need at least 2 stations".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Collect,
+            "station_run",
+            "sweepSolid: need at least 2 stations",
+        ));
     }
     // The lap with its wrap: station 0 again, arriving as the LAST segment's end.
     let mut lap_points = points.to_vec();
@@ -1144,7 +1228,7 @@ fn roll_over_the_lap(
     r_axes: &mut [Vec3],
     s_axes: &mut [Vec3],
     roll: f64,
-) -> Result<(), String> {
+) -> Result<(), KernelRefusal> {
     let stations = points.len();
     let mut travelled = Vec::with_capacity(stations);
     let mut length = 0.0;
@@ -1153,7 +1237,11 @@ fn roll_over_the_lap(
         length += points[(index + 1) % stations].sub(points[index]).length();
     }
     if length <= 0.0 {
-        return Err("sweepSolid: the closed path has zero length".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Classify,
+            "lap_length",
+            "sweepSolid: the closed path has zero length",
+        ));
     }
     for station in 0..stations {
         let phi = roll * travelled[station] / length;
@@ -1172,13 +1260,13 @@ fn transported_frames(
     points: &[Vec3],
     tangents: &[Vec3],
     screw: Option<(&[usize], &SweepPath)>,
-) -> Result<(Vec<Vec3>, Vec<Vec3>), String> {
+) -> Result<(Vec<Vec3>, Vec<Vec3>), KernelRefusal> {
     let stations = points.len();
     let mut r_axes = Vec::with_capacity(stations);
     let mut s_axes = Vec::with_capacity(stations);
     {
-        let r0 = tangents[0].perpendicular()?; // any unit vector ⟂ T0
-        s_axes.push(tangents[0].cross(r0).normalized()?);
+        let r0 = tangents[0].perpendicular().or_refuse(KernelStage::Classify, "perpendicular")?; // any unit vector ⟂ T0
+        s_axes.push(tangents[0].cross(r0).normalized().or_refuse(KernelStage::Classify, "normalized")?);
         r_axes.push(r0);
         // The helix segment the running roll was fixed for, and that roll.
         let mut roll: Option<(usize, f64)> = None;
@@ -1195,7 +1283,13 @@ fn transported_frames(
                     t_next,
                     points[index + 1].sub(points[index]),
                 )
-                .ok_or_else(|| format!("sweepSolid: frame degenerated at station {index}"))?,
+                .ok_or_else(|| {
+                    KernelRefusal::internal(
+                        KernelStage::Classify,
+                        "frame_step",
+                        format!("sweepSolid: frame degenerated at station {index}"),
+                    )
+                })?,
                 Some((segment, axis, path)) => {
                     // The roll is fixed ONCE per helix segment, at the station it
                     // departs from — station 0, or the joint the previous segment
@@ -1219,7 +1313,7 @@ fn transported_frames(
                         .add(t_next.cross(reference).scale(sin_phi))
                 }
             };
-            s_axes.push(t_next.cross(r_next).normalized()?);
+            s_axes.push(t_next.cross(r_next).normalized().or_refuse(KernelStage::Classify, "normalized")?);
             r_axes.push(r_next);
         }
     }
@@ -1242,14 +1336,18 @@ fn transported_frames(
 ///
 /// Undefined only where the path runs ALONG its own axis, which a helix of
 /// positive radius never does; refused by name there rather than guessed.
-fn screw_reference(axis: Vec3, tangent: Vec3, segment: &str, station: usize) -> Result<Vec3, String> {
+fn screw_reference(axis: Vec3, tangent: Vec3, segment: &str, station: usize) -> Result<Vec3, KernelRefusal> {
     axis.sub(tangent.scale(axis.dot(tangent)))
         .normalized()
         .map_err(|_| {
-            format!(
+            KernelRefusal::ill_posed(
+                KernelStage::Classify,
+                "screw_reference",
+                format!(
                 "sweepSolid: path segment '{segment}' runs along its own helix axis at station \
                  {station}, so the screw motion that carries the section has no direction \
                  about the path there"
+                ),
             )
         })
 }
@@ -1298,7 +1396,7 @@ pub(crate) fn curvature_vector(first: Vec3, second: Vec3) -> Vec3 {
 /// Extracted from the chain sweep so the tight-bend INSTRUMENT
 /// ([`sweep_bend_profile`]) measures the very stations the sweep lofts through,
 /// rather than a second sampling that agrees with it today.
-fn chain_stations(path: &SweepPath, stations: usize) -> Result<StationSamples, String> {
+fn chain_stations(path: &SweepPath, stations: usize) -> Result<StationSamples, KernelRefusal> {
     let tolerance = 1e-6;
     let chain = path.curves.as_slice();
     // --- Per-segment arc-length estimate, and the domain each one is sampled
@@ -1312,28 +1410,40 @@ fn chain_stations(path: &SweepPath, stations: usize) -> Result<StationSamples, S
     let mut lengths = Vec::with_capacity(chain.len());
     let mut turning = Vec::with_capacity(chain.len());
     for (index, curve) in chain.iter().enumerate() {
-        let [t0, t1] = curve.domain()?;
+        let [t0, t1] = curve.domain().or_refuse(KernelStage::Collect, "domain")?;
         if (t1 - t0).abs() <= tolerance {
-            return Err(format!(
-                "sweepSolid: path segment {index} has a degenerate domain"
+            return Err(KernelRefusal::input(
+                KernelStage::Collect,
+                "path_domain",
+                format!("sweepSolid: path segment {index} has a degenerate domain"),
             ));
         }
         let mut length = 0.0;
-        let mut previous = curve.evaluate(t0)?;
+        let mut previous = curve.evaluate(t0).or_refuse(KernelStage::Collect, "evaluate")?;
         for sample in 1..=16 {
-            let point = curve.evaluate(t0 + (t1 - t0) * sample as f64 / 16.0)?;
+            let point = curve.evaluate(t0 + (t1 - t0) * sample as f64 / 16.0).or_refuse(KernelStage::Collect, "evaluate")?;
             length += point.sub(previous).length();
             previous = point;
         }
         domains.push([t0, t1]);
         lengths.push(length);
+        // `segment_turning` is a stringly reading of the curve's unit tangents;
+        // a failure there is a degenerate tangent, which is the path's fault.
         turning.push(segment_turning(curve, [t0, t1]).map_err(|error| {
-            format!("sweepSolid: path tangent is degenerate on segment {index}: {error}")
+            KernelRefusal::input(
+                KernelStage::Classify,
+                "path_tangent",
+                format!("sweepSolid: path tangent is degenerate on segment {index}: {error}"),
+            )
         })?);
     }
     let total_length: f64 = lengths.iter().sum();
     if total_length <= tolerance {
-        return Err("sweepSolid: path chain has zero length".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "path_length",
+            "sweepSolid: path chain has zero length",
+        ));
     }
 
     // --- Station budget per segment: proportional to arc length, floored at 2
@@ -1415,11 +1525,15 @@ fn chain_stations(path: &SweepPath, stations: usize) -> Result<StationSamples, S
     // hang. Refuse with the count instead — the same honesty the twist cap uses.
     const MAX_STATIONS: usize = 1024;
     if emitted > MAX_STATIONS {
-        return Err(format!(
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Collect,
+            "station_cap",
+            format!(
             "sweepSolid: a {}-segment path needs at least {emitted} stations, past the \
              {MAX_STATIONS}-station cap the loft solve can carry; sweep it in fewer, \
              longer pieces",
             chain.len()
+            ),
         ));
     }
     if emitted < stations {
@@ -1455,7 +1569,7 @@ fn chain_stations(path: &SweepPath, stations: usize) -> Result<StationSamples, S
             // START of a curved piece would quote the straight piece's κ = 0 and
             // the bend would go unnamed; on the wire harness's own span the two
             // ends are mirror images and only ONE of them was being read.
-            let derivatives = curve.derivatives_small(t0, 2)?;
+            let derivatives = curve.derivatives_small(t0, 2).or_refuse(KernelStage::Collect, "derivatives")?;
             let arriving = curvature_vector(derivatives[1], derivatives[2]);
             if let Some(departing) = curvatures.last_mut() {
                 if arriving.length() > departing.length() {
@@ -1466,9 +1580,13 @@ fn chain_stations(path: &SweepPath, stations: usize) -> Result<StationSamples, S
         let last = count - usize::from(path.closed && index + 1 == chain.len());
         for sample in first..last {
             let t = t0 + (t1 - t0) * sample as f64 / (count - 1) as f64;
-            let derivatives = curve.derivatives_small(t, 2)?;
+            let derivatives = curve.derivatives_small(t, 2).or_refuse(KernelStage::Collect, "derivatives")?;
             let tangent = derivatives[1].normalized().map_err(|_| {
-                format!("sweepSolid: path tangent is degenerate on segment {index}")
+                KernelRefusal::input(
+                    KernelStage::Classify,
+                    "path_tangent",
+                    format!("sweepSolid: path tangent is degenerate on segment {index}"),
+                )
             })?;
             points.push(derivatives[0]);
             tangents.push(tangent);
@@ -1481,7 +1599,7 @@ fn chain_stations(path: &SweepPath, stations: usize) -> Result<StationSamples, S
     // segment's end is station 0, and it was dropped rather than emitted.
     if path.closed {
         if let (Some(curve), Some(domain)) = (chain.last(), domains.last()) {
-            let derivatives = curve.derivatives_small(domain[1], 2)?;
+            let derivatives = curve.derivatives_small(domain[1], 2).or_refuse(KernelStage::Collect, "derivatives")?;
             let arriving = curvature_vector(derivatives[1], derivatives[2]);
             if let Some(departing) = curvatures.first_mut() {
                 if arriving.length() > departing.length() {
@@ -1511,17 +1629,25 @@ fn chain_stations(path: &SweepPath, stations: usize) -> Result<StationSamples, S
 ///
 /// The guard is the one case a fixed axis cannot serve: a tangent parallel to the
 /// normal, which a planar path cannot have and a mis-fitted plane could.
-fn ring_normal(normal: Vec3, tangents: &[Vec3]) -> Result<Vec3, String> {
+fn ring_normal(normal: Vec3, tangents: &[Vec3]) -> Result<Vec3, KernelRefusal> {
     for (index, tangent) in tangents.iter().enumerate() {
         if tangent.cross(normal).length() < 0.5 {
-            return Err(format!(
+            return Err(KernelRefusal::internal(
+                KernelStage::Classify,
+                "ring_normal",
+                format!(
                 "sweepSolid: the closed path's own plane normal is within 30° of its tangent \
                  at station {index}, so the path does not lie in that plane after all"
+                ),
             ));
         }
     }
     normal.normalized().map_err(|_| {
-        "sweepSolid: the closed path's plane normal is degenerate".to_string()
+        KernelRefusal::internal(
+            KernelStage::Classify,
+            "ring_normal_degenerate",
+            "sweepSolid: the closed path's plane normal is degenerate",
+        )
     })
 }
 
@@ -1655,14 +1781,14 @@ pub struct BendStation {
 fn section_offsets(
     profile: &[NurbsCurve],
     placement: &ProfileAnchor,
-) -> Result<Vec<(f64, f64)>, String> {
+) -> Result<Vec<(f64, f64)>, KernelRefusal> {
     let ProfileAnchor { origin, pu, pv, .. } = *placement;
     let mut offsets = Vec::with_capacity(profile.len() * BEND_SECTION_SAMPLES);
     for curve in profile {
-        let [start, end] = curve.domain()?;
+        let [start, end] = curve.domain().or_refuse(KernelStage::Classify, "domain")?;
         for sample in 0..BEND_SECTION_SAMPLES {
             let t = start + (end - start) * sample as f64 / BEND_SECTION_SAMPLES as f64;
-            let local = curve.evaluate(t)?.sub(origin);
+            let local = curve.evaluate(t).or_refuse(KernelStage::Classify, "evaluate")?.sub(origin);
             offsets.push((local.dot(pu), local.dot(pv)));
         }
     }
@@ -1725,7 +1851,7 @@ pub fn sweep_bend_profile(
     profile: &[NurbsCurve],
     path: &SweepPath,
     stations: usize,
-) -> Result<Vec<BendStation>, String> {
+) -> Result<Vec<BendStation>, KernelRefusal> {
     let placement = resolve_placement(profile, None, SectionPlacement::Transplant)?;
     let StationSamples {
         points,
@@ -1748,13 +1874,27 @@ pub fn sweep_bend_profile(
 /// (the wire harness reports it as a bundle status) without matching free text.
 pub const SWEEP_TIGHT_BEND_REFUSAL: &str = "sweepSolid: the path bends TIGHTER than the section";
 
+/// The slug of the tight-bend refusal (`UnsupportedGeometry`), shared by its
+/// one mint ([`tight_bend_refusal`]) and [`is_sweep_tight_bend`].
+pub(crate) const SWEEP_TIGHT_BEND_WHAT: &str = "tight_bend";
+
+/// Is this the sweep's tight-bend refusal ([`SWEEP_TIGHT_BEND_REFUSAL`])? Read
+/// off the class and its slug, so a caller that decides on it (the wire
+/// harness's bundle status) follows the refusal, not its wording.
+pub(crate) fn is_sweep_tight_bend(refusal: &KernelRefusal) -> bool {
+    matches!(
+        &refusal.class,
+        crate::RefusalClass::UnsupportedGeometry { what } if what == SWEEP_TIGHT_BEND_WHAT
+    )
+}
+
 /// The refusal for a path that bends tighter than the section reaches, or `None`
 /// when every station builds.
 ///
 /// Quotes the WORST station rather than the first one scanned — the tightest
 /// bend is the one the user has to ease, and a path can cross the bar in several
 /// places (both ends of one Hermite span, typically).
-fn tight_bend_refusal(profile: &[BendStation], stations: usize) -> Option<String> {
+fn tight_bend_refusal(profile: &[BendStation], stations: usize) -> Option<KernelRefusal> {
     let folded = profile.iter().filter(|station| station.ratio >= 1.0).count();
     if folded == 0 {
         return None;
@@ -1763,7 +1903,12 @@ fn tight_bend_refusal(profile: &[BendStation], stations: usize) -> Option<String
         .iter()
         .max_by(|a, b| a.ratio.total_cmp(&b.ratio))
         .expect("a folded station exists");
-    Some(format!(
+    // The solid exists — the envelope trimmed at its self-intersection — and
+    // this lane does not build it: a named deferral.
+    Some(KernelRefusal::unsupported(
+        KernelStage::Classify,
+        SWEEP_TIGHT_BEND_WHAT,
+        format!(
         "{SWEEP_TIGHT_BEND_REFUSAL} at station {} of {stations} ({:.4}, {:.4}, {:.4}): the path's \
          radius of curvature there is {:.6} and the section reaches {:.6} into the bend, so \
          ρ·κ = {:.3} ≥ 1 ({folded} of {stations} stations do). A section carried through a bend \
@@ -1782,6 +1927,7 @@ fn tight_bend_refusal(profile: &[BendStation], stations: usize) -> Option<String
         worst.reach,
         worst.radius,
         2.0 * worst.radius,
+        ),
     ))
 }
 
@@ -1826,11 +1972,15 @@ fn sweep_sections_through_samples(
     closure: RingFrame,
     envelope_gap: Option<&str>,
     chain: Option<(&[usize], &SweepPath)>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let tolerance = 1e-6;
     let stations = points.len();
     if stations < 2 {
-        return Err("sweepSolid: need at least 2 stations".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Collect,
+            "station_run",
+            "sweepSolid: need at least 2 stations",
+        ));
     }
 
     let ProfileAnchor { origin, pu, pv, .. } = placement;
@@ -1852,7 +2002,11 @@ fn sweep_sections_through_samples(
             cumulative[index] = total;
         }
         if total <= tolerance {
-            return Err("sweepSolid: path has zero length; cannot distribute the twist".into());
+            return Err(KernelRefusal::input(
+                KernelStage::Collect,
+                "path_length",
+                "sweepSolid: path has zero length; cannot distribute the twist",
+            ));
         }
         for length in &mut cumulative {
             *length /= total;
@@ -1934,12 +2088,18 @@ fn sweep_sections_through_samples(
             .sum();
         let gap = points[stations - 1].sub(points[0]).length();
         if travel > tolerance && gap <= 1e-3 * travel {
-            return Err(format!(
+            // A run that is nearly a loop without being one: the input does not
+            // say whether it is a ring or an open sweep, so neither is chosen.
+            return Err(KernelRefusal::ill_posed(
+                KernelStage::Classify,
+                "near_closed_path",
+                format!(
                 "sweepSolid: the path returns to where it started ({gap:.3e} apart after \
                  travelling {travel:.3e}), so the sweep's two end caps would land on top of each \
                  other. A closed path swept this way IS a revolution — build it with Revolve \
                  about the same axis, or close the path exactly so it sweeps as a capless ring, \
                  or sweep the run in two halves and union them"
+                ),
             ));
         }
     }
@@ -2046,7 +2206,7 @@ fn sweep_sections_through_samples(
                 curve.degree,
                 curve.knots.clone(),
                 control_points,
-            )?);
+            ).or_refuse(KernelStage::Fragment, "curve_new")?);
         }
         sections.push(section);
     }
@@ -2108,20 +2268,22 @@ fn sweep_sections_through_samples(
         // a large one.
         let noise = 1e-9 * longest_step.max(tolerance);
         if most_positive > noise && most_negative < -noise {
-            return Err(
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "straddles_axis",
                 "sweepSolid: the profile sweeps back through itself — part of it advances along \
                  the path while part of it retreats. A turning path carries the profile around \
                  the turn's own axis, so a profile that STRADDLES that axis folds into itself; \
-                 move the profile clear of the axis, or sweep the run in pieces"
-                    .into(),
-            );
+                 move the profile clear of the axis, or sweep the run in pieces",
+            ));
         }
         if most_positive <= noise && most_negative >= -noise {
-            return Err(
+            return Err(KernelRefusal::input(
+                KernelStage::Classify,
+                "no_advance",
                 "sweepSolid: the path does not advance through the profile — it runs inside the \
-                 profile plane, so the sweep encloses no volume"
-                    .into(),
-            );
+                 profile plane, so the sweep encloses no volume",
+            ));
         }
         // The near-parallel case, on the anchor origin's own track: the same 0.1
         // threshold `extrude_profile_brep` refuses a sliver at, so a STRAIGHT
@@ -2136,11 +2298,12 @@ fn sweep_sections_through_samples(
                 continue;
             }
             if step.dot(section_normals[station]).abs() / length < 0.1 {
-                return Err(
+                return Err(KernelRefusal::input(
+                    KernelStage::Classify,
+                    "sliver",
                     "sweepSolid: the path is nearly parallel to the profile plane, which sweeps a \
-                     sliver rather than a solid"
-                        .into(),
-                );
+                     sliver rather than a solid",
+                ));
             }
         }
     }
@@ -2175,11 +2338,13 @@ fn sweep_sections_through_samples(
             // path to measure — so the refusal names the boundary of what is
             // built rather than only the bend that is refused.
             return Err(match envelope_gap {
-                Some(gap) if !gap.is_empty() => format!(
+                Some(gap) if !gap.is_empty() => refusal.with_message(|refusal| {
+                    format!(
                     "{refusal}. The swept envelope trimmed at its own self-intersection is built \
                      for a CIRCLE carried along one circular planar arc, and this sweep is not \
                      that: {gap}"
-                ),
+                    )
+                }),
                 _ => refusal,
             });
         }
@@ -2200,14 +2365,24 @@ fn sweep_sections_through_samples(
     //   A RING whose requested twist lands each curve `shift` along skins each
     //   wall from its own curve into that one (`loft_profile_brep_closed_shifted`),
     //   so there is still one wall per section curve.
+    //   The loft mints its own refusals; the wrap below keeps that class and
+    //   prefixes the text.
     match closure {
         RingFrame::Planar(_) | RingFrame::Spatial => {
+            // The loft mints its own refusals; its class rides through the
+            // sweep's wrap (a station cap stays a deferral, the acceptance's
+            // fold stays an UnsoundResult).
             crate::loft_profile_brep_closed_shifted(&sections, requested.shift).map_err(|error| {
-                format!("sweepSolid: closed loft through swept sections failed: {error}")
+                error.with_message(|error| {
+                    format!("sweepSolid: closed loft through swept sections failed: {error}")
+                })
             })
         }
-        RingFrame::Open => loft_profile_brep(&sections)
-            .map_err(|error| format!("sweepSolid: loft through swept sections failed: {error}")),
+        RingFrame::Open => loft_profile_brep(&sections).map_err(|error| {
+            error.with_message(|error| {
+                format!("sweepSolid: loft through swept sections failed: {error}")
+            })
+        }),
     }
 }
 
@@ -2244,11 +2419,15 @@ pub fn helix_sample_points(
     turns: f64,
     start_angle: f64,
     left_handed: bool,
-) -> Result<(Vec<Vec3>, Vec<f64>), String> {
+) -> Result<(Vec<Vec3>, Vec<f64>), KernelRefusal> {
     use std::f64::consts::TAU;
-    let w = axis_direction
-        .normalized()
-        .map_err(|_| "helix: axis direction is degenerate".to_string())?;
+    let w = axis_direction.normalized().map_err(|_| {
+        KernelRefusal::input(
+            KernelStage::Collect,
+            "helix_axis",
+            "helix: axis direction is degenerate",
+        )
+    })?;
     for (name, value) in [
         ("radius", start_radius),
         ("end radius", end_radius),
@@ -2257,32 +2436,59 @@ pub fn helix_sample_points(
         ("start angle", start_angle),
     ] {
         if !value.is_finite() {
-            return Err(format!("helix: {name} must be a finite number"));
+            return Err(KernelRefusal::input(
+                KernelStage::Collect,
+                "helix_finite",
+                format!("helix: {name} must be a finite number"),
+            ));
         }
     }
     if start_radius < 0.0 || end_radius < 0.0 {
-        return Err("helix: radius must not be negative".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "helix_radius",
+            "helix: radius must not be negative",
+        ));
     }
     if pitch < 0.0 {
-        return Err("helix: pitch must not be negative".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "helix_pitch",
+            "helix: pitch must not be negative",
+        ));
     }
     if turns <= 0.0 {
-        return Err("helix: turns must be positive".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "helix_turns",
+            "helix: turns must be positive",
+        ));
     }
     if turns > 256.0 {
-        return Err("helix: turns must be at most 256".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "helix_turns_limit",
+            "helix: turns must be at most 256",
+        ));
     }
     if start_radius == 0.0 && end_radius == 0.0 && pitch == 0.0 {
-        return Err("helix: zero radius and zero pitch describe a single point".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "helix_point",
+            "helix: zero radius and zero pitch describe a single point",
+        ));
     }
     let u = match reference {
         Some(reference) => {
             let radial = reference.sub(w.scale(reference.dot(w)));
-            radial.normalized().or_else(|_| w.perpendicular())?
+            radial
+                .normalized()
+                .or_else(|_| w.perpendicular())
+                .or_refuse(KernelStage::Collect, "perpendicular")?
         }
-        None => w.perpendicular()?,
+        None => w.perpendicular().or_refuse(KernelStage::Collect, "perpendicular")?,
     };
-    let v = w.cross(u).normalized()?;
+    let v = w.cross(u).normalized().or_refuse(KernelStage::Collect, "normalized")?;
     let total_angle = turns * TAU;
     let height = pitch * turns;
     let sign = if left_handed { -1.0 } else { 1.0 };
@@ -2319,7 +2525,7 @@ pub fn fit_helix_curve(
     turns: f64,
     start_angle: f64,
     left_handed: bool,
-) -> Result<NurbsCurve, String> {
+) -> Result<NurbsCurve, KernelRefusal> {
     let (points, parameters) = helix_sample_points(
         axis_origin,
         axis_direction,
@@ -2331,7 +2537,7 @@ pub fn fit_helix_curve(
         start_angle,
         left_handed,
     )?;
-    interpolate_curve(&points, 3, &parameters)
+    interpolate_curve(&points, 3, &parameters).or_refuse(KernelStage::Refine, "interpolate")
 }
 
 /// The helix is transcendental, not exactly NURBS-representable, so the path
@@ -2380,26 +2586,46 @@ pub fn sweep_profile_helix(
     pitch: f64,
     turns: f64,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     use std::f64::consts::TAU;
 
     // --- 1. Validate the helix parameters with honest errors.
-    let w = axis_direction
-        .normalized()
-        .map_err(|_| "sweep_profile_helix: axis direction is degenerate".to_string())?;
+    let w = axis_direction.normalized().map_err(|_| {
+        KernelRefusal::input(
+            KernelStage::Collect,
+            "helix_axis",
+            "sweep_profile_helix: axis direction is degenerate",
+        )
+    })?;
     if !(helix_radius.is_finite() && helix_radius > 0.0) {
-        return Err("sweep_profile_helix: helix radius must be positive".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "helix_radius",
+            "sweep_profile_helix: helix radius must be positive",
+        ));
     }
     if !(pitch.is_finite() && pitch > 0.0) {
-        return Err("sweep_profile_helix: pitch must be positive".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "helix_pitch",
+            "sweep_profile_helix: pitch must be positive",
+        ));
     }
     if !(turns.is_finite() && turns > 0.0) {
-        return Err("sweep_profile_helix: turns must be positive".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "helix_turns",
+            "sweep_profile_helix: turns must be positive",
+        ));
     }
     // 64 turns bounds the loft's O(stations³) interpolation solve; beyond it
     // the station cap would silently degrade per-turn density anyway.
     if turns > 64.0 {
-        return Err("sweep_profile_helix: turns must be at most 64".into());
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Collect,
+            "helix_turns_cap",
+            "sweep_profile_helix: turns must be at most 64",
+        ));
     }
 
     // --- 2. Profile extent about its centroid, sampled exactly like the path
@@ -2407,9 +2633,9 @@ pub fn sweep_profile_helix(
     //        extent is measured about the point that actually rides the path.
     let mut samples = Vec::new();
     for curve in profile {
-        let [start, end] = curve.domain()?;
+        let [start, end] = curve.domain().or_refuse(KernelStage::Collect, "domain")?;
         for sample in 0..16 {
-            samples.push(curve.evaluate(start + (end - start) * sample as f64 / 16.0)?);
+            samples.push(curve.evaluate(start + (end - start) * sample as f64 / 16.0).or_refuse(KernelStage::Collect, "evaluate")?);
         }
     }
     if !samples.is_empty() {
@@ -2426,10 +2652,14 @@ pub fn sweep_profile_helix(
                              // Fold-over: profile reaches past the helix's center of curvature.
         let curvature_radius = (helix_radius * helix_radius + c * c) / helix_radius;
         if extent >= curvature_radius {
-            return Err(format!(
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "helix_fold",
+                format!(
                 "sweep_profile_helix: profile extent {extent:.6} reaches the helix \
                  curvature radius {curvature_radius:.6}; the tube would fold through \
                  itself — increase the helix radius or pitch, or shrink the profile"
+                ),
             ));
         }
         // Coil collision: only possible once the sweep spans a full revolution.
@@ -2438,11 +2668,15 @@ pub fn sweep_profile_helix(
             let turn_length = (circumference * circumference + pitch * pitch).sqrt();
             let coil_gap = pitch * circumference / turn_length;
             if coil_gap <= 2.0 * extent {
-                return Err(format!(
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "coil_collision",
+                    format!(
                     "sweep_profile_helix: consecutive turns would self-intersect — \
                      coil gap {coil_gap:.6} does not clear the profile diameter {:.6}; \
                      increase the pitch or shrink the profile",
                     2.0 * extent
+                    ),
                 ));
             }
         }
@@ -2461,7 +2695,9 @@ pub fn sweep_profile_helix(
         0.0,
         false,
     )
-    .map_err(|error| format!("sweep_profile_helix: helix path fit failed: {error}"))?;
+    .map_err(|error| {
+        error.with_message(|error| format!("sweep_profile_helix: helix path fit failed: {error}"))
+    })?;
 
     // --- 4. Drive the existing sweep core; its (or the loft's) failures
     //        propagate with helix context prepended.
@@ -2479,5 +2715,5 @@ pub fn sweep_profile_helix(
         None,
         SectionPlacement::Transplant,
     )
-        .map_err(|error| format!("sweep_profile_helix: {error}"))
+        .map_err(|error| error.with_message(|error| format!("sweep_profile_helix: {error}")))
 }

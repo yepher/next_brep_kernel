@@ -41,6 +41,7 @@ use crate::{
     boolean_operation, extrude_profile_brep, make_arc, make_line, revolve_profile_brep,
     BooleanOperation, BooleanOptions, NurbsCurve, Vec3,
 };
+use crate::{KernelRefusal, KernelStage, OrRefuse, RefusalClass};
 
 #[path = "fillet/analyze.rs"]
 mod analyze;

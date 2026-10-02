@@ -15,18 +15,18 @@ pub use tolerance::{
     MeasuredTolerance, OFFSET_CONSTRUCTION_FLOOR, OFFSET_CONSTRUCTION_REL,
     VERTEX_MATCH_FLOOR, VOLUME_DRIFT_ABS, VOLUME_DRIFT_REL,
 };
-// Per-entity measured tolerances (`per-entity-tolerances.md` slice S1): the
-// lazy, capped band an individual edge or vertex earns from its own redundant
-// representations, on top of the global policy above. Measurement only — no
-// record field, no serialization; see the module doc for invariants I1/I2.
+// Per-entity measured tolerances: the lazy, capped band an individual edge or
+// vertex earns from its own redundant representations, on top of the global
+// policy above. Measurement only — no record field, no serialization; see the
+// module doc for invariants I1/I2.
 #[path = "geometry/entity_tolerance.rs"]
 mod entity_tolerance;
 pub use entity_tolerance::{EntityTolerances, EDGE_CAP_FRACTION, VERTEX_CAP_FRACTION};
 #[path = "props/diagnostics.rs"]
 mod diagnostics;
 pub use diagnostics::{
-    DiagnosticEvent, DiagnosticSeverity, KernelDiagnostics, KernelOutcome, KernelRefusal, KernelStage,
-    OrRefuse, RefusalClass,
+    Backing, DiagnosticEvent, DiagnosticSeverity, KernelDiagnostics, KernelOutcome, KernelRefusal,
+    KernelStage, OrRefuse, RefusalClass, SoundnessDefect, UndecidedCause,
 };
 #[path = "geometry/polygon.rs"]
 mod polygon;
@@ -39,6 +39,7 @@ pub use curve::{
 #[path = "blending/blend/mod.rs"]
 mod blend;
 pub use blend::{
+    take_blend_notes,
     blend_closed_edge, blend_edge_variable, blend_open_edge, blend_smooth_chain,
     round_convex_corner,
 };
@@ -56,7 +57,7 @@ pub use law::{LawSegment, RadiusLaw};
 #[path = "geometry/fit.rs"]
 mod fit;
 pub use fit::{
-    fit_polyline, fit_polyline_at, interpolate_curve, interpolate_curve_closed,
+    fit_polyline, fit_polyline_at, fit_polyline_of_degree, interpolate_curve, interpolate_curve_closed,
     interpolate_curve_local, interpolate_curve_thinned, interpolate_curve_with_end_tangents,
     simplify_polyline, simplify_polyline_indices, solve_banded, solve_dense, PolylineFit,
     PolylineFitExit, PolylineFitLedger, PolylineFitReport, PolylineFitScope, MAX_FIT_STATIONS,
@@ -129,6 +130,7 @@ pub use analytic_topology::{
 };
 #[path = "construction/sweep_topology.rs"]
 mod sweep_topology;
+pub(crate) use sweep_topology::is_sweep_tight_bend;
 pub use sweep_topology::{
     extrude_profile_brep, extrude_profile_brep_draft, fit_helix_curve, helix_sample_points,
     profile_anchor, rib_from_profile, sweep_bend_profile, sweep_closure, BendStation,
@@ -167,7 +169,7 @@ pub use mass_properties::{
     face_set_identity, mass_caller, parameter_space_area, solid_edge_length_total,
     solid_mass_properties,
     solid_mass_properties_full, solid_signed_volume, trim_polygons, DensityMassProperties,
-    FaceSetIdentity, FullMassProperties, MassCaller, MassProperties,
+    FaceSetIdentity, FullMassProperties, MassCaller, MassProperties, MassPropertiesCache,
 };
 #[path = "meshing/tessellation.rs"]
 mod tessellation;
@@ -194,7 +196,8 @@ pub use feature_pipeline::face_transform_pivot;
 // whole history and read the results without a JSON round trip.
 pub use feature_pipeline::{
     clear_history_cache, execute_history, execute_history_observed, AddedSolid, Axis,
-    ComponentRecord, FeatureDescriptor, FeatureResult, Frame, HistoryProgress, HistoryRequest,
+    ComponentRecord, FeatureDescriptor, FeatureRefusal, FeatureResult, Frame, Fulfilment,
+    HistoryProgress, HistoryRequest, Rejected, RejectedKind,
     HistoryResult, PortKind, PortRecord, ProfileLoop, ScenePoint, SketchProfile,
 };
 // Wire harness: the document's `wireHarness` block (connections), the tail's
@@ -378,8 +381,9 @@ mod pcurve;
 pub use pcurve::{
     build_pcurve_on_surface, build_pcurve_on_surface_marched, build_pcurve_on_surface_range,
     build_pcurve_on_surface_range_dense, build_pcurve_on_surface_stations, fit_pcurve_on_surface,
-    fit_pcurve_on_surface_marched, PcurveFit, PcurveFitExit, PcurveFitLedger, PcurveFitReport,
-    PcurveFitScope,
+    fit_pcurve_on_surface_marched, fit_pcurve_on_surface_range, fit_pcurve_on_surface_range_dense,
+    fit_pcurve_on_surface_stations, PcurveFit, PcurveFitExit, PcurveFitLedger, PcurveFitReport,
+    PcurveFitScope, PCURVE_OFF_BAR, PCURVE_REFINEMENT_TOLERANCE,
 };
 #[path = "csg/imprint.rs"]
 mod imprint;
@@ -518,6 +522,7 @@ pub use offset_shell::{
     offset_shell, offset_shell_with_diagnostics, OffsetFaceRole, OffsetShellFaceImageRecord,
     OffsetShellResultRecord,
 };
+pub(crate) use offset_shell::{is_offset_shell_no_retained_face, is_offset_shell_open_curved_rim};
 #[path = "io/step_matrix.rs"]
 mod step_matrix;
 #[path = "io/step.rs"]
@@ -590,7 +595,8 @@ mod solver_linear_algebra;
 #[path = "solvers/sketch_solver.rs"]
 mod sketch_solver;
 pub use sketch_solver::{
-    sketch_id_key, solve_sketch, solve_sketch_from_json, SketchSolverSettings, SolveSketchRequest,
+    is_sketch_origin_point_id, sketch_id_key, solve_sketch, solve_sketch_from_json,
+    SketchSolverSettings, SolveSketchRequest, SKETCH_ORIGIN_POINT_ID,
 };
 #[path = "solvers/assembly_solver.rs"]
 mod assembly_solver;
@@ -598,9 +604,9 @@ pub use assembly_solver::{
     solve_assembly, AssemblyBody, AssemblyMate, AssemblySolution, AssemblySolveOptions, BodyPose,
     MateAlign, MateAxis, MateKind, MatePlane, MateResidualReport, SolveStrategy,
 };
-// Assembly selection resolution (build-spec §5): a namespaced selection ref
-// resolved to an analytic frame (plane/axis/sphere/circle/line/point) read from
-// the exact BREP, feeding `MateKind` inputs in component-local coordinates.
+// Assembly selection resolution: a namespaced selection ref resolved to an
+// analytic frame (plane/axis/sphere/circle/line/point) read from the exact
+// BREP, feeding `MateKind` inputs in component-local coordinates.
 #[path = "solvers/assembly_resolve.rs"]
 mod assembly_resolve;
 pub use assembly_resolve::{
@@ -615,6 +621,10 @@ pub use direct_edit::{
     offset_revolution_face, offset_ruled_face, offset_sphere_face, offset_torus_face,
     recut_moved_planes, recut_moved_planes_rigid, resolve_face_by_point, rotate_faces,
     route_reading, RouteReading,
+};
+pub use direct_edit::{face_refusal_slugs, face_transform_reason, FaceTransformReason};
+pub use direct_edit::{
+    refit_faces_as_one, refit_refusal_phrases, RefitCarrier, RefitReport, RefitSurfaceKind,
 };
 #[path = "healing/sew.rs"]
 mod sew;

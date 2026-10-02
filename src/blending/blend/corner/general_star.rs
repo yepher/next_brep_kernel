@@ -25,7 +25,7 @@ pub(super) fn round_general_star(
     corner: Vec3,
     radius: f64,
     name: Option<&str>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
     use std::f64::consts::{PI, TAU};
 
@@ -42,7 +42,11 @@ pub(super) fn round_general_star(
         Some((*vpoint.get(s)?, *vpoint.get(e)?))
     };
     if result.vertices.is_empty() {
-        return Err("round_general_star: solid has no vertices".into());
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "empty_solid",
+            "round_general_star: solid has no vertices",
+        ));
     }
     let centroid = result
         .vertices
@@ -93,15 +97,23 @@ pub(super) fn round_general_star(
     }
     let n_faces = normals.len();
     if n_faces < 4 {
-        return Err(format!(
-            "round_general_star: expected N≥4 walls at a no-common-ball star, found {n_faces}"
+        return Err(KernelRefusal::internal(
+            KernelStage::Classify,
+            "wall_count",
+            format!(
+                "round_general_star: expected N≥4 walls at a no-common-ball star, found {n_faces}"
+            ),
         ));
     }
     if n_faces != 4 {
-        return Err(format!(
-            "round_general_star: only N=4 general stars are supported (found N={n_faces}); \
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "star_n5",
+            format!(
+                "round_general_star: only N=4 general stars are supported (found N={n_faces}); \
              N≥5 needs recursive fillet-of-fillet subdivision (Golovanov §6.9.7) which is \
              not yet implemented"
+            ),
         ));
     }
 
@@ -145,9 +157,18 @@ pub(super) fn round_general_star(
             if !borders {
                 continue;
             }
-            let [u0, u1] = face.surface.domain_u()?;
-            let [v0, v1] = face.surface.domain_v()?;
-            let sample = face.surface.evaluate((u0 + u1) * 0.5, (v0 + v1) * 0.5)?;
+            let [u0, u1] = face
+                .surface
+                .domain_u()
+                .or_refuse(KernelStage::Classify, "domain")?;
+            let [v0, v1] = face
+                .surface
+                .domain_v()
+                .or_refuse(KernelStage::Classify, "domain")?;
+            let sample = face
+                .surface
+                .evaluate((u0 + u1) * 0.5, (v0 + v1) * 0.5)
+                .or_refuse(KernelStage::Classify, "evaluate")?;
             let d = sample.sub(frame.origin);
             let axial = d.dot(frame.axis);
             let rad = d.sub(frame.axis.scale(axial)).length();
@@ -166,9 +187,13 @@ pub(super) fn round_general_star(
         }
     }
     if cyls.len() != n_faces {
-        return Err(format!(
-            "round_general_star: expected {n_faces} fillet cylinders at the corner, found {}",
-            cyls.len()
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "fillet_cylinders",
+            format!(
+                "round_general_star: expected {n_faces} fillet cylinders at the corner, found {}",
+                cyls.len()
+            ),
         ));
     }
 
@@ -198,16 +223,24 @@ pub(super) fn round_general_star(
             }
         }
         if members.len() != 2 {
-            return Err(format!(
-                "round_general_star: wall has {} axis-parallel cylinders (expected 2)",
-                members.len()
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "wall_cylinders",
+                format!(
+                    "round_general_star: wall has {} axis-parallel cylinders (expected 2)",
+                    members.len()
+                ),
             ));
         }
         // Project each cylinder axis line onto the wall plane (through `corner`,
         // normal n): point o - n·(n·(o-corner)), direction axis - n·(axis·n).
-        let project = |cyl: &StarCyl| -> Result<(Vec3, Vec3), String> {
+        let project = |cyl: &StarCyl| -> Result<(Vec3, Vec3), KernelRefusal> {
             let o = cyl.origin.sub(n.scale(n.dot(cyl.origin.sub(corner))));
-            let d = cyl.axis.sub(n.scale(cyl.axis.dot(*n))).normalized()?;
+            let d = cyl
+                .axis
+                .sub(n.scale(cyl.axis.dot(*n)))
+                .normalized()
+                .or_refuse(KernelStage::Classify, "normalized")?;
             Ok((o, d))
         };
         let (p1, d1) = project(&cyls[members[0]])?;
@@ -217,7 +250,11 @@ pub(super) fn round_general_star(
         let (a, b, c, d, e) = (d1.dot(d1), d1.dot(d2), d2.dot(d2), d1.dot(w), d2.dot(w));
         let den = a * c - b * b;
         if den.abs() < 1e-12 {
-            return Err("round_general_star: contact lines on a wall are parallel".into());
+            return Err(KernelRefusal::ill_posed(
+                KernelStage::Classify,
+                "parallel_contact_lines",
+                "round_general_star: contact lines on a wall are parallel",
+            ));
         }
         let s = (b * e - c * d) / den;
         let pf = p1.add(d1.scale(s));
@@ -231,12 +268,22 @@ pub(super) fn round_general_star(
                     .length()
                     .total_cmp(&y.point.sub(pf).length())
             })
-            .ok_or("round_general_star: no vertices to match a corner point")?;
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Classify,
+                    "corner_vertices",
+                    "round_general_star: no vertices to match a corner point",
+                )
+            })?;
         if matched.point.sub(pf).length() > 1e-4 * (1.0 + radius) {
-            return Err(format!(
-                "round_general_star: corner point {pf:?} has no existing tangent vertex \
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "tangent_vertex",
+                format!(
+                    "round_general_star: corner point {pf:?} has no existing tangent vertex \
                  (nearest is {:.3e} away)",
-                matched.point.sub(pf).length()
+                    matched.point.sub(pf).length()
+                ),
             ));
         }
         corners.push(StarCorner {
@@ -247,9 +294,13 @@ pub(super) fn round_general_star(
         });
     }
     if corners.len() != n_faces {
-        return Err(format!(
-            "round_general_star: expected {n_faces} corner points, found {}",
-            corners.len()
+        return Err(KernelRefusal::internal(
+            KernelStage::Classify,
+            "corner_count",
+            format!(
+                "round_general_star: expected {n_faces} corner points, found {}",
+                corners.len()
+            ),
         ));
     }
     // Every cylinder must appear in exactly two corner pairs.
@@ -259,8 +310,12 @@ pub(super) fn round_general_star(
             .filter(|k| k.cyl_a == ci || k.cyl_b == ci)
             .count();
         if deg != 2 {
-            return Err(format!(
-                "round_general_star: cylinder {ci} borders {deg} corner points (expected 2)"
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "cylinder_degree",
+                format!(
+                    "round_general_star: cylinder {ci} borders {deg} corner points (expected 2)"
+                ),
             ));
         }
     }
@@ -297,15 +352,25 @@ pub(super) fn round_general_star(
             .enumerate()
             .flat_map(|(si, s)| s.faces.iter().map(move |f| (si, f)))
             .find(|(_, f)| f.id == cyl.face_id)
-            .ok_or("round_general_star: cylinder face vanished")?;
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Fragment,
+                    "cylinder_face",
+                    "round_general_star: cylinder face vanished",
+                )
+            })?;
         if patch_shell.is_none() {
             patch_shell = Some(si);
         }
         if face.loops.len() != 1 {
-            return Err(format!(
-                "round_general_star: cylinder face {} has {} loops",
-                face.id,
-                face.loops.len()
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Fragment,
+                "multi_loop",
+                format!(
+                    "round_general_star: cylinder face {} has {} loops",
+                    face.id,
+                    face.loops.len()
+                ),
             ));
         }
         let coedges = &face.loops[0].coedges;
@@ -332,30 +397,46 @@ pub(super) fn round_general_star(
             })
             .collect();
         let anchor = (0..n).find(|&i| !is_corner[i]).ok_or_else(|| {
-            format!(
-                "round_general_star: cylinder face {} is all corner-end",
-                face.id
+            KernelRefusal::unsupported(
+                KernelStage::Fragment,
+                "all_corner_end",
+                format!(
+                    "round_general_star: cylinder face {} is all corner-end",
+                    face.id
+                ),
             )
         })?;
         let (prefix, run, suffix) = partition_corner_loop(coedges, &is_corner, anchor);
         if run.is_empty() {
-            return Err(format!(
-                "round_general_star: cylinder face {} has no corner-end coedge",
-                face.id
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Fragment,
+                "no_corner_run",
+                format!(
+                    "round_general_star: cylinder face {} has no corner-end coedge",
+                    face.id
+                ),
             ));
         }
         let before = prefix.last().ok_or_else(|| {
-            format!(
-                "round_general_star: cylinder {} corner run has no predecessor",
-                face.id
+            KernelRefusal::internal(
+                KernelStage::Fragment,
+                "run_predecessor",
+                format!(
+                    "round_general_star: cylinder {} corner run has no predecessor",
+                    face.id
+                ),
             )
         })?;
         let (bs, be) = *edge_ends.get(&before.edge_id).unwrap();
         let t_a = if before.forward { be } else { bs };
         let after = suffix.first().or_else(|| prefix.first()).ok_or_else(|| {
-            format!(
-                "round_general_star: cylinder {} corner run has no successor",
-                face.id
+            KernelRefusal::internal(
+                KernelStage::Fragment,
+                "run_successor",
+                format!(
+                    "round_general_star: cylinder {} corner run has no successor",
+                    face.id
+                ),
             )
         })?;
         let (as_, ae) = *edge_ends.get(&after.edge_id).unwrap();
@@ -367,10 +448,14 @@ pub(super) fn round_general_star(
             .map(|k| k.vid)
             .collect();
         if !(my.contains(&t_a) && my.contains(&t_b) && t_a != t_b) {
-            return Err(format!(
-                "round_general_star: cylinder {} run ends ({t_a},{t_b}) are not its two corner \
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Fragment,
+                "run_ends",
+                format!(
+                    "round_general_star: cylinder {} run ends ({t_a},{t_b}) are not its two corner \
                  points {my:?}",
-                face.id
+                    face.id
+                ),
             ));
         }
 
@@ -410,9 +495,14 @@ pub(super) fn round_general_star(
                 w: 1.0,
             })
             .collect();
-        let bez = fit::interpolate_homogeneous(&bez_points, 3, &[0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0])?;
+        let bez = fit::interpolate_homogeneous(&bez_points, 3, &[0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0])
+            .or_refuse(KernelStage::Fragment, "interpolate")?;
         if bez.control_points.len() != 4 {
-            return Err("round_general_star: boundary Bézier is not a 4-point cubic".into());
+            return Err(KernelRefusal::internal(
+                KernelStage::Fragment,
+                "bezier_cubic",
+                "round_general_star: boundary Bézier is not a 4-point cubic",
+            ));
         }
         let ctrl: [Vec3; 4] = [
             Vec3::new(
@@ -464,8 +554,11 @@ pub(super) fn round_general_star(
         let mut previous_u: Option<f64> = None;
         for k in 0..PCURVE_SAMPLES {
             let fraction = k as f64 / (PCURVE_SAMPLES - 1) as f64;
-            let p = bez.evaluate(fraction)?;
-            let projection = crate::project_point_to_surface(&cyl.surface, p)?;
+            let p = bez
+                .evaluate(fraction)
+                .or_refuse(KernelStage::Fragment, "evaluate")?;
+            let projection = crate::project_point_to_surface(&cyl.surface, p)
+                .or_refuse(KernelStage::Fragment, "project")?;
             let mut u = projection.u;
             let v = projection.v;
             if let Some(pu) = previous_u {
@@ -485,7 +578,8 @@ pub(super) fn round_general_star(
             });
             uv_params.push(fraction);
         }
-        let pcurve = fit::interpolate_homogeneous(&uv_points, 3, &uv_params)?;
+        let pcurve = fit::interpolate_homogeneous(&uv_points, 3, &uv_params)
+            .or_refuse(KernelStage::Fragment, "interpolate")?;
         let fresh_co = CoedgeRecord {
             id: next_id(),
             edge_id: arc_id,
@@ -563,13 +657,23 @@ pub(super) fn round_general_star(
     for _ in 0..(boundaries.len() - 1) {
         let nxt = (0..boundaries.len())
             .find(|&j| !used[j] && boundaries[j].end_vid == chain_vertex)
-            .ok_or("round_general_star: boundary arcs do not form a closed quad")?;
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Fragment,
+                    "arc_chain",
+                    "round_general_star: boundary arcs do not form a closed quad",
+                )
+            })?;
         used[nxt] = true;
         order.push(nxt);
         chain_vertex = boundaries[nxt].start_vid;
     }
     if chain_vertex != boundaries[0].end_vid {
-        return Err("round_general_star: boundary arc loop is not closed".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Fragment,
+            "arc_loop",
+            "round_general_star: boundary arc loop is not closed",
+        ));
     }
     // Traversal vertices W0..W3 where Wk = end_vid(order[k]) = start_vid(order[k-1]).
     // net corners: net[0][0]=W0, net[3][0]=W1, net[3][3]=W2, net[0][3]=W3.
@@ -617,20 +721,28 @@ pub(super) fn round_general_star(
         vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
         vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
         control_points,
-    )?;
+    )
+    .or_refuse(KernelStage::Fragment, "surface_new")?;
 
     // Sanity: the patch must not be collapsed (its four corners are distinct and
     // the mid-point is a real interior point of a smooth cap).
     let pc = normals
         .iter()
         .fold(Vec3::default(), |acc, n| acc.add(*n))
-        .normalized()?;
-    let mid = surface.evaluate(0.5, 0.5)?;
+        .normalized()
+        .or_refuse(KernelStage::Validate, "normalized")?;
+    let mid = surface
+        .evaluate(0.5, 0.5)
+        .or_refuse(KernelStage::Validate, "evaluate")?;
     let corner_pts = [net[0][0], net[3][0], net[3][3], net[0][3]];
     for a in 0..4 {
         for b in (a + 1)..4 {
             if corner_pts[a].sub(corner_pts[b]).length() < 1e-6 {
-                return Err("round_general_star: degenerate patch (coincident corners)".into());
+                return Err(KernelRefusal::internal(
+                    KernelStage::Validate,
+                    "patch_corners",
+                    "round_general_star: degenerate patch (coincident corners)",
+                ));
             }
         }
     }
@@ -643,25 +755,41 @@ pub(super) fn round_general_star(
         .iter()
         .fold(Vec3::default(), |acc, p| acc.add(*p))
         .scale(0.25);
-    let apex_dir = corner.sub(quad_centroid).normalized()?;
+    let apex_dir = corner
+        .sub(quad_centroid)
+        .normalized()
+        .or_refuse(KernelStage::Validate, "normalized")?;
     let bulge = mid.sub(quad_centroid).dot(apex_dir);
     if bulge < -1e-9 {
-        return Err(format!(
-            "round_general_star: patch centre folds inward (bulge {bulge:.3e} below the corner quad)"
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Validate,
+            "patch_fold",
+            format!(
+                "round_general_star: patch centre folds inward (bulge {bulge:.3e} below the corner quad)"
+            ),
         ));
     }
     let mid_extent = corner_pts
         .iter()
         .fold(f64::INFINITY, |acc, p| acc.min(mid.sub(*p).length()));
     if mid_extent < 1e-6 {
-        return Err("round_general_star: degenerate patch (centre coincides with a corner)".into());
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "patch_centre",
+            "round_general_star: degenerate patch (centre coincides with a corner)",
+        ));
     }
-    let surface_normal = surface.normal(0.5, 0.5)?;
+    let surface_normal = surface
+        .normal(0.5, 0.5)
+        .or_refuse(KernelStage::Validate, "normal")?;
     let same_sense = surface_normal.dot(pc) > 0.0;
 
     // Patch coedges (all forward=false): W0->W1 (v=0), W1->W2 (u=1), W2->W3
     // (v=1, u decreasing), W3->W0 (u=0, v decreasing).
-    let pl = |u0, v0, u1, v1| crate::sweep_topology::parameter_line(u0, v0, u1, v1);
+    let pl = |u0, v0, u1, v1| {
+        crate::sweep_topology::parameter_line(u0, v0, u1, v1)
+            .or_refuse(KernelStage::Fragment, "parameter_line")
+    };
     let patch_loop_id = next_id();
     let patch_coedges = vec![
         CoedgeRecord {
@@ -737,7 +865,11 @@ pub(super) fn round_general_star(
 
     let issues = result.validate();
     if !issues.is_empty() {
-        return Err(format!("round_general_star: {issues:?}"));
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "validate",
+            format!("round_general_star: {issues:?}"),
+        ));
     }
     Ok(result)
 }

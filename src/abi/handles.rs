@@ -139,6 +139,26 @@ pub(crate) fn with_registered_solid<T>(
 /// pipeline, which stays JsValue-free internally (JsValue only at the wasm
 /// boundary; the host test target cannot run JsValue error paths). Short borrow:
 /// never hold the registry across a feature execution.
+/// [`with_registered_solid_str`] for a typed body: the closure returns
+/// `KernelRefusal`, an unknown handle is an `InvalidInput`, and the result
+/// keeps the class so a feature can carry it to `FeatureResult.refusal`.
+pub(crate) fn with_registered_solid_typed<T>(
+    handle: u32,
+    f: impl FnOnce(&BrepSolid) -> Result<T, crate::KernelRefusal>,
+) -> Result<T, crate::KernelRefusal> {
+    SOLID_REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        let solid = registry.solids.get(&handle).ok_or_else(|| {
+            crate::KernelRefusal::input(
+                crate::KernelStage::Collect,
+                "handle",
+                format!("unknown solid handle {handle}"),
+            )
+        })?;
+        f(solid)
+    })
+}
+
 pub(crate) fn with_registered_solid_str<T>(
     handle: u32,
     f: impl FnOnce(&BrepSolid) -> Result<T, String>,
