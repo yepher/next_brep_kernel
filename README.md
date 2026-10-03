@@ -1,6 +1,6 @@
-# BREP — a boundary-representation geometry kernel
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/yepher/next_brep_kernel)
 
-* [Manual](https://deepwiki.com/yepher/next_brep_kernel)
+# BREP — a boundary-representation geometry kernel
 
 A native/WASM B-rep geometry kernel for building CAD applications, written in
 Rust. Published on crates.io as **`BREP_kernel`** with library name
